@@ -8,6 +8,8 @@ pub enum WorkerToRunner {
         /// Workers unique identifier
         worker_id: u32,
     },
+    /// Worker signals it is ready for the runner to send work.
+    Ready,
 }
 
 /// Messages passed from the main runner to one of the worker processes.
