@@ -13,10 +13,13 @@ use crate::cli::Cli;
 async fn main() -> codec::Result<()> {
     let args = Cli::parse();
 
-    eprintln!("worker {} connecting to {}", args.worker_id, args.socket);
+    eprintln!("[worker {}] connecting to {}", args.worker_id, args.socket);
     let mut stream = UnixStream::connect(&args.socket).await?;
 
-    eprintln!("worker {} sending HELLO to {}", args.worker_id, args.socket);
+    eprintln!(
+        "[worker {}] sending HELLO to {}",
+        args.worker_id, args.socket
+    );
     write_frame(
         &mut stream,
         &WorkerToRunner::Hello {
@@ -29,7 +32,7 @@ async fn main() -> codec::Result<()> {
     match read_frame::<RunnerToWorker, _>(&mut stream).await? {
         RunnerToWorker::HelloAck { runner_version } => {
             eprintln!(
-                "worker {} handshake ok, runner version {runner_version}",
+                "[worker {}] handshake ok, runner version {runner_version}",
                 args.worker_id
             );
         }
@@ -37,11 +40,14 @@ async fn main() -> codec::Result<()> {
     }
 
     write_frame(&mut stream, &WorkerToRunner::Ready).await?;
-    eprintln!("worker {} sent READY", args.worker_id);
+    eprintln!("[worker {}] sent READY", args.worker_id);
 
     let schedule_id = match read_frame::<RunnerToWorker, _>(&mut stream).await? {
         RunnerToWorker::Schedule { schedule_id, .. } => {
-            eprintln!("worker {} received SCHEDULE {schedule_id}", args.worker_id);
+            eprintln!(
+                "[worker {}] received SCHEDULE {schedule_id}",
+                args.worker_id
+            );
             schedule_id
         }
         other => panic!("expected Schedule, got {other:?}"),
@@ -56,7 +62,7 @@ async fn main() -> codec::Result<()> {
     )
     .await?;
     eprintln!(
-        "worker {} sent RUN_RESULT for schedule {schedule_id}",
+        "[worker {}] sent RUN_RESULT for schedule {schedule_id}",
         args.worker_id
     );
 
