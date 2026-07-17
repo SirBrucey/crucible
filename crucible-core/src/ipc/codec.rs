@@ -1,4 +1,4 @@
-//! Length-prefixed bincode framing for IPC messages.
+//! Length-prefixed postcard framing for IPC messages.
 
 use std::io;
 
@@ -18,38 +18,41 @@ pub enum Error {
     #[error(transparent)]
     Io(#[from] io::Error),
     #[error(transparent)]
-    Encode(#[from] bincode::error::EncodeError),
-    #[error(transparent)]
-    Decode(#[from] bincode::error::DecodeError),
+    Postcard(#[from] postcard::Error),
     #[error("frame too large: {size} bytes exceeds {max}")]
     TooLarge { size: usize, max: usize },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// Serialize `message` with bincode and write it as a length-prefixed frame.
+/// Serialize `message` with postcard and write it as a length-prefixed frame.
 ///
-/// The frame is a 4-byte big-endian length header followed by the bincode payload.
+/// The frame is a 4-byte big-endian length header followed by the postcard payload.
+/// Encoding happens into a stack-allocated buffer of `MAX_FRAME_SIZE` bytes;
+/// larger messages are rejected as `Error::TooLarge`.
 pub async fn write_frame<T, W>(writer: &mut W, message: &T) -> Result<()>
 where
     T: Serialize,
     W: AsyncWriteExt + Unpin,
 {
-    let bytes = bincode::serde::encode_to_vec(message, bincode::config::standard())?;
-    let size = bytes.len();
-    if size > MAX_FRAME_SIZE {
-        return Err(Error::TooLarge {
-            size,
-            max: MAX_FRAME_SIZE,
-        });
-    }
-    let len = u32::try_from(size).expect("size <= MAX_FRAME_SIZE fits in u32");
+    let mut buf = [0u8; MAX_FRAME_SIZE];
+    let bytes = match postcard::to_slice(message, &mut buf) {
+        Ok(bytes) => bytes,
+        Err(postcard::Error::SerializeBufferFull) => {
+            return Err(Error::TooLarge {
+                size: MAX_FRAME_SIZE + 1,
+                max: MAX_FRAME_SIZE,
+            });
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let len = u32::try_from(bytes.len()).expect("size <= MAX_FRAME_SIZE fits in u32");
     writer.write_all(&len.to_be_bytes()).await?;
-    writer.write_all(&bytes).await?;
+    writer.write_all(bytes).await?;
     Ok(())
 }
 
-/// Read one length-prefixed frame and deserialize it with bincode.
+/// Read one length-prefixed frame and deserialize it with postcard.
 pub async fn read_frame<T, R>(reader: &mut R) -> Result<T>
 where
     T: DeserializeOwned,
@@ -64,9 +67,9 @@ where
             max: MAX_FRAME_SIZE,
         });
     }
-    let mut bytes = vec![0u8; len];
-    reader.read_exact(&mut bytes).await?;
-    let (message, _) = bincode::serde::decode_from_slice(&bytes, bincode::config::standard())?;
+    let mut bytes = [0u8; MAX_FRAME_SIZE];
+    reader.read_exact(&mut bytes[..len]).await?;
+    let message = postcard::from_bytes(&bytes[..len])?;
     Ok(message)
 }
 
