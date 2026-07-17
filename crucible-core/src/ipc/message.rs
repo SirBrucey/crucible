@@ -56,6 +56,8 @@ pub enum RunnerToWorker {
         #[serde(with = "base64_bytes")]
         payload: Vec<u8>,
     },
+    /// Runner tells the worker there is no more work and to exit cleanly.
+    Shutdown,
 }
 
 mod base64_bytes {
