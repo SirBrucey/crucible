@@ -113,6 +113,15 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn roundtrips_schedule() {
+        roundtrip(RunnerToWorker::Schedule {
+            schedule_id: 7,
+            payload: vec![0u8; 128],
+        })
+        .await;
+    }
+
+    #[tokio::test]
     async fn write_frame_rejects_oversized_payload() {
         let (mut tx, _rx) = tokio::io::duplex(MAX_FRAME_SIZE);
         let big = "x".repeat(MAX_FRAME_SIZE + 1);

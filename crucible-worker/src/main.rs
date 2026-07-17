@@ -26,12 +26,15 @@ async fn main() -> codec::Result<()> {
     )
     .await?;
 
-    let ack: RunnerToWorker = read_frame(&mut stream).await?;
-    let RunnerToWorker::HelloAck { runner_version } = ack;
-    eprintln!(
-        "worker {} handshake ok, runner version {runner_version}",
-        args.worker_id
-    );
+    match read_frame::<RunnerToWorker, _>(&mut stream).await? {
+        RunnerToWorker::HelloAck { runner_version } => {
+            eprintln!(
+                "worker {} handshake ok, runner version {runner_version}",
+                args.worker_id
+            );
+        }
+        other => panic!("expected HelloAck during handshake, got {other:?}"),
+    }
 
     Ok(())
 }

@@ -21,4 +21,11 @@ pub enum RunnerToWorker {
         /// Version of the runner
         runner_version: String,
     },
+    /// Runner sends a schedule for the worker to execute.
+    Schedule {
+        /// Correlation id, referenced by the matching `RunResult`.
+        schedule_id: u32,
+        /// Serialized schedule spec.
+        payload: Vec<u8>,
+    },
 }
