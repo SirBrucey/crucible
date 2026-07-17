@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crucible","crucible-core"]
+members = ["crucible","crucible-core", "crucible-worker"]
 
 [workspace.package]
 edition = "2024"
