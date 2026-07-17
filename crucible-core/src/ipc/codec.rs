@@ -122,6 +122,11 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn roundtrips_shutdown() {
+        roundtrip(RunnerToWorker::Shutdown).await;
+    }
+
+    #[tokio::test]
     async fn roundtrips_run_result() {
         roundtrip(WorkerToRunner::RunResult {
             schedule_id: 7,
