@@ -1,9 +1,13 @@
 mod cli;
 
 use clap::Parser;
-use crucible_core::ipc::{
-    RunnerToWorker, Verdict, WorkerToRunner,
-    codec::{self, read_frame, write_frame},
+use crucible_core::{
+    ipc::{
+        RunnerToWorker, WorkerToRunner,
+        codec::{self, read_frame, write_frame},
+    },
+    orchestrator::Orchestrator,
+    scheduler::Schedule,
 };
 use tokio::net::UnixStream;
 
@@ -39,26 +43,39 @@ async fn main() -> codec::Result<()> {
         other => panic!("expected HelloAck during handshake, got {other:?}"),
     }
 
+    let mut orchestrator = Orchestrator::new();
+    orchestrator.setup();
+
     loop {
         write_frame(&mut stream, &WorkerToRunner::Ready).await?;
         eprintln!("[worker {}] sent READY", args.worker_id);
 
         match read_frame::<RunnerToWorker, _>(&mut stream).await? {
-            RunnerToWorker::Schedule { schedule_id, .. } => {
+            RunnerToWorker::Schedule {
+                schedule_id,
+                invariant,
+                payload,
+            } => {
                 eprintln!(
-                    "[worker {}] received SCHEDULE {schedule_id}",
+                    "[worker {}] received SCHEDULE {schedule_id} ({invariant:?})",
                     args.worker_id
                 );
+                let schedule = Schedule {
+                    schedule_id,
+                    invariant,
+                    payload,
+                };
+                let verdict = orchestrator.execute(&schedule);
                 write_frame(
                     &mut stream,
                     &WorkerToRunner::RunResult {
                         schedule_id,
-                        verdict: Verdict::Pass,
+                        verdict,
                     },
                 )
                 .await?;
                 eprintln!(
-                    "[worker {}] sent RUN_RESULT for schedule {schedule_id}",
+                    "[worker {}] sent RUN_RESULT for schedule {schedule_id} ({verdict:?})",
                     args.worker_id
                 );
             }
@@ -69,6 +86,8 @@ async fn main() -> codec::Result<()> {
             other => panic!("expected Schedule or Shutdown, got {other:?}"),
         }
     }
+
+    orchestrator.teardown();
 
     Ok(())
 }

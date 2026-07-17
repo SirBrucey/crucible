@@ -1,3 +1,5 @@
+use crate::verdict::Invariant;
+
 /// Messages passed from one of the worker processes to the main runner.
 #[derive(Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub enum WorkerToRunner {
@@ -52,6 +54,8 @@ pub enum RunnerToWorker {
     Schedule {
         /// Correlation id, referenced by the matching `RunResult`.
         schedule_id: u32,
+        /// Which invariant this schedule targets.
+        invariant: Invariant,
         /// Serialized schedule spec.
         #[serde(with = "base64_bytes")]
         payload: Vec<u8>,
