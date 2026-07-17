@@ -8,6 +8,7 @@ use crucible_core::{
         RunnerToWorker, WorkerToRunner,
         codec::{read_frame, write_frame},
     },
+    journal,
 };
 use tokio::{net::UnixListener, process::Command, time::timeout};
 
@@ -30,14 +31,11 @@ async fn main() -> Result<()> {
     let socket_path = PathBuf::from(format!("/tmp/crucible-{}.sock", std::process::id()));
     let _ = tokio::fs::remove_file(&socket_path).await;
 
-    let (bus, mut journal_rx) = EventBus::new();
+    let (bus, journal_rx) = EventBus::new();
 
-    // Journal stand-in until #14 lands.
-    let journal = tokio::spawn(async move {
-        while let Some(event) = journal_rx.recv().await {
-            eprintln!("[journal] {event:?}");
-        }
-    });
+    let journal_path = journal::default_path(std::process::id());
+    eprintln!("[runner] journal at {}", journal_path.display());
+    let journal = tokio::spawn(journal::run(journal_rx, journal_path));
 
     // Demo observer on the broadcast side.
     let mut observer_rx = bus.subscribe();
@@ -146,7 +144,7 @@ async fn main() -> Result<()> {
 
     // Shutdown bus: drop it, then wait for journal + observer to drain and exit.
     drop(bus);
-    let _ = journal.await;
+    journal.await.expect("journal task should not panic")?;
     let _ = observer.await;
 
     if status.success() {
