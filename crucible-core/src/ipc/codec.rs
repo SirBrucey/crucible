@@ -80,27 +80,36 @@ mod tests {
     use super::*;
     use crate::ipc::{RunnerToWorker, WorkerToRunner};
 
-    #[tokio::test]
-    async fn roundtrips_worker_to_runner() {
+    /// Encode `msg`, decode it, and assert the decoded value equals the original.
+    async fn roundtrip<T>(msg: T)
+    where
+        T: Serialize + DeserializeOwned + PartialEq + std::fmt::Debug,
+    {
         let (mut tx, mut rx) = tokio::io::duplex(MAX_FRAME_SIZE);
-        let msg = WorkerToRunner::Hello {
-            worker_version: "0.1.0".to_string(),
-            worker_id: 42,
-        };
         write_frame(&mut tx, &msg).await.unwrap();
-        let back: WorkerToRunner = read_frame(&mut rx).await.unwrap();
-        assert_eq!(back, msg);
+        assert_eq!(read_frame::<T, _>(&mut rx).await.unwrap(), msg);
     }
 
     #[tokio::test]
-    async fn roundtrips_runner_to_worker() {
-        let (mut tx, mut rx) = tokio::io::duplex(MAX_FRAME_SIZE);
-        let msg = RunnerToWorker::HelloAck {
+    async fn roundtrips_hello() {
+        roundtrip(WorkerToRunner::Hello {
+            worker_version: "0.1.0".to_string(),
+            worker_id: 42,
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn roundtrips_ready() {
+        roundtrip(WorkerToRunner::Ready).await;
+    }
+
+    #[tokio::test]
+    async fn roundtrips_hello_ack() {
+        roundtrip(RunnerToWorker::HelloAck {
             runner_version: "0.1.0".to_string(),
-        };
-        write_frame(&mut tx, &msg).await.unwrap();
-        let back: RunnerToWorker = read_frame(&mut rx).await.unwrap();
-        assert_eq!(back, msg);
+        })
+        .await;
     }
 
     #[tokio::test]

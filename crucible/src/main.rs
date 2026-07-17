@@ -64,11 +64,15 @@ async fn main() -> Result<()> {
     let hello: WorkerToRunner = timeout(HANDSHAKE_TIMEOUT, read_frame(&mut stream))
         .await
         .map_err(|_| Error::HandshakeTimeout)??;
-    let WorkerToRunner::Hello {
-        worker_version,
-        worker_id,
-    } = hello;
-    eprintln!("runner received HELLO from worker {worker_id} version {worker_version}");
+    match hello {
+        WorkerToRunner::Hello {
+            worker_version,
+            worker_id,
+        } => {
+            eprintln!("runner received HELLO from worker {worker_id} version {worker_version}");
+        }
+        other => panic!("expected Hello during handshake, got {other:?}"),
+    }
 
     write_frame(
         &mut stream,
