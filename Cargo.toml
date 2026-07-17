@@ -17,6 +17,7 @@ all = { level = "warn", priority = -1 }
 undocumented_unsafe_blocks = "warn"
 
 [workspace.dependencies]
+base64 = "0.22"
 clap = { version = "4", features = ["derive", "env"] }
 libc = "0.2"
 postcard = { version = "1", default-features = false }
