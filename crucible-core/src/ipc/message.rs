@@ -10,6 +10,24 @@ pub enum WorkerToRunner {
     },
     /// Worker signals it is ready for the runner to send work.
     Ready,
+    /// Worker reports the outcome of executing a schedule.
+    RunResult {
+        /// Correlation id, matching the `Schedule` this result is for.
+        schedule_id: u32,
+        /// Outcome of the run.
+        verdict: Verdict,
+    },
+}
+
+/// Outcome of running a schedule.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub enum Verdict {
+    /// All invariants held.
+    Pass,
+    /// An invariant was violated.
+    Fail,
+    /// Neither passed nor failed within the run budget.
+    Inconclusive,
 }
 
 /// Messages passed from the main runner to one of the worker processes.
