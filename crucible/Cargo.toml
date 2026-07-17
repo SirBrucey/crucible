@@ -7,6 +7,10 @@ publish.workspace = true
 license.workspace = true
 
 [dependencies]
+crucible-core = { path = "../crucible-core" }
+libc = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
 
 [lints]
 workspace = true
