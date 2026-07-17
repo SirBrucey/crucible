@@ -48,7 +48,7 @@ async fn main() -> Result<()> {
     });
 
     let listener = UnixListener::bind(&socket_path)?;
-    eprintln!("runner listening on {}", socket_path.display());
+    eprintln!("[runner] listening on {}", socket_path.display());
 
     let mut command = Command::new(worker_bin_path()?);
     command
@@ -74,12 +74,12 @@ async fn main() -> Result<()> {
     }
     let mut child = command.spawn()?;
     let child_pid = child.id().ok_or(Error::ChildPidMissing)?;
-    eprintln!("runner spawned worker pid {child_pid}");
+    eprintln!("[runner] spawned worker pid {child_pid}");
 
     let (mut stream, _addr) = timeout(HANDSHAKE_TIMEOUT, listener.accept())
         .await
         .map_err(|_| Error::HandshakeTimeout)??;
-    eprintln!("runner accepted connection");
+    eprintln!("[runner] accepted connection");
 
     let hello: WorkerToRunner = timeout(HANDSHAKE_TIMEOUT, read_frame(&mut stream))
         .await
@@ -141,7 +141,7 @@ async fn main() -> Result<()> {
     .expect("journal receiver alive");
 
     let status = child.wait().await?;
-    eprintln!("worker exited: {status}");
+    eprintln!("[runner] worker exited: {status}");
     let _ = tokio::fs::remove_file(&socket_path).await;
 
     // Shutdown bus: drop it, then wait for journal + observer to drain and exit.
