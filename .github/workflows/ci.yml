@@ -69,3 +69,13 @@ jobs:
       - env:
           RUSTDOCFLAGS: "-D warnings -D rustdoc::broken_intra_doc_links"
         run: cargo doc --workspace --no-deps --all-features
+
+  machete:
+    name: machete
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@cargo-machete
+      - run: cargo machete
