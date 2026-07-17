@@ -10,7 +10,12 @@ use crucible_core::{
     },
     journal,
 };
-use tokio::{net::UnixListener, process::Command, time::timeout};
+use tokio::{
+    io::{AsyncBufReadExt, BufReader},
+    net::UnixListener,
+    process::Command,
+    time::timeout,
+};
 
 use crate::error::{Error, Result};
 
@@ -55,7 +60,7 @@ async fn main() -> Result<()> {
         .arg("--worker-id")
         .arg("0")
         .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
+        .stderr(Stdio::piped());
     // SAFETY: `pre_exec` runs after `fork()` and before `exec()` in the child.
     // `prctl(PR_SET_PDEATHSIG, SIGKILL)` sets a per-process flag with no aliasing
     // or shared-state concerns, and its side effect (kill worker if runner dies)
@@ -73,6 +78,17 @@ async fn main() -> Result<()> {
     let mut child = command.spawn()?;
     let child_pid = child.id().ok_or(Error::ChildPidMissing)?;
     eprintln!("[runner] spawned worker pid {child_pid}");
+
+    let worker_stderr = child
+        .stderr
+        .take()
+        .expect("stderr set to piped so child has one");
+    let stderr_relay = tokio::spawn(async move {
+        let mut lines = BufReader::new(worker_stderr).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            eprintln!("{line}");
+        }
+    });
 
     let (mut stream, _addr) = timeout(HANDSHAKE_TIMEOUT, listener.accept())
         .await
@@ -146,6 +162,7 @@ async fn main() -> Result<()> {
     drop(bus);
     journal.await.expect("journal task should not panic")?;
     let _ = observer.await;
+    let _ = stderr_relay.await;
 
     if status.success() {
         Ok(())
