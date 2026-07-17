@@ -1,17 +1,14 @@
 mod error;
 
-use std::path::PathBuf;
-use std::process::Stdio;
-use std::time::Duration;
-
-use tokio::{net::UnixListener, process::Command, time::timeout};
+use std::{path::PathBuf, process::Stdio, time::Duration};
 
 use crucible_core::ipc::{
     RunnerToWorker, WorkerToRunner,
     codec::{read_frame, write_frame},
 };
+use tokio::{net::UnixListener, process::Command, time::timeout};
 
-use error::{Error, Result};
+use crate::error::{Error, Result};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
