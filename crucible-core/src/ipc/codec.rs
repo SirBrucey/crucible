@@ -78,7 +78,7 @@ mod tests {
     use tokio::io::AsyncWriteExt;
 
     use super::*;
-    use crate::ipc::{RunnerToWorker, Verdict, WorkerToRunner};
+    use crate::ipc::{RunnerToWorker, Verdict, WorkerEvent, WorkerToRunner};
 
     /// Encode `msg`, decode it, and assert the decoded value equals the original.
     async fn roundtrip<T>(msg: T)
@@ -128,6 +128,11 @@ mod tests {
             verdict: Verdict::Pass,
         })
         .await;
+    }
+
+    #[tokio::test]
+    async fn roundtrips_event_log() {
+        roundtrip(WorkerToRunner::Event(WorkerEvent::Log("hello".into()))).await;
     }
 
     #[tokio::test]
