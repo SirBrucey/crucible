@@ -1,4 +1,5 @@
 [licenses]
 version = 2
+allow = ["Apache-2.0", "MIT", "Unicode-3.0"]
 # FIXME: remove once we decide on licensing
 private = { ignore = true }

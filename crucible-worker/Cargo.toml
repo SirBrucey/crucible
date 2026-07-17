@@ -1,5 +1,5 @@
 [package]
-name = "crucible-core"
+name = "crucible-worker"
 version = "0.1.0"
 edition.workspace = true
 authors.workspace = true
@@ -7,9 +7,8 @@ publish.workspace = true
 license.workspace = true
 
 [dependencies]
-postcard = { workspace = true }
-serde = { workspace = true }
-thiserror = { workspace = true }
+clap = { workspace = true }
+crucible-core = { path = "../crucible-core" }
 tokio = { workspace = true }
 
 [lints]

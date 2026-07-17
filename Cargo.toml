@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crucible","crucible-core"]
+members = ["crucible", "crucible-core", "crucible-worker"]
 
 [workspace.package]
 edition = "2024"
@@ -17,3 +17,9 @@ all = { level = "warn", priority = -1 }
 undocumented_unsafe_blocks = "warn"
 
 [workspace.dependencies]
+clap = { version = "4", features = ["derive", "env"] }
+libc = "0.2"
+postcard = { version = "1", default-features = false }
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
