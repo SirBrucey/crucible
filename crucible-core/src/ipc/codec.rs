@@ -1,0 +1,124 @@
+//! Length-prefixed bincode framing for IPC messages.
+
+use std::io;
+
+use serde::{Serialize, de::DeserializeOwned};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+/// Maximum size of a single frame. Anything larger is refused as malformed.
+///
+/// Kept small on purpose. The handshake is tens of bytes; other IPC messages
+/// currently fit comfortably in this budget. Bump deliberately if a real
+/// message needs more headroom.
+const MAX_FRAME_SIZE: usize = 1024;
+
+/// Errors returned by the codec.
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error(transparent)]
+    Io(#[from] io::Error),
+    #[error(transparent)]
+    Encode(#[from] bincode::error::EncodeError),
+    #[error(transparent)]
+    Decode(#[from] bincode::error::DecodeError),
+    #[error("frame too large: {size} bytes exceeds {max}")]
+    TooLarge { size: usize, max: usize },
+}
+
+pub type Result<T> = std::result::Result<T, Error>;
+
+/// Serialize `message` with bincode and write it as a length-prefixed frame.
+///
+/// The frame is a 4-byte big-endian length header followed by the bincode payload.
+pub async fn write_frame<T, W>(writer: &mut W, message: &T) -> Result<()>
+where
+    T: Serialize,
+    W: AsyncWriteExt + Unpin,
+{
+    let bytes = bincode::serde::encode_to_vec(message, bincode::config::standard())?;
+    let size = bytes.len();
+    if size > MAX_FRAME_SIZE {
+        return Err(Error::TooLarge {
+            size,
+            max: MAX_FRAME_SIZE,
+        });
+    }
+    let len = u32::try_from(size).expect("size <= MAX_FRAME_SIZE fits in u32");
+    writer.write_all(&len.to_be_bytes()).await?;
+    writer.write_all(&bytes).await?;
+    Ok(())
+}
+
+/// Read one length-prefixed frame and deserialize it with bincode.
+pub async fn read_frame<T, R>(reader: &mut R) -> Result<T>
+where
+    T: DeserializeOwned,
+    R: AsyncReadExt + Unpin,
+{
+    let mut len_buf = [0u8; 4];
+    reader.read_exact(&mut len_buf).await?;
+    let len = u32::from_be_bytes(len_buf) as usize;
+    if len > MAX_FRAME_SIZE {
+        return Err(Error::TooLarge {
+            size: len,
+            max: MAX_FRAME_SIZE,
+        });
+    }
+    let mut bytes = vec![0u8; len];
+    reader.read_exact(&mut bytes).await?;
+    let (message, _) = bincode::serde::decode_from_slice(&bytes, bincode::config::standard())?;
+    Ok(message)
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::io::AsyncWriteExt;
+
+    use super::*;
+    use crate::ipc::{RunnerToWorker, WorkerToRunner};
+
+    #[tokio::test]
+    async fn roundtrips_worker_to_runner() {
+        let (mut tx, mut rx) = tokio::io::duplex(MAX_FRAME_SIZE);
+        let msg = WorkerToRunner::Hello {
+            worker_version: "0.1.0".to_string(),
+            worker_id: 42,
+        };
+        write_frame(&mut tx, &msg).await.unwrap();
+        let back: WorkerToRunner = read_frame(&mut rx).await.unwrap();
+        assert_eq!(back, msg);
+    }
+
+    #[tokio::test]
+    async fn roundtrips_runner_to_worker() {
+        let (mut tx, mut rx) = tokio::io::duplex(MAX_FRAME_SIZE);
+        let msg = RunnerToWorker::HelloAck {
+            runner_version: "0.1.0".to_string(),
+        };
+        write_frame(&mut tx, &msg).await.unwrap();
+        let back: RunnerToWorker = read_frame(&mut rx).await.unwrap();
+        assert_eq!(back, msg);
+    }
+
+    #[tokio::test]
+    async fn write_frame_rejects_oversized_payload() {
+        let (mut tx, _rx) = tokio::io::duplex(MAX_FRAME_SIZE);
+        let big = "x".repeat(MAX_FRAME_SIZE + 1);
+        let msg = WorkerToRunner::Hello {
+            worker_version: big,
+            worker_id: 0,
+        };
+        let result = write_frame(&mut tx, &msg).await;
+        assert!(matches!(result, Err(Error::TooLarge { .. })));
+    }
+
+    #[tokio::test]
+    async fn read_frame_rejects_oversized_declared_length() {
+        let bad_len = u32::try_from(MAX_FRAME_SIZE + 1).unwrap().to_be_bytes();
+        let (mut tx, mut rx) = tokio::io::duplex(MAX_FRAME_SIZE);
+        tx.write_all(&bad_len).await.unwrap();
+        drop(tx);
+        let result: Result<WorkerToRunner> = read_frame(&mut rx).await;
+        assert!(matches!(result, Err(Error::TooLarge { .. })));
+    }
+}
