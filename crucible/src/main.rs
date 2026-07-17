@@ -9,6 +9,7 @@ use crucible_core::{
         codec::{read_frame, write_frame},
     },
     journal,
+    scheduler::{RandomScheduler, Scheduler},
 };
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
@@ -120,39 +121,46 @@ async fn main() -> Result<()> {
     .await
     .expect("journal receiver alive");
 
-    let ready = read_frame::<WorkerToRunner, _>(&mut stream).await?;
-    if !matches!(&ready, WorkerToRunner::Ready) {
-        panic!("expected Ready, got {ready:?}");
-    }
-    bus.publish(RunnerEvent::WorkerMessage {
-        worker_id,
-        message: ready,
-    })
-    .await
-    .expect("journal receiver alive");
+    let mut scheduler = RandomScheduler::new(3);
+    loop {
+        let ready = read_frame::<WorkerToRunner, _>(&mut stream).await?;
+        if !matches!(&ready, WorkerToRunner::Ready) {
+            panic!("expected Ready, got {ready:?}");
+        }
+        bus.publish(RunnerEvent::WorkerMessage {
+            worker_id,
+            message: ready,
+        })
+        .await
+        .expect("journal receiver alive");
 
-    let schedule = RunnerToWorker::Schedule {
-        schedule_id: 0,
-        payload: Vec::new(),
-    };
-    write_frame(&mut stream, &schedule).await?;
-    bus.publish(RunnerEvent::RunnerMessage {
-        worker_id,
-        message: schedule,
-    })
-    .await
-    .expect("journal receiver alive");
+        let outbound = scheduler
+            .next()
+            .map(RunnerToWorker::from)
+            .unwrap_or(RunnerToWorker::Shutdown);
+        let is_shutdown = matches!(outbound, RunnerToWorker::Shutdown);
+        write_frame(&mut stream, &outbound).await?;
+        bus.publish(RunnerEvent::RunnerMessage {
+            worker_id,
+            message: outbound,
+        })
+        .await
+        .expect("journal receiver alive");
+        if is_shutdown {
+            break;
+        }
 
-    let run_result = read_frame::<WorkerToRunner, _>(&mut stream).await?;
-    if !matches!(&run_result, WorkerToRunner::RunResult { .. }) {
-        panic!("expected RunResult, got {run_result:?}");
+        let run_result = read_frame::<WorkerToRunner, _>(&mut stream).await?;
+        if !matches!(&run_result, WorkerToRunner::RunResult { .. }) {
+            panic!("expected RunResult, got {run_result:?}");
+        }
+        bus.publish(RunnerEvent::WorkerMessage {
+            worker_id,
+            message: run_result,
+        })
+        .await
+        .expect("journal receiver alive");
     }
-    bus.publish(RunnerEvent::WorkerMessage {
-        worker_id,
-        message: run_result,
-    })
-    .await
-    .expect("journal receiver alive");
 
     let status = child.wait().await?;
     eprintln!("[runner] worker exited: {status}");
