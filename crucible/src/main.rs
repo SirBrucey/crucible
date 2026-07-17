@@ -64,11 +64,15 @@ async fn main() -> Result<()> {
     let hello: WorkerToRunner = timeout(HANDSHAKE_TIMEOUT, read_frame(&mut stream))
         .await
         .map_err(|_| Error::HandshakeTimeout)??;
-    let WorkerToRunner::Hello {
-        worker_version,
-        worker_id,
-    } = hello;
-    eprintln!("runner received HELLO from worker {worker_id} version {worker_version}");
+    match hello {
+        WorkerToRunner::Hello {
+            worker_version,
+            worker_id,
+        } => {
+            eprintln!("runner received HELLO from worker {worker_id} version {worker_version}");
+        }
+        other => panic!("expected Hello during handshake, got {other:?}"),
+    }
 
     write_frame(
         &mut stream,
@@ -78,6 +82,33 @@ async fn main() -> Result<()> {
     )
     .await?;
     eprintln!("runner sent HELLO_ACK");
+
+    match read_frame::<WorkerToRunner, _>(&mut stream).await? {
+        WorkerToRunner::Ready => {
+            eprintln!("runner received READY");
+        }
+        other => panic!("expected Ready, got {other:?}"),
+    }
+
+    write_frame(
+        &mut stream,
+        &RunnerToWorker::Schedule {
+            schedule_id: 0,
+            payload: Vec::new(),
+        },
+    )
+    .await?;
+    eprintln!("runner sent SCHEDULE 0");
+
+    match read_frame::<WorkerToRunner, _>(&mut stream).await? {
+        WorkerToRunner::RunResult {
+            schedule_id,
+            verdict,
+        } => {
+            eprintln!("runner received RUN_RESULT schedule={schedule_id} verdict={verdict:?}");
+        }
+        other => panic!("expected RunResult, got {other:?}"),
+    }
 
     let status = child.wait().await?;
     eprintln!("worker exited: {status}");

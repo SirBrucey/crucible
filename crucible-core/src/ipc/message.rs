@@ -8,6 +8,35 @@ pub enum WorkerToRunner {
         /// Workers unique identifier
         worker_id: u32,
     },
+    /// Worker signals it is ready for the runner to send work.
+    Ready,
+    /// Worker reports the outcome of executing a schedule.
+    RunResult {
+        /// Correlation id, matching the `Schedule` this result is for.
+        schedule_id: u32,
+        /// Outcome of the run.
+        verdict: Verdict,
+    },
+    /// Worker emits an observational event for the runner to record.
+    Event(WorkerEvent),
+}
+
+/// Observational events streamed from a worker to the runner.
+#[derive(Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub enum WorkerEvent {
+    /// Free-form log line from the worker.
+    Log(String),
+}
+
+/// Outcome of running a schedule.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub enum Verdict {
+    /// All invariants held.
+    Pass,
+    /// An invariant was violated.
+    Fail,
+    /// Neither passed nor failed within the run budget.
+    Inconclusive,
 }
 
 /// Messages passed from the main runner to one of the worker processes.
@@ -18,5 +47,12 @@ pub enum RunnerToWorker {
     HelloAck {
         /// Version of the runner
         runner_version: String,
+    },
+    /// Runner sends a schedule for the worker to execute.
+    Schedule {
+        /// Correlation id, referenced by the matching `RunResult`.
+        schedule_id: u32,
+        /// Serialized schedule spec.
+        payload: Vec<u8>,
     },
 }
