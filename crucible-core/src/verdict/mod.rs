@@ -4,11 +4,12 @@ pub mod drivers;
 
 pub use drivers::{Converges, Durable, Idempotent, Recovers};
 use serde::{Deserialize, Serialize};
+use strum::EnumIter;
 
 use crate::ipc::Verdict;
 
 /// The four canonical event-driven invariants Crucible checks.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize, EnumIter)]
 pub enum Invariant {
     Idempotent,
     Converges,

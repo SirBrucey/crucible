@@ -116,6 +116,7 @@ mod tests {
     async fn roundtrips_schedule() {
         roundtrip(RunnerToWorker::Schedule {
             schedule_id: 7,
+            invariant: crate::verdict::Invariant::Durable,
             payload: vec![0u8; 128],
         })
         .await;
