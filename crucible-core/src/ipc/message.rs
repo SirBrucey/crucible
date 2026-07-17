@@ -17,6 +17,15 @@ pub enum WorkerToRunner {
         /// Outcome of the run.
         verdict: Verdict,
     },
+    /// Worker emits an observational event for the runner to record.
+    Event(WorkerEvent),
+}
+
+/// Observational events streamed from a worker to the runner.
+#[derive(Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub enum WorkerEvent {
+    /// Free-form log line from the worker.
+    Log(String),
 }
 
 /// Outcome of running a schedule.
