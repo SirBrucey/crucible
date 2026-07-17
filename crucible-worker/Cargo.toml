@@ -8,6 +8,8 @@ license.workspace = true
 
 [dependencies]
 clap = { workspace = true }
+crucible-core = { path = "../crucible-core" }
+tokio = { workspace = true }
 
 [lints]
 workspace = true
