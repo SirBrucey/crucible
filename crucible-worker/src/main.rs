@@ -1,14 +1,13 @@
 mod cli;
 
 use clap::Parser;
-use tokio::net::UnixStream;
-
 use crucible_core::ipc::{
     RunnerToWorker, WorkerToRunner,
     codec::{self, read_frame, write_frame},
 };
+use tokio::net::UnixStream;
 
-use cli::Cli;
+use crate::cli::Cli;
 
 #[tokio::main]
 async fn main() -> codec::Result<()> {
