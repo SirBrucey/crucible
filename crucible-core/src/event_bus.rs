@@ -16,7 +16,7 @@ const MPSC_CAPACITY: usize = 1024;
 const BROADCAST_CAPACITY: usize = 256;
 
 /// Events published on the runner's event bus.
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
 pub enum RunnerEvent {
     /// A message received from a worker over IPC.
     WorkerMessage {
