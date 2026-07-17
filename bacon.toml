@@ -1,0 +1,13 @@
+default_job = "check"
+
+[jobs.check]
+command = ["cargo", "check", "--workspace", "--all-targets", "--all-features"]
+need_stdout = false
+
+[jobs.clippy]
+command = ["cargo", "clippy", "--workspace", "--all-targets", "--all-features", "--", "-W", "clippy::pedantic"]
+need_stdout = false
+
+[jobs.test]
+command = ["cargo", "nextest", "run", "--workspace", "--all-targets", "--all-features"]
+need_stdout = true
