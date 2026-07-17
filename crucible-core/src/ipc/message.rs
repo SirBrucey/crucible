@@ -53,6 +53,21 @@ pub enum RunnerToWorker {
         /// Correlation id, referenced by the matching `RunResult`.
         schedule_id: u32,
         /// Serialized schedule spec.
+        #[serde(with = "base64_bytes")]
         payload: Vec<u8>,
     },
+}
+
+mod base64_bytes {
+    use base64::{Engine as _, prelude::BASE64_STANDARD};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(bytes: &Vec<u8>, s: S) -> Result<S::Ok, S::Error> {
+        BASE64_STANDARD.encode(bytes).serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+        let s = String::deserialize(d)?;
+        BASE64_STANDARD.decode(s).map_err(serde::de::Error::custom)
+    }
 }

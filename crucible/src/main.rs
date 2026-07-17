@@ -8,8 +8,14 @@ use crucible_core::{
         RunnerToWorker, WorkerToRunner,
         codec::{read_frame, write_frame},
     },
+    journal,
 };
-use tokio::{net::UnixListener, process::Command, time::timeout};
+use tokio::{
+    io::{AsyncBufReadExt, BufReader},
+    net::UnixListener,
+    process::Command,
+    time::timeout,
+};
 
 use crate::error::{Error, Result};
 
@@ -30,14 +36,11 @@ async fn main() -> Result<()> {
     let socket_path = PathBuf::from(format!("/tmp/crucible-{}.sock", std::process::id()));
     let _ = tokio::fs::remove_file(&socket_path).await;
 
-    let (bus, mut journal_rx) = EventBus::new();
+    let (bus, journal_rx) = EventBus::new();
 
-    // Journal stand-in until #14 lands.
-    let journal = tokio::spawn(async move {
-        while let Some(event) = journal_rx.recv().await {
-            eprintln!("[journal] {event:?}");
-        }
-    });
+    let journal_path = journal::default_path(std::process::id());
+    eprintln!("[runner] journal at {}", journal_path.display());
+    let journal = tokio::spawn(journal::run(journal_rx, journal_path));
 
     // Demo observer on the broadcast side.
     let mut observer_rx = bus.subscribe();
@@ -57,7 +60,7 @@ async fn main() -> Result<()> {
         .arg("--worker-id")
         .arg("0")
         .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
+        .stderr(Stdio::piped());
     // SAFETY: `pre_exec` runs after `fork()` and before `exec()` in the child.
     // `prctl(PR_SET_PDEATHSIG, SIGKILL)` sets a per-process flag with no aliasing
     // or shared-state concerns, and its side effect (kill worker if runner dies)
@@ -75,6 +78,17 @@ async fn main() -> Result<()> {
     let mut child = command.spawn()?;
     let child_pid = child.id().ok_or(Error::ChildPidMissing)?;
     eprintln!("[runner] spawned worker pid {child_pid}");
+
+    let worker_stderr = child
+        .stderr
+        .take()
+        .expect("stderr set to piped so child has one");
+    let stderr_relay = tokio::spawn(async move {
+        let mut lines = BufReader::new(worker_stderr).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            eprintln!("{line}");
+        }
+    });
 
     let (mut stream, _addr) = timeout(HANDSHAKE_TIMEOUT, listener.accept())
         .await
@@ -146,8 +160,9 @@ async fn main() -> Result<()> {
 
     // Shutdown bus: drop it, then wait for journal + observer to drain and exit.
     drop(bus);
-    let _ = journal.await;
+    journal.await.expect("journal task should not panic")?;
     let _ = observer.await;
+    let _ = stderr_relay.await;
 
     if status.success() {
         Ok(())
