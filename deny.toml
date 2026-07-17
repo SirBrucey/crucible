@@ -1,0 +1,4 @@
+[licenses]
+version = 2
+# FIXME: remove once we decide on licensing
+private = { ignore = true }

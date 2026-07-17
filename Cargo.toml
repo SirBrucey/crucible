@@ -6,6 +6,8 @@ members = ["crucible","crucible-core"]
 edition = "2024"
 authors = ["Stuart Bruce"]
 publish = false
+# FIXME: Decide on licensing
+license = "UNLICENSED"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "warn"
