@@ -17,9 +17,9 @@ all = { level = "warn", priority = -1 }
 undocumented_unsafe_blocks = "warn"
 
 [workspace.dependencies]
-bincode = { version = "2", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env"] }
 libc = "0.2"
+postcard = { version = "1", default-features = false }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
