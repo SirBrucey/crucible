@@ -83,6 +83,33 @@ async fn main() -> Result<()> {
     .await?;
     eprintln!("runner sent HELLO_ACK");
 
+    match read_frame::<WorkerToRunner, _>(&mut stream).await? {
+        WorkerToRunner::Ready => {
+            eprintln!("runner received READY");
+        }
+        other => panic!("expected Ready, got {other:?}"),
+    }
+
+    write_frame(
+        &mut stream,
+        &RunnerToWorker::Schedule {
+            schedule_id: 0,
+            payload: Vec::new(),
+        },
+    )
+    .await?;
+    eprintln!("runner sent SCHEDULE 0");
+
+    match read_frame::<WorkerToRunner, _>(&mut stream).await? {
+        WorkerToRunner::RunResult {
+            schedule_id,
+            verdict,
+        } => {
+            eprintln!("runner received RUN_RESULT schedule={schedule_id} verdict={verdict:?}");
+        }
+        other => panic!("expected RunResult, got {other:?}"),
+    }
+
     let status = child.wait().await?;
     eprintln!("worker exited: {status}");
     let _ = tokio::fs::remove_file(&socket_path).await;
