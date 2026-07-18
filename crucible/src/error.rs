@@ -16,6 +16,12 @@ pub enum Error {
     HandshakeTimeout,
     #[error("worker exited with non-zero status: {0}")]
     WorkerExitedNonZero(ExitStatus),
+    #[error("runner session in state `{state}` expected `{expected}`, got `{got}`")]
+    UnexpectedMessage {
+        state: &'static str,
+        expected: &'static str,
+        got: String,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
