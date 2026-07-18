@@ -105,9 +105,7 @@ impl Session<Dispatching> {
         .await
         .expect("journal receiver alive");
 
-        let outbound = schedule
-            .map(RunnerToWorker::from)
-            .unwrap_or(RunnerToWorker::Shutdown);
+        let outbound = schedule.map_or(RunnerToWorker::Shutdown, RunnerToWorker::from);
         let is_shutdown = matches!(outbound, RunnerToWorker::Shutdown);
         write_frame(&mut self.stream, &outbound).await?;
         bus.publish(RunnerEvent::RunnerMessage {
