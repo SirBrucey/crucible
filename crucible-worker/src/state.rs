@@ -17,8 +17,8 @@ use tokio::net::UnixStream;
 use crate::error::{Error, Result};
 
 pub struct Worker<S> {
-    worker_id: u32,
-    worker_version: String,
+    id: u32,
+    version: String,
     stream: UnixStream,
     state: S,
 }
@@ -44,10 +44,10 @@ pub enum IdleNext {
 }
 
 impl Worker<Handshaking> {
-    pub fn new(stream: UnixStream, worker_id: u32, worker_version: String) -> Self {
+    pub fn new(stream: UnixStream, id: u32, version: String) -> Self {
         Self {
-            worker_id,
-            worker_version,
+            id,
+            version,
             stream,
             state: Handshaking,
         }
@@ -57,8 +57,8 @@ impl Worker<Handshaking> {
         write_frame(
             &mut self.stream,
             &WorkerToRunner::Hello {
-                worker_version: self.worker_version.clone(),
-                worker_id: self.worker_id,
+                worker_version: self.version.clone(),
+                worker_id: self.id,
             },
         )
         .await?;
@@ -66,13 +66,13 @@ impl Worker<Handshaking> {
             RunnerToWorker::HelloAck { runner_version } => {
                 eprintln!(
                     "[worker {}] handshake ok, runner version {runner_version}",
-                    self.worker_id
+                    self.id
                 );
                 let mut orchestrator = Orchestrator::new();
                 orchestrator.setup();
                 Ok(Worker {
-                    worker_id: self.worker_id,
-                    worker_version: self.worker_version,
+                    id: self.id,
+                    version: self.version,
                     stream: self.stream,
                     state: Idle { orchestrator },
                 })
@@ -89,7 +89,7 @@ impl Worker<Handshaking> {
 impl Worker<Idle> {
     pub async fn await_work(mut self) -> Result<IdleNext> {
         write_frame(&mut self.stream, &WorkerToRunner::Ready).await?;
-        eprintln!("[worker {}] sent READY", self.worker_id);
+        eprintln!("[worker {}] sent READY", self.id);
 
         match read_frame::<RunnerToWorker, _>(&mut self.stream).await? {
             RunnerToWorker::Schedule {
@@ -99,11 +99,11 @@ impl Worker<Idle> {
             } => {
                 eprintln!(
                     "[worker {}] received SCHEDULE {schedule_id} ({invariant:?})",
-                    self.worker_id
+                    self.id
                 );
                 Ok(IdleNext::Work(Worker {
-                    worker_id: self.worker_id,
-                    worker_version: self.worker_version,
+                    id: self.id,
+                    version: self.version,
                     stream: self.stream,
                     state: Executing {
                         orchestrator: self.state.orchestrator,
@@ -116,17 +116,17 @@ impl Worker<Idle> {
                 }))
             }
             RunnerToWorker::Shutdown => {
-                eprintln!("[worker {}] received SHUTDOWN", self.worker_id);
+                eprintln!("[worker {}] received SHUTDOWN", self.id);
                 Ok(IdleNext::Shutdown(Worker {
-                    worker_id: self.worker_id,
-                    worker_version: self.worker_version,
+                    id: self.id,
+                    version: self.version,
                     stream: self.stream,
                     state: ShuttingDown {
                         orchestrator: self.state.orchestrator,
                     },
                 }))
             }
-            other => Err(Error::UnexpectedMessage {
+            other @ RunnerToWorker::HelloAck { .. } => Err(Error::UnexpectedMessage {
                 state: "Idle",
                 expected: "Schedule or Shutdown",
                 got: format!("{other:?}"),
@@ -148,11 +148,11 @@ impl Worker<Executing> {
         .await?;
         eprintln!(
             "[worker {}] sent RUN_RESULT for schedule {} ({verdict:?})",
-            self.worker_id, self.state.schedule.schedule_id
+            self.id, self.state.schedule.schedule_id
         );
         Ok(Worker {
-            worker_id: self.worker_id,
-            worker_version: self.worker_version,
+            id: self.id,
+            version: self.version,
             stream: self.stream,
             state: Idle {
                 orchestrator: self.state.orchestrator,
@@ -164,6 +164,6 @@ impl Worker<Executing> {
 impl Worker<ShuttingDown> {
     pub fn teardown(mut self) {
         self.state.orchestrator.teardown();
-        eprintln!("[worker {}] teardown complete", self.worker_id);
+        eprintln!("[worker {}] teardown complete", self.id);
     }
 }
