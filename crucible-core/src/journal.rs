@@ -42,9 +42,7 @@ pub async fn run(mut rx: mpsc::Receiver<Arc<RunnerEvent>>, path: PathBuf) -> io:
 /// falling back to `$HOME/.local/state/...` when `XDG_STATE_HOME` is unset.
 pub fn default_path(pid: u32) -> PathBuf {
     let base = std::env::var_os("XDG_STATE_HOME").map_or_else(
-        || {
-            PathBuf::from(std::env::var_os("HOME").expect("HOME must be set")).join(".local/state")
-        },
+        || PathBuf::from(std::env::var_os("HOME").expect("HOME must be set")).join(".local/state"),
         PathBuf::from,
     );
     base.join("crucible")
