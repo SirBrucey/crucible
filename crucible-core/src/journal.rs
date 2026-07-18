@@ -41,11 +41,10 @@ pub async fn run(mut rx: mpsc::Receiver<Arc<RunnerEvent>>, path: PathBuf) -> io:
 /// Default journal path under `$XDG_STATE_HOME/crucible/logs/{pid}/journal.ndjson`,
 /// falling back to `$HOME/.local/state/...` when `XDG_STATE_HOME` is unset.
 pub fn default_path(pid: u32) -> PathBuf {
-    let base = std::env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(std::env::var_os("HOME").expect("HOME must be set")).join(".local/state")
-        });
+    let base = std::env::var_os("XDG_STATE_HOME").map_or_else(
+        || PathBuf::from(std::env::var_os("HOME").expect("HOME must be set")).join(".local/state"),
+        PathBuf::from,
+    );
     base.join("crucible")
         .join("logs")
         .join(pid.to_string())
