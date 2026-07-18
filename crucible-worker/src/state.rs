@@ -126,7 +126,7 @@ impl Worker<Idle> {
                     },
                 }))
             }
-            other => Err(Error::UnexpectedMessage {
+            other @ RunnerToWorker::HelloAck { .. } => Err(Error::UnexpectedMessage {
                 state: "Idle",
                 expected: "Schedule or Shutdown",
                 got: format!("{other:?}"),
