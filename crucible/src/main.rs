@@ -1,13 +1,10 @@
 mod error;
+mod session;
 
 use std::{path::PathBuf, process::Stdio, time::Duration};
 
 use crucible_core::{
-    event_bus::{EventBus, RunnerEvent},
-    ipc::{
-        RunnerToWorker, WorkerToRunner,
-        codec::{read_frame, write_frame},
-    },
+    event_bus::EventBus,
     journal,
     scheduler::{RandomScheduler, Scheduler},
 };
@@ -18,7 +15,10 @@ use tokio::{
     time::timeout,
 };
 
-use crate::error::{Error, Result};
+use crate::{
+    error::{Error, Result},
+    session::{DispatchNext, Session},
+};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -91,75 +91,24 @@ async fn main() -> Result<()> {
         }
     });
 
-    let (mut stream, _addr) = timeout(HANDSHAKE_TIMEOUT, listener.accept())
+    let (stream, _addr) = timeout(HANDSHAKE_TIMEOUT, listener.accept())
         .await
         .map_err(|_| Error::HandshakeTimeout)??;
     eprintln!("[runner] accepted connection");
 
-    let hello: WorkerToRunner = timeout(HANDSHAKE_TIMEOUT, read_frame(&mut stream))
-        .await
-        .map_err(|_| Error::HandshakeTimeout)??;
-    let worker_id = match &hello {
-        WorkerToRunner::Hello { worker_id, .. } => *worker_id,
-        other => panic!("expected Hello during handshake, got {other:?}"),
-    };
-    bus.publish(RunnerEvent::WorkerMessage {
-        worker_id,
-        message: hello,
-    })
+    let mut session = timeout(
+        HANDSHAKE_TIMEOUT,
+        Session::new(stream, env!("CARGO_PKG_VERSION").to_string()).handshake(&bus),
+    )
     .await
-    .expect("journal receiver alive");
-
-    let ack = RunnerToWorker::HelloAck {
-        runner_version: env!("CARGO_PKG_VERSION").to_string(),
-    };
-    write_frame(&mut stream, &ack).await?;
-    bus.publish(RunnerEvent::RunnerMessage {
-        worker_id,
-        message: ack,
-    })
-    .await
-    .expect("journal receiver alive");
+    .map_err(|_| Error::HandshakeTimeout)??;
 
     let mut scheduler = RandomScheduler::new(3);
     loop {
-        let ready = read_frame::<WorkerToRunner, _>(&mut stream).await?;
-        if !matches!(&ready, WorkerToRunner::Ready) {
-            panic!("expected Ready, got {ready:?}");
-        }
-        bus.publish(RunnerEvent::WorkerMessage {
-            worker_id,
-            message: ready,
-        })
-        .await
-        .expect("journal receiver alive");
-
-        let outbound = scheduler
-            .next()
-            .map(RunnerToWorker::from)
-            .unwrap_or(RunnerToWorker::Shutdown);
-        let is_shutdown = matches!(outbound, RunnerToWorker::Shutdown);
-        write_frame(&mut stream, &outbound).await?;
-        bus.publish(RunnerEvent::RunnerMessage {
-            worker_id,
-            message: outbound,
-        })
-        .await
-        .expect("journal receiver alive");
-        if is_shutdown {
-            break;
-        }
-
-        let run_result = read_frame::<WorkerToRunner, _>(&mut stream).await?;
-        if !matches!(&run_result, WorkerToRunner::RunResult { .. }) {
-            panic!("expected RunResult, got {run_result:?}");
-        }
-        bus.publish(RunnerEvent::WorkerMessage {
-            worker_id,
-            message: run_result,
-        })
-        .await
-        .expect("journal receiver alive");
+        session = match session.dispatch(&bus, scheduler.next()).await? {
+            DispatchNext::More(session) => session.await_result(&bus).await?,
+            DispatchNext::Done => break,
+        };
     }
 
     let status = child.wait().await?;
