@@ -30,7 +30,7 @@ async fn main() -> Result<()> {
         worker = match worker.await_work().await? {
             IdleNext::Work(worker) => worker.execute_and_report().await?,
             IdleNext::Shutdown(worker) => {
-                worker.teardown();
+                worker.teardown().await?;
                 break;
             }
         };
