@@ -35,6 +35,61 @@ pub enum Error {
         addr: SocketAddr,
         timeout: Duration,
     },
+    #[error("teardown incomplete: {0}")]
+    TeardownIncomplete(TeardownFailures),
+}
+
+/// Items teardown could not remove, paired with the daemon's reason.
+#[derive(Debug, Default)]
+pub struct TeardownFailures {
+    containers: Vec<(String, String)>,
+    network: Option<String>,
+}
+
+impl TeardownFailures {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn append_container(&mut self, name: impl Into<String>, reason: impl Into<String>) {
+        self.containers.push((name.into(), reason.into()));
+    }
+
+    pub fn set_network(&mut self, reason: impl Into<String>) {
+        self.network = Some(reason.into());
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.containers.is_empty() && self.network.is_none()
+    }
+
+    pub fn containers(&self) -> &[(String, String)] {
+        &self.containers
+    }
+
+    pub fn network(&self) -> Option<&str> {
+        self.network.as_deref()
+    }
+}
+
+impl std::fmt::Display for TeardownFailures {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut first = true;
+        for (name, reason) in &self.containers {
+            if !first {
+                f.write_str("; ")?;
+            }
+            write!(f, "container `{name}`: {reason}")?;
+            first = false;
+        }
+        if let Some(reason) = &self.network {
+            if !first {
+                f.write_str("; ")?;
+            }
+            write!(f, "network: {reason}")?;
+        }
+        Ok(())
+    }
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -198,6 +253,38 @@ mod tests {
 
     use super::*;
     use crate::fleet;
+
+    #[test]
+    fn teardown_failures_is_empty_by_default() {
+        assert!(TeardownFailures::new().is_empty());
+    }
+
+    #[test]
+    fn teardown_failures_appended_items_show_up_in_display() {
+        let mut failures = TeardownFailures::new();
+        failures.append_container("api", "boom");
+        failures.append_container("db", "gone");
+        failures.set_network("network still has endpoints");
+        assert!(!failures.is_empty());
+        assert_eq!(
+            failures.to_string(),
+            "container `api`: boom; container `db`: gone; network: network still has endpoints"
+        );
+    }
+
+    #[test]
+    fn teardown_failures_display_with_only_network() {
+        let mut failures = TeardownFailures::new();
+        failures.set_network("still in use");
+        assert_eq!(failures.to_string(), "network: still in use");
+    }
+
+    #[test]
+    fn teardown_failures_display_with_only_containers() {
+        let mut failures = TeardownFailures::new();
+        failures.append_container("api", "boom");
+        assert_eq!(failures.to_string(), "container `api`: boom");
+    }
 
     /// Best-effort teardown for the setup-only test until `Deployment::teardown` lands.
     async fn manual_cleanup(deployment: &Deployment) {
