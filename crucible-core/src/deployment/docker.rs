@@ -1,4 +1,4 @@
-//! Docker-backed [`Deployment`](super::Deployment) implementation.
+//! Docker-backed [`Deployment`] implementation.
 
 use std::{
     collections::HashMap,
