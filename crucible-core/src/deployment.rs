@@ -3,6 +3,7 @@
 use std::{
     collections::HashMap,
     net::{IpAddr, Ipv4Addr, SocketAddr},
+    time::Duration,
 };
 
 use bollard::{
@@ -13,8 +14,14 @@ use bollard::{
     },
 };
 use futures_util::TryStreamExt;
+use tokio::{net::TcpStream, time::timeout};
 
 use crate::fleet::{Fleet, Service};
+
+const READINESS_TIMEOUT: Duration = Duration::from_secs(60);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
+const INITIAL_BACKOFF: Duration = Duration::from_millis(100);
+const MAX_BACKOFF: Duration = Duration::from_secs(2);
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -22,6 +29,12 @@ pub enum Error {
     Docker(#[from] bollard::errors::Error),
     #[error("service `{name}` did not publish port {port}")]
     MissingPort { name: String, port: u16 },
+    #[error("service `{name}` at {addr} did not become ready within {timeout:?}")]
+    ReadinessTimeout {
+        name: String,
+        addr: SocketAddr,
+        timeout: Duration,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -65,6 +78,31 @@ impl Deployment {
         for service in fleet.services {
             self.start_service(service).await?;
         }
+        Ok(())
+    }
+
+    /// Wait until every service accepts a TCP connection on its published port,
+    /// with per-service exponential backoff and a shared overall deadline.
+    pub async fn wait_ready(&self) -> Result<()> {
+        let probes = self.endpoints.iter().map(|(name, addr)| async move {
+            let start = tokio::time::Instant::now();
+            let mut backoff = INITIAL_BACKOFF;
+            loop {
+                if start.elapsed() >= READINESS_TIMEOUT {
+                    return Err(Error::ReadinessTimeout {
+                        name: name.clone(),
+                        addr: *addr,
+                        timeout: READINESS_TIMEOUT,
+                    });
+                }
+                if let Ok(Ok(_)) = timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await {
+                    return Ok(());
+                }
+                tokio::time::sleep(backoff).await;
+                backoff = std::cmp::min(backoff * 2, MAX_BACKOFF);
+            }
+        });
+        futures_util::future::try_join_all(probes).await?;
         Ok(())
     }
 
@@ -177,12 +215,11 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires docker daemon"]
-    async fn setup_starts_every_service_and_records_a_published_port() {
+    async fn setup_and_wait_ready_bring_up_every_service() {
         let worker_id = std::process::id();
         let mut deployment = Deployment::new(worker_id).expect("connect to docker");
 
-        let outcome = deployment.setup(&fleet::EXAMPLE).await;
-
+        let setup_outcome = deployment.setup(&fleet::EXAMPLE).await;
         for service in fleet::EXAMPLE.services {
             let endpoint = deployment.endpoint(service.name);
             assert!(
@@ -193,7 +230,10 @@ mod tests {
         }
         assert_eq!(deployment.containers.len(), fleet::EXAMPLE.services.len());
 
+        let wait_outcome = deployment.wait_ready().await;
+
         manual_cleanup(&deployment).await;
-        outcome.expect("setup should succeed");
+        setup_outcome.expect("setup should succeed");
+        wait_outcome.expect("every service should become ready");
     }
 }
