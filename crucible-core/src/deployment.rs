@@ -77,6 +77,8 @@ impl Deployment {
         let config = ContainerCreateBody {
             image: Some(service.image.to_string()),
             exposed_ports: Some(vec![exposed_port.clone()]),
+            env: (!service.env.is_empty())
+                .then(|| service.env.iter().map(|e| (*e).to_string()).collect()),
             host_config: Some(HostConfig {
                 network_mode: Some(self.network.clone()),
                 publish_all_ports: Some(true),
