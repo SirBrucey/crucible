@@ -5,6 +5,8 @@
 //! next `Worker<_>`; illegal sequences are compile errors.
 
 use crucible_core::{
+    deployment::Docker,
+    fleet,
     ipc::{
         RunnerToWorker, WorkerToRunner,
         codec::{read_frame, write_frame},
@@ -26,16 +28,16 @@ pub struct Worker<S> {
 pub struct Handshaking;
 
 pub struct Idle {
-    orchestrator: Orchestrator,
+    orchestrator: Orchestrator<Docker>,
 }
 
 pub struct Executing {
-    orchestrator: Orchestrator,
+    orchestrator: Orchestrator<Docker>,
     schedule: Schedule,
 }
 
 pub struct ShuttingDown {
-    orchestrator: Orchestrator,
+    orchestrator: Orchestrator<Docker>,
 }
 
 pub enum IdleNext {
@@ -68,8 +70,9 @@ impl Worker<Handshaking> {
                     "[worker {}] handshake ok, runner version {runner_version}",
                     self.id
                 );
-                let mut orchestrator = Orchestrator::new();
-                orchestrator.setup();
+                let docker = Docker::new(self.id, &fleet::EXAMPLE)?;
+                let mut orchestrator = Orchestrator::new(docker);
+                orchestrator.setup().await?;
                 Ok(Worker {
                     id: self.id,
                     version: self.version,
@@ -162,8 +165,9 @@ impl Worker<Executing> {
 }
 
 impl Worker<ShuttingDown> {
-    pub fn teardown(mut self) {
-        self.state.orchestrator.teardown();
+    pub async fn teardown(mut self) -> Result<()> {
+        self.state.orchestrator.teardown().await?;
         eprintln!("[worker {}] teardown complete", self.id);
+        Ok(())
     }
 }

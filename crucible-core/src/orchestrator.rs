@@ -1,21 +1,33 @@
 //! L4 orchestrator: brings up the fleet replica, executes one schedule, tears it down.
 
 use crate::{
+    deployment::Deployment,
     ipc::Verdict,
     scheduler::Schedule,
     verdict::{Observations, driver_for},
 };
 
 /// Per-worker orchestrator that owns the replica lifecycle around each schedule.
-pub struct Orchestrator {}
+pub struct Orchestrator<D>
+where
+    D: Deployment,
+{
+    deployment: D,
+}
 
-impl Orchestrator {
-    pub fn new() -> Self {
-        Self {}
+impl<D> Orchestrator<D>
+where
+    D: Deployment,
+{
+    pub fn new(deployment: D) -> Self {
+        Self { deployment }
     }
 
-    /// Bring up the fleet replica this worker will drive.
-    pub fn setup(&mut self) {}
+    /// Bring the fleet replica up and wait for every service to become ready.
+    pub async fn setup(&mut self) -> Result<(), D::Error> {
+        self.deployment.setup().await?;
+        self.deployment.wait_ready().await
+    }
 
     /// Execute one schedule and produce a verdict from the observations.
     pub fn execute(&mut self, schedule: &Schedule) -> Verdict {
@@ -24,23 +36,19 @@ impl Orchestrator {
     }
 
     /// Tear down the replica.
-    pub fn teardown(&mut self) {}
-}
-
-impl Default for Orchestrator {
-    fn default() -> Self {
-        Self::new()
+    pub async fn teardown(&mut self) -> Result<(), D::Error> {
+        self.deployment.teardown().await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::verdict::Invariant;
+    use crate::{deployment::Noop, verdict::Invariant};
 
     #[test]
     fn execute_yields_inconclusive_for_every_invariant() {
-        let mut orchestrator = Orchestrator::new();
+        let mut orchestrator = Orchestrator::new(Noop);
         for invariant in [
             Invariant::Idempotent,
             Invariant::Converges,

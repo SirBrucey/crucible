@@ -23,7 +23,9 @@ must_use_candidate = "allow"
 
 [workspace.dependencies]
 base64 = "0.22"
+bollard = "0.21"
 clap = { version = "4", features = ["derive", "env"] }
+futures-util = "0.3"
 libc = "0.2"
 postcard = { version = "1", default-features = false }
 serde = { version = "1", features = ["derive"] }
