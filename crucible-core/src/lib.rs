@@ -1,3 +1,4 @@
+pub mod deployment;
 pub mod event_bus;
 pub mod fleet;
 pub mod ipc;
