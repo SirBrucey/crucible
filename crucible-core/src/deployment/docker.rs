@@ -1,4 +1,4 @@
-//! Docker deployment: brings up the fleet, tears it down.
+//! Docker-backed [`Deployment`](super::Deployment) implementation.
 
 use std::{
     collections::HashMap,
@@ -7,7 +7,7 @@ use std::{
 };
 
 use bollard::{
-    Docker,
+    Docker as DockerClient,
     models::{ContainerCreateBody, HostConfig, NetworkCreateRequest},
     query_parameters::{
         CreateContainerOptionsBuilder, CreateImageOptionsBuilder, RemoveContainerOptionsBuilder,
@@ -17,6 +17,7 @@ use bollard::{
 use futures_util::TryStreamExt;
 use tokio::{net::TcpStream, time::timeout};
 
+use super::Deployment;
 use crate::fleet::{Fleet, Service};
 
 const READINESS_TIMEOUT: Duration = Duration::from_secs(60);
@@ -95,18 +96,18 @@ impl std::fmt::Display for TeardownFailures {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-pub struct Deployment {
-    docker: Docker,
+pub struct Docker {
+    client: DockerClient,
     network: String,
     fleet: &'static Fleet,
     endpoints: HashMap<String, SocketAddr>,
 }
 
-impl Deployment {
+impl Docker {
     pub fn new(worker_id: u32, fleet: &'static Fleet) -> Result<Self> {
-        let docker = Docker::connect_with_socket_defaults()?;
+        let client = DockerClient::connect_with_socket_defaults()?;
         Ok(Self {
-            docker,
+            client,
             network: format!("crucible-{worker_id}"),
             fleet,
             endpoints: HashMap::new(),
@@ -117,17 +118,56 @@ impl Deployment {
         &self.network
     }
 
-    pub fn endpoint(&self, name: &str) -> Option<SocketAddr> {
-        self.endpoints.get(name).copied()
-    }
+    async fn start_service(&mut self, service: &Service) -> Result<()> {
+        pull_image(&self.client, service.image).await?;
 
-    /// Runs [`Self::teardown`] to sweep any leftovers from a prior run with the
-    /// same worker id, then creates the network and brings every service up.
-    /// Bails if the pre-sweep teardown could not clean the previous state.
-    pub async fn setup(&mut self) -> Result<()> {
+        let container_name = format!("{}-{}", self.network, service.name);
+        let exposed_port = format!("{}/tcp", service.port);
+
+        let config = ContainerCreateBody {
+            image: Some(service.image.to_string()),
+            exposed_ports: Some(vec![exposed_port.clone()]),
+            env: (!service.env.is_empty())
+                .then(|| service.env.iter().map(|e| (*e).to_string()).collect()),
+            host_config: Some(HostConfig {
+                network_mode: Some(self.network.clone()),
+                publish_all_ports: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        self.client
+            .create_container(
+                Some(
+                    CreateContainerOptionsBuilder::default()
+                        .name(&container_name)
+                        .build(),
+                ),
+                config,
+            )
+            .await?;
+
+        self.client
+            .start_container(&container_name, None::<StartContainerOptions>)
+            .await?;
+
+        let host_port = published_port(&self.client, &container_name, service.port).await?;
+        self.endpoints.insert(
+            service.name.to_string(),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), host_port),
+        );
+        Ok(())
+    }
+}
+
+impl Deployment for Docker {
+    type Error = Error;
+
+    async fn setup(&mut self) -> Result<()> {
         self.teardown().await?;
 
-        self.docker
+        self.client
             .create_network(NetworkCreateRequest {
                 name: self.network.clone(),
                 ..Default::default()
@@ -140,41 +180,7 @@ impl Deployment {
         Ok(())
     }
 
-    /// Remove every service container this deployment's fleet declares, then
-    /// remove the network. Not-found responses are treated as success so
-    /// teardown is idempotent. Any real failures accumulate into
-    /// [`TeardownFailures`] so the caller sees exactly what was left behind.
-    pub async fn teardown(&mut self) -> Result<()> {
-        let opts = RemoveContainerOptionsBuilder::default().force(true).build();
-        let mut failures = TeardownFailures::new();
-        for service in self.fleet.services {
-            let name = format!("{}-{}", self.network, service.name);
-            match self
-                .docker
-                .remove_container(&name, Some(opts.clone()))
-                .await
-            {
-                Ok(()) => {}
-                Err(e) if is_not_found(&e) => {}
-                Err(e) => failures.append_container(name, e.to_string()),
-            }
-        }
-        self.endpoints.clear();
-        match self.docker.remove_network(&self.network).await {
-            Ok(()) => {}
-            Err(e) if is_not_found(&e) => {}
-            Err(e) => failures.set_network(e.to_string()),
-        }
-        if failures.is_empty() {
-            Ok(())
-        } else {
-            Err(Error::TeardownIncomplete(failures))
-        }
-    }
-
-    /// Wait until every service accepts a TCP connection on its published port,
-    /// with per-service exponential backoff and a shared overall deadline.
-    pub async fn wait_ready(&self) -> Result<()> {
+    async fn wait_ready(&self) -> Result<()> {
         let probes = self.endpoints.iter().map(|(name, addr)| async move {
             let start = tokio::time::Instant::now();
             let mut backoff = INITIAL_BACKOFF;
@@ -197,46 +203,36 @@ impl Deployment {
         Ok(())
     }
 
-    async fn start_service(&mut self, service: &Service) -> Result<()> {
-        pull_image(&self.docker, service.image).await?;
+    async fn teardown(&mut self) -> Result<()> {
+        let opts = RemoveContainerOptionsBuilder::default().force(true).build();
+        let mut failures = TeardownFailures::new();
+        for service in self.fleet.services {
+            let name = format!("{}-{}", self.network, service.name);
+            match self
+                .client
+                .remove_container(&name, Some(opts.clone()))
+                .await
+            {
+                Ok(()) => {}
+                Err(e) if is_not_found(&e) => {}
+                Err(e) => failures.append_container(name, e.to_string()),
+            }
+        }
+        self.endpoints.clear();
+        match self.client.remove_network(&self.network).await {
+            Ok(()) => {}
+            Err(e) if is_not_found(&e) => {}
+            Err(e) => failures.set_network(e.to_string()),
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(Error::TeardownIncomplete(failures))
+        }
+    }
 
-        let container_name = format!("{}-{}", self.network, service.name);
-        let exposed_port = format!("{}/tcp", service.port);
-
-        let config = ContainerCreateBody {
-            image: Some(service.image.to_string()),
-            exposed_ports: Some(vec![exposed_port.clone()]),
-            env: (!service.env.is_empty())
-                .then(|| service.env.iter().map(|e| (*e).to_string()).collect()),
-            host_config: Some(HostConfig {
-                network_mode: Some(self.network.clone()),
-                publish_all_ports: Some(true),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-
-        self.docker
-            .create_container(
-                Some(
-                    CreateContainerOptionsBuilder::default()
-                        .name(&container_name)
-                        .build(),
-                ),
-                config,
-            )
-            .await?;
-
-        self.docker
-            .start_container(&container_name, None::<StartContainerOptions>)
-            .await?;
-
-        let host_port = published_port(&self.docker, &container_name, service.port).await?;
-        self.endpoints.insert(
-            service.name.to_string(),
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), host_port),
-        );
-        Ok(())
+    fn endpoint(&self, name: &str) -> Option<SocketAddr> {
+        self.endpoints.get(name).copied()
     }
 }
 
@@ -250,7 +246,7 @@ fn is_not_found(e: &bollard::errors::Error) -> bool {
     )
 }
 
-async fn pull_image(docker: &Docker, image: &str) -> Result<()> {
+async fn pull_image(docker: &DockerClient, image: &str) -> Result<()> {
     docker
         .create_image(
             Some(
@@ -266,7 +262,11 @@ async fn pull_image(docker: &Docker, image: &str) -> Result<()> {
     Ok(())
 }
 
-async fn published_port(docker: &Docker, container: &str, container_port: u16) -> Result<u16> {
+async fn published_port(
+    docker: &DockerClient,
+    container: &str,
+    container_port: u16,
+) -> Result<u16> {
     let inspect = docker.inspect_container(container, None).await?;
     let ports = inspect
         .network_settings
@@ -333,21 +333,20 @@ mod tests {
     #[ignore = "requires docker daemon"]
     async fn deployment_lifecycle_brings_up_and_tears_down_every_service() {
         let worker_id = std::process::id();
-        let mut deployment =
-            Deployment::new(worker_id, &fleet::EXAMPLE).expect("connect to docker");
+        let mut docker = Docker::new(worker_id, &fleet::EXAMPLE).expect("connect to docker");
 
-        let setup_outcome = deployment.setup().await;
+        let setup_outcome = docker.setup().await;
         for service in fleet::EXAMPLE.services {
             assert!(
-                deployment.endpoint(service.name).is_some(),
+                docker.endpoint(service.name).is_some(),
                 "expected endpoint for `{}`",
                 service.name
             );
         }
 
-        let wait_outcome = deployment.wait_ready().await;
+        let wait_outcome = docker.wait_ready().await;
 
-        let teardown_outcome = deployment.teardown().await;
+        let teardown_outcome = docker.teardown().await;
 
         setup_outcome.expect("setup should succeed");
         wait_outcome.expect("every service should become ready");
@@ -355,7 +354,7 @@ mod tests {
 
         for service in fleet::EXAMPLE.services {
             assert!(
-                deployment.endpoint(service.name).is_none(),
+                docker.endpoint(service.name).is_none(),
                 "endpoint for `{}` should be cleared after teardown",
                 service.name
             );
@@ -377,11 +376,11 @@ mod tests {
         let worker_id = std::process::id().wrapping_add(1);
         let orphan_name = format!("crucible-{worker_id}-orphan");
 
-        let docker = Docker::connect_with_socket_defaults().expect("connect to docker");
-        pull_image(&docker, "nginx:alpine")
+        let client = DockerClient::connect_with_socket_defaults().expect("connect to docker");
+        pull_image(&client, "nginx:alpine")
             .await
             .expect("pull nginx");
-        docker
+        client
             .create_container(
                 Some(
                     CreateContainerOptionsBuilder::default()
@@ -396,15 +395,14 @@ mod tests {
             .await
             .expect("plant orphan");
 
-        let mut deployment =
-            Deployment::new(worker_id, &ORPHAN_TEST_FLEET).expect("connect to docker");
-        let setup_outcome = deployment.setup().await;
-        let teardown_outcome = deployment.teardown().await;
+        let mut docker = Docker::new(worker_id, &ORPHAN_TEST_FLEET).expect("connect to docker");
+        let setup_outcome = docker.setup().await;
+        let teardown_outcome = docker.teardown().await;
 
         setup_outcome.expect("setup should sweep the orphan and succeed");
         teardown_outcome.expect("teardown should succeed");
 
-        let inspect = docker.inspect_container(&orphan_name, None).await;
+        let inspect = client.inspect_container(&orphan_name, None).await;
         assert!(
             inspect.is_err(),
             "orphan container should have been removed"
