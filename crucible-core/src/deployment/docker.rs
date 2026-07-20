@@ -9,7 +9,8 @@ use std::{
 use bollard::{
     Docker as DockerClient,
     models::{
-        ContainerCreateBody, EndpointSettings, HostConfig, NetworkCreateRequest, NetworkingConfig,
+        ContainerCreateBody, EndpointSettings, HealthConfig, HealthStatusEnum, HostConfig,
+        NetworkCreateRequest, NetworkingConfig,
     },
     query_parameters::{
         CreateContainerOptionsBuilder, CreateImageOptionsBuilder, RemoveContainerOptionsBuilder,
@@ -17,15 +18,15 @@ use bollard::{
     },
 };
 use futures_util::TryStreamExt;
-use tokio::{net::TcpStream, time::timeout};
+use tokio::time::sleep;
 
 use super::Deployment;
 use crate::fleet::{Fleet, Service};
 
 const READINESS_TIMEOUT: Duration = Duration::from_secs(60);
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
-const INITIAL_BACKOFF: Duration = Duration::from_millis(100);
-const MAX_BACKOFF: Duration = Duration::from_secs(2);
+const READINESS_POLL: Duration = Duration::from_millis(500);
+const HEALTHCHECK_INTERVAL: Duration = Duration::from_secs(1);
+const HEALTHCHECK_START_PERIOD: Duration = Duration::from_secs(30);
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -135,11 +136,25 @@ impl Docker {
             },
         );
 
+        let healthcheck = (!service.healthcheck.is_empty()).then(|| HealthConfig {
+            test: Some(
+                service
+                    .healthcheck
+                    .iter()
+                    .map(|s| (*s).to_string())
+                    .collect(),
+            ),
+            interval: Some(nanos(HEALTHCHECK_INTERVAL)),
+            start_period: Some(nanos(HEALTHCHECK_START_PERIOD)),
+            ..Default::default()
+        });
+
         let config = ContainerCreateBody {
             image: Some(service.image.to_string()),
             exposed_ports: Some(vec![exposed_port.clone()]),
             env: (!service.env.is_empty())
                 .then(|| service.env.iter().map(|e| (*e).to_string()).collect()),
+            healthcheck,
             host_config: Some(HostConfig {
                 publish_all_ports: Some(true),
                 ..Default::default()
@@ -194,22 +209,26 @@ impl Deployment for Docker {
     }
 
     async fn wait_ready(&self) -> Result<()> {
-        let probes = self.endpoints.iter().map(|(name, addr)| async move {
+        let probes = self.fleet.services.iter().map(|service| async move {
+            let container_name = format!("{}-{}", self.network, service.name);
             let start = tokio::time::Instant::now();
-            let mut backoff = INITIAL_BACKOFF;
             loop {
                 if start.elapsed() >= READINESS_TIMEOUT {
+                    let addr = self
+                        .endpoints
+                        .get(service.name)
+                        .copied()
+                        .unwrap_or_else(|| SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0));
                     return Err(Error::ReadinessTimeout {
-                        name: name.clone(),
-                        addr: *addr,
+                        name: service.name.to_string(),
+                        addr,
                         timeout: READINESS_TIMEOUT,
                     });
                 }
-                if let Ok(Ok(_)) = timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await {
+                if container_ready(&self.client, &container_name).await? {
                     return Ok(());
                 }
-                tokio::time::sleep(backoff).await;
-                backoff = std::cmp::min(backoff * 2, MAX_BACKOFF);
+                sleep(READINESS_POLL).await;
             }
         });
         futures_util::future::try_join_all(probes).await?;
@@ -246,6 +265,24 @@ impl Deployment for Docker {
 
     fn endpoint(&self, name: &str) -> Option<SocketAddr> {
         self.endpoints.get(name).copied()
+    }
+}
+
+fn nanos(d: Duration) -> i64 {
+    i64::try_from(d.as_nanos()).expect("healthcheck duration fits in i64")
+}
+
+async fn container_ready(docker: &DockerClient, container: &str) -> Result<bool> {
+    let inspect = docker.inspect_container(container, None).await?;
+    let state = inspect.state;
+    let status = state
+        .as_ref()
+        .and_then(|s| s.health.as_ref())
+        .and_then(|h| h.status);
+    match status {
+        Some(HealthStatusEnum::HEALTHY) => Ok(true),
+        Some(_) => Ok(false),
+        None => Ok(state.and_then(|s| s.running).unwrap_or(false)),
     }
 }
 
@@ -351,12 +388,14 @@ mod tests {
                 image: "nginx:alpine",
                 port: 80,
                 env: &[],
+                healthcheck: &[],
             },
             Service {
                 name: "web-b",
                 image: "nginx:alpine",
                 port: 80,
                 env: &[],
+                healthcheck: &[],
             },
         ],
     };
@@ -399,6 +438,7 @@ mod tests {
             image: "nginx:alpine",
             port: 80,
             env: &[],
+            healthcheck: &[],
         }],
     };
 
