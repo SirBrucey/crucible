@@ -8,7 +8,6 @@ license.workspace = true
 
 [dependencies]
 clap = { workspace = true }
-crucible-core = { path = "../crucible-core" }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

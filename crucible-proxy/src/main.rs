@@ -1,12 +1,15 @@
 mod error;
+mod proxy;
 
 use std::net::SocketAddr;
 
 use clap::Parser;
-use crucible_core::proxy::Proxy;
 use tokio::net::lookup_host;
 
-use crate::error::{Error, Result};
+use crate::{
+    error::{Error, Result},
+    proxy::Proxy,
+};
 
 #[derive(Parser)]
 #[command(about = "Multi-listener bytes-through proxy for a crucible fleet")]
@@ -43,7 +46,7 @@ async fn main() -> Result<()> {
                 .ok_or_else(|| Error::UpstreamUnresolved {
                     upstream: upstream_str.to_string(),
                 })?;
-        let (proxy, _handle, mut events) = Proxy::bind(listen, upstream).await?;
+        let (proxy, _local_addr, mut events) = Proxy::bind(listen, upstream).await?;
         tracing::info!(%listen, %upstream, "proxy pair up");
 
         tokio::spawn(async move {
