@@ -1,0 +1,12 @@
+[package]
+name = "crucible-proxy"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true
