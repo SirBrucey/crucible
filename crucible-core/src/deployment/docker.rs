@@ -308,7 +308,6 @@ async fn published_port(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fleet;
 
     #[test]
     fn teardown_failures_is_empty_by_default() {
@@ -342,14 +341,31 @@ mod tests {
         assert_eq!(failures.to_string(), "container `api`: boom");
     }
 
+    const LIFECYCLE_TEST_FLEET: Fleet = Fleet {
+        services: &[
+            Service {
+                name: "web-a",
+                image: "nginx:alpine",
+                port: 80,
+                env: &[],
+            },
+            Service {
+                name: "web-b",
+                image: "nginx:alpine",
+                port: 80,
+                env: &[],
+            },
+        ],
+    };
+
     #[tokio::test]
     #[ignore = "requires docker daemon"]
     async fn deployment_lifecycle_brings_up_and_tears_down_every_service() {
         let worker_id = std::process::id();
-        let mut docker = Docker::new(worker_id, &fleet::EXAMPLE).expect("connect to docker");
+        let mut docker = Docker::new(worker_id, &LIFECYCLE_TEST_FLEET).expect("connect to docker");
 
         let setup_outcome = docker.setup().await;
-        for service in fleet::EXAMPLE.services {
+        for service in LIFECYCLE_TEST_FLEET.services {
             assert!(
                 docker.endpoint(service.name).is_some(),
                 "expected endpoint for `{}`",
@@ -365,7 +381,7 @@ mod tests {
         wait_outcome.expect("every service should become ready");
         teardown_outcome.expect("teardown should succeed");
 
-        for service in fleet::EXAMPLE.services {
+        for service in LIFECYCLE_TEST_FLEET.services {
             assert!(
                 docker.endpoint(service.name).is_none(),
                 "endpoint for `{}` should be cleared after teardown",
