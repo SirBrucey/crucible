@@ -53,6 +53,10 @@ where
         self.observer = Some(observer);
     }
 
+    pub fn deployment(&self) -> &D {
+        &self.deployment
+    }
+
     /// Run the scenario against the fleet and produce a verdict from the observations.
     pub async fn execute(&mut self, schedule: &Schedule) -> Result<Verdict, Error> {
         let api = self
