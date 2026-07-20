@@ -121,7 +121,7 @@ impl Docker {
     }
 
     async fn start_service(&mut self, service: &Service) -> Result<()> {
-        pull_image(&self.client, service.image).await?;
+        ensure_image(&self.client, service.image).await?;
 
         let container_name = format!("{}-{}", self.network, service.name);
         let exposed_port = format!("{}/tcp", service.port);
@@ -259,7 +259,10 @@ fn is_not_found(e: &bollard::errors::Error) -> bool {
     )
 }
 
-async fn pull_image(docker: &DockerClient, image: &str) -> Result<()> {
+async fn ensure_image(docker: &DockerClient, image: &str) -> Result<()> {
+    if docker.inspect_image(image).await.is_ok() {
+        return Ok(());
+    }
     docker
         .create_image(
             Some(
@@ -406,7 +409,7 @@ mod tests {
         let orphan_name = format!("crucible-{worker_id}-orphan");
 
         let client = DockerClient::connect_with_socket_defaults().expect("connect to docker");
-        pull_image(&client, "nginx:alpine")
+        ensure_image(&client, "nginx:alpine")
             .await
             .expect("pull nginx");
         client
