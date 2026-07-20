@@ -34,25 +34,40 @@ fn worker_bin_path() -> Result<PathBuf> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .with_writer(std::io::stderr)
+        .init();
+
+    let result = run().await;
+    if let Err(e) = &result {
+        tracing::error!(error = %e, "runner exiting with error");
+    }
+    result
+}
+
+async fn run() -> Result<()> {
     let socket_path = PathBuf::from(format!("/tmp/crucible-{}.sock", std::process::id()));
     let _ = tokio::fs::remove_file(&socket_path).await;
 
     let (bus, journal_rx) = EventBus::new();
 
     let journal_path = journal::default_path(std::process::id());
-    eprintln!("[runner] journal at {}", journal_path.display());
-    let journal = tokio::spawn(journal::run(journal_rx, journal_path));
+    tracing::info!(path = %journal_path.display(), "journal ready");
+    let journal_task = tokio::spawn(journal::run(journal_rx, journal_path));
 
-    // Demo observer on the broadcast side.
     let mut observer_rx = bus.subscribe();
-    let observer = tokio::spawn(async move {
+    let observer_task = tokio::spawn(async move {
         while let Ok(event) = observer_rx.recv().await {
-            eprintln!("[observer] {event:?}");
+            tracing::info!(target: "observer", event = ?event, "");
         }
     });
 
     let listener = UnixListener::bind(&socket_path)?;
-    eprintln!("[runner] listening on {}", socket_path.display());
+    tracing::info!(socket = %socket_path.display(), "listening");
 
     let mut command = Command::new(worker_bin_path()?);
     command
@@ -78,7 +93,7 @@ async fn main() -> Result<()> {
     }
     let mut child = command.spawn()?;
     let child_pid = child.id().ok_or(Error::ChildPidMissing)?;
-    eprintln!("[runner] spawned worker pid {child_pid}");
+    tracing::info!(pid = child_pid, "spawned worker");
 
     let worker_stderr = child
         .stderr
@@ -91,39 +106,44 @@ async fn main() -> Result<()> {
         }
     });
 
+    let workload = drive(&listener, &bus).await;
+
+    let status = child.wait().await?;
+    tracing::info!(?status, "worker exited");
+    let _ = tokio::fs::remove_file(&socket_path).await;
+
+    drop(bus);
+    journal_task.await.expect("journal task should not panic")?;
+    let _ = observer_task.await;
+    let _ = stderr_relay.await;
+
+    workload?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(Error::WorkerExitedNonZero(status))
+    }
+}
+
+async fn drive(listener: &UnixListener, bus: &EventBus) -> Result<()> {
     let (stream, _addr) = timeout(HANDSHAKE_TIMEOUT, listener.accept())
         .await
         .map_err(|_| Error::HandshakeTimeout)??;
-    eprintln!("[runner] accepted connection");
+    tracing::info!("accepted worker connection");
 
     let mut session = timeout(
         HANDSHAKE_TIMEOUT,
-        Session::new(stream, env!("CARGO_PKG_VERSION").to_string()).handshake(&bus),
+        Session::new(stream, env!("CARGO_PKG_VERSION").to_string()).handshake(bus),
     )
     .await
     .map_err(|_| Error::HandshakeTimeout)??;
 
     let mut scheduler = RandomScheduler::new(3);
     loop {
-        session = match session.dispatch(&bus, scheduler.next()).await? {
-            DispatchNext::More(session) => session.await_result(&bus).await?,
+        session = match session.dispatch(bus, scheduler.next()).await? {
+            DispatchNext::More(session) => session.await_result(bus).await?,
             DispatchNext::Done => break,
         };
     }
-
-    let status = child.wait().await?;
-    eprintln!("[runner] worker exited: {status}");
-    let _ = tokio::fs::remove_file(&socket_path).await;
-
-    // Shutdown bus: drop it, then wait for journal + observer to drain and exit.
-    drop(bus);
-    journal.await.expect("journal task should not panic")?;
-    let _ = observer.await;
-    let _ = stderr_relay.await;
-
-    if status.success() {
-        Ok(())
-    } else {
-        Err(Error::WorkerExitedNonZero(status))
-    }
+    Ok(())
 }

@@ -24,6 +24,7 @@ pub const EXAMPLE: Fleet = Fleet {
             env: &[
                 "DATABASE_URL=mysql://root@db:3306/orders",
                 "BROKER_URL=amqp://broker:5672",
+                "RUST_LOG=info",
             ],
         },
         Service {
@@ -48,6 +49,7 @@ pub const EXAMPLE: Fleet = Fleet {
             env: &[
                 "DATABASE_URL=mysql://root@db:3306/orders",
                 "BROKER_URL=amqp://broker:5672",
+                "RUST_LOG=info",
             ],
         },
     ],

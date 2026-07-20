@@ -13,9 +13,25 @@ use crate::{
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .with_writer(std::io::stderr)
+        .init();
+
+    if let Err(e) = run().await {
+        tracing::error!(error = %e, "worker exiting with error");
+        return Err(e);
+    }
+    Ok(())
+}
+
+async fn run() -> Result<()> {
     let args = Cli::parse();
 
-    eprintln!("[worker {}] connecting to {}", args.worker_id, args.socket);
+    tracing::info!(worker_id = args.worker_id, socket = %args.socket, "connecting");
     let stream = UnixStream::connect(&args.socket).await?;
 
     let mut worker = Worker::new(
