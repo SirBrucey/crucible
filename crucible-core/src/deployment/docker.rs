@@ -8,7 +8,9 @@ use std::{
 
 use bollard::{
     Docker as DockerClient,
-    models::{ContainerCreateBody, HostConfig, NetworkCreateRequest},
+    models::{
+        ContainerCreateBody, EndpointSettings, HostConfig, NetworkCreateRequest, NetworkingConfig,
+    },
     query_parameters::{
         CreateContainerOptionsBuilder, CreateImageOptionsBuilder, RemoveContainerOptionsBuilder,
         StartContainerOptions,
@@ -124,15 +126,26 @@ impl Docker {
         let container_name = format!("{}-{}", self.network, service.name);
         let exposed_port = format!("{}/tcp", service.port);
 
+        let mut endpoints_config = HashMap::new();
+        endpoints_config.insert(
+            self.network.clone(),
+            EndpointSettings {
+                aliases: Some(vec![service.name.to_string()]),
+                ..Default::default()
+            },
+        );
+
         let config = ContainerCreateBody {
             image: Some(service.image.to_string()),
             exposed_ports: Some(vec![exposed_port.clone()]),
             env: (!service.env.is_empty())
                 .then(|| service.env.iter().map(|e| (*e).to_string()).collect()),
             host_config: Some(HostConfig {
-                network_mode: Some(self.network.clone()),
                 publish_all_ports: Some(true),
                 ..Default::default()
+            }),
+            networking_config: Some(NetworkingConfig {
+                endpoints_config: Some(endpoints_config),
             }),
             ..Default::default()
         };
