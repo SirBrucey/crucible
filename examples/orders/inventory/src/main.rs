@@ -12,6 +12,7 @@ use lapin::{
 };
 use serde::Deserialize;
 use sqlx::{MySql, Pool};
+use tokio::net::TcpListener;
 use tracing::{info, warn};
 
 const EXCHANGE: &str = "orders";
@@ -76,6 +77,16 @@ async fn main() -> anyhow::Result<()> {
         )
         .await
         .context("bind queue")?;
+
+    let readiness_addr =
+        std::env::var("READINESS_ADDR").unwrap_or_else(|_| "0.0.0.0:8081".to_string());
+    let readiness = TcpListener::bind(&readiness_addr)
+        .await
+        .with_context(|| format!("bind {readiness_addr}"))?;
+    tokio::spawn(async move {
+        while let Ok((_conn, _)) = readiness.accept().await {}
+    });
+    info!(addr = %readiness_addr, "readiness listener bound");
 
     let mut consumer = channel
         .basic_consume(
