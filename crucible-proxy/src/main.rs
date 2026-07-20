@@ -1,8 +1,12 @@
+mod error;
+
 use std::net::SocketAddr;
 
 use clap::Parser;
 use crucible_core::proxy::Proxy;
 use tokio::net::lookup_host;
+
+use crate::error::{Error, Result};
 
 #[derive(Parser)]
 #[command(about = "Multi-listener bytes-through proxy for a crucible fleet")]
@@ -14,7 +18,7 @@ struct Cli {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -27,12 +31,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for spec in cli.pairs {
         let (listen_str, upstream_str) = spec
             .split_once('=')
-            .ok_or_else(|| format!("pair `{spec}` must be in the form LISTEN=UPSTREAM"))?;
-        let listen: SocketAddr = listen_str.parse()?;
-        let upstream = lookup_host(upstream_str)
-            .await?
-            .next()
-            .ok_or_else(|| format!("resolve upstream `{upstream_str}` produced no addresses"))?;
+            .ok_or_else(|| Error::MalformedPair { pair: spec.clone() })?;
+        let listen: SocketAddr = listen_str.parse().map_err(|source| Error::ParseListen {
+            addr: listen_str.to_string(),
+            source,
+        })?;
+        let upstream =
+            lookup_host(upstream_str)
+                .await?
+                .next()
+                .ok_or_else(|| Error::UpstreamUnresolved {
+                    upstream: upstream_str.to_string(),
+                })?;
         let (proxy, _handle, mut events) = Proxy::bind(listen, upstream).await?;
         tracing::info!(%listen, %upstream, "proxy pair up");
 
