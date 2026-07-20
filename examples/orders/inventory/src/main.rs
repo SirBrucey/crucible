@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use anyhow::Context;
+use axum::{Router, http::StatusCode, routing::get};
 use futures_util::StreamExt;
 use lapin::{
     Channel, Connection, ConnectionProperties, ExchangeKind,
@@ -13,7 +14,6 @@ use lapin::{
 use serde::Deserialize;
 use sqlx::{MySql, Pool};
 use tokio::net::TcpListener;
-use tracing::{info, warn};
 
 const EXCHANGE: &str = "orders";
 const QUEUE: &str = "orders.inventory";
@@ -78,15 +78,17 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("bind queue")?;
 
-    let readiness_addr =
-        std::env::var("READINESS_ADDR").unwrap_or_else(|_| "0.0.0.0:8081".to_string());
-    let readiness = TcpListener::bind(&readiness_addr)
+    let health_addr = std::env::var("HEALTH_ADDR").unwrap_or_else(|_| "0.0.0.0:8081".to_string());
+    let health_listener = TcpListener::bind(&health_addr)
         .await
-        .with_context(|| format!("bind {readiness_addr}"))?;
+        .with_context(|| format!("bind {health_addr}"))?;
+    let health_router = Router::new().route("/healthz", get(|| async { StatusCode::OK }));
     tokio::spawn(async move {
-        while let Ok((_conn, _)) = readiness.accept().await {}
+        if let Err(e) = axum::serve(health_listener, health_router).await {
+            tracing::warn!(?e, "health server ended");
+        }
     });
-    info!(addr = %readiness_addr, "readiness listener bound");
+    tracing::info!(addr = %health_addr, "health server ready");
 
     let mut consumer = channel
         .basic_consume(
@@ -97,19 +99,22 @@ async fn main() -> anyhow::Result<()> {
         )
         .await
         .context("start consumer")?;
-    info!(queue = QUEUE, "consuming");
+    tracing::info!(queue = QUEUE, "consuming");
 
     while let Some(delivery) = consumer.next().await {
         let delivery = delivery.context("delivery error")?;
         match serde_json::from_slice::<OrderCreated>(&delivery.data) {
             Ok(event) => {
                 if let Err(e) = apply_order(&db, &event).await {
-                    warn!(?e, order_id = event.id, "failed to apply order");
+                    tracing::warn!(?e, order_id = event.id, "failed to apply order");
                 }
             }
-            Err(e) => warn!(?e, "failed to parse event"),
+            Err(e) => tracing::warn!(?e, "failed to parse event"),
         }
-        delivery.ack(BasicAckOptions::default()).await.context("ack")?;
+        delivery
+            .ack(BasicAckOptions::default())
+            .await
+            .context("ack")?;
     }
     Ok(())
 }
@@ -143,9 +148,9 @@ async fn apply_order(db: &Pool<MySql>, event: &OrderCreated) -> anyhow::Result<(
         .await
         .context("decrement stock")?;
     if result.rows_affected() == 0 {
-        warn!(item = %event.item, "unknown item, stock unchanged");
+        tracing::warn!(item = %event.item, "unknown item, stock unchanged");
     } else {
-        info!(
+        tracing::info!(
             order_id = event.id,
             item = %event.item,
             quantity = event.quantity,
@@ -160,7 +165,7 @@ async fn connect_db(url: &str) -> anyhow::Result<Pool<MySql>> {
         match Pool::<MySql>::connect(url).await {
             Ok(pool) => return Ok(pool),
             Err(e) => {
-                warn!(?e, attempt, "db not ready");
+                tracing::warn!(?e, attempt, "db not ready");
                 tokio::time::sleep(RETRY_DELAY).await;
             }
         }
@@ -173,7 +178,7 @@ async fn connect_broker(url: &str) -> anyhow::Result<Channel> {
         match Connection::connect(url, ConnectionProperties::default()).await {
             Ok(conn) => return conn.create_channel().await.context("open channel"),
             Err(e) => {
-                warn!(?e, attempt, "broker not ready");
+                tracing::warn!(?e, attempt, "broker not ready");
                 tokio::time::sleep(RETRY_DELAY).await;
             }
         }
