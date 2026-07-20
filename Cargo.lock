@@ -402,6 +402,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "crucible-proxy"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "crucible-core",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "crucible-worker"
 version = "0.1.0"
 dependencies = [

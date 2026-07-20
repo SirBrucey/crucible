@@ -1,14 +1,12 @@
-//! L1 session proxy: bytes-through TCP forwarder with connection tracking.
+//! Bytes-through TCP forwarder that emits connection events.
 
 use std::{
-    collections::HashMap,
     io,
     net::SocketAddr,
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::Instant,
 };
 
 use tokio::{
@@ -39,69 +37,30 @@ pub enum ConnEventKind {
     },
 }
 
-#[derive(Debug, Clone)]
-pub struct ConnMeta {
-    pub id: ConnId,
-    pub peer: SocketAddr,
-    pub opened_at: Instant,
-}
-
 pub struct Proxy {
     listener: TcpListener,
     upstream: SocketAddr,
     events_tx: mpsc::UnboundedSender<ConnEvent>,
-    conns: Arc<Mutex<HashMap<ConnId, ConnMeta>>>,
     next_id: Arc<AtomicU64>,
-}
-
-/// Read-only view of a running proxy's local address and open connections.
-#[derive(Clone)]
-pub struct ProxyHandle {
-    local_addr: SocketAddr,
-    conns: Arc<Mutex<HashMap<ConnId, ConnMeta>>>,
-}
-
-impl ProxyHandle {
-    #[must_use]
-    pub fn local_addr(&self) -> SocketAddr {
-        self.local_addr
-    }
-
-    /// A snapshot of the currently-open connections.
-    #[must_use]
-    pub fn snapshot(&self) -> Vec<ConnMeta> {
-        self.conns
-            .lock()
-            .expect("proxy conns mutex poisoned")
-            .values()
-            .cloned()
-            .collect()
-    }
 }
 
 impl Proxy {
     /// Bind to `listen` and prepare to forward every accepted connection to `upstream`.
+    /// Returns the proxy, its bound local address, and the receiver for connection events.
     pub async fn bind(
         listen: SocketAddr,
         upstream: SocketAddr,
-    ) -> io::Result<(Self, ProxyHandle, mpsc::UnboundedReceiver<ConnEvent>)> {
+    ) -> io::Result<(Self, SocketAddr, mpsc::UnboundedReceiver<ConnEvent>)> {
         let listener = TcpListener::bind(listen).await?;
         let local_addr = listener.local_addr()?;
-        let conns = Arc::new(Mutex::new(HashMap::new()));
         let (events_tx, events_rx) = mpsc::unbounded_channel();
-        let next_id = Arc::new(AtomicU64::new(0));
-        let handle = ProxyHandle {
-            local_addr,
-            conns: conns.clone(),
-        };
         let proxy = Self {
             listener,
             upstream,
             events_tx,
-            conns,
-            next_id,
+            next_id: Arc::new(AtomicU64::new(0)),
         };
-        Ok((proxy, handle, events_rx))
+        Ok((proxy, local_addr, events_rx))
     }
 
     /// Accept-forward loop; returns only if `accept()` errors.
@@ -114,7 +73,6 @@ impl Proxy {
                 client,
                 peer,
                 self.upstream,
-                self.conns.clone(),
                 self.events_tx.clone(),
             ));
         }
@@ -126,7 +84,6 @@ async fn forward(
     mut client: TcpStream,
     peer: SocketAddr,
     upstream: SocketAddr,
-    conns: Arc<Mutex<HashMap<ConnId, ConnMeta>>>,
     events_tx: mpsc::UnboundedSender<ConnEvent>,
 ) {
     let mut upstream_conn = match TcpStream::connect(upstream).await {
@@ -142,21 +99,12 @@ async fn forward(
         }
     };
 
-    let meta = ConnMeta {
-        id,
-        peer,
-        opened_at: Instant::now(),
-    };
-    conns
-        .lock()
-        .expect("proxy conns mutex poisoned")
-        .insert(id, meta);
     let _ = events_tx.send(ConnEvent {
         id,
         kind: ConnEventKind::Opened { peer },
     });
 
-    let event = match tokio::io::copy_bidirectional(&mut client, &mut upstream_conn).await {
+    let kind = match tokio::io::copy_bidirectional(&mut client, &mut upstream_conn).await {
         Ok((up, down)) => ConnEventKind::Closed {
             bytes_client_to_upstream: up,
             bytes_upstream_to_client: down,
@@ -166,11 +114,7 @@ async fn forward(
         },
     };
 
-    conns
-        .lock()
-        .expect("proxy conns mutex poisoned")
-        .remove(&id);
-    let _ = events_tx.send(ConnEvent { id, kind: event });
+    let _ = events_tx.send(ConnEvent { id, kind });
 }
 
 #[cfg(test)]
@@ -214,12 +158,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn round_trips_two_concurrent_connections_with_distinct_tracking() {
+    async fn two_concurrent_connections_round_trip_and_emit_distinct_events() {
         let echo = spawn_echo().await;
-        let (proxy, handle, mut events) = Proxy::bind((Ipv4Addr::LOCALHOST, 0).into(), echo)
+        let (proxy, proxy_addr, mut events) = Proxy::bind((Ipv4Addr::LOCALHOST, 0).into(), echo)
             .await
             .unwrap();
-        let proxy_addr = handle.local_addr();
         tokio::spawn(proxy.run());
 
         let mut a = TcpStream::connect(proxy_addr).await.unwrap();
@@ -235,23 +178,16 @@ mod tests {
         assert_eq!(&buf_a, b"foo");
         assert_eq!(&buf_b, b"abcdef");
 
-        let snapshot = handle.snapshot();
-        assert_eq!(snapshot.len(), 2);
-        let ids: std::collections::HashSet<_> = snapshot.iter().map(|m| m.id).collect();
-        assert_eq!(ids, [0, 1].into_iter().collect());
-        let peers: std::collections::HashSet<_> = snapshot.iter().map(|m| m.peer).collect();
-        assert_eq!(peers.len(), 2);
-
         a.shutdown().await.unwrap();
         b.shutdown().await.unwrap();
 
-        let mut opened = std::collections::HashMap::new();
+        let mut opened = std::collections::HashSet::new();
         let mut closed = std::collections::HashMap::new();
         for _ in 0..4 {
             let event = recv(&mut events).await;
             match event.kind {
-                ConnEventKind::Opened { peer } => {
-                    opened.insert(event.id, peer);
+                ConnEventKind::Opened { .. } => {
+                    opened.insert(event.id);
                 }
                 ConnEventKind::Closed {
                     bytes_client_to_upstream,
@@ -270,8 +206,6 @@ mod tests {
         assert_eq!(closed.len(), 2);
         assert!(closed.values().any(|&counts| counts == (3, 3)));
         assert!(closed.values().any(|&counts| counts == (6, 6)));
-
-        assert!(handle.snapshot().is_empty());
     }
 
     #[tokio::test]
@@ -280,16 +214,14 @@ mod tests {
             let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
             listener.local_addr().unwrap()
         };
-        let (proxy, handle, mut events) = Proxy::bind((Ipv4Addr::LOCALHOST, 0).into(), unused)
+        let (proxy, proxy_addr, mut events) = Proxy::bind((Ipv4Addr::LOCALHOST, 0).into(), unused)
             .await
             .unwrap();
-        let proxy_addr = handle.local_addr();
         tokio::spawn(proxy.run());
 
         let _client = TcpStream::connect(proxy_addr).await.unwrap();
 
         let event = recv(&mut events).await;
         assert!(matches!(event.kind, ConnEventKind::Failed { .. }));
-        assert!(handle.snapshot().is_empty());
     }
 }
