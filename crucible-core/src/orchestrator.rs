@@ -3,8 +3,9 @@
 use crate::{
     deployment::Deployment,
     ipc::Verdict,
+    scenario::{self, Orders},
     scheduler::Schedule,
-    verdict::{Observations, driver_for},
+    verdict::driver_for,
 };
 
 /// Per-worker orchestrator that owns the replica lifecycle around each schedule.
@@ -13,14 +14,18 @@ where
     D: Deployment,
 {
     deployment: D,
+    scenario: Orders,
 }
 
 impl<D> Orchestrator<D>
 where
     D: Deployment,
 {
-    pub fn new(deployment: D) -> Self {
-        Self { deployment }
+    pub fn new(deployment: D, scenario: Orders) -> Self {
+        Self {
+            deployment,
+            scenario,
+        }
     }
 
     /// Bring the fleet replica up and wait for every service to become ready.
@@ -29,38 +34,18 @@ where
         self.deployment.wait_ready().await
     }
 
-    /// Execute one schedule and produce a verdict from the observations.
-    pub fn execute(&mut self, schedule: &Schedule) -> Verdict {
-        let observations = Observations::empty();
-        driver_for(schedule.invariant).drive(&observations)
+    /// Run the scenario against the fleet and produce a verdict from the observations.
+    pub async fn execute(&mut self, schedule: &Schedule) -> Result<Verdict, scenario::Error> {
+        let api = self
+            .deployment
+            .endpoint("api")
+            .expect("api endpoint present after setup");
+        let observations = self.scenario.run(api).await?;
+        Ok(driver_for(schedule.invariant).drive(&observations))
     }
 
     /// Tear down the replica.
     pub async fn teardown(&mut self) -> Result<(), D::Error> {
         self.deployment.teardown().await
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{deployment::Noop, verdict::Invariant};
-
-    #[test]
-    fn execute_yields_inconclusive_for_every_invariant() {
-        let mut orchestrator = Orchestrator::new(Noop);
-        for invariant in [
-            Invariant::Idempotent,
-            Invariant::Converges,
-            Invariant::Durable,
-            Invariant::Recovers,
-        ] {
-            let schedule = Schedule {
-                schedule_id: 0,
-                invariant,
-                payload: Vec::new(),
-            };
-            assert_eq!(orchestrator.execute(&schedule), Verdict::Inconclusive);
-        }
     }
 }
