@@ -6,6 +6,9 @@ pub struct Service {
     pub port: u16,
     /// Environment variables passed to the container, one per entry in `KEY=value` form.
     pub env: &'static [&'static str],
+    /// Command to run inside the container as a HEALTHCHECK; empty means the image's
+    /// built-in HEALTHCHECK is used.
+    pub healthcheck: &'static [&'static str],
 }
 
 pub struct Fleet {
@@ -26,12 +29,14 @@ pub const EXAMPLE: Fleet = Fleet {
                 "BROKER_URL=amqp://broker:5672",
                 "RUST_LOG=info",
             ],
+            healthcheck: &[],
         },
         Service {
             name: "broker",
             image: "rabbitmq:3.13-management",
             port: 5672,
             env: &[],
+            healthcheck: &["CMD", "rabbitmq-diagnostics", "-q", "ping"],
         },
         Service {
             name: "db",
@@ -41,6 +46,7 @@ pub const EXAMPLE: Fleet = Fleet {
                 "MARIADB_ALLOW_EMPTY_ROOT_PASSWORD=yes",
                 "MARIADB_DATABASE=orders",
             ],
+            healthcheck: &["CMD", "mariadb-admin", "ping", "-h", "127.0.0.1"],
         },
         Service {
             name: "inventory",
@@ -51,6 +57,7 @@ pub const EXAMPLE: Fleet = Fleet {
                 "BROKER_URL=amqp://broker:5672",
                 "RUST_LOG=info",
             ],
+            healthcheck: &[],
         },
     ],
 };
