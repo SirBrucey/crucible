@@ -3,10 +3,21 @@
 use crate::{
     deployment::Deployment,
     ipc::Verdict,
+    observer::{self, DbObserver},
     scenario::{self, Orders},
     scheduler::Schedule,
-    verdict::driver_for,
+    verdict::{Observations, driver_for},
 };
+
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error(transparent)]
+    Scenario(#[from] scenario::Error),
+    #[error(transparent)]
+    Observer(#[from] observer::Error),
+    #[error("observer not installed; call set_observer after setup")]
+    ObserverMissing,
+}
 
 /// Per-worker orchestrator that owns the replica lifecycle around each schedule.
 pub struct Orchestrator<D>
@@ -15,6 +26,9 @@ where
 {
     deployment: D,
     scenario: Orders,
+    // FIXME(#84): stopgap until an orchestrator state machine models the phases;
+    // the observer only exists after setup.
+    observer: Option<DbObserver>,
 }
 
 impl<D> Orchestrator<D>
@@ -25,6 +39,7 @@ where
         Self {
             deployment,
             scenario,
+            observer: None,
         }
     }
 
@@ -34,13 +49,19 @@ where
         self.deployment.wait_ready().await
     }
 
+    pub fn set_observer(&mut self, observer: DbObserver) {
+        self.observer = Some(observer);
+    }
+
     /// Run the scenario against the fleet and produce a verdict from the observations.
-    pub async fn execute(&mut self, schedule: &Schedule) -> Result<Verdict, scenario::Error> {
+    pub async fn execute(&mut self, schedule: &Schedule) -> Result<Verdict, Error> {
         let api = self
             .deployment
             .endpoint("api")
             .expect("api endpoint present after setup");
-        let observations = self.scenario.run(api).await?;
+        let observer = self.observer.as_ref().ok_or(Error::ObserverMissing)?;
+        let mut observations: Observations = self.scenario.run(api).await?;
+        observer.observe(&mut observations).await?;
         Ok(driver_for(schedule.invariant).drive(&observations))
     }
 
