@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = ["crucible", "crucible-core", "crucible-worker"]
+exclude = ["examples"]
 
 [workspace.package]
 edition = "2024"
