@@ -1,7 +1,12 @@
 use std::{sync::Arc, time::Duration};
 
 use anyhow::Context;
-use axum::{Json, Router, extract::State, http::StatusCode, routing::post};
+use axum::{
+    Json, Router,
+    extract::State,
+    http::StatusCode,
+    routing::{get, post},
+};
 use lapin::{
     BasicProperties, Channel, Connection, ConnectionProperties, ExchangeKind,
     options::{BasicPublishOptions, ExchangeDeclareOptions},
@@ -10,7 +15,6 @@ use lapin::{
 use serde::{Deserialize, Serialize};
 use sqlx::{MySql, Pool};
 use tokio::net::TcpListener;
-use tracing::{info, warn};
 
 const EXCHANGE: &str = "orders";
 const ROUTING_KEY: &str = "order.created";
@@ -78,13 +82,14 @@ async fn main() -> anyhow::Result<()> {
 
     let state = Arc::new(AppState { db, channel });
     let app = Router::new()
+        .route("/healthz", get(|| async { StatusCode::OK }))
         .route("/orders", post(create_order))
         .with_state(state);
 
     let listener = TcpListener::bind(&listen_addr)
         .await
         .with_context(|| format!("bind {listen_addr}"))?;
-    info!(addr = %listen_addr, "listening");
+    tracing::info!(addr = %listen_addr, "listening");
     axum::serve(listener, app).await.context("serve")?;
     Ok(())
 }
@@ -94,7 +99,7 @@ async fn connect_db(url: &str) -> anyhow::Result<Pool<MySql>> {
         match Pool::<MySql>::connect(url).await {
             Ok(pool) => return Ok(pool),
             Err(e) => {
-                warn!(?e, attempt, "db not ready");
+                tracing::warn!(?e, attempt, "db not ready");
                 tokio::time::sleep(RETRY_DELAY).await;
             }
         }
@@ -107,7 +112,7 @@ async fn connect_broker(url: &str) -> anyhow::Result<Channel> {
         match Connection::connect(url, ConnectionProperties::default()).await {
             Ok(conn) => return conn.create_channel().await.context("open channel"),
             Err(e) => {
-                warn!(?e, attempt, "broker not ready");
+                tracing::warn!(?e, attempt, "broker not ready");
                 tokio::time::sleep(RETRY_DELAY).await;
             }
         }
@@ -125,7 +130,7 @@ async fn create_order(
         .execute(&state.db)
         .await
         .map_err(|e| {
-            warn!(?e, "insert failed");
+            tracing::warn!(?e, "insert failed");
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
     let order_id = result.last_insert_id();
@@ -147,7 +152,7 @@ async fn create_order(
         )
         .await
         .map_err(|e| {
-            warn!(?e, "publish failed");
+            tracing::warn!(?e, "publish failed");
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 

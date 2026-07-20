@@ -18,14 +18,24 @@ pub enum Invariant {
 }
 
 /// Observations captured during schedule execution and fed to a [`Driver`].
-///
-/// Empty for now.
-pub struct Observations;
+#[derive(Debug, Default)]
+pub struct Observations {
+    pub http_outcomes: Vec<HttpOutcome>,
+}
 
 impl Observations {
     pub fn empty() -> Self {
-        Self
+        Self::default()
     }
+}
+
+/// The result of one HTTP call made by a scenario.
+#[derive(Debug)]
+pub struct HttpOutcome {
+    pub method: String,
+    pub path: String,
+    pub status: u16,
+    pub body: Vec<u8>,
 }
 
 /// Produces a [`Verdict`] from a set of observations for one invariant.
