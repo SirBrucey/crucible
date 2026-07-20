@@ -23,7 +23,7 @@ use tokio::time::sleep;
 use super::Deployment;
 use crate::fleet::{Fleet, Service};
 
-const READINESS_TIMEOUT: Duration = Duration::from_secs(60);
+const READINESS_TIMEOUT: Duration = Duration::from_mins(1);
 const READINESS_POLL: Duration = Duration::from_millis(500);
 const HEALTHCHECK_INTERVAL: Duration = Duration::from_secs(1);
 const HEALTHCHECK_START_PERIOD: Duration = Duration::from_secs(30);

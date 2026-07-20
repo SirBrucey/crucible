@@ -5,12 +5,13 @@
 //! next `Worker<_>`; illegal sequences are compile errors.
 
 use crucible_core::{
-    deployment::Docker,
+    deployment::{Deployment, Docker},
     fleet,
     ipc::{
         RunnerToWorker, WorkerToRunner,
         codec::{read_frame, write_frame},
     },
+    observer::DbObserver,
     orchestrator::Orchestrator,
     scenario::Orders,
     scheduler::Schedule,
@@ -71,6 +72,12 @@ impl Worker<Handshaking> {
                 let mut orchestrator =
                     Orchestrator::new(Docker::new(self.id, &fleet::EXAMPLE)?, Orders::new()?);
                 orchestrator.setup().await?;
+                let db_addr = orchestrator
+                    .deployment()
+                    .endpoint("db")
+                    .expect("db endpoint present after setup");
+                let db_url = format!("mysql://root@{db_addr}/orders");
+                orchestrator.set_observer(DbObserver::connect(&db_url).await?);
                 Ok(Worker {
                     id: self.id,
                     version: self.version,
