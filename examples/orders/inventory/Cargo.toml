@@ -8,6 +8,7 @@ license.workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
+axum = { workspace = true }
 futures-util = { workspace = true }
 lapin = { workspace = true }
 serde = { workspace = true }
