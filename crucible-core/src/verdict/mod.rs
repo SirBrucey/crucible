@@ -18,9 +18,11 @@ pub enum Invariant {
 }
 
 /// Observations captured during schedule execution and fed to a [`Driver`].
+// FIXME(#83): shape belongs to a kind plugin, not this shared type.
 #[derive(Debug, Default)]
 pub struct Observations {
     pub http_outcomes: Vec<HttpOutcome>,
+    pub db_state: Option<DbState>,
 }
 
 impl Observations {
@@ -36,6 +38,26 @@ pub struct HttpOutcome {
     pub path: String,
     pub status: u16,
     pub body: Vec<u8>,
+}
+
+/// Snapshot of the fleet's persisted state after the scenario finished.
+#[derive(Debug, Default)]
+pub struct DbState {
+    pub orders: Vec<OrderRow>,
+    pub stock: Vec<StockRow>,
+}
+
+#[derive(Debug)]
+pub struct OrderRow {
+    pub id: u64,
+    pub item: String,
+    pub quantity: i32,
+}
+
+#[derive(Debug)]
+pub struct StockRow {
+    pub item: String,
+    pub level: i32,
 }
 
 /// Produces a [`Verdict`] from a set of observations for one invariant.
