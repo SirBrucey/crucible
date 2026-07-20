@@ -15,27 +15,3 @@ pub trait Deployment {
     fn teardown(&mut self) -> impl Future<Output = Result<(), Self::Error>> + Send;
     fn endpoint(&self, name: &str) -> Option<SocketAddr>;
 }
-
-#[cfg(test)]
-pub struct Noop;
-
-#[cfg(test)]
-impl Deployment for Noop {
-    type Error = std::convert::Infallible;
-
-    async fn setup(&mut self) -> Result<(), Self::Error> {
-        Ok(())
-    }
-
-    async fn wait_ready(&self) -> Result<(), Self::Error> {
-        Ok(())
-    }
-
-    async fn teardown(&mut self) -> Result<(), Self::Error> {
-        Ok(())
-    }
-
-    fn endpoint(&self, _: &str) -> Option<SocketAddr> {
-        None
-    }
-}

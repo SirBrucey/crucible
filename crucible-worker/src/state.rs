@@ -12,6 +12,7 @@ use crucible_core::{
         codec::{read_frame, write_frame},
     },
     orchestrator::Orchestrator,
+    scenario::Orders,
     scheduler::Schedule,
 };
 use tokio::net::UnixStream;
@@ -67,8 +68,8 @@ impl Worker<Handshaking> {
         match read_frame::<RunnerToWorker, _>(&mut self.stream).await? {
             RunnerToWorker::HelloAck { runner_version } => {
                 tracing::info!(worker_id = self.id, %runner_version, "handshake ok");
-                let docker = Docker::new(self.id, &fleet::EXAMPLE)?;
-                let mut orchestrator = Orchestrator::new(docker);
+                let mut orchestrator =
+                    Orchestrator::new(Docker::new(self.id, &fleet::EXAMPLE)?, Orders::new()?);
                 orchestrator.setup().await?;
                 Ok(Worker {
                     id: self.id,
@@ -140,7 +141,14 @@ impl Worker<Idle> {
 impl Worker<Executing> {
     pub async fn execute_and_report(mut self) -> Result<Worker<Idle>> {
         let schedule_id = self.state.schedule.schedule_id;
-        let verdict = self.state.orchestrator.execute(&self.state.schedule);
+        let verdict = self
+            .state
+            .orchestrator
+            .execute(&self.state.schedule)
+            .await
+            .inspect_err(
+                |e| tracing::error!(worker_id = self.id, schedule_id, error = %e, "execute failed"),
+            )?;
         write_frame(
             &mut self.stream,
             &WorkerToRunner::RunResult {
