@@ -12,6 +12,7 @@ use crucible_core::{
         codec::{read_frame, write_frame},
     },
     orchestrator::Orchestrator,
+    scenario::Orders,
     scheduler::Schedule,
 };
 use tokio::net::UnixStream;
@@ -66,12 +67,9 @@ impl Worker<Handshaking> {
         .await?;
         match read_frame::<RunnerToWorker, _>(&mut self.stream).await? {
             RunnerToWorker::HelloAck { runner_version } => {
-                eprintln!(
-                    "[worker {}] handshake ok, runner version {runner_version}",
-                    self.id
-                );
-                let docker = Docker::new(self.id, &fleet::EXAMPLE)?;
-                let mut orchestrator = Orchestrator::new(docker);
+                tracing::info!(worker_id = self.id, %runner_version, "handshake ok");
+                let mut orchestrator =
+                    Orchestrator::new(Docker::new(self.id, &fleet::EXAMPLE)?, Orders::new()?);
                 orchestrator.setup().await?;
                 Ok(Worker {
                     id: self.id,
@@ -92,7 +90,7 @@ impl Worker<Handshaking> {
 impl Worker<Idle> {
     pub async fn await_work(mut self) -> Result<IdleNext> {
         write_frame(&mut self.stream, &WorkerToRunner::Ready).await?;
-        eprintln!("[worker {}] sent READY", self.id);
+        tracing::debug!(worker_id = self.id, "sent READY");
 
         match read_frame::<RunnerToWorker, _>(&mut self.stream).await? {
             RunnerToWorker::Schedule {
@@ -100,9 +98,11 @@ impl Worker<Idle> {
                 invariant,
                 payload,
             } => {
-                eprintln!(
-                    "[worker {}] received SCHEDULE {schedule_id} ({invariant:?})",
-                    self.id
+                tracing::info!(
+                    worker_id = self.id,
+                    schedule_id,
+                    ?invariant,
+                    "received schedule"
                 );
                 Ok(IdleNext::Work(Worker {
                     id: self.id,
@@ -119,7 +119,7 @@ impl Worker<Idle> {
                 }))
             }
             RunnerToWorker::Shutdown => {
-                eprintln!("[worker {}] received SHUTDOWN", self.id);
+                tracing::info!(worker_id = self.id, "received shutdown");
                 Ok(IdleNext::Shutdown(Worker {
                     id: self.id,
                     version: self.version,
@@ -140,18 +140,28 @@ impl Worker<Idle> {
 
 impl Worker<Executing> {
     pub async fn execute_and_report(mut self) -> Result<Worker<Idle>> {
-        let verdict = self.state.orchestrator.execute(&self.state.schedule);
+        let schedule_id = self.state.schedule.schedule_id;
+        let verdict = self
+            .state
+            .orchestrator
+            .execute(&self.state.schedule)
+            .await
+            .inspect_err(
+                |e| tracing::error!(worker_id = self.id, schedule_id, error = %e, "execute failed"),
+            )?;
         write_frame(
             &mut self.stream,
             &WorkerToRunner::RunResult {
-                schedule_id: self.state.schedule.schedule_id,
+                schedule_id,
                 verdict,
             },
         )
         .await?;
-        eprintln!(
-            "[worker {}] sent RUN_RESULT for schedule {} ({verdict:?})",
-            self.id, self.state.schedule.schedule_id
+        tracing::info!(
+            worker_id = self.id,
+            schedule_id,
+            ?verdict,
+            "sent run result"
         );
         Ok(Worker {
             id: self.id,
@@ -167,7 +177,7 @@ impl Worker<Executing> {
 impl Worker<ShuttingDown> {
     pub async fn teardown(mut self) -> Result<()> {
         self.state.orchestrator.teardown().await?;
-        eprintln!("[worker {}] teardown complete", self.id);
+        tracing::info!(worker_id = self.id, "teardown complete");
         Ok(())
     }
 }
