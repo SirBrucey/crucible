@@ -27,6 +27,9 @@ const READINESS_TIMEOUT: Duration = Duration::from_mins(1);
 const READINESS_POLL: Duration = Duration::from_millis(500);
 const HEALTHCHECK_INTERVAL: Duration = Duration::from_secs(1);
 const HEALTHCHECK_START_PERIOD: Duration = Duration::from_secs(30);
+const PROXY_IMAGE: &str = "crucible-proxy:0.1";
+const PROXY_SUFFIX: &str = "proxy";
+const BACKING_SUFFIX: &str = "actual";
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -121,17 +124,29 @@ impl Docker {
         &self.network
     }
 
+    fn backing_container_name(&self, service: &Service) -> String {
+        format!("{}-{}-{}", self.network, service.name, BACKING_SUFFIX)
+    }
+
+    fn proxy_container_name(&self, service: &Service) -> String {
+        format!("{}-{}-{}", self.network, service.name, PROXY_SUFFIX)
+    }
+
+    fn backing_alias(service: &Service) -> String {
+        format!("{}-{}", service.name, BACKING_SUFFIX)
+    }
+
     async fn start_service(&mut self, service: &Service) -> Result<()> {
         ensure_image(&self.client, service.image).await?;
 
-        let container_name = format!("{}-{}", self.network, service.name);
+        let container_name = self.backing_container_name(service);
         let exposed_port = format!("{}/tcp", service.port);
 
         let mut endpoints_config = HashMap::new();
         endpoints_config.insert(
             self.network.clone(),
             EndpointSettings {
-                aliases: Some(vec![service.name.to_string()]),
+                aliases: Some(vec![Self::backing_alias(service)]),
                 ..Default::default()
             },
         );
@@ -151,10 +166,60 @@ impl Docker {
 
         let config = ContainerCreateBody {
             image: Some(service.image.to_string()),
-            exposed_ports: Some(vec![exposed_port.clone()]),
+            exposed_ports: Some(vec![exposed_port]),
             env: (!service.env.is_empty())
                 .then(|| service.env.iter().map(|e| (*e).to_string()).collect()),
             healthcheck,
+            networking_config: Some(NetworkingConfig {
+                endpoints_config: Some(endpoints_config),
+            }),
+            ..Default::default()
+        };
+
+        self.client
+            .create_container(
+                Some(
+                    CreateContainerOptionsBuilder::default()
+                        .name(&container_name)
+                        .build(),
+                ),
+                config,
+            )
+            .await?;
+
+        self.client
+            .start_container(&container_name, None::<StartContainerOptions>)
+            .await?;
+        Ok(())
+    }
+
+    async fn start_proxy_for(&mut self, service: &Service) -> Result<()> {
+        ensure_image(&self.client, PROXY_IMAGE).await?;
+
+        let container_name = self.proxy_container_name(service);
+        let cmd = vec![
+            "--pair".to_string(),
+            format!(
+                "0.0.0.0:{port}={upstream}:{port}",
+                port = service.port,
+                upstream = Self::backing_alias(service)
+            ),
+        ];
+        let exposed_port = format!("{}/tcp", service.port);
+
+        let mut endpoints_config = HashMap::new();
+        endpoints_config.insert(
+            self.network.clone(),
+            EndpointSettings {
+                aliases: Some(vec![service.name.to_string()]),
+                ..Default::default()
+            },
+        );
+
+        let config = ContainerCreateBody {
+            image: Some(PROXY_IMAGE.to_string()),
+            cmd: Some(cmd),
+            exposed_ports: Some(vec![exposed_port]),
             host_config: Some(HostConfig {
                 publish_all_ports: Some(true),
                 ..Default::default()
@@ -204,33 +269,33 @@ impl Deployment for Docker {
 
         for service in self.fleet.services {
             self.start_service(service).await?;
+            self.start_proxy_for(service).await?;
         }
         Ok(())
     }
 
     async fn wait_ready(&self) -> Result<()> {
-        let probes = self.fleet.services.iter().map(|service| async move {
-            let container_name = format!("{}-{}", self.network, service.name);
-            let start = tokio::time::Instant::now();
-            loop {
-                if start.elapsed() >= READINESS_TIMEOUT {
-                    let addr = self
-                        .endpoints
-                        .get(service.name)
-                        .copied()
-                        .unwrap_or_else(|| SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0));
-                    return Err(Error::ReadinessTimeout {
-                        name: service.name.to_string(),
-                        addr,
-                        timeout: READINESS_TIMEOUT,
-                    });
+        let probes = self
+            .fleet
+            .services
+            .iter()
+            .flat_map(|s| [self.backing_container_name(s), self.proxy_container_name(s)])
+            .map(|container_name| async move {
+                let start = tokio::time::Instant::now();
+                loop {
+                    if start.elapsed() >= READINESS_TIMEOUT {
+                        return Err(Error::ReadinessTimeout {
+                            name: container_name,
+                            addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+                            timeout: READINESS_TIMEOUT,
+                        });
+                    }
+                    if container_ready(&self.client, &container_name).await? {
+                        return Ok(());
+                    }
+                    sleep(READINESS_POLL).await;
                 }
-                if container_ready(&self.client, &container_name).await? {
-                    return Ok(());
-                }
-                sleep(READINESS_POLL).await;
-            }
-        });
+            });
         futures_util::future::try_join_all(probes).await?;
         Ok(())
     }
@@ -238,8 +303,12 @@ impl Deployment for Docker {
     async fn teardown(&mut self) -> Result<()> {
         let opts = RemoveContainerOptionsBuilder::default().force(true).build();
         let mut failures = TeardownFailures::new();
-        for service in self.fleet.services {
-            let name = format!("{}-{}", self.network, service.name);
+        let names = self
+            .fleet
+            .services
+            .iter()
+            .flat_map(|s| [self.backing_container_name(s), self.proxy_container_name(s)]);
+        for name in names {
             match self
                 .client
                 .remove_container(&name, Some(opts.clone()))
@@ -446,7 +515,7 @@ mod tests {
     #[ignore = "requires docker daemon"]
     async fn setup_sweeps_an_orphan_container_from_a_prior_run() {
         let worker_id = std::process::id().wrapping_add(1);
-        let orphan_name = format!("crucible-{worker_id}-orphan");
+        let orphan_name = format!("crucible-{worker_id}-orphan-actual");
 
         let client = DockerClient::connect_with_socket_defaults().expect("connect to docker");
         ensure_image(&client, "nginx:alpine")
