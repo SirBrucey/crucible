@@ -27,6 +27,7 @@ async fn main() -> Result<()> {
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
+        .with_writer(std::io::stderr)
         .init();
 
     let cli = Cli::parse();
@@ -56,7 +57,10 @@ async fn main() -> Result<()> {
         });
         tokio::spawn(async move {
             while let Some(event) = events.recv().await {
-                tracing::info!(?event, "conn event");
+                match serde_json::to_string(&event) {
+                    Ok(line) => println!("{line}"),
+                    Err(e) => tracing::error!(?e, "serialize conn event"),
+                }
             }
         });
     }

@@ -7,8 +7,10 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
+    time::{SystemTime, UNIX_EPOCH},
 };
 
+use serde::Serialize;
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::mpsc,
@@ -16,13 +18,35 @@ use tokio::{
 
 pub type ConnId = u64;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ConnEvent {
     pub id: ConnId,
+    /// Wall-clock nanoseconds since the Unix epoch. Read from the host kernel
+    /// clock so events from different sidecars sort together faithfully.
+    pub ts_ns: u128,
+    #[serde(flatten)]
     pub kind: ConnEventKind,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+impl ConnEvent {
+    fn new(id: ConnId, kind: ConnEventKind) -> Self {
+        Self {
+            id,
+            ts_ns: now_ns(),
+            kind,
+        }
+    }
+}
+
+fn now_ns() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock is before Unix epoch")
+        .as_nanos()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind")]
 pub enum ConnEventKind {
     Opened {
         peer: SocketAddr,
@@ -89,20 +113,17 @@ async fn forward(
     let mut upstream_conn = match TcpStream::connect(upstream).await {
         Ok(s) => s,
         Err(e) => {
-            let _ = events_tx.send(ConnEvent {
+            let _ = events_tx.send(ConnEvent::new(
                 id,
-                kind: ConnEventKind::Failed {
+                ConnEventKind::Failed {
                     reason: format!("dial upstream {upstream}: {e}"),
                 },
-            });
+            ));
             return;
         }
     };
 
-    let _ = events_tx.send(ConnEvent {
-        id,
-        kind: ConnEventKind::Opened { peer },
-    });
+    let _ = events_tx.send(ConnEvent::new(id, ConnEventKind::Opened { peer }));
 
     let kind = match tokio::io::copy_bidirectional(&mut client, &mut upstream_conn).await {
         Ok((up, down)) => ConnEventKind::Closed {
@@ -114,7 +135,7 @@ async fn forward(
         },
     };
 
-    let _ = events_tx.send(ConnEvent { id, kind });
+    let _ = events_tx.send(ConnEvent::new(id, kind));
 }
 
 #[cfg(test)]
