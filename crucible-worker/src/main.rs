@@ -44,6 +44,7 @@ async fn run() -> Result<()> {
 
     loop {
         worker = match worker.await_work().await? {
+            IdleNext::Learn(worker) => worker.execute_learn().await?,
             IdleNext::Work(worker) => worker.execute_and_report().await?,
             IdleNext::Shutdown(worker) => {
                 worker.teardown().await?;

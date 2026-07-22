@@ -338,13 +338,7 @@ impl Deployment for Docker {
         }
     }
 
-    fn endpoint(&self, name: &str) -> Option<SocketAddr> {
-        self.endpoints.get(name).copied()
-    }
-}
-
-impl Docker {
-    pub async fn collect_sessions(&self) -> Result<Vec<Session>> {
+    async fn collect_sessions(&self) -> Result<Vec<Session>> {
         let mut sessions = Sessions::new();
         for service in self.fleet.services {
             let container = self.proxy_container_name(service);
@@ -362,6 +356,10 @@ impl Docker {
             }
         }
         Ok(sessions.into_iter().collect())
+    }
+
+    fn endpoint(&self, name: &str) -> Option<SocketAddr> {
+        self.endpoints.get(name).copied()
     }
 }
 
