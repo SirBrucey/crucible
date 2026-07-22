@@ -44,9 +44,9 @@ impl Sessions {
                         conn_id: id,
                         peer,
                         opened_ns,
-                        closed_ns: ts_ns,
-                        bytes_client_to_upstream,
-                        bytes_upstream_to_client,
+                        closed_ns: Some(ts_ns),
+                        bytes_client_to_upstream: Some(bytes_client_to_upstream),
+                        bytes_upstream_to_client: Some(bytes_upstream_to_client),
                     });
                 }
             }
@@ -91,6 +91,17 @@ impl IntoIterator for Sessions {
     type IntoIter = std::vec::IntoIter<Session>;
 
     fn into_iter(mut self) -> Self::IntoIter {
+        for ((service, conn_id), (opened_ns, peer)) in self.opened.drain() {
+            self.finished.push(Session {
+                service,
+                conn_id,
+                peer,
+                opened_ns,
+                closed_ns: None,
+                bytes_client_to_upstream: None,
+                bytes_upstream_to_client: None,
+            });
+        }
         self.finished
             .sort_by_key(|s| (s.opened_ns, s.service.clone(), s.conn_id));
         self.finished.into_iter()
@@ -122,7 +133,8 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].service, "db");
         assert_eq!(out[0].opened_ns, 100);
-        assert_eq!(out[0].closed_ns, 200);
+        assert_eq!(out[0].closed_ns, Some(200));
+        assert_eq!(out[0].bytes_client_to_upstream, Some(3));
         assert_eq!(out[1].service, "api");
         assert_eq!(out[1].opened_ns, 105);
     }
@@ -149,14 +161,18 @@ mod tests {
     }
 
     #[test]
-    fn open_without_close_is_dropped() {
+    fn open_without_close_is_kept_as_still_open() {
         let out: Vec<Session> = Sessions::from_iter([(
             "api".into(),
             ConnEvent::opened_at(0, 100, "127.0.0.1:1".parse().unwrap()),
         )])
         .into_iter()
         .collect();
-        assert!(out.is_empty());
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].opened_ns, 100);
+        assert_eq!(out[0].closed_ns, None);
+        assert_eq!(out[0].bytes_client_to_upstream, None);
+        assert_eq!(out[0].bytes_upstream_to_client, None);
     }
 
     #[test]
