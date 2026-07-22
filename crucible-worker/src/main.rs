@@ -34,7 +34,7 @@ async fn run() -> Result<()> {
     tracing::info!(worker_id = args.worker_id, socket = %args.socket, "connecting");
     let stream = UnixStream::connect(&args.socket).await?;
 
-    let mut worker = Worker::new(
+    let worker = Worker::new(
         stream,
         args.worker_id,
         env!("CARGO_PKG_VERSION").to_string(),
@@ -42,15 +42,9 @@ async fn run() -> Result<()> {
     .handshake()
     .await?;
 
-    loop {
-        worker = match worker.await_work().await? {
-            IdleNext::Learn(worker) => worker.execute_learn().await?,
-            IdleNext::Work(worker) => worker.execute_and_report().await?,
-            IdleNext::Shutdown(worker) => {
-                worker.teardown().await?;
-                break;
-            }
-        };
+    match worker.await_work().await? {
+        IdleNext::Learn(worker) => worker.execute_learn().await?.teardown().await?,
+        IdleNext::Work(worker) => worker.execute_and_report().await?.teardown().await?,
     }
 
     Ok(())

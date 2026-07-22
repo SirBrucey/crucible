@@ -49,7 +49,6 @@ pub struct ShuttingDown {
 pub enum IdleNext {
     Learn(Worker<Learning>),
     Work(Worker<Executing>),
-    Shutdown(Worker<ShuttingDown>),
 }
 
 impl Worker<Handshaking> {
@@ -141,20 +140,9 @@ impl Worker<Idle> {
                     },
                 }))
             }
-            RunnerToWorker::Shutdown => {
-                tracing::info!(worker_id = self.id, "received shutdown");
-                Ok(IdleNext::Shutdown(Worker {
-                    id: self.id,
-                    version: self.version,
-                    stream: self.stream,
-                    state: ShuttingDown {
-                        orchestrator: self.state.orchestrator,
-                    },
-                }))
-            }
             other @ RunnerToWorker::HelloAck { .. } => Err(Error::UnexpectedMessage {
                 state: "Idle",
-                expected: "Learn, Schedule, or Shutdown",
+                expected: "Learn or Schedule",
                 got: format!("{other:?}"),
             }),
         }
@@ -162,7 +150,7 @@ impl Worker<Idle> {
 }
 
 impl Worker<Learning> {
-    pub async fn execute_learn(mut self) -> Result<Worker<Idle>> {
+    pub async fn execute_learn(mut self) -> Result<Worker<ShuttingDown>> {
         let sessions =
             self.state.orchestrator.learn().await.inspect_err(
                 |e| tracing::error!(worker_id = self.id, error = %e, "learn failed"),
@@ -178,7 +166,7 @@ impl Worker<Learning> {
             id: self.id,
             version: self.version,
             stream: self.stream,
-            state: Idle {
+            state: ShuttingDown {
                 orchestrator: self.state.orchestrator,
             },
         })
@@ -186,7 +174,7 @@ impl Worker<Learning> {
 }
 
 impl Worker<Executing> {
-    pub async fn execute_and_report(mut self) -> Result<Worker<Idle>> {
+    pub async fn execute_and_report(mut self) -> Result<Worker<ShuttingDown>> {
         let schedule_id = self.state.schedule.schedule_id;
         let verdict = self
             .state
@@ -214,7 +202,7 @@ impl Worker<Executing> {
             id: self.id,
             version: self.version,
             stream: self.stream,
-            state: Idle {
+            state: ShuttingDown {
                 orchestrator: self.state.orchestrator,
             },
         })
