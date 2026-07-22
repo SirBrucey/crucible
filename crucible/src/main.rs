@@ -131,12 +131,15 @@ async fn drive(listener: &UnixListener, bus: &EventBus) -> Result<()> {
         .map_err(|_| Error::HandshakeTimeout)??;
     tracing::info!("accepted worker connection");
 
-    let mut session = timeout(
+    let session = timeout(
         HANDSHAKE_TIMEOUT,
         Session::new(stream, env!("CARGO_PKG_VERSION").to_string()).handshake(bus),
     )
     .await
     .map_err(|_| Error::HandshakeTimeout)??;
+
+    let (mut session, catalogue) = session.learn(bus).await?;
+    tracing::info!(count = catalogue.len(), "session catalogue received");
 
     let mut scheduler = RandomScheduler::new(3);
     loop {

@@ -7,7 +7,7 @@
 use crucible_core::{
     event_bus::{EventBus, RunnerEvent},
     ipc::{
-        RunnerToWorker, WorkerToRunner,
+        RunnerToWorker, Session as ProxySession, WorkerToRunner,
         codec::{read_frame, write_frame},
     },
     scheduler::Schedule,
@@ -85,6 +85,64 @@ impl Session<Handshaking> {
 }
 
 impl Session<Dispatching> {
+    pub async fn learn(
+        mut self,
+        bus: &EventBus,
+    ) -> Result<(Session<Dispatching>, Vec<ProxySession>)> {
+        let ready = read_frame::<WorkerToRunner, _>(&mut self.stream).await?;
+        if !matches!(&ready, WorkerToRunner::Ready) {
+            return Err(Error::UnexpectedMessage {
+                state: "Learning",
+                expected: "Ready",
+                got: format!("{ready:?}"),
+            });
+        }
+        bus.publish(RunnerEvent::WorkerMessage {
+            worker_id: self.state.worker_id,
+            message: ready,
+        })
+        .await
+        .expect("journal receiver alive");
+
+        let outbound = RunnerToWorker::Learn;
+        write_frame(&mut self.stream, &outbound).await?;
+        bus.publish(RunnerEvent::RunnerMessage {
+            worker_id: self.state.worker_id,
+            message: outbound,
+        })
+        .await
+        .expect("journal receiver alive");
+
+        let msg = read_frame::<WorkerToRunner, _>(&mut self.stream).await?;
+        let sessions = match &msg {
+            WorkerToRunner::SessionCatalogue { sessions } => sessions.clone(),
+            other => {
+                return Err(Error::UnexpectedMessage {
+                    state: "Learning",
+                    expected: "SessionCatalogue",
+                    got: format!("{other:?}"),
+                });
+            }
+        };
+        bus.publish(RunnerEvent::WorkerMessage {
+            worker_id: self.state.worker_id,
+            message: msg,
+        })
+        .await
+        .expect("journal receiver alive");
+
+        Ok((
+            Session {
+                stream: self.stream,
+                runner_version: self.runner_version,
+                state: Dispatching {
+                    worker_id: self.state.worker_id,
+                },
+            },
+            sessions,
+        ))
+    }
+
     pub async fn dispatch(
         mut self,
         bus: &EventBus,
