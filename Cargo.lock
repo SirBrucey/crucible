@@ -390,6 +390,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "bollard",
+ "crucible-protocol",
  "futures-util",
  "postcard",
  "reqwest",
@@ -402,11 +403,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "crucible-protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "crucible-proxy"
 version = "0.1.0"
 dependencies = [
  "clap",
- "serde",
+ "crucible-protocol",
  "serde_json",
  "thiserror",
  "tokio",

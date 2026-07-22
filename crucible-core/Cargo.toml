@@ -9,6 +9,7 @@ license.workspace = true
 [dependencies]
 base64 = { workspace = true }
 bollard = { workspace = true }
+crucible-protocol = { path = "../crucible-protocol" }
 futures-util = { workspace = true }
 postcard = { workspace = true }
 reqwest = { workspace = true }
