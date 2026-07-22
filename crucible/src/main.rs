@@ -1,7 +1,11 @@
 mod error;
 mod session;
 
-use std::{path::PathBuf, process::Stdio, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    process::Stdio,
+    time::Duration,
+};
 
 use crucible_core::{
     event_bus::EventBus,
@@ -11,13 +15,14 @@ use crucible_core::{
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
     net::UnixListener,
-    process::Command,
+    process::{Child, Command},
+    task::JoinHandle,
     time::timeout,
 };
 
 use crate::{
     error::{Error, Result},
-    session::{DispatchNext, Session},
+    session::{Dispatching, Session},
 };
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -69,12 +74,50 @@ async fn run() -> Result<()> {
     let listener = UnixListener::bind(&socket_path)?;
     tracing::info!(socket = %socket_path.display(), "listening");
 
+    let workload = drive(&listener, &bus, &socket_path).await;
+
+    let _ = tokio::fs::remove_file(&socket_path).await;
+    drop(bus);
+    journal_task.await.expect("journal task should not panic")?;
+    let _ = observer_task.await;
+
+    workload
+}
+
+async fn drive(listener: &UnixListener, bus: &EventBus, socket_path: &Path) -> Result<()> {
+    let mut worker_id: u32 = 0;
+
+    let (mut child, stderr_relay) = spawn_worker(socket_path, worker_id)?;
+    let session = accept_and_handshake(listener, bus).await?;
+    let catalogue = session.learn(bus).await?;
+    tracing::info!(count = catalogue.len(), "session catalogue received");
+    wait_worker(&mut child, stderr_relay).await?;
+    worker_id += 1;
+
+    let mut scheduler = RandomScheduler::new(3);
+    while let Some(schedule) = scheduler.next() {
+        let (mut child, stderr_relay) = spawn_worker(socket_path, worker_id)?;
+        let session = accept_and_handshake(listener, bus).await?;
+        let verdict = session
+            .dispatch(bus, schedule)
+            .await?
+            .await_result(bus)
+            .await?;
+        tracing::info!(?verdict, "run result");
+        wait_worker(&mut child, stderr_relay).await?;
+        worker_id += 1;
+    }
+
+    Ok(())
+}
+
+fn spawn_worker(socket_path: &Path, worker_id: u32) -> Result<(Child, JoinHandle<()>)> {
     let mut command = Command::new(worker_bin_path()?);
     command
         .arg("--socket")
-        .arg(&socket_path)
+        .arg(socket_path)
         .arg("--worker-id")
-        .arg("0")
+        .arg(worker_id.to_string())
         .stdout(Stdio::inherit())
         .stderr(Stdio::piped());
     // SAFETY: `pre_exec` runs after `fork()` and before `exec()` in the child.
@@ -93,7 +136,7 @@ async fn run() -> Result<()> {
     }
     let mut child = command.spawn()?;
     let child_pid = child.id().ok_or(Error::ChildPidMissing)?;
-    tracing::info!(pid = child_pid, "spawned worker");
+    tracing::info!(worker_id, pid = child_pid, "spawned worker");
 
     let worker_stderr = child
         .stderr
@@ -106,44 +149,33 @@ async fn run() -> Result<()> {
         }
     });
 
-    let workload = drive(&listener, &bus).await;
-
-    let status = child.wait().await?;
-    tracing::info!(?status, "worker exited");
-    let _ = tokio::fs::remove_file(&socket_path).await;
-
-    drop(bus);
-    journal_task.await.expect("journal task should not panic")?;
-    let _ = observer_task.await;
-    let _ = stderr_relay.await;
-
-    workload?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(Error::WorkerExitedNonZero(status))
-    }
+    Ok((child, stderr_relay))
 }
 
-async fn drive(listener: &UnixListener, bus: &EventBus) -> Result<()> {
+async fn accept_and_handshake(
+    listener: &UnixListener,
+    bus: &EventBus,
+) -> Result<Session<Dispatching>> {
     let (stream, _addr) = timeout(HANDSHAKE_TIMEOUT, listener.accept())
         .await
         .map_err(|_| Error::HandshakeTimeout)??;
     tracing::info!("accepted worker connection");
 
-    let mut session = timeout(
+    timeout(
         HANDSHAKE_TIMEOUT,
         Session::new(stream, env!("CARGO_PKG_VERSION").to_string()).handshake(bus),
     )
     .await
-    .map_err(|_| Error::HandshakeTimeout)??;
+    .map_err(|_| Error::HandshakeTimeout)?
+}
 
-    let mut scheduler = RandomScheduler::new(3);
-    loop {
-        session = match session.dispatch(bus, scheduler.next()).await? {
-            DispatchNext::More(session) => session.await_result(bus).await?,
-            DispatchNext::Done => break,
-        };
+async fn wait_worker(child: &mut Child, stderr_relay: JoinHandle<()>) -> Result<()> {
+    let status = child.wait().await?;
+    tracing::info!(?status, "worker exited");
+    let _ = stderr_relay.await;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(Error::WorkerExitedNonZero(status))
     }
-    Ok(())
 }

@@ -33,6 +33,10 @@ pub struct Idle {
     orchestrator: Orchestrator<Docker>,
 }
 
+pub struct Learning {
+    orchestrator: Orchestrator<Docker>,
+}
+
 pub struct Executing {
     orchestrator: Orchestrator<Docker>,
     schedule: Schedule,
@@ -43,8 +47,8 @@ pub struct ShuttingDown {
 }
 
 pub enum IdleNext {
+    Learn(Worker<Learning>),
     Work(Worker<Executing>),
-    Shutdown(Worker<ShuttingDown>),
 }
 
 impl Worker<Handshaking> {
@@ -100,6 +104,17 @@ impl Worker<Idle> {
         tracing::debug!(worker_id = self.id, "sent READY");
 
         match read_frame::<RunnerToWorker, _>(&mut self.stream).await? {
+            RunnerToWorker::Learn => {
+                tracing::info!(worker_id = self.id, "received learn");
+                Ok(IdleNext::Learn(Worker {
+                    id: self.id,
+                    version: self.version,
+                    stream: self.stream,
+                    state: Learning {
+                        orchestrator: self.state.orchestrator,
+                    },
+                }))
+            }
             RunnerToWorker::Schedule {
                 schedule_id,
                 invariant,
@@ -125,28 +140,41 @@ impl Worker<Idle> {
                     },
                 }))
             }
-            RunnerToWorker::Shutdown => {
-                tracing::info!(worker_id = self.id, "received shutdown");
-                Ok(IdleNext::Shutdown(Worker {
-                    id: self.id,
-                    version: self.version,
-                    stream: self.stream,
-                    state: ShuttingDown {
-                        orchestrator: self.state.orchestrator,
-                    },
-                }))
-            }
             other @ RunnerToWorker::HelloAck { .. } => Err(Error::UnexpectedMessage {
                 state: "Idle",
-                expected: "Schedule or Shutdown",
+                expected: "Learn or Schedule",
                 got: format!("{other:?}"),
             }),
         }
     }
 }
 
+impl Worker<Learning> {
+    pub async fn execute_learn(mut self) -> Result<Worker<ShuttingDown>> {
+        let sessions =
+            self.state.orchestrator.learn().await.inspect_err(
+                |e| tracing::error!(worker_id = self.id, error = %e, "learn failed"),
+            )?;
+        let count = sessions.len();
+        write_frame(
+            &mut self.stream,
+            &WorkerToRunner::SessionCatalogue { sessions },
+        )
+        .await?;
+        tracing::info!(worker_id = self.id, count, "sent session catalogue");
+        Ok(Worker {
+            id: self.id,
+            version: self.version,
+            stream: self.stream,
+            state: ShuttingDown {
+                orchestrator: self.state.orchestrator,
+            },
+        })
+    }
+}
+
 impl Worker<Executing> {
-    pub async fn execute_and_report(mut self) -> Result<Worker<Idle>> {
+    pub async fn execute_and_report(mut self) -> Result<Worker<ShuttingDown>> {
         let schedule_id = self.state.schedule.schedule_id;
         let verdict = self
             .state
@@ -174,7 +202,7 @@ impl Worker<Executing> {
             id: self.id,
             version: self.version,
             stream: self.stream,
-            state: Idle {
+            state: ShuttingDown {
                 orchestrator: self.state.orchestrator,
             },
         })

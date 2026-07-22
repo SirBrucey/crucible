@@ -9,33 +9,11 @@ use std::{
     },
 };
 
+use crucible_protocol::{ConnEvent, ConnId};
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::mpsc,
 };
-
-pub type ConnId = u64;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ConnEvent {
-    pub id: ConnId,
-    pub kind: ConnEventKind,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ConnEventKind {
-    Opened {
-        peer: SocketAddr,
-    },
-    Closed {
-        bytes_client_to_upstream: u64,
-        bytes_upstream_to_client: u64,
-    },
-    /// Forwarding failed before or during byte transfer.
-    Failed {
-        reason: String,
-    },
-}
 
 pub struct Proxy {
     listener: TcpListener,
@@ -89,38 +67,29 @@ async fn forward(
     let mut upstream_conn = match TcpStream::connect(upstream).await {
         Ok(s) => s,
         Err(e) => {
-            let _ = events_tx.send(ConnEvent {
+            let _ = events_tx.send(ConnEvent::failed(
                 id,
-                kind: ConnEventKind::Failed {
-                    reason: format!("dial upstream {upstream}: {e}"),
-                },
-            });
+                format!("dial upstream {upstream}: {e}"),
+            ));
             return;
         }
     };
 
-    let _ = events_tx.send(ConnEvent {
-        id,
-        kind: ConnEventKind::Opened { peer },
-    });
+    let _ = events_tx.send(ConnEvent::opened(id, peer));
 
-    let kind = match tokio::io::copy_bidirectional(&mut client, &mut upstream_conn).await {
-        Ok((up, down)) => ConnEventKind::Closed {
-            bytes_client_to_upstream: up,
-            bytes_upstream_to_client: down,
-        },
-        Err(e) => ConnEventKind::Failed {
-            reason: format!("forwarding: {e}"),
-        },
+    let event = match tokio::io::copy_bidirectional(&mut client, &mut upstream_conn).await {
+        Ok((up, down)) => ConnEvent::closed(id, up, down),
+        Err(e) => ConnEvent::failed(id, format!("forwarding: {e}")),
     };
 
-    let _ = events_tx.send(ConnEvent { id, kind });
+    let _ = events_tx.send(event);
 }
 
 #[cfg(test)]
 mod tests {
     use std::{net::Ipv4Addr, time::Duration};
 
+    use crucible_protocol::ConnEventKind;
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,

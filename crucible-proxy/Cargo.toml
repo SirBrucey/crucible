@@ -8,6 +8,8 @@ license.workspace = true
 
 [dependencies]
 clap = { workspace = true }
+crucible-protocol = { path = "../crucible-protocol" }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
