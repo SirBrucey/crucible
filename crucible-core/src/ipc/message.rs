@@ -1,3 +1,5 @@
+pub use crucible_protocol::Session;
+
 use crate::verdict::Invariant;
 
 /// Messages passed from one of the worker processes to the main runner.
@@ -19,6 +21,8 @@ pub enum WorkerToRunner {
         /// Outcome of the run.
         verdict: Verdict,
     },
+    /// Worker returns the sessions observed by the sidecars during a `Learn` run.
+    SessionCatalogue { sessions: Vec<Session> },
     /// Worker emits an observational event for the runner to record.
     Event(WorkerEvent),
 }
@@ -50,6 +54,9 @@ pub enum RunnerToWorker {
         /// Version of the runner
         runner_version: String,
     },
+    /// Runner asks the worker to run the scenario once with faults disabled and
+    /// return the sessions the sidecars observed as a `SessionCatalogue`.
+    Learn,
     /// Runner sends a schedule for the worker to execute.
     Schedule {
         /// Correlation id, referenced by the matching `RunResult`.
@@ -60,8 +67,6 @@ pub enum RunnerToWorker {
         #[serde(with = "base64_bytes")]
         payload: Vec<u8>,
     },
-    /// Runner tells the worker there is no more work and to exit cleanly.
-    Shutdown,
 }
 
 mod base64_bytes {

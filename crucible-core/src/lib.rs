@@ -5,6 +5,7 @@ pub mod ipc;
 pub mod journal;
 pub mod observer;
 pub mod orchestrator;
+pub mod proxy_log;
 pub mod scenario;
 pub mod scheduler;
 pub mod verdict;

@@ -1,7 +1,9 @@
 //! L4 orchestrator: brings up the fleet replica, executes one schedule, tears it down.
 
+use crucible_protocol::Session;
+
 use crate::{
-    deployment::Deployment,
+    deployment::{Deployment, docker},
     ipc::Verdict,
     observer::{self, DbObserver},
     scenario::{self, Orders},
@@ -15,6 +17,8 @@ pub enum Error {
     Scenario(#[from] scenario::Error),
     #[error(transparent)]
     Observer(#[from] observer::Error),
+    #[error(transparent)]
+    Docker(#[from] docker::Error),
     #[error("observer not installed; call set_observer after setup")]
     ObserverMissing,
 }
@@ -67,6 +71,19 @@ where
         let mut observations: Observations = self.scenario.run(api).await?;
         observer.observe(&mut observations).await?;
         Ok(driver_for(schedule.invariant).drive(&observations))
+    }
+
+    /// Run the scenario fault-free and return the sessions observed by the sidecars.
+    pub async fn learn(&mut self) -> Result<Vec<Session>, Error>
+    where
+        Error: From<<D as Deployment>::Error>,
+    {
+        let api = self
+            .deployment
+            .endpoint("api")
+            .expect("api endpoint present after setup");
+        self.scenario.run(api).await?;
+        Ok(self.deployment.collect_sessions().await?)
     }
 
     /// Tear down the replica.
