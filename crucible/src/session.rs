@@ -7,7 +7,7 @@
 use crucible_core::{
     event_bus::{EventBus, RunnerEvent},
     ipc::{
-        RunnerToWorker, Session as ProxySession, WorkerToRunner,
+        RunnerToWorker, Session as ProxySession, Verdict, WorkerToRunner,
         codec::{read_frame, write_frame},
     },
     scheduler::Schedule,
@@ -30,11 +30,6 @@ pub struct Dispatching {
 
 pub struct AwaitingResult {
     worker_id: u32,
-}
-
-pub enum DispatchNext {
-    More(Session<AwaitingResult>),
-    Done,
 }
 
 impl Session<Handshaking> {
@@ -85,10 +80,7 @@ impl Session<Handshaking> {
 }
 
 impl Session<Dispatching> {
-    pub async fn learn(
-        mut self,
-        bus: &EventBus,
-    ) -> Result<(Session<Dispatching>, Vec<ProxySession>)> {
+    pub async fn learn(mut self, bus: &EventBus) -> Result<Vec<ProxySession>> {
         let ready = read_frame::<WorkerToRunner, _>(&mut self.stream).await?;
         if !matches!(&ready, WorkerToRunner::Ready) {
             return Err(Error::UnexpectedMessage {
@@ -131,23 +123,14 @@ impl Session<Dispatching> {
         .await
         .expect("journal receiver alive");
 
-        Ok((
-            Session {
-                stream: self.stream,
-                runner_version: self.runner_version,
-                state: Dispatching {
-                    worker_id: self.state.worker_id,
-                },
-            },
-            sessions,
-        ))
+        Ok(sessions)
     }
 
     pub async fn dispatch(
         mut self,
         bus: &EventBus,
-        schedule: Option<Schedule>,
-    ) -> Result<DispatchNext> {
+        schedule: Schedule,
+    ) -> Result<Session<AwaitingResult>> {
         let ready = read_frame::<WorkerToRunner, _>(&mut self.stream).await?;
         if !matches!(&ready, WorkerToRunner::Ready) {
             return Err(Error::UnexpectedMessage {
@@ -163,8 +146,7 @@ impl Session<Dispatching> {
         .await
         .expect("journal receiver alive");
 
-        let outbound = schedule.map_or(RunnerToWorker::Shutdown, RunnerToWorker::from);
-        let is_shutdown = matches!(outbound, RunnerToWorker::Shutdown);
+        let outbound = RunnerToWorker::from(schedule);
         write_frame(&mut self.stream, &outbound).await?;
         bus.publish(RunnerEvent::RunnerMessage {
             worker_id: self.state.worker_id,
@@ -173,43 +155,35 @@ impl Session<Dispatching> {
         .await
         .expect("journal receiver alive");
 
-        if is_shutdown {
-            Ok(DispatchNext::Done)
-        } else {
-            Ok(DispatchNext::More(Session {
-                stream: self.stream,
-                runner_version: self.runner_version,
-                state: AwaitingResult {
-                    worker_id: self.state.worker_id,
-                },
-            }))
-        }
+        Ok(Session {
+            stream: self.stream,
+            runner_version: self.runner_version,
+            state: AwaitingResult {
+                worker_id: self.state.worker_id,
+            },
+        })
     }
 }
 
 impl Session<AwaitingResult> {
-    pub async fn await_result(mut self, bus: &EventBus) -> Result<Session<Dispatching>> {
+    pub async fn await_result(mut self, bus: &EventBus) -> Result<Verdict> {
         let msg = read_frame::<WorkerToRunner, _>(&mut self.stream).await?;
-        if !matches!(&msg, WorkerToRunner::RunResult { .. }) {
-            return Err(Error::UnexpectedMessage {
-                state: "AwaitingResult",
-                expected: "RunResult",
-                got: format!("{msg:?}"),
-            });
-        }
+        let verdict = match &msg {
+            WorkerToRunner::RunResult { verdict, .. } => *verdict,
+            other => {
+                return Err(Error::UnexpectedMessage {
+                    state: "AwaitingResult",
+                    expected: "RunResult",
+                    got: format!("{other:?}"),
+                });
+            }
+        };
         bus.publish(RunnerEvent::WorkerMessage {
             worker_id: self.state.worker_id,
             message: msg,
         })
         .await
         .expect("journal receiver alive");
-
-        Ok(Session {
-            stream: self.stream,
-            runner_version: self.runner_version,
-            state: Dispatching {
-                worker_id: self.state.worker_id,
-            },
-        })
+        Ok(verdict)
     }
 }
