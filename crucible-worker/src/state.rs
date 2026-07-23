@@ -117,13 +117,16 @@ impl Worker<Idle> {
             }
             RunnerToWorker::Schedule {
                 schedule_id,
-                invariant,
+                session,
+                fault_offset_ns,
                 payload,
             } => {
                 tracing::info!(
                     worker_id = self.id,
                     schedule_id,
-                    ?invariant,
+                    service = %session.service,
+                    conn_id = session.conn_id,
+                    fault_offset_ns,
                     "received schedule"
                 );
                 Ok(IdleNext::Work(Worker {
@@ -134,7 +137,8 @@ impl Worker<Idle> {
                         orchestrator: self.state.orchestrator,
                         schedule: Schedule {
                             schedule_id,
-                            invariant,
+                            session,
+                            fault_offset_ns,
                             payload,
                         },
                     },

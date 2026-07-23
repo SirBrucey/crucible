@@ -8,7 +8,7 @@ use crate::{
     observer::{self, DbObserver},
     scenario::{self, Orders},
     scheduler::Schedule,
-    verdict::{Observations, driver_for},
+    verdict::{Invariant, Observations, driver_for},
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -62,7 +62,7 @@ where
     }
 
     /// Run the scenario against the fleet and produce a verdict from the observations.
-    pub async fn execute(&mut self, schedule: &Schedule) -> Result<Verdict, Error> {
+    pub async fn execute(&mut self, _schedule: &Schedule) -> Result<Verdict, Error> {
         let api = self
             .deployment
             .endpoint("api")
@@ -70,7 +70,7 @@ where
         let observer = self.observer.as_ref().ok_or(Error::ObserverMissing)?;
         let mut observations: Observations = self.scenario.run(api).await?;
         observer.observe(&mut observations).await?;
-        Ok(driver_for(schedule.invariant).drive(&observations))
+        Ok(driver_for(Invariant::Durable).drive(&observations))
     }
 
     /// Run the scenario fault-free and return the sessions observed by the sidecars.

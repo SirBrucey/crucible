@@ -4,13 +4,13 @@ mod session;
 use std::{
     path::{Path, PathBuf},
     process::Stdio,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use crucible_core::{
     event_bus::EventBus,
     journal,
-    scheduler::{RandomScheduler, Scheduler},
+    scheduler::{Scheduler, SessionDerivedScheduler},
 };
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
@@ -26,6 +26,7 @@ use crate::{
 };
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+const TOTAL_BUDGET: Duration = Duration::from_mins(10);
 
 fn worker_bin_path() -> Result<PathBuf> {
     let runner = std::env::current_exe()?;
@@ -89,12 +90,18 @@ async fn drive(listener: &UnixListener, bus: &EventBus, socket_path: &Path) -> R
 
     let (mut child, stderr_relay) = spawn_worker(socket_path, worker_id)?;
     let session = accept_and_handshake(listener, bus).await?;
+    let learn_start = Instant::now();
     let catalogue = session.learn(bus).await?;
-    tracing::info!(count = catalogue.len(), "session catalogue received");
+    let run_cost = learn_start.elapsed();
+    tracing::info!(
+        count = catalogue.len(),
+        run_cost_ms = run_cost.as_millis(),
+        "session catalogue received"
+    );
     wait_worker(&mut child, stderr_relay).await?;
     worker_id += 1;
 
-    let mut scheduler = RandomScheduler::new(3);
+    let mut scheduler = SessionDerivedScheduler::new(&catalogue, run_cost, TOTAL_BUDGET);
     while let Some(schedule) = scheduler.next() {
         let (mut child, stderr_relay) = spawn_worker(socket_path, worker_id)?;
         let session = accept_and_handshake(listener, bus).await?;
