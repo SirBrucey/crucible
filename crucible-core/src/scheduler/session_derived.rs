@@ -6,6 +6,10 @@ use crucible_protocol::{Session, SessionRef};
 
 use super::{Schedule, Scheduler};
 
+/// Floor on time samples per session, so tight budgets still give at least
+/// start/middle/end coverage rather than collapsing to a single offset.
+const MIN_SAMPLES_PER_SESSION: u128 = 3;
+
 pub struct SessionDerivedScheduler {
     schedules: std::vec::IntoIter<Schedule>,
 }
@@ -25,8 +29,9 @@ impl SessionDerivedScheduler {
         let cost_ns = run_cost.as_nanos().max(1);
         let n_sessions = catalogue.len() as u128;
         let total_schedules = (budget_ns / cost_ns).max(1);
-        let t_per_session = usize::try_from((total_schedules / n_sessions).max(1))
-            .expect("schedules per session fits usize");
+        let t_per_session =
+            usize::try_from((total_schedules / n_sessions).max(MIN_SAMPLES_PER_SESSION))
+                .expect("schedules per session fits usize");
 
         let session_end_ns = catalogue
             .iter()
@@ -122,9 +127,35 @@ mod tests {
             move || s.next()
         })
         .collect();
-        assert_eq!(all.len(), 2);
+        assert_eq!(all.len(), 6);
         let api = all.iter().find(|s| s.session.service == "api").unwrap();
         assert_eq!(api.fault_offset_ns, 0);
+    }
+
+    #[test]
+    fn tight_budget_still_produces_min_samples_per_session() {
+        let catalogue = vec![
+            session("db", 0, 0, Some(300)),
+            session("api", 0, 0, Some(300)),
+        ];
+        // 10ms budget, 10ms run cost => raw total = 1, per-session = 0, floored to 3.
+        let scheduler = SessionDerivedScheduler::new(
+            &catalogue,
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+        );
+        let all: Vec<_> = std::iter::from_fn({
+            let mut s = scheduler;
+            move || s.next()
+        })
+        .collect();
+        assert_eq!(all.len(), 6);
+        let db_offsets: Vec<_> = all
+            .iter()
+            .filter(|s| s.session.service == "db")
+            .map(|s| s.fault_offset_ns)
+            .collect();
+        assert_eq!(db_offsets, vec![0, 100, 200]);
     }
 
     #[test]
