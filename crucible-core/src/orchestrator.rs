@@ -3,9 +3,9 @@
 use crucible_protocol::Session;
 
 use crate::{
-    deployment::{Deployment, docker},
+    deployment::{Deployment, Docker, docker},
     ipc::Verdict,
-    observer::{self, DbObserver},
+    observer::{self, DbObserver, SessionObserver},
     scenario::{self, Orders},
     scheduler::Schedule,
     verdict::{Invariant, Observations, driver_for},
@@ -24,40 +24,38 @@ pub enum Error {
 }
 
 /// Per-worker orchestrator that owns the replica lifecycle around each schedule.
-pub struct Orchestrator<D>
-where
-    D: Deployment,
-{
-    deployment: D,
+pub struct Orchestrator {
+    deployment: Docker,
     scenario: Orders,
     // FIXME(#84): stopgap until an orchestrator state machine models the phases;
-    // the observer only exists after setup.
-    observer: Option<DbObserver>,
+    // the observers only exist after setup.
+    db_observer: Option<DbObserver>,
+    session_observer: Option<SessionObserver>,
 }
 
-impl<D> Orchestrator<D>
-where
-    D: Deployment,
-{
-    pub fn new(deployment: D, scenario: Orders) -> Self {
+impl Orchestrator {
+    pub fn new(deployment: Docker, scenario: Orders) -> Self {
         Self {
             deployment,
             scenario,
-            observer: None,
+            db_observer: None,
+            session_observer: None,
         }
     }
 
-    /// Bring the fleet replica up and wait for every service to become ready.
-    pub async fn setup(&mut self) -> Result<(), D::Error> {
+    /// Bring the fleet replica up, wait for readiness, and start the session observer.
+    pub async fn setup(&mut self) -> Result<(), docker::Error> {
         self.deployment.setup().await?;
-        self.deployment.wait_ready().await
+        self.deployment.wait_ready().await?;
+        self.session_observer = Some(self.deployment.start_session_observer());
+        Ok(())
     }
 
-    pub fn set_observer(&mut self, observer: DbObserver) {
-        self.observer = Some(observer);
+    pub fn set_db_observer(&mut self, observer: DbObserver) {
+        self.db_observer = Some(observer);
     }
 
-    pub fn deployment(&self) -> &D {
+    pub fn deployment(&self) -> &Docker {
         &self.deployment
     }
 
@@ -67,27 +65,37 @@ where
             .deployment
             .endpoint("api")
             .expect("api endpoint present after setup");
-        let observer = self.observer.as_ref().ok_or(Error::ObserverMissing)?;
+        let db_observer = self.db_observer.as_ref().ok_or(Error::ObserverMissing)?;
+        let session_observer = self
+            .session_observer
+            .as_mut()
+            .ok_or(Error::ObserverMissing)?;
         let mut observations: Observations = self.scenario.run(api).await?;
-        observer.observe(&mut observations).await?;
+        db_observer.observe(&mut observations).await?;
+        session_observer.observe(&mut observations);
         Ok(driver_for(Invariant::Durable).drive(&observations))
     }
 
     /// Run the scenario fault-free and return the sessions observed by the sidecars.
-    pub async fn learn(&mut self) -> Result<Vec<Session>, Error>
-    where
-        Error: From<<D as Deployment>::Error>,
-    {
+    pub async fn learn(&mut self) -> Result<Vec<Session>, Error> {
         let api = self
             .deployment
             .endpoint("api")
             .expect("api endpoint present after setup");
-        self.scenario.run(api).await?;
-        Ok(self.deployment.collect_sessions().await?)
+        let session_observer = self
+            .session_observer
+            .as_mut()
+            .ok_or(Error::ObserverMissing)?;
+        let mut observations: Observations = self.scenario.run(api).await?;
+        session_observer.observe(&mut observations);
+        Ok(observations.sessions)
     }
 
-    /// Tear down the replica.
-    pub async fn teardown(&mut self) -> Result<(), D::Error> {
+    /// Tear down the replica and stop the session observer.
+    pub async fn teardown(&mut self) -> Result<(), docker::Error> {
+        if let Some(observer) = self.session_observer.take() {
+            observer.shutdown().await;
+        }
         self.deployment.teardown().await
     }
 }
