@@ -26,7 +26,7 @@ use crate::{
 };
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
-const TOTAL_BUDGET: Duration = Duration::from_mins(5);
+const TOTAL_BUDGET: Duration = Duration::from_mins(10);
 
 fn worker_bin_path() -> Result<PathBuf> {
     let runner = std::env::current_exe()?;
