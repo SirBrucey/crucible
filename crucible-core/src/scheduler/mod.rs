@@ -1,15 +1,18 @@
 //! Schedule generation.
 
-pub mod random;
+pub mod session_derived;
 
-pub use random::RandomScheduler;
+pub use session_derived::SessionDerivedScheduler;
 
-use crate::{ipc::RunnerToWorker, verdict::Invariant};
+use crucible_protocol::SessionRef;
+
+use crate::ipc::RunnerToWorker;
 
 /// A schedule the runner hands to a worker to execute.
 pub struct Schedule {
     pub schedule_id: u32,
-    pub invariant: Invariant,
+    pub session: SessionRef,
+    pub fault_offset_ns: u128,
     pub payload: Vec<u8>,
 }
 
@@ -17,7 +20,8 @@ impl From<Schedule> for RunnerToWorker {
     fn from(schedule: Schedule) -> Self {
         RunnerToWorker::Schedule {
             schedule_id: schedule.schedule_id,
-            invariant: schedule.invariant,
+            session: schedule.session,
+            fault_offset_ns: schedule.fault_offset_ns,
             payload: schedule.payload,
         }
     }
