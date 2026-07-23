@@ -4,4 +4,4 @@ mod proxy;
 mod session;
 
 pub use proxy::{ConnEvent, ConnEventKind, ConnId};
-pub use session::Session;
+pub use session::{Session, SessionRef};
