@@ -1,6 +1,4 @@
-pub use crucible_protocol::Session;
-
-use crate::verdict::Invariant;
+pub use crucible_protocol::{Session, SessionRef};
 
 /// Messages passed from one of the worker processes to the main runner.
 #[derive(Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -61,8 +59,10 @@ pub enum RunnerToWorker {
     Schedule {
         /// Correlation id, referenced by the matching `RunResult`.
         schedule_id: u32,
-        /// Which invariant this schedule targets.
-        invariant: Invariant,
+        /// Target session for the kill fault.
+        session: SessionRef,
+        /// Kill fires this many nanoseconds after the target session opens.
+        fault_offset_ns: u128,
         /// Serialized schedule spec.
         #[serde(with = "base64_bytes")]
         payload: Vec<u8>,

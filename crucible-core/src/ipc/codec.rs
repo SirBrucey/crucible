@@ -116,7 +116,8 @@ mod tests {
     async fn roundtrips_schedule() {
         roundtrip(RunnerToWorker::Schedule {
             schedule_id: 7,
-            invariant: crate::verdict::Invariant::Durable,
+            session: crucible_protocol::SessionRef::new("db", 3),
+            fault_offset_ns: 1_500_000,
             payload: vec![0u8; 128],
         })
         .await;
