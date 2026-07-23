@@ -4,25 +4,17 @@ use sqlx::{MySql, Pool, Row};
 
 use crate::verdict::{DbState, Observations, OrderRow, StockRow};
 
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-    #[error(transparent)]
-    Sqlx(#[from] sqlx::Error),
-}
-
-pub type Result<T> = std::result::Result<T, Error>;
-
 pub struct DbObserver {
     pool: Pool<MySql>,
 }
 
 impl DbObserver {
-    pub async fn connect(url: &str) -> Result<Self> {
+    pub async fn connect(url: &str) -> super::Result<Self> {
         let pool = Pool::<MySql>::connect(url).await?;
         Ok(Self { pool })
     }
 
-    pub async fn observe(&self, observations: &mut Observations) -> Result<()> {
+    pub async fn observe(&self, observations: &mut Observations) -> super::Result<()> {
         let orders = sqlx::query("SELECT id, item, quantity FROM orders ORDER BY id")
             .fetch_all(&self.pool)
             .await?

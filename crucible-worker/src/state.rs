@@ -30,20 +30,20 @@ pub struct Worker<S> {
 pub struct Handshaking;
 
 pub struct Idle {
-    orchestrator: Orchestrator<Docker>,
+    orchestrator: Orchestrator,
 }
 
 pub struct Learning {
-    orchestrator: Orchestrator<Docker>,
+    orchestrator: Orchestrator,
 }
 
 pub struct Executing {
-    orchestrator: Orchestrator<Docker>,
+    orchestrator: Orchestrator,
     schedule: Schedule,
 }
 
 pub struct ShuttingDown {
-    orchestrator: Orchestrator<Docker>,
+    orchestrator: Orchestrator,
 }
 
 pub enum IdleNext {
@@ -81,7 +81,7 @@ impl Worker<Handshaking> {
                     .endpoint("db")
                     .expect("db endpoint present after setup");
                 let db_url = format!("mysql://root@{db_addr}/orders");
-                orchestrator.set_observer(DbObserver::connect(&db_url).await?);
+                orchestrator.set_db_observer(DbObserver::connect(&db_url).await?);
                 Ok(Worker {
                     id: self.id,
                     version: self.version,

@@ -13,19 +13,15 @@ use bollard::{
         NetworkCreateRequest, NetworkingConfig,
     },
     query_parameters::{
-        CreateContainerOptionsBuilder, CreateImageOptionsBuilder, LogsOptionsBuilder,
-        RemoveContainerOptionsBuilder, StartContainerOptions,
+        CreateContainerOptionsBuilder, CreateImageOptionsBuilder, RemoveContainerOptionsBuilder,
+        StartContainerOptions,
     },
 };
-use crucible_protocol::Session;
 use futures_util::TryStreamExt;
 use tokio::time::sleep;
 
 use super::Deployment;
-use crate::{
-    fleet::{Fleet, Service},
-    proxy_log::{self, Sessions},
-};
+use crate::fleet::{Fleet, Service};
 
 const READINESS_TIMEOUT: Duration = Duration::from_mins(1);
 const READINESS_POLL: Duration = Duration::from_millis(500);
@@ -49,8 +45,6 @@ pub enum Error {
     },
     #[error("teardown incomplete: {0}")]
     TeardownIncomplete(TeardownFailures),
-    #[error(transparent)]
-    ProxyLog(#[from] proxy_log::Error),
 }
 
 /// Items teardown could not remove, paired with the daemon's reason.
@@ -128,6 +122,16 @@ impl Docker {
 
     pub fn network(&self) -> &str {
         &self.network
+    }
+
+    pub fn start_session_observer(&self) -> crate::observer::SessionObserver {
+        let sidecars = self
+            .fleet
+            .services
+            .iter()
+            .map(|s| (s.name.to_string(), self.proxy_container_name(s)))
+            .collect();
+        crate::observer::SessionObserver::start(&self.client, sidecars)
     }
 
     fn backing_container_name(&self, service: &Service) -> String {
@@ -336,26 +340,6 @@ impl Deployment for Docker {
         } else {
             Err(Error::TeardownIncomplete(failures))
         }
-    }
-
-    async fn collect_sessions(&self) -> Result<Vec<Session>> {
-        let mut sessions = Sessions::new();
-        for service in self.fleet.services {
-            let container = self.proxy_container_name(service);
-            let options = LogsOptionsBuilder::default()
-                .stdout(true)
-                .stderr(false)
-                .build();
-            let mut stream = self.client.logs(&container, Some(options));
-            let mut buf: Vec<u8> = Vec::new();
-            while let Some(chunk) = stream.try_next().await? {
-                buf.extend_from_slice(chunk.as_ref());
-            }
-            for line in String::from_utf8_lossy(&buf).lines() {
-                sessions.accept_line(service.name, line)?;
-            }
-        }
-        Ok(sessions.into_iter().collect())
     }
 
     fn endpoint(&self, name: &str) -> Option<SocketAddr> {
