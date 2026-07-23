@@ -1,0 +1,15 @@
+//! Observers snapshot per-run state into the shared `Observations` bag.
+
+pub mod db;
+pub mod session;
+
+pub use db::DbObserver;
+pub use session::SessionObserver;
+
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error(transparent)]
+    Sqlx(#[from] sqlx::Error),
+}
+
+pub type Result<T> = std::result::Result<T, Error>;

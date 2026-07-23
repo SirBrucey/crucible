@@ -23,6 +23,7 @@ pub enum Invariant {
 pub struct Observations {
     pub http_outcomes: Vec<HttpOutcome>,
     pub db_state: Option<DbState>,
+    pub sessions: Vec<crucible_protocol::Session>,
 }
 
 impl Observations {
