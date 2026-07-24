@@ -1,10 +1,12 @@
 //! Shared wire types used across Crucible's components.
 
+mod kill;
 mod proxy;
 mod session;
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+pub use kill::{KillMissReason, KillReport, KillResult};
 pub use proxy::{ConnEvent, ConnEventKind, ConnId};
 pub use session::{Session, SessionRef};
 
