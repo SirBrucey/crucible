@@ -33,6 +33,6 @@ pub enum KillMissReason {
     ScenarioEndedBeforeTargetOpened,
     /// Observer's log stream closed before we saw the target.
     ObserverStreamClosed,
-    /// bollard's kill_container returned an error.
+    /// bollard's `kill_container` returned an error.
     KillFailed(String),
 }
