@@ -8,7 +8,7 @@ use crucible_core::{
     deployment::{Deployment, Docker},
     fleet,
     ipc::{
-        RunnerToWorker, WorkerToRunner,
+        RunnerToWorker, WorkerEvent, WorkerToRunner,
         codec::{read_frame, write_frame},
     },
     observer::DbObserver,
@@ -180,7 +180,7 @@ impl Worker<Learning> {
 impl Worker<Executing> {
     pub async fn execute_and_report(mut self) -> Result<Worker<ShuttingDown>> {
         let schedule_id = self.state.schedule.schedule_id;
-        let verdict = self
+        let (verdict, kill_report) = self
             .state
             .orchestrator
             .execute(&self.state.schedule)
@@ -188,6 +188,17 @@ impl Worker<Executing> {
             .inspect_err(
                 |e| tracing::error!(worker_id = self.id, schedule_id, error = %e, "execute failed"),
             )?;
+        write_frame(
+            &mut self.stream,
+            &WorkerToRunner::Event(WorkerEvent::Kill(kill_report.clone())),
+        )
+        .await?;
+        tracing::info!(
+            worker_id = self.id,
+            schedule_id,
+            ?kill_report,
+            "sent kill event"
+        );
         write_frame(
             &mut self.stream,
             &WorkerToRunner::RunResult {
