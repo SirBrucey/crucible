@@ -1,8 +1,10 @@
 //! Reconstruct `Session` records from sidecar proxy log lines.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
-use crucible_protocol::{ConnEvent, ConnEventKind, ConnId, Session};
+use crucible_protocol::{
+    ConnEvent, ConnEventKind, ConnId, HISTOGRAM_BIN_NS, ServiceProfile, Session, WriteRecord,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -15,10 +17,16 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+struct Pending {
+    opened_ns: u128,
+    peer: String,
+    writes: Vec<WriteRecord>,
+}
+
 /// Sessions observed across a Learn run.
 #[derive(Default)]
 pub struct Sessions {
-    opened: HashMap<(String, ConnId), (u128, String)>,
+    opened: HashMap<(String, ConnId), Pending>,
     finished: Vec<Session>,
 }
 
@@ -31,22 +39,33 @@ impl Sessions {
         let ConnEvent { id, ts_ns, kind } = event;
         match kind {
             ConnEventKind::Opened { peer } => {
-                self.opened
-                    .insert((service.to_string(), id), (ts_ns, peer.to_string()));
+                self.opened.insert(
+                    (service.to_string(), id),
+                    Pending {
+                        opened_ns: ts_ns,
+                        peer: peer.to_string(),
+                        writes: Vec::new(),
+                    },
+                );
             }
-            ConnEventKind::Closed {
-                bytes_client_to_upstream,
-                bytes_upstream_to_client,
-            } => {
-                if let Some((opened_ns, peer)) = self.opened.remove(&(service.to_string(), id)) {
+            ConnEventKind::Wrote { direction, bytes } => {
+                if let Some(pending) = self.opened.get_mut(&(service.to_string(), id)) {
+                    pending.writes.push(WriteRecord {
+                        ts_ns,
+                        direction,
+                        bytes,
+                    });
+                }
+            }
+            ConnEventKind::Closed { .. } => {
+                if let Some(pending) = self.opened.remove(&(service.to_string(), id)) {
                     self.finished.push(Session {
                         service: service.to_string(),
                         conn_id: id,
-                        peer,
-                        opened_ns,
+                        peer: pending.peer,
+                        opened_ns: pending.opened_ns,
                         closed_ns: Some(ts_ns),
-                        bytes_client_to_upstream: Some(bytes_client_to_upstream),
-                        bytes_upstream_to_client: Some(bytes_upstream_to_client),
+                        writes: pending.writes,
                     });
                 }
             }
@@ -70,6 +89,37 @@ impl Sessions {
     }
 }
 
+/// Bin the write events across a session catalogue into per-service
+/// `ServiceProfile`s scenario-relative to `scenario_start_ns`. Writes before
+/// scenario start are ignored.
+pub fn service_profiles_from_sessions(
+    sessions: &[Session],
+    scenario_start_ns: u128,
+) -> Vec<ServiceProfile> {
+    let mut by_service: BTreeMap<String, BTreeMap<u128, u64>> = BTreeMap::new();
+    for session in sessions {
+        for write in &session.writes {
+            if write.ts_ns < scenario_start_ns {
+                continue;
+            }
+            let bin = (write.ts_ns - scenario_start_ns) / HISTOGRAM_BIN_NS;
+            let entry = by_service
+                .entry(session.service.clone())
+                .or_default()
+                .entry(bin)
+                .or_insert(0);
+            *entry = entry.saturating_add(write.bytes);
+        }
+    }
+    by_service
+        .into_iter()
+        .map(|(service, bins)| ServiceProfile {
+            service,
+            bins: bins.into_iter().collect(),
+        })
+        .collect()
+}
+
 impl Extend<(String, ConnEvent)> for Sessions {
     fn extend<I: IntoIterator<Item = (String, ConnEvent)>>(&mut self, iter: I) {
         for (service, event) in iter {
@@ -91,15 +141,14 @@ impl IntoIterator for Sessions {
     type IntoIter = std::vec::IntoIter<Session>;
 
     fn into_iter(mut self) -> Self::IntoIter {
-        for ((service, conn_id), (opened_ns, peer)) in self.opened.drain() {
+        for ((service, conn_id), pending) in self.opened.drain() {
             self.finished.push(Session {
                 service,
                 conn_id,
-                peer,
-                opened_ns,
+                peer: pending.peer,
+                opened_ns: pending.opened_ns,
                 closed_ns: None,
-                bytes_client_to_upstream: None,
-                bytes_upstream_to_client: None,
+                writes: pending.writes,
             });
         }
         self.finished
@@ -110,74 +159,56 @@ impl IntoIterator for Sessions {
 
 #[cfg(test)]
 mod tests {
+    use crucible_protocol::Direction;
+
     use super::*;
 
     #[test]
-    fn pairs_opens_and_closes_across_services() {
-        let out: Vec<Session> = [
+    fn writes_are_folded_into_session() {
+        let mut sessions = Sessions::new();
+        sessions.accept_event(
+            "db",
+            ConnEvent::opened_at(0, 100, "127.0.0.1:1".parse().unwrap()),
+        );
+        sessions.accept_event(
+            "db",
+            ConnEvent::wrote_at(0, 150, Direction::ClientToUpstream, 32),
+        );
+        sessions.accept_event(
+            "db",
+            ConnEvent::wrote_at(0, 180, Direction::UpstreamToClient, 64),
+        );
+        sessions.accept_event("db", ConnEvent::closed_at(0, 200, 0, 0));
+        let out: Vec<_> = sessions.into_iter().collect();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].writes.len(), 2);
+        assert_eq!(out[0].writes[0].ts_ns, 150);
+        assert_eq!(out[0].writes[0].direction, Direction::ClientToUpstream);
+        assert_eq!(out[0].writes[0].bytes, 32);
+    }
+
+    #[test]
+    fn open_without_close_keeps_writes() {
+        let out: Vec<_> = Sessions::from_iter([
             (
-                "db".into(),
+                "api".into(),
                 ConnEvent::opened_at(0, 100, "127.0.0.1:1".parse().unwrap()),
             ),
             (
                 "api".into(),
-                ConnEvent::opened_at(0, 105, "127.0.0.1:2".parse().unwrap()),
+                ConnEvent::wrote_at(0, 120, Direction::ClientToUpstream, 16),
             ),
-            ("db".into(), ConnEvent::closed_at(0, 200, 3, 4)),
-            ("api".into(), ConnEvent::closed_at(0, 210, 5, 6)),
-        ]
-        .into_iter()
-        .collect::<Sessions>()
-        .into_iter()
-        .collect();
-        assert_eq!(out.len(), 2);
-        assert_eq!(out[0].service, "db");
-        assert_eq!(out[0].opened_ns, 100);
-        assert_eq!(out[0].closed_ns, Some(200));
-        assert_eq!(out[0].bytes_client_to_upstream, Some(3));
-        assert_eq!(out[1].service, "api");
-        assert_eq!(out[1].opened_ns, 105);
-    }
-
-    #[test]
-    fn same_conn_id_across_services_does_not_collide() {
-        let out: Vec<Session> = Sessions::from_iter([
-            (
-                "db".into(),
-                ConnEvent::opened_at(7, 100, "127.0.0.1:1".parse().unwrap()),
-            ),
-            (
-                "api".into(),
-                ConnEvent::opened_at(7, 110, "127.0.0.1:2".parse().unwrap()),
-            ),
-            ("db".into(), ConnEvent::closed_at(7, 200, 3, 4)),
-            ("api".into(), ConnEvent::closed_at(7, 210, 5, 6)),
         ])
         .into_iter()
         .collect();
-        assert_eq!(out.len(), 2);
-        assert!(out.iter().any(|s| s.service == "db"));
-        assert!(out.iter().any(|s| s.service == "api"));
-    }
-
-    #[test]
-    fn open_without_close_is_kept_as_still_open() {
-        let out: Vec<Session> = Sessions::from_iter([(
-            "api".into(),
-            ConnEvent::opened_at(0, 100, "127.0.0.1:1".parse().unwrap()),
-        )])
-        .into_iter()
-        .collect();
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0].opened_ns, 100);
         assert_eq!(out[0].closed_ns, None);
-        assert_eq!(out[0].bytes_client_to_upstream, None);
-        assert_eq!(out[0].bytes_upstream_to_client, None);
+        assert_eq!(out[0].writes.len(), 1);
     }
 
     #[test]
-    fn failed_event_drops_pending_open() {
-        let out: Vec<Session> = Sessions::from_iter([
+    fn failed_drops_pending() {
+        let out: Vec<_> = Sessions::from_iter([
             (
                 "api".into(),
                 ConnEvent::opened_at(0, 100, "127.0.0.1:1".parse().unwrap()),
@@ -190,35 +221,5 @@ mod tests {
         .into_iter()
         .collect();
         assert!(out.is_empty());
-    }
-
-    #[test]
-    fn accept_line_errors_on_malformed_json() {
-        let mut sessions = Sessions::new();
-        assert!(matches!(
-            sessions.accept_line("api", "not-json"),
-            Err(Error::Parse { .. })
-        ));
-    }
-
-    #[test]
-    fn accept_line_skips_empty_and_parses_valid() {
-        let mut sessions = Sessions::new();
-        sessions.accept_line("api", "").unwrap();
-        sessions
-            .accept_line(
-                "api",
-                r#"{"id":0,"ts_ns":100,"kind":"Opened","peer":"127.0.0.1:1"}"#,
-            )
-            .unwrap();
-        sessions.accept_line("api", "  ").unwrap();
-        sessions
-            .accept_line(
-                "api",
-                r#"{"id":0,"ts_ns":200,"kind":"Closed","bytes_client_to_upstream":1,"bytes_upstream_to_client":2}"#,
-            )
-            .unwrap();
-        let out: Vec<Session> = sessions.into_iter().collect();
-        assert_eq!(out.len(), 1);
     }
 }

@@ -71,6 +71,18 @@ impl ConnEvent {
             },
         }
     }
+
+    pub fn wrote(id: ConnId, direction: Direction, bytes: u64) -> Self {
+        Self::wrote_at(id, now_ns(), direction, bytes)
+    }
+
+    pub fn wrote_at(id: ConnId, ts_ns: u128, direction: Direction, bytes: u64) -> Self {
+        Self {
+            id,
+            ts_ns,
+            kind: ConnEventKind::Wrote { direction, bytes },
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -79,6 +91,11 @@ pub enum ConnEventKind {
     Opened {
         peer: SocketAddr,
     },
+    /// A non-empty chunk was forwarded on the connection.
+    Wrote {
+        direction: Direction,
+        bytes: u64,
+    },
     Closed {
         bytes_client_to_upstream: u64,
         bytes_upstream_to_client: u64,
@@ -86,4 +103,10 @@ pub enum ConnEventKind {
     Failed {
         reason: String,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+pub enum Direction {
+    ClientToUpstream,
+    UpstreamToClient,
 }

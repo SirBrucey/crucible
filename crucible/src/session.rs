@@ -7,7 +7,7 @@
 use crucible_core::{
     event_bus::{EventBus, RunnerEvent},
     ipc::{
-        RunnerToWorker, Session as ProxySession, Verdict, WorkerToRunner,
+        RunnerToWorker, ServiceProfile, Verdict, WorkerToRunner,
         codec::{read_frame, write_frame},
     },
     scheduler::Schedule,
@@ -80,7 +80,7 @@ impl Session<Handshaking> {
 }
 
 impl Session<Dispatching> {
-    pub async fn learn(mut self, bus: &EventBus) -> Result<Vec<ProxySession>> {
+    pub async fn learn(mut self, bus: &EventBus) -> Result<Vec<ServiceProfile>> {
         let ready = read_frame::<WorkerToRunner, _>(&mut self.stream).await?;
         if !matches!(&ready, WorkerToRunner::Ready) {
             return Err(Error::UnexpectedMessage {
@@ -106,8 +106,8 @@ impl Session<Dispatching> {
         .expect("journal receiver alive");
 
         let msg = read_frame::<WorkerToRunner, _>(&mut self.stream).await?;
-        let sessions = match &msg {
-            WorkerToRunner::SessionCatalogue { sessions } => sessions.clone(),
+        let services = match &msg {
+            WorkerToRunner::SessionCatalogue { services } => services.clone(),
             other => {
                 return Err(Error::UnexpectedMessage {
                     state: "Learning",
@@ -123,7 +123,7 @@ impl Session<Dispatching> {
         .await
         .expect("journal receiver alive");
 
-        Ok(sessions)
+        Ok(services)
     }
 
     pub async fn dispatch(
