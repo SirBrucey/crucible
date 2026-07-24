@@ -8,7 +8,7 @@ use crucible_core::{
     deployment::{Deployment, Docker},
     fleet,
     ipc::{
-        RunnerToWorker, WorkerToRunner,
+        RunnerToWorker, WorkerEvent, WorkerToRunner,
         codec::{read_frame, write_frame},
     },
     observer::DbObserver,
@@ -117,15 +117,14 @@ impl Worker<Idle> {
             }
             RunnerToWorker::Schedule {
                 schedule_id,
-                session,
+                service,
                 fault_offset_ns,
                 payload,
             } => {
                 tracing::info!(
                     worker_id = self.id,
                     schedule_id,
-                    service = %session.service,
-                    conn_id = session.conn_id,
+                    %service,
                     fault_offset_ns,
                     "received schedule"
                 );
@@ -137,7 +136,7 @@ impl Worker<Idle> {
                         orchestrator: self.state.orchestrator,
                         schedule: Schedule {
                             schedule_id,
-                            session,
+                            service,
                             fault_offset_ns,
                             payload,
                         },
@@ -155,14 +154,14 @@ impl Worker<Idle> {
 
 impl Worker<Learning> {
     pub async fn execute_learn(mut self) -> Result<Worker<ShuttingDown>> {
-        let sessions =
+        let services =
             self.state.orchestrator.learn().await.inspect_err(
                 |e| tracing::error!(worker_id = self.id, error = %e, "learn failed"),
             )?;
-        let count = sessions.len();
+        let count = services.len();
         write_frame(
             &mut self.stream,
-            &WorkerToRunner::SessionCatalogue { sessions },
+            &WorkerToRunner::SessionCatalogue { services },
         )
         .await?;
         tracing::info!(worker_id = self.id, count, "sent session catalogue");
@@ -180,7 +179,7 @@ impl Worker<Learning> {
 impl Worker<Executing> {
     pub async fn execute_and_report(mut self) -> Result<Worker<ShuttingDown>> {
         let schedule_id = self.state.schedule.schedule_id;
-        let verdict = self
+        let (verdict, kill_report) = self
             .state
             .orchestrator
             .execute(&self.state.schedule)
@@ -188,6 +187,17 @@ impl Worker<Executing> {
             .inspect_err(
                 |e| tracing::error!(worker_id = self.id, schedule_id, error = %e, "execute failed"),
             )?;
+        write_frame(
+            &mut self.stream,
+            &WorkerToRunner::Event(WorkerEvent::Kill(kill_report.clone())),
+        )
+        .await?;
+        tracing::info!(
+            worker_id = self.id,
+            schedule_id,
+            ?kill_report,
+            "sent kill event"
+        );
         write_frame(
             &mut self.stream,
             &WorkerToRunner::RunResult {

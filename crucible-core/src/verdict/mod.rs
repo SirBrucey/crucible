@@ -24,6 +24,7 @@ pub struct Observations {
     pub http_outcomes: Vec<HttpOutcome>,
     pub db_state: Option<DbState>,
     pub sessions: Vec<crucible_protocol::Session>,
+    pub kill: Option<crucible_protocol::KillReport>,
 }
 
 impl Observations {

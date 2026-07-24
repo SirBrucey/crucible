@@ -7,10 +7,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Maximum size of a single frame. Anything larger is refused as malformed.
 ///
-/// Kept small on purpose. The handshake is tens of bytes; other IPC messages
-/// currently fit comfortably in this budget. Bump deliberately if a real
-/// message needs more headroom.
-const MAX_FRAME_SIZE: usize = 1024;
+/// Kept small on purpose. The handshake is tens of bytes; the biggest current
+/// message is `SessionCatalogue` carrying compact per-service histograms,
+/// which comfortably fits.
+const MAX_FRAME_SIZE: usize = 4096;
 
 /// Errors returned by the codec.
 #[derive(Debug, thiserror::Error)]
@@ -28,8 +28,8 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// Serialize `message` with postcard and write it as a length-prefixed frame.
 ///
 /// The frame is a 4-byte big-endian length header followed by the postcard payload.
-/// Encoding happens into a stack-allocated buffer of `MAX_FRAME_SIZE` bytes;
-/// larger messages are rejected as `Error::TooLarge`.
+/// Encoding uses a stack-allocated buffer of `MAX_FRAME_SIZE` bytes; larger
+/// messages are rejected as `Error::TooLarge`.
 pub async fn write_frame<T, W>(writer: &mut W, message: &T) -> Result<()>
 where
     T: Serialize,
@@ -116,7 +116,7 @@ mod tests {
     async fn roundtrips_schedule() {
         roundtrip(RunnerToWorker::Schedule {
             schedule_id: 7,
-            session: crucible_protocol::SessionRef::new("db", 3),
+            service: "db".into(),
             fault_offset_ns: 1_500_000,
             payload: vec![0u8; 128],
         })

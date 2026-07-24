@@ -9,8 +9,9 @@ use std::{
     },
 };
 
-use crucible_protocol::{ConnEvent, ConnId};
+use crucible_protocol::{ConnEvent, ConnId, Direction};
 use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::mpsc,
 };
@@ -59,12 +60,12 @@ impl Proxy {
 
 async fn forward(
     id: ConnId,
-    mut client: TcpStream,
+    client: TcpStream,
     peer: SocketAddr,
     upstream: SocketAddr,
     events_tx: mpsc::UnboundedSender<ConnEvent>,
 ) {
-    let mut upstream_conn = match TcpStream::connect(upstream).await {
+    let upstream_conn = match TcpStream::connect(upstream).await {
         Ok(s) => s,
         Err(e) => {
             let _ = events_tx.send(ConnEvent::failed(
@@ -77,11 +78,53 @@ async fn forward(
 
     let _ = events_tx.send(ConnEvent::opened(id, peer));
 
-    let event = match tokio::io::copy_bidirectional(&mut client, &mut upstream_conn).await {
-        Ok((up, down)) => ConnEvent::closed(id, up, down),
-        Err(e) => ConnEvent::failed(id, format!("forwarding: {e}")),
-    };
+    let (mut client_r, mut client_w) = client.into_split();
+    let (mut upstream_r, mut upstream_w) = upstream_conn.into_split();
 
+    let events_tx_c2u = events_tx.clone();
+    let c2u = tokio::spawn(async move {
+        let mut bytes_total: u64 = 0;
+        let mut buf = vec![0u8; 4096];
+        loop {
+            let n = match client_r.read(&mut buf).await {
+                Ok(0) => break Ok(bytes_total),
+                Ok(n) => n,
+                Err(e) => break Err(format!("client_read: {e}")),
+            };
+            let _ = events_tx_c2u.send(ConnEvent::wrote(id, Direction::ClientToUpstream, n as u64));
+            if let Err(e) = upstream_w.write_all(&buf[..n]).await {
+                break Err(format!("upstream_write: {e}"));
+            }
+            bytes_total += n as u64;
+        }
+    });
+
+    let events_tx_u2c = events_tx.clone();
+    let u2c = tokio::spawn(async move {
+        let mut bytes_total: u64 = 0;
+        let mut buf = vec![0u8; 4096];
+        loop {
+            let n = match upstream_r.read(&mut buf).await {
+                Ok(0) => break Ok(bytes_total),
+                Ok(n) => n,
+                Err(e) => break Err(format!("upstream_read: {e}")),
+            };
+            let _ = events_tx_u2c.send(ConnEvent::wrote(id, Direction::UpstreamToClient, n as u64));
+            if let Err(e) = client_w.write_all(&buf[..n]).await {
+                break Err(format!("client_write: {e}"));
+            }
+            bytes_total += n as u64;
+        }
+    });
+
+    let (c2u_res, u2c_res) = tokio::join!(c2u, u2c);
+    let event = match (
+        c2u_res.unwrap_or(Err("c2u task panicked".into())),
+        u2c_res.unwrap_or(Err("u2c task panicked".into())),
+    ) {
+        (Ok(up), Ok(down)) => ConnEvent::closed(id, up, down),
+        (Err(e), _) | (_, Err(e)) => ConnEvent::failed(id, format!("forwarding: {e}")),
+    };
     let _ = events_tx.send(event);
 }
 
@@ -152,11 +195,17 @@ mod tests {
 
         let mut opened = std::collections::HashSet::new();
         let mut closed = std::collections::HashMap::new();
-        for _ in 0..4 {
+        let mut wrote_counts: std::collections::HashMap<ConnId, u64> =
+            std::collections::HashMap::default();
+        // Two opens + two closes + variable number of wrote events (at least 4: one c2u and one u2c per conn).
+        while closed.len() < 2 {
             let event = recv(&mut events).await;
             match event.kind {
                 ConnEventKind::Opened { .. } => {
                     opened.insert(event.id);
+                }
+                ConnEventKind::Wrote { bytes, .. } => {
+                    *wrote_counts.entry(event.id).or_default() += bytes;
                 }
                 ConnEventKind::Closed {
                     bytes_client_to_upstream,

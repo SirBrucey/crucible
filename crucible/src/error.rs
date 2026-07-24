@@ -1,4 +1,4 @@
-use std::process::ExitStatus;
+use std::{process::ExitStatus, time::Duration};
 
 use crucible_core::ipc::codec;
 
@@ -16,6 +16,8 @@ pub enum Error {
     HandshakeTimeout,
     #[error("worker exited with non-zero status: {0}")]
     WorkerExitedNonZero(ExitStatus),
+    #[error("worker did not exit within {0:?}")]
+    WorkerTimeout(Duration),
     #[error("runner session in state `{state}` expected `{expected}`, got `{got}`")]
     UnexpectedMessage {
         state: &'static str,

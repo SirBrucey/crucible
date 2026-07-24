@@ -1,7 +1,7 @@
 mod error;
 mod proxy;
 
-use std::net::SocketAddr;
+use std::{io::Write, net::SocketAddr};
 
 use clap::Parser;
 use tokio::net::lookup_host;
@@ -58,7 +58,10 @@ async fn main() -> Result<()> {
         tokio::spawn(async move {
             while let Some(event) = events.recv().await {
                 match serde_json::to_string(&event) {
-                    Ok(line) => println!("{line}"),
+                    Ok(line) => {
+                        println!("{line}");
+                        let _ = std::io::stdout().flush();
+                    }
                     Err(e) => tracing::error!(?e, "serialize conn event"),
                 }
             }
