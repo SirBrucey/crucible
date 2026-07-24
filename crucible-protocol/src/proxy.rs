@@ -1,9 +1,8 @@
-use std::{
-    net::SocketAddr,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::net::SocketAddr;
 
 use serde::{Deserialize, Serialize};
+
+use crate::now_ns;
 
 pub type ConnId = u64;
 
@@ -72,13 +71,6 @@ impl ConnEvent {
             },
         }
     }
-}
-
-fn now_ns() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock is before Unix epoch")
-        .as_nanos()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
