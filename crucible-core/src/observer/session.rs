@@ -3,44 +3,29 @@
 use std::sync::{Arc, Mutex};
 
 use bollard::{Docker as DockerClient, query_parameters::LogsOptionsBuilder};
-use crucible_protocol::{ConnEvent, ConnEventKind, ConnId};
+use crucible_protocol::ConnEvent;
 use futures_util::StreamExt;
-use tokio::{
-    sync::{broadcast, mpsc},
-    task::JoinHandle,
-};
+use tokio::{sync::mpsc, task::JoinHandle};
 
 use crate::{proxy_log::Sessions, verdict::Observations};
 
-const BROADCAST_CAPACITY: usize = 1024;
-
-#[derive(Debug, thiserror::Error)]
-pub enum WaitError {
-    #[error("session observer stream closed")]
-    Closed,
-}
-
 pub struct SessionObserver {
     buffer: Arc<Mutex<Vec<(String, ConnEvent)>>>,
-    events_tx: broadcast::Sender<(String, ConnEvent)>,
     tasks: Vec<JoinHandle<()>>,
 }
 
 impl SessionObserver {
     pub fn start(client: &DockerClient, sidecars: Vec<(String, String)>) -> Self {
-        let (events_tx, _) = broadcast::channel(BROADCAST_CAPACITY);
         let (mpsc_tx, mut mpsc_rx) = mpsc::unbounded_channel::<(String, ConnEvent)>();
         let buffer: Arc<Mutex<Vec<(String, ConnEvent)>>> = Arc::new(Mutex::new(Vec::new()));
 
         let agg_buffer = buffer.clone();
-        let agg_events_tx = events_tx.clone();
         let aggregator = tokio::spawn(async move {
             while let Some(pair) = mpsc_rx.recv().await {
                 agg_buffer
                     .lock()
                     .expect("session observer buffer mutex")
-                    .push(pair.clone());
-                let _ = agg_events_tx.send(pair);
+                    .push(pair);
             }
         });
 
@@ -53,11 +38,7 @@ impl SessionObserver {
             }));
         }
 
-        Self {
-            buffer,
-            events_tx,
-            tasks,
-        }
+        Self { buffer, tasks }
     }
 
     /// Snapshot every event the observer has recorded so far, correlate them
@@ -73,40 +54,6 @@ impl SessionObserver {
             sessions.accept_event(&service, event);
         }
         observations.sessions = sessions.into_iter().collect();
-    }
-
-    /// Return the sidecar-stamped timestamp of the `Opened` event matching
-    /// `(service, conn_id)`. Subscribes first, then scans the buffer, so an
-    /// event that arrives between the two paths is caught by either.
-    pub async fn wait_for(&self, service: &str, conn_id: ConnId) -> Result<u128, WaitError> {
-        let mut rx = self.events_tx.subscribe();
-        {
-            let buffer = self.buffer.lock().expect("session observer buffer mutex");
-            for (svc, event) in buffer.iter() {
-                if svc == service
-                    && event.id == conn_id
-                    && matches!(event.kind, ConnEventKind::Opened { .. })
-                {
-                    return Ok(event.ts_ns);
-                }
-            }
-        }
-        loop {
-            match rx.recv().await {
-                Ok((svc, event))
-                    if svc == service
-                        && event.id == conn_id
-                        && matches!(event.kind, ConnEventKind::Opened { .. }) =>
-                {
-                    return Ok(event.ts_ns);
-                }
-                Ok(_) => {}
-                Err(broadcast::error::RecvError::Lagged(dropped)) => {
-                    tracing::warn!(target: "session_observer", dropped, "wait_for lagged");
-                }
-                Err(broadcast::error::RecvError::Closed) => return Err(WaitError::Closed),
-            }
-        }
     }
 
     pub async fn shutdown(self) {

@@ -117,15 +117,14 @@ impl Worker<Idle> {
             }
             RunnerToWorker::Schedule {
                 schedule_id,
-                session,
+                service,
                 fault_offset_ns,
                 payload,
             } => {
                 tracing::info!(
                     worker_id = self.id,
                     schedule_id,
-                    service = %session.service,
-                    conn_id = session.conn_id,
+                    %service,
                     fault_offset_ns,
                     "received schedule"
                 );
@@ -137,7 +136,7 @@ impl Worker<Idle> {
                         orchestrator: self.state.orchestrator,
                         schedule: Schedule {
                             schedule_id,
-                            session,
+                            service,
                             fault_offset_ns,
                             payload,
                         },
@@ -155,14 +154,14 @@ impl Worker<Idle> {
 
 impl Worker<Learning> {
     pub async fn execute_learn(mut self) -> Result<Worker<ShuttingDown>> {
-        let sessions =
+        let services =
             self.state.orchestrator.learn().await.inspect_err(
                 |e| tracing::error!(worker_id = self.id, error = %e, "learn failed"),
             )?;
-        let count = sessions.len();
+        let count = services.len();
         write_frame(
             &mut self.stream,
-            &WorkerToRunner::SessionCatalogue { sessions },
+            &WorkerToRunner::SessionCatalogue { services },
         )
         .await?;
         tracing::info!(worker_id = self.id, count, "sent session catalogue");

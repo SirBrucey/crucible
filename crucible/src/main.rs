@@ -11,7 +11,7 @@ use crucible_core::{
     deployment::docker::HEAL_BUDGET,
     event_bus::EventBus,
     journal,
-    scheduler::{Scheduler, SessionDerivedScheduler},
+    scheduler::{BurstScheduler, Scheduler},
 };
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
@@ -94,10 +94,10 @@ async fn drive(listener: &UnixListener, bus: &EventBus, socket_path: &Path) -> R
     let (mut child, stderr_relay) = spawn_worker(socket_path, worker_id)?;
     let session = accept_and_handshake(listener, bus).await?;
     let learn_start = Instant::now();
-    let catalogue = session.learn(bus).await?;
+    let services = session.learn(bus).await?;
     let run_cost = learn_start.elapsed();
     tracing::info!(
-        count = catalogue.len(),
+        services = services.len(),
         run_cost_ms = run_cost.as_millis(),
         "session catalogue received"
     );
@@ -105,7 +105,7 @@ async fn drive(listener: &UnixListener, bus: &EventBus, socket_path: &Path) -> R
     worker_id += 1;
 
     let schedule_budget = run_cost + HEAL_BUDGET + SCHEDULE_MARGIN;
-    let mut scheduler = SessionDerivedScheduler::new(&catalogue, run_cost, TOTAL_BUDGET);
+    let mut scheduler = BurstScheduler::new(&services, run_cost, TOTAL_BUDGET);
     while let Some(schedule) = scheduler.next() {
         let (mut child, stderr_relay) = spawn_worker(socket_path, worker_id)?;
         let session = accept_and_handshake(listener, bus).await?;
