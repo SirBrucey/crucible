@@ -13,10 +13,11 @@ use bollard::{
         NetworkCreateRequest, NetworkingConfig,
     },
     query_parameters::{
-        CreateContainerOptionsBuilder, CreateImageOptionsBuilder, RemoveContainerOptionsBuilder,
-        StartContainerOptions,
+        CreateContainerOptionsBuilder, CreateImageOptionsBuilder, KillContainerOptionsBuilder,
+        RemoveContainerOptionsBuilder, StartContainerOptions,
     },
 };
+use crucible_protocol::now_ns;
 use futures_util::TryStreamExt;
 use tokio::time::sleep;
 
@@ -27,6 +28,7 @@ const READINESS_TIMEOUT: Duration = Duration::from_mins(1);
 const READINESS_POLL: Duration = Duration::from_millis(500);
 const HEALTHCHECK_INTERVAL: Duration = Duration::from_secs(1);
 const HEALTHCHECK_START_PERIOD: Duration = Duration::from_secs(30);
+const HEAL_BUDGET: Duration = Duration::from_secs(15);
 const PROXY_IMAGE: &str = "crucible-proxy:0.1";
 const PROXY_SUFFIX: &str = "proxy";
 const BACKING_SUFFIX: &str = "actual";
@@ -45,6 +47,8 @@ pub enum Error {
     },
     #[error("teardown incomplete: {0}")]
     TeardownIncomplete(TeardownFailures),
+    #[error("unknown service `{0}`")]
+    UnknownService(String),
 }
 
 /// Items teardown could not remove, paired with the daemon's reason.
@@ -122,6 +126,56 @@ impl Docker {
 
     pub fn network(&self) -> &str {
         &self.network
+    }
+
+    fn service_by_name(&self, name: &str) -> Result<&'static Service> {
+        self.fleet
+            .services
+            .iter()
+            .find(|s| s.name == name)
+            .ok_or_else(|| Error::UnknownService(name.to_string()))
+    }
+
+    /// SIGKILL the service's backing container. Returns the wall-clock
+    /// nanoseconds since the Unix epoch of the moment bollard's kill returned.
+    pub async fn kill_service(&self, name: &str) -> Result<u128> {
+        let service = self.service_by_name(name)?;
+        let container = self.backing_container_name(service);
+        let options = KillContainerOptionsBuilder::default()
+            .signal("SIGKILL")
+            .build();
+        self.client
+            .kill_container(&container, Some(options))
+            .await?;
+        Ok(now_ns())
+    }
+
+    /// Start the previously-killed backing container and wait for its healthcheck
+    /// to report healthy plus a heal-budget grace period so the app can catch up
+    /// on any recovery work. Returns wall-clock nanoseconds when the heal budget
+    /// expires.
+    pub async fn restart_service(&self, name: &str) -> Result<u128> {
+        let service = self.service_by_name(name)?;
+        let container = self.backing_container_name(service);
+        self.client
+            .start_container(&container, None::<StartContainerOptions>)
+            .await?;
+        let deadline = tokio::time::Instant::now() + READINESS_TIMEOUT;
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                return Err(Error::ReadinessTimeout {
+                    name: container,
+                    addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+                    timeout: READINESS_TIMEOUT,
+                });
+            }
+            if container_ready(&self.client, &container).await? {
+                break;
+            }
+            sleep(READINESS_POLL).await;
+        }
+        sleep(HEAL_BUDGET).await;
+        Ok(now_ns())
     }
 
     pub fn start_session_observer(&self) -> crate::observer::SessionObserver {
