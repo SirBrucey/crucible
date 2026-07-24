@@ -127,6 +127,7 @@ async fn stream_sidecar(
         .stdout(true)
         .stderr(false)
         .follow(true)
+        .tail("all")
         .build();
     let mut stream = client.logs(&container, Some(options));
     let mut buffer: Vec<u8> = Vec::new();

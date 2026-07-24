@@ -48,8 +48,10 @@ impl Orchestrator {
     /// Bring the fleet replica up, wait for readiness, and start the session observer.
     pub async fn setup(&mut self) -> Result<(), docker::Error> {
         self.deployment.setup().await?;
-        self.deployment.wait_ready().await?;
+        // Start streaming before wait_ready so we capture app-boot pool
+        // connections as they open, not after they've already flown.
         self.session_observer = Some(self.deployment.start_session_observer());
+        self.deployment.wait_ready().await?;
         Ok(())
     }
 
@@ -104,12 +106,10 @@ impl Orchestrator {
         let mut observations = scenario_result?;
         observations.kill = Some(kill_report.clone());
 
-        if matches!(kill_report.result, KillResult::Fired { .. })
-            && observations
-                .http_outcomes
-                .iter()
-                .any(|o| (200..300).contains(&o.status))
-        {
+        // Restart whenever the kill fired so post-fault observers can query.
+        // The driver decides the verdict from observations.kill and the http /
+        // db state; a run with no acked writes just yields Inconclusive.
+        if matches!(kill_report.result, KillResult::Fired { .. }) {
             self.deployment
                 .restart_service(&kill_report.session.service)
                 .await?;
@@ -117,7 +117,7 @@ impl Orchestrator {
 
         db_observer.observe(&mut observations).await?;
         self.session_observer
-            .as_mut()
+            .as_ref()
             .expect("session observer present after setup")
             .observe(&mut observations);
         let verdict = driver_for(Invariant::Durable).drive(&observations);
@@ -132,7 +132,7 @@ impl Orchestrator {
             .expect("api endpoint present after setup");
         let session_observer = self
             .session_observer
-            .as_mut()
+            .as_ref()
             .ok_or(Error::ObserverMissing)?;
         let mut observations: Observations = self.scenario.run(api).await?;
         session_observer.observe(&mut observations);
