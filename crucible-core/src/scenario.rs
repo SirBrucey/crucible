@@ -28,7 +28,7 @@ impl Orders {
     pub async fn run(&self, api: SocketAddr) -> Result<Observations> {
         let mut observations = Observations::empty();
         for (item, quantity) in [("book", 4), ("noodles", 10), ("usb-c cable", 1)] {
-            let response = self
+            let outcome = match self
                 .client
                 .post(format!("http://{api}/orders"))
                 .json(&OrderRequest {
@@ -36,15 +36,26 @@ impl Orders {
                     quantity,
                 })
                 .send()
-                .await?;
-            let status = response.status().as_u16();
-            let bytes = response.bytes().await?;
-            observations.http_outcomes.push(HttpOutcome {
-                method: "POST".into(),
-                path: "/orders".into(),
-                status,
-                body: bytes.to_vec(),
-            });
+                .await
+            {
+                Ok(response) => {
+                    let status = response.status().as_u16();
+                    let bytes = response.bytes().await.unwrap_or_default();
+                    HttpOutcome {
+                        method: "POST".into(),
+                        path: "/orders".into(),
+                        status,
+                        body: bytes.to_vec(),
+                    }
+                }
+                Err(e) => HttpOutcome {
+                    method: "POST".into(),
+                    path: "/orders".into(),
+                    status: 0,
+                    body: e.to_string().into_bytes(),
+                },
+            };
+            observations.http_outcomes.push(outcome);
         }
         Ok(observations)
     }

@@ -1,17 +1,16 @@
 //! Schedule generation.
 
-pub mod session_derived;
+pub mod burst;
 
-pub use session_derived::SessionDerivedScheduler;
-
-use crucible_protocol::SessionRef;
+pub use burst::BurstScheduler;
 
 use crate::ipc::RunnerToWorker;
 
 /// A schedule the runner hands to a worker to execute.
 pub struct Schedule {
     pub schedule_id: u32,
-    pub session: SessionRef,
+    pub service: String,
+    /// Nanoseconds from scenario start at which the fault should fire.
     pub fault_offset_ns: u128,
     pub payload: Vec<u8>,
 }
@@ -20,7 +19,7 @@ impl From<Schedule> for RunnerToWorker {
     fn from(schedule: Schedule) -> Self {
         RunnerToWorker::Schedule {
             schedule_id: schedule.schedule_id,
-            session: schedule.session,
+            service: schedule.service,
             fault_offset_ns: schedule.fault_offset_ns,
             payload: schedule.payload,
         }

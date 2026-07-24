@@ -7,7 +7,7 @@
 use crucible_core::{
     event_bus::{EventBus, RunnerEvent},
     ipc::{
-        RunnerToWorker, Session as ProxySession, Verdict, WorkerToRunner,
+        RunnerToWorker, ServiceProfile, Verdict, WorkerToRunner,
         codec::{read_frame, write_frame},
     },
     scheduler::Schedule,
@@ -80,7 +80,7 @@ impl Session<Handshaking> {
 }
 
 impl Session<Dispatching> {
-    pub async fn learn(mut self, bus: &EventBus) -> Result<Vec<ProxySession>> {
+    pub async fn learn(mut self, bus: &EventBus) -> Result<Vec<ServiceProfile>> {
         let ready = read_frame::<WorkerToRunner, _>(&mut self.stream).await?;
         if !matches!(&ready, WorkerToRunner::Ready) {
             return Err(Error::UnexpectedMessage {
@@ -106,8 +106,8 @@ impl Session<Dispatching> {
         .expect("journal receiver alive");
 
         let msg = read_frame::<WorkerToRunner, _>(&mut self.stream).await?;
-        let sessions = match &msg {
-            WorkerToRunner::SessionCatalogue { sessions } => sessions.clone(),
+        let services = match &msg {
+            WorkerToRunner::SessionCatalogue { services } => services.clone(),
             other => {
                 return Err(Error::UnexpectedMessage {
                     state: "Learning",
@@ -123,7 +123,7 @@ impl Session<Dispatching> {
         .await
         .expect("journal receiver alive");
 
-        Ok(sessions)
+        Ok(services)
     }
 
     pub async fn dispatch(
@@ -166,24 +166,36 @@ impl Session<Dispatching> {
 }
 
 impl Session<AwaitingResult> {
+    /// Read frames until `RunResult`; every intervening `Event(_)` is journaled
+    /// via the bus.
+    ///
+    /// SAFETY: an ill-behaved worker could stream `Event`s indefinitely and
+    /// hang this loop. The runner runs each schedule inside a per-schedule
+    /// wall-clock deadline (see [`crate::wait_worker`]), so an unbounded
+    /// worker gets killed at the parent level.
     pub async fn await_result(mut self, bus: &EventBus) -> Result<Verdict> {
-        let msg = read_frame::<WorkerToRunner, _>(&mut self.stream).await?;
-        let verdict = match &msg {
-            WorkerToRunner::RunResult { verdict, .. } => *verdict,
-            other => {
-                return Err(Error::UnexpectedMessage {
-                    state: "AwaitingResult",
-                    expected: "RunResult",
-                    got: format!("{other:?}"),
-                });
+        loop {
+            let msg = read_frame::<WorkerToRunner, _>(&mut self.stream).await?;
+            let verdict = match &msg {
+                WorkerToRunner::RunResult { verdict, .. } => Some(*verdict),
+                WorkerToRunner::Event(_) => None,
+                other => {
+                    return Err(Error::UnexpectedMessage {
+                        state: "AwaitingResult",
+                        expected: "RunResult or Event",
+                        got: format!("{other:?}"),
+                    });
+                }
+            };
+            bus.publish(RunnerEvent::WorkerMessage {
+                worker_id: self.state.worker_id,
+                message: msg,
+            })
+            .await
+            .expect("journal receiver alive");
+            if let Some(v) = verdict {
+                return Ok(v);
             }
-        };
-        bus.publish(RunnerEvent::WorkerMessage {
-            worker_id: self.state.worker_id,
-            message: msg,
-        })
-        .await
-        .expect("journal receiver alive");
-        Ok(verdict)
+        }
     }
 }

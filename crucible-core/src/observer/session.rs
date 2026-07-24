@@ -1,4 +1,6 @@
-//! `SessionObserver`: streams sidecar proxy events into an observation buffer.
+//! `SessionObserver`: streams sidecar proxy events into an authoritative log.
+
+use std::sync::{Arc, Mutex};
 
 use bollard::{Docker as DockerClient, query_parameters::LogsOptionsBuilder};
 use crucible_protocol::ConnEvent;
@@ -8,33 +10,47 @@ use tokio::{sync::mpsc, task::JoinHandle};
 use crate::{proxy_log::Sessions, verdict::Observations};
 
 pub struct SessionObserver {
-    events_rx: mpsc::UnboundedReceiver<(String, ConnEvent)>,
+    buffer: Arc<Mutex<Vec<(String, ConnEvent)>>>,
     tasks: Vec<JoinHandle<()>>,
 }
 
 impl SessionObserver {
     pub fn start(client: &DockerClient, sidecars: Vec<(String, String)>) -> Self {
-        let (tx, rx) = mpsc::unbounded_channel();
-        let mut tasks = Vec::with_capacity(sidecars.len());
+        let (mpsc_tx, mut mpsc_rx) = mpsc::unbounded_channel::<(String, ConnEvent)>();
+        let buffer: Arc<Mutex<Vec<(String, ConnEvent)>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let agg_buffer = buffer.clone();
+        let aggregator = tokio::spawn(async move {
+            while let Some(pair) = mpsc_rx.recv().await {
+                agg_buffer
+                    .lock()
+                    .expect("session observer buffer mutex")
+                    .push(pair);
+            }
+        });
+
+        let mut tasks = vec![aggregator];
         for (service, container) in sidecars {
             let client = client.clone();
-            let tx = tx.clone();
+            let tx = mpsc_tx.clone();
             tasks.push(tokio::spawn(async move {
                 stream_sidecar(client, service, container, tx).await;
             }));
         }
-        Self {
-            events_rx: rx,
-            tasks,
-        }
+
+        Self { buffer, tasks }
     }
 
-    /// Drain every event the streaming tasks have delivered so far, correlate
-    /// the raw events into `Session` records, and place the result in
-    /// `observations.sessions`.
-    pub fn observe(&mut self, observations: &mut Observations) {
+    /// Snapshot every event the observer has recorded so far, correlate them
+    /// into `Session` records, and place the result in `observations.sessions`.
+    pub fn observe(&self, observations: &mut Observations) {
+        let events = self
+            .buffer
+            .lock()
+            .expect("session observer buffer mutex")
+            .clone();
         let mut sessions = Sessions::new();
-        while let Ok((service, event)) = self.events_rx.try_recv() {
+        for (service, event) in events {
             sessions.accept_event(&service, event);
         }
         observations.sessions = sessions.into_iter().collect();
@@ -58,6 +74,7 @@ async fn stream_sidecar(
         .stdout(true)
         .stderr(false)
         .follow(true)
+        .tail("all")
         .build();
     let mut stream = client.logs(&container, Some(options));
     let mut buffer: Vec<u8> = Vec::new();
