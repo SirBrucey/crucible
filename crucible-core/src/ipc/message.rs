@@ -1,4 +1,4 @@
-pub use crucible_protocol::{Session, SessionRef};
+pub use crucible_protocol::{KillReport, Session, SessionRef};
 
 /// Messages passed from one of the worker processes to the main runner.
 #[derive(Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -30,6 +30,8 @@ pub enum WorkerToRunner {
 pub enum WorkerEvent {
     /// Free-form log line from the worker.
     Log(String),
+    /// Kill primitive outcome for a schedule.
+    Kill(KillReport),
 }
 
 /// Outcome of running a schedule.
