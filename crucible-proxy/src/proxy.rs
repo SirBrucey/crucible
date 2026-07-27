@@ -13,7 +13,7 @@ use crucible_protocol::{ConnEvent, ConnId, Direction};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    sync::mpsc,
+    sync::{mpsc, watch},
 };
 
 pub struct Proxy {
@@ -21,14 +21,18 @@ pub struct Proxy {
     upstream: SocketAddr,
     events_tx: mpsc::UnboundedSender<ConnEvent>,
     next_id: Arc<AtomicU64>,
+    pause: watch::Receiver<bool>,
 }
 
 impl Proxy {
     /// Bind to `listen` and prepare to forward every accepted connection to `upstream`.
-    /// Returns the proxy, its bound local address, and the receiver for connection events.
+    /// `pause` gates forwarding: while it holds `true`, every connection holds its
+    /// bytes (delivering none) until it flips back to `false`. Returns the proxy,
+    /// its bound local address, and the receiver for connection events.
     pub async fn bind(
         listen: SocketAddr,
         upstream: SocketAddr,
+        pause: watch::Receiver<bool>,
     ) -> io::Result<(Self, SocketAddr, mpsc::UnboundedReceiver<ConnEvent>)> {
         let listener = TcpListener::bind(listen).await?;
         let local_addr = listener.local_addr()?;
@@ -38,6 +42,7 @@ impl Proxy {
             upstream,
             events_tx,
             next_id: Arc::new(AtomicU64::new(0)),
+            pause,
         };
         Ok((proxy, local_addr, events_rx))
     }
@@ -53,7 +58,18 @@ impl Proxy {
                 peer,
                 self.upstream,
                 self.events_tx.clone(),
+                self.pause.clone(),
             ));
+        }
+    }
+}
+
+/// Block while the pause gate holds `true`, returning as soon as it is `false`
+/// (or the sender is dropped, so forwarding never wedges if control goes away).
+async fn wait_while_paused(pause: &mut watch::Receiver<bool>) {
+    while *pause.borrow() {
+        if pause.changed().await.is_err() {
+            return;
         }
     }
 }
@@ -64,6 +80,7 @@ async fn forward(
     peer: SocketAddr,
     upstream: SocketAddr,
     events_tx: mpsc::UnboundedSender<ConnEvent>,
+    pause: watch::Receiver<bool>,
 ) {
     let upstream_conn = match TcpStream::connect(upstream).await {
         Ok(s) => s,
@@ -82,6 +99,7 @@ async fn forward(
     let (mut upstream_r, mut upstream_w) = upstream_conn.into_split();
 
     let events_tx_c2u = events_tx.clone();
+    let mut pause_c2u = pause.clone();
     let c2u = tokio::spawn(async move {
         let mut bytes_total: u64 = 0;
         let mut buf = vec![0u8; 4096];
@@ -92,6 +110,7 @@ async fn forward(
                 Err(e) => break Err(format!("client_read: {e}")),
             };
             let _ = events_tx_c2u.send(ConnEvent::wrote(id, Direction::ClientToUpstream, n as u64));
+            wait_while_paused(&mut pause_c2u).await;
             if let Err(e) = upstream_w.write_all(&buf[..n]).await {
                 break Err(format!("upstream_write: {e}"));
             }
@@ -100,6 +119,7 @@ async fn forward(
     });
 
     let events_tx_u2c = events_tx.clone();
+    let mut pause_u2c = pause;
     let u2c = tokio::spawn(async move {
         let mut bytes_total: u64 = 0;
         let mut buf = vec![0u8; 4096];
@@ -110,6 +130,7 @@ async fn forward(
                 Err(e) => break Err(format!("upstream_read: {e}")),
             };
             let _ = events_tx_u2c.send(ConnEvent::wrote(id, Direction::UpstreamToClient, n as u64));
+            wait_while_paused(&mut pause_u2c).await;
             if let Err(e) = client_w.write_all(&buf[..n]).await {
                 break Err(format!("client_write: {e}"));
             }
@@ -140,6 +161,11 @@ mod tests {
     };
 
     use super::*;
+
+    /// A pause receiver that never pauses, for tests that do not exercise the gate.
+    fn never_paused() -> watch::Receiver<bool> {
+        watch::channel(false).1
+    }
 
     async fn spawn_echo() -> SocketAddr {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
@@ -172,9 +198,10 @@ mod tests {
     #[tokio::test]
     async fn two_concurrent_connections_round_trip_and_emit_distinct_events() {
         let echo = spawn_echo().await;
-        let (proxy, proxy_addr, mut events) = Proxy::bind((Ipv4Addr::LOCALHOST, 0).into(), echo)
-            .await
-            .unwrap();
+        let (proxy, proxy_addr, mut events) =
+            Proxy::bind((Ipv4Addr::LOCALHOST, 0).into(), echo, never_paused())
+                .await
+                .unwrap();
         tokio::spawn(proxy.run());
 
         let mut a = TcpStream::connect(proxy_addr).await.unwrap();
@@ -232,14 +259,44 @@ mod tests {
             let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
             listener.local_addr().unwrap()
         };
-        let (proxy, proxy_addr, mut events) = Proxy::bind((Ipv4Addr::LOCALHOST, 0).into(), unused)
-            .await
-            .unwrap();
+        let (proxy, proxy_addr, mut events) =
+            Proxy::bind((Ipv4Addr::LOCALHOST, 0).into(), unused, never_paused())
+                .await
+                .unwrap();
         tokio::spawn(proxy.run());
 
         let _client = TcpStream::connect(proxy_addr).await.unwrap();
 
         let event = recv(&mut events).await;
         assert!(matches!(event.kind, ConnEventKind::Failed { .. }));
+    }
+
+    #[tokio::test]
+    async fn paused_proxy_holds_bytes_until_resumed() {
+        let echo = spawn_echo().await;
+        let (pause_tx, pause_rx) = watch::channel(false);
+        let (proxy, proxy_addr, _events) =
+            Proxy::bind((Ipv4Addr::LOCALHOST, 0).into(), echo, pause_rx)
+                .await
+                .unwrap();
+        tokio::spawn(proxy.run());
+
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+
+        // Pause, then send: the proxy reads the bytes but must hold them, so the
+        // echo upstream never sees them and nothing comes back.
+        pause_tx.send(true).unwrap();
+        client.write_all(b"ping").await.unwrap();
+        let mut buf = [0u8; 4];
+        let held = timeout(Duration::from_millis(300), client.read_exact(&mut buf)).await;
+        assert!(held.is_err(), "bytes should be held while paused");
+
+        // Resume: the held bytes flow, echo replies, and the round trip completes.
+        pause_tx.send(false).unwrap();
+        timeout(Duration::from_secs(2), client.read_exact(&mut buf))
+            .await
+            .expect("echo within 2s after resume")
+            .expect("read succeeds");
+        assert_eq!(&buf, b"ping");
     }
 }
