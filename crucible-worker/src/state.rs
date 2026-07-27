@@ -75,13 +75,26 @@ impl Worker<Handshaking> {
                 tracing::info!(worker_id = self.id, %runner_version, "handshake ok");
                 let mut orchestrator =
                     Orchestrator::new(Docker::new(self.id, &fleet::EXAMPLE)?, Orders::new()?);
-                orchestrator.setup().await?;
+                // Tear the replica down on any bring-up failure so a worker that
+                // dies here (a flaky readiness timeout, a crash) does not leak
+                // its containers.
+                if let Err(e) = orchestrator.setup().await {
+                    let _ = orchestrator.teardown().await;
+                    return Err(e.into());
+                }
                 let db_addr = orchestrator
                     .deployment()
                     .endpoint("db")
                     .expect("db endpoint present after setup");
                 let db_url = format!("mysql://root@{db_addr}/orders");
-                orchestrator.set_db_observer(DbObserver::connect(&db_url).await?);
+                let db_observer = match DbObserver::connect(&db_url).await {
+                    Ok(observer) => observer,
+                    Err(e) => {
+                        let _ = orchestrator.teardown().await;
+                        return Err(e.into());
+                    }
+                };
+                orchestrator.set_db_observer(db_observer);
                 Ok(Worker {
                     id: self.id,
                     version: self.version,
