@@ -29,7 +29,7 @@ pub const EXAMPLE: Fleet = Fleet {
                 "BROKER_URL=amqp://broker:5672",
                 "RUST_LOG=info",
             ],
-            healthcheck: &[],
+            healthcheck: &["CMD", "curl", "-fsS", "http://127.0.0.1:8080/healthz"],
         },
         Service {
             name: "broker",
@@ -57,7 +57,7 @@ pub const EXAMPLE: Fleet = Fleet {
                 "BROKER_URL=amqp://broker:5672",
                 "RUST_LOG=info",
             ],
-            healthcheck: &[],
+            healthcheck: &["CMD", "curl", "-fsS", "http://127.0.0.1:8081/healthz"],
         },
     ],
 };
