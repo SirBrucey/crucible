@@ -36,7 +36,14 @@ pub const EXAMPLE: Fleet = Fleet {
             image: "rabbitmq:3.13-management",
             port: 5672,
             env: &[],
-            healthcheck: &["CMD", "rabbitmq-diagnostics", "-q", "ping"],
+            // Probe the AMQP port rather than run `rabbitmq-diagnostics`. That
+            // command starts an Erlang node, and Docker runs healthchecks as the
+            // image's default user (root here), so under a slow concurrent boot a
+            // probe can create a root-owned /var/lib/rabbitmq/.erlang.cookie before
+            // the broker (running as rabbitmq) writes its own; the broker then
+            // cannot read the cookie and dies with `.erlang.cookie: eacces`. A bare
+            // TCP connect touches no cookie and still gates on the listener.
+            healthcheck: &["CMD", "bash", "-c", ": < /dev/tcp/127.0.0.1/5672"],
         },
         Service {
             name: "db",
