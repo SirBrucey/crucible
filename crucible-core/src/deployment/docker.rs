@@ -200,7 +200,7 @@ impl Docker {
         format!("{}-{}", service.name, BACKING_SUFFIX)
     }
 
-    async fn start_service(&mut self, service: &Service) -> Result<()> {
+    async fn start_service(&self, service: &Service) -> Result<()> {
         ensure_image(&self.client, service.image).await?;
 
         let container_name = self.backing_container_name(service);
@@ -257,7 +257,9 @@ impl Docker {
         Ok(())
     }
 
-    async fn start_proxy_for(&mut self, service: &Service) -> Result<()> {
+    /// Start the sidecar proxy for `service` and return its published host
+    /// endpoint keyed by service name, for the caller to record.
+    async fn start_proxy_for(&self, service: &Service) -> Result<(String, SocketAddr)> {
         ensure_image(&self.client, PROXY_IMAGE).await?;
 
         let container_name = self.proxy_container_name(service);
@@ -310,11 +312,10 @@ impl Docker {
             .await?;
 
         let host_port = published_port(&self.client, &container_name, service.port).await?;
-        self.endpoints.insert(
+        Ok((
             service.name.to_string(),
             SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), host_port),
-        );
-        Ok(())
+        ))
     }
 }
 
@@ -331,10 +332,17 @@ impl Deployment for Docker {
             })
             .await?;
 
-        for service in self.fleet.services {
-            self.start_service(service).await?;
-            self.start_proxy_for(service).await?;
-        }
+        // Bring every service (backing + its proxy) up concurrently; they wire
+        // to each other lazily at runtime, so create order does not matter.
+        let docker = &*self;
+        let endpoints = futures_util::future::try_join_all(docker.fleet.services.iter().map(
+            |service| async move {
+                docker.start_service(service).await?;
+                docker.start_proxy_for(service).await
+            },
+        ))
+        .await?;
+        self.endpoints.extend(endpoints);
         Ok(())
     }
 
@@ -367,17 +375,23 @@ impl Deployment for Docker {
     async fn teardown(&mut self) -> Result<()> {
         let opts = RemoveContainerOptionsBuilder::default().force(true).build();
         let mut failures = TeardownFailures::new();
-        let names = self
+        let names: Vec<String> = self
             .fleet
             .services
             .iter()
-            .flat_map(|s| [self.backing_container_name(s), self.proxy_container_name(s)]);
-        for name in names {
-            match self
-                .client
-                .remove_container(&name, Some(opts.clone()))
-                .await
-            {
+            .flat_map(|s| [self.backing_container_name(s), self.proxy_container_name(s)])
+            .collect();
+        let removals = futures_util::future::join_all(names.into_iter().map(|name| {
+            let client = &self.client;
+            let opts = opts.clone();
+            async move {
+                let result = client.remove_container(&name, Some(opts)).await;
+                (name, result)
+            }
+        }))
+        .await;
+        for (name, result) in removals {
+            match result {
                 Ok(()) => {}
                 Err(e) if is_not_found(&e) => {}
                 Err(e) => failures.append_container(name, e.to_string()),
