@@ -27,7 +27,7 @@ use crate::{
 };
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
-const TOTAL_BUDGET: Duration = Duration::from_mins(10);
+const TOTAL_BUDGET: Duration = Duration::from_mins(5);
 const SCHEDULE_MARGIN: Duration = Duration::from_secs(30);
 const LEARN_MARGIN: Duration = Duration::from_secs(30);
 
@@ -89,6 +89,7 @@ async fn run() -> Result<()> {
 }
 
 async fn drive(listener: &UnixListener, bus: &EventBus, socket_path: &Path) -> Result<()> {
+    let campaign_start = Instant::now();
     let mut worker_id: u32 = 0;
 
     let (mut child, stderr_relay) = spawn_worker(socket_path, worker_id)?;
@@ -105,8 +106,17 @@ async fn drive(listener: &UnixListener, bus: &EventBus, socket_path: &Path) -> R
     worker_id += 1;
 
     let schedule_budget = run_cost + HEAL_BUDGET + SCHEDULE_MARGIN;
-    let mut scheduler = BurstScheduler::new(&services, run_cost, TOTAL_BUDGET);
-    while let Some(schedule) = scheduler.next() {
+    let mut scheduler = BurstScheduler::new(&services);
+    let total = scheduler.total();
+    let mut ran: usize = 0;
+    // TOTAL_BUDGET is a wall-clock cap: dispatch schedules until it is reached
+    // (the in-flight schedule at the cap runs to completion, so the campaign
+    // overshoots by at most one schedule). Schedules are emitted round-robin
+    // across bursts, so a truncated campaign still samples every burst evenly.
+    while campaign_start.elapsed() < TOTAL_BUDGET {
+        let Some(schedule) = scheduler.next() else {
+            break;
+        };
         let (mut child, stderr_relay) = spawn_worker(socket_path, worker_id)?;
         let session = accept_and_handshake(listener, bus).await?;
         let verdict = session
@@ -116,7 +126,21 @@ async fn drive(listener: &UnixListener, bus: &EventBus, socket_path: &Path) -> R
             .await?;
         tracing::info!(?verdict, "run result");
         wait_worker(&mut child, stderr_relay, schedule_budget).await?;
+        ran += 1;
         worker_id += 1;
+    }
+
+    let elapsed_s = campaign_start.elapsed().as_secs();
+    if ran < total {
+        tracing::warn!(
+            ran,
+            total,
+            elapsed_s,
+            budget_s = TOTAL_BUDGET.as_secs(),
+            "campaign hit its wall-clock budget; remaining schedules skipped"
+        );
+    } else {
+        tracing::info!(ran, total, elapsed_s, "campaign complete");
     }
 
     Ok(())
