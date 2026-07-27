@@ -150,10 +150,10 @@ impl Docker {
         Ok(now_ns())
     }
 
-    /// Start the previously-killed backing container and wait for its healthcheck
-    /// to report healthy plus a heal-budget grace period so the app can catch up
-    /// on any recovery work. Returns wall-clock nanoseconds when the heal budget
-    /// expires.
+    /// Start the previously-killed backing container and wait for its
+    /// healthcheck to report healthy. The caller waits for fleet quiescence
+    /// (see `SessionObserver::wait_for_quiescence`) before collecting the
+    /// verdict. Returns wall-clock nanoseconds when the service was ready.
     pub async fn restart_service(&self, name: &str) -> Result<u128> {
         let service = self.service_by_name(name)?;
         let container = self.backing_container_name(service);
@@ -174,7 +174,6 @@ impl Docker {
             }
             sleep(READINESS_POLL).await;
         }
-        sleep(HEAL_BUDGET).await;
         Ok(now_ns())
     }
 
