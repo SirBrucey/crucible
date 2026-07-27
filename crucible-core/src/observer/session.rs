@@ -1,13 +1,18 @@
 //! `SessionObserver`: streams sidecar proxy events into an authoritative log.
 
-use std::sync::{Arc, Mutex};
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use bollard::{Docker as DockerClient, query_parameters::LogsOptionsBuilder};
-use crucible_protocol::ConnEvent;
+use crucible_protocol::{ConnEvent, now_ns};
 use futures_util::StreamExt;
 use tokio::{sync::mpsc, task::JoinHandle};
 
 use crate::{proxy_log::Sessions, verdict::Observations};
+
+const QUIESCENCE_POLL: Duration = Duration::from_millis(200);
 
 pub struct SessionObserver {
     buffer: Arc<Mutex<Vec<(String, ConnEvent)>>>,
@@ -54,6 +59,43 @@ impl SessionObserver {
             sessions.accept_event(&service, event);
         }
         observations.sessions = sessions.into_iter().collect();
+    }
+
+    /// Wall-clock nanoseconds of the most recent event the observer has
+    /// recorded, or `None` if nothing has been observed yet.
+    pub fn last_event_ns(&self) -> Option<u128> {
+        self.buffer
+            .lock()
+            .expect("session observer buffer mutex")
+            .iter()
+            .map(|(_, event)| event.ts_ns)
+            .max()
+    }
+
+    /// Block until no sidecar has forwarded traffic for `idle`, or until
+    /// `ceiling` elapses. Waits `min_settle` first so post-restart recovery
+    /// traffic has a chance to start before the fleet can be judged quiescent.
+    /// Network idle across every sidecar implies persisted-state writes have
+    /// landed too, since those flow through the db sidecar.
+    pub async fn wait_for_quiescence(
+        &self,
+        min_settle: Duration,
+        idle: Duration,
+        ceiling: Duration,
+    ) {
+        let deadline = tokio::time::Instant::now() + ceiling;
+        tokio::time::sleep(min_settle.min(ceiling)).await;
+        let idle_ns = idle.as_nanos();
+        loop {
+            let quiet_for = match self.last_event_ns() {
+                Some(ts) => now_ns().saturating_sub(ts),
+                None => idle_ns,
+            };
+            if quiet_for >= idle_ns || tokio::time::Instant::now() >= deadline {
+                return;
+            }
+            tokio::time::sleep(QUIESCENCE_POLL).await;
+        }
     }
 
     pub async fn shutdown(self) {
