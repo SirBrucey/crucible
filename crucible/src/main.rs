@@ -10,8 +10,9 @@ use std::{
 use crucible_core::{
     deployment::docker::HEAL_BUDGET,
     event_bus::EventBus,
+    ipc::Verdict,
     journal,
-    scheduler::{BurstScheduler, Scheduler},
+    scheduler::{BurstScheduler, Schedule, Scheduler},
 };
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
@@ -109,6 +110,7 @@ async fn drive(listener: &UnixListener, bus: &EventBus, socket_path: &Path) -> R
     let mut scheduler = BurstScheduler::new(&services);
     let total = scheduler.total();
     let mut ran: usize = 0;
+    let mut failed: usize = 0;
     // TOTAL_BUDGET is a wall-clock cap: dispatch schedules until it is reached
     // (the in-flight schedule at the cap runs to completion, so the campaign
     // overshoots by at most one schedule). Schedules are emitted round-robin
@@ -117,33 +119,92 @@ async fn drive(listener: &UnixListener, bus: &EventBus, socket_path: &Path) -> R
         let Some(schedule) = scheduler.next() else {
             break;
         };
-        let (mut child, stderr_relay) = spawn_worker(socket_path, worker_id)?;
-        let session = accept_and_handshake(listener, bus).await?;
-        let verdict = session
-            .dispatch(bus, schedule)
-            .await?
-            .await_result(bus)
-            .await?;
-        tracing::info!(?verdict, "run result");
-        wait_worker(&mut child, stderr_relay, schedule_budget).await?;
-        ran += 1;
+        let schedule_id = schedule.schedule_id;
+        // A single worker's failure (a flaky bring-up, a crash) is recorded
+        // against its schedule and the campaign moves on, rather than aborting.
+        match run_one_schedule(
+            listener,
+            bus,
+            socket_path,
+            worker_id,
+            schedule,
+            schedule_budget,
+        )
+        .await
+        {
+            Ok(verdict) => {
+                tracing::info!(schedule_id, ?verdict, "run result");
+                ran += 1;
+            }
+            Err(e) => {
+                tracing::warn!(schedule_id, error = %e, "schedule failed; continuing campaign");
+                failed += 1;
+            }
+        }
         worker_id += 1;
     }
 
     let elapsed_s = campaign_start.elapsed().as_secs();
-    if ran < total {
+    if ran + failed < total {
         tracing::warn!(
             ran,
+            failed,
             total,
             elapsed_s,
             budget_s = TOTAL_BUDGET.as_secs(),
             "campaign hit its wall-clock budget; remaining schedules skipped"
         );
     } else {
-        tracing::info!(ran, total, elapsed_s, "campaign complete");
+        tracing::info!(ran, failed, total, elapsed_s, "campaign complete");
     }
 
     Ok(())
+}
+
+/// Run one schedule on a fresh worker and return its verdict. Reaps the worker
+/// on every path so a failure cannot leave a zombie. A pipeline error or a
+/// worker that exceeds `schedule_budget` is returned as `Err` for the caller to
+/// record; only the failing schedule is affected.
+async fn run_one_schedule(
+    listener: &UnixListener,
+    bus: &EventBus,
+    socket_path: &Path,
+    worker_id: u32,
+    schedule: Schedule,
+    schedule_budget: Duration,
+) -> Result<Verdict> {
+    let (mut child, stderr_relay) = spawn_worker(socket_path, worker_id)?;
+    let pipeline = async {
+        let session = accept_and_handshake(listener, bus).await?;
+        session
+            .dispatch(bus, schedule)
+            .await?
+            .await_result(bus)
+            .await
+    };
+    match tokio::time::timeout(schedule_budget, pipeline).await {
+        Ok(Ok(verdict)) => {
+            // Success: let the worker finish its teardown and exit cleanly.
+            wait_worker(&mut child, stderr_relay, schedule_budget).await?;
+            Ok(verdict)
+        }
+        Ok(Err(e)) => {
+            reap_worker(&mut child, stderr_relay).await;
+            Err(e)
+        }
+        Err(_) => {
+            reap_worker(&mut child, stderr_relay).await;
+            Err(Error::WorkerTimeout(schedule_budget))
+        }
+    }
+}
+
+/// Kill (if still alive) and wait on a worker child, draining its stderr relay,
+/// so a failed schedule leaves no zombie process behind.
+async fn reap_worker(child: &mut Child, stderr_relay: JoinHandle<()>) {
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+    let _ = stderr_relay.await;
 }
 
 fn spawn_worker(socket_path: &Path, worker_id: u32) -> Result<(Child, JoinHandle<()>)> {
