@@ -38,6 +38,7 @@ impl Observations {
 pub struct HttpOutcome {
     pub method: String,
     pub path: String,
+    pub request_body: Vec<u8>,
     pub status: u16,
     pub body: Vec<u8>,
 }
