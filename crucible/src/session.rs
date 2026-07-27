@@ -177,7 +177,7 @@ impl Session<AwaitingResult> {
         loop {
             let msg = read_frame::<WorkerToRunner, _>(&mut self.stream).await?;
             let verdict = match &msg {
-                WorkerToRunner::RunResult { verdict, .. } => Some(*verdict),
+                WorkerToRunner::RunResult { verdict, .. } => Some(verdict.clone()),
                 WorkerToRunner::Event(_) => None,
                 other => {
                     return Err(Error::UnexpectedMessage {

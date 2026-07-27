@@ -28,13 +28,16 @@ impl Orders {
     pub async fn run(&self, api: SocketAddr) -> Result<Observations> {
         let mut observations = Observations::empty();
         for (item, quantity) in [("book", 4), ("noodles", 10), ("usb-c cable", 1)] {
+            let request = OrderRequest {
+                item: item.to_string(),
+                quantity,
+            };
+            let request_body =
+                serde_json::to_vec(&request).expect("OrderRequest serializes cleanly");
             let outcome = match self
                 .client
                 .post(format!("http://{api}/orders"))
-                .json(&OrderRequest {
-                    item: item.to_string(),
-                    quantity,
-                })
+                .json(&request)
                 .send()
                 .await
             {
@@ -44,6 +47,7 @@ impl Orders {
                     HttpOutcome {
                         method: "POST".into(),
                         path: "/orders".into(),
+                        request_body,
                         status,
                         body: bytes.to_vec(),
                     }
@@ -51,6 +55,7 @@ impl Orders {
                 Err(e) => HttpOutcome {
                     method: "POST".into(),
                     path: "/orders".into(),
+                    request_body,
                     status: 0,
                     body: e.to_string().into_bytes(),
                 },
