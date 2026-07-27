@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use crucible_protocol::{KillMissReason, KillReport, KillResult, ServiceProfile, now_ns};
 
 use crate::{
-    deployment::{Deployment, Docker, docker},
+    deployment::{Deployment, Docker, docker, docker::HEAL_BUDGET},
     ipc::Verdict,
     observer::{self, DbObserver, SessionObserver},
     proxy_log::service_profiles_from_sessions,
@@ -13,6 +13,13 @@ use crate::{
     scheduler::Schedule,
     verdict::{Invariant, Observations, driver_for},
 };
+
+/// After a restart, wait this long before judging the fleet quiescent, so
+/// recovery traffic has a chance to start.
+const HEAL_MIN_SETTLE: Duration = Duration::from_millis(500);
+/// Consider the fleet quiescent once no sidecar has forwarded traffic for this
+/// long. Comfortably larger than a DB write plus docker-log delivery latency.
+const HEAL_QUIESCENCE_IDLE: Duration = Duration::from_secs(1);
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -123,6 +130,9 @@ impl Orchestrator {
             self.deployment
                 .restart_service(&kill_report.service)
                 .await?;
+            session_observer
+                .wait_for_quiescence(HEAL_MIN_SETTLE, HEAL_QUIESCENCE_IDLE, HEAL_BUDGET)
+                .await;
         }
 
         db_observer.observe(&mut observations).await?;
