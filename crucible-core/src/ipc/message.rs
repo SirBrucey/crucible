@@ -16,7 +16,7 @@ pub enum WorkerToRunner {
     RunResult {
         /// Correlation id, matching the `Schedule` this result is for.
         schedule_id: u32,
-        /// Outcome of the run.
+        /// Outcome of the run, carrying the driver's explanation.
         verdict: Verdict,
     },
     /// Worker returns per-service byte-over-time histograms derived from the
@@ -35,15 +35,16 @@ pub enum WorkerEvent {
     Kill(KillReport),
 }
 
-/// Outcome of running a schedule.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+/// Outcome of running a schedule. Non-`Pass` verdicts carry the reason the
+/// driver reached them, for the journal and report.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub enum Verdict {
-    /// All invariants held.
+    /// The invariant held.
     Pass,
-    /// An invariant was violated.
-    Fail,
+    /// The invariant was violated.
+    Fail { reason: String },
     /// Neither passed nor failed within the run budget.
-    Inconclusive,
+    Inconclusive { reason: String },
 }
 
 /// Messages passed from the main runner to one of the worker processes.
