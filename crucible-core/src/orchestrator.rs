@@ -95,25 +95,35 @@ impl Orchestrator {
             );
             tokio::select! {
                 biased;
-                () = tokio::time::sleep(sleep) => match self.deployment.kill_service(&schedule.service).await {
-                    Ok(killed_at_ns) => {
-                        let actual = scenario_start.elapsed().as_nanos();
-                        KillReport {
+                () = tokio::time::sleep(sleep) => {
+                    // Freeze the whole fleet atomically, kill the target against
+                    // the held flow, then release so the fault manifests: the
+                    // held bytes reach the now-dead service. Freezing pins the
+                    // kill to a fixed point instead of racing whatever chunk was
+                    // mid-flight.
+                    let _ = self.deployment.pause_proxies().await;
+                    let killed = self.deployment.kill_service(&schedule.service).await;
+                    let _ = self.deployment.resume_proxies().await;
+                    match killed {
+                        Ok(killed_at_ns) => {
+                            let actual = scenario_start.elapsed().as_nanos();
+                            KillReport {
+                                schedule_id: schedule.schedule_id,
+                                service: schedule.service.clone(),
+                                result: KillResult::Fired {
+                                    requested_offset_ns: schedule.fault_offset_ns,
+                                    actual_offset_ns: actual,
+                                    killed_at_ns,
+                                },
+                            }
+                        }
+                        Err(e) => KillReport {
                             schedule_id: schedule.schedule_id,
                             service: schedule.service.clone(),
-                            result: KillResult::Fired {
-                                requested_offset_ns: schedule.fault_offset_ns,
-                                actual_offset_ns: actual,
-                                killed_at_ns,
-                            },
-                        }
+                            result: KillResult::Missed(KillMissReason::KillFailed(e.to_string())),
+                        },
                     }
-                    Err(e) => KillReport {
-                        schedule_id: schedule.schedule_id,
-                        service: schedule.service.clone(),
-                        result: KillResult::Missed(KillMissReason::KillFailed(e.to_string())),
-                    },
-                },
+                }
                 _ = &mut scenario_end_rx => KillReport {
                     schedule_id: schedule.schedule_id,
                     service: schedule.service.clone(),
