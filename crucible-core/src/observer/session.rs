@@ -20,7 +20,10 @@ pub struct SessionObserver {
 }
 
 impl SessionObserver {
-    pub fn start(client: &DockerClient, sidecars: Vec<(String, String)>) -> Self {
+    /// Stream the fleet's single proxy container. Every pair in that proxy tags
+    /// its event lines with its service, so the interleaved stream stays
+    /// attributable per service.
+    pub fn start(client: &DockerClient, proxy_container: String) -> Self {
         let (mpsc_tx, mut mpsc_rx) = mpsc::unbounded_channel::<(String, ConnEvent)>();
         let buffer: Arc<Mutex<Vec<(String, ConnEvent)>>> = Arc::new(Mutex::new(Vec::new()));
 
@@ -34,16 +37,17 @@ impl SessionObserver {
             }
         });
 
-        let mut tasks = vec![aggregator];
-        for (service, container) in sidecars {
+        let stream = {
             let client = client.clone();
-            let tx = mpsc_tx.clone();
-            tasks.push(tokio::spawn(async move {
-                stream_sidecar(client, service, container, tx).await;
-            }));
-        }
+            tokio::spawn(async move {
+                stream_sidecar(client, proxy_container, mpsc_tx).await;
+            })
+        };
 
-        Self { buffer, tasks }
+        Self {
+            buffer,
+            tasks: vec![aggregator, stream],
+        }
     }
 
     /// Snapshot every event the observer has recorded so far, correlate them
@@ -108,7 +112,6 @@ impl SessionObserver {
 
 async fn stream_sidecar(
     client: DockerClient,
-    service: String,
     container: String,
     tx: mpsc::UnboundedSender<(String, ConnEvent)>,
 ) {
@@ -124,7 +127,7 @@ async fn stream_sidecar(
         let chunk = match chunk_result {
             Ok(c) => c,
             Err(e) => {
-                tracing::warn!(target: "session_observer", %service, %container, error = %e, "log stream error");
+                tracing::warn!(target: "session_observer", %container, error = %e, "log stream error");
                 return;
             }
         };
@@ -136,14 +139,20 @@ async fn stream_sidecar(
             if trimmed.is_empty() {
                 continue;
             }
-            match serde_json::from_str::<ConnEvent>(trimmed) {
+            // Each line is `service\tjson`: the proxy tags every event with the
+            // pair's service so one interleaved stream stays attributable.
+            let Some((service, json)) = trimmed.split_once('\t') else {
+                tracing::warn!(target: "session_observer", %container, line = %trimmed, "conn event line missing service tag");
+                continue;
+            };
+            match serde_json::from_str::<ConnEvent>(json) {
                 Ok(event) => {
-                    if tx.send((service.clone(), event)).is_err() {
+                    if tx.send((service.to_string(), event)).is_err() {
                         return;
                     }
                 }
                 Err(e) => {
-                    tracing::warn!(target: "session_observer", %service, %container, error = %e, line = %trimmed, "parse conn event");
+                    tracing::warn!(target: "session_observer", %container, error = %e, line = %json, "parse conn event");
                 }
             }
         }

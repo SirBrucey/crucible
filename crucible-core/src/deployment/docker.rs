@@ -49,6 +49,11 @@ pub enum Error {
     TeardownIncomplete(TeardownFailures),
     #[error("unknown service `{0}`")]
     UnknownService(String),
+    #[error(
+        "two services share port {0}; the single-container proxy would need to remap it and \
+         rewrite the consumer's endpoint, which is not wired yet"
+    )]
+    PortCollision(u16),
 }
 
 /// Items teardown could not remove, paired with the daemon's reason.
@@ -160,6 +165,30 @@ impl Docker {
         Ok(now_ns())
     }
 
+    /// Freeze forwarding on the fleet proxy (SIGUSR1) so a fault lands against a
+    /// held flow. One process fronts every service behind a shared pause gate, so
+    /// this freezes all pairs atomically; [`resume_proxies`](Self::resume_proxies)
+    /// releases the held bytes.
+    pub async fn pause_proxies(&self) -> Result<()> {
+        self.signal_proxy("SIGUSR1").await
+    }
+
+    /// Release forwarding on the fleet proxy (SIGUSR2), letting the bytes held
+    /// since [`pause_proxies`](Self::pause_proxies) flow again.
+    pub async fn resume_proxies(&self) -> Result<()> {
+        self.signal_proxy("SIGUSR2").await
+    }
+
+    async fn signal_proxy(&self, signal: &str) -> Result<()> {
+        let options = KillContainerOptionsBuilder::default()
+            .signal(signal)
+            .build();
+        self.client
+            .kill_container(&self.proxy_container_name(), Some(options))
+            .await?;
+        Ok(())
+    }
+
     /// Start the previously-killed backing container and wait for its
     /// healthcheck to report healthy. The caller waits for fleet quiescence
     /// (see `SessionObserver::wait_for_quiescence`) before collecting the
@@ -188,21 +217,16 @@ impl Docker {
     }
 
     pub fn start_session_observer(&self) -> crate::observer::SessionObserver {
-        let sidecars = self
-            .fleet
-            .services
-            .iter()
-            .map(|s| (s.name.to_string(), self.proxy_container_name(s)))
-            .collect();
-        crate::observer::SessionObserver::start(&self.client, sidecars)
+        crate::observer::SessionObserver::start(&self.client, self.proxy_container_name())
     }
 
     fn backing_container_name(&self, service: &Service) -> String {
         format!("{}-{}-{}", self.network, service.name, BACKING_SUFFIX)
     }
 
-    fn proxy_container_name(&self, service: &Service) -> String {
-        format!("{}-{}-{}", self.network, service.name, PROXY_SUFFIX)
+    /// The single proxy container that fronts every service in the fleet.
+    fn proxy_container_name(&self) -> String {
+        format!("{}-{}", self.network, PROXY_SUFFIX)
     }
 
     fn backing_alias(service: &Service) -> String {
@@ -266,27 +290,55 @@ impl Docker {
         Ok(())
     }
 
-    /// Start the sidecar proxy for `service` and return its published host
-    /// endpoint keyed by service name, for the caller to record.
-    async fn start_proxy_for(&self, service: &Service) -> Result<(String, SocketAddr)> {
+    /// Start the single proxy container fronting the whole fleet: one pair per
+    /// service (`service=0.0.0.0:port=service-actual:port`), every service name
+    /// as a network alias, and all ports published to the host. Returns each
+    /// service's published host endpoint. Every pair shares one process-wide
+    /// pause gate, so a single signal freezes the whole fleet atomically.
+    async fn start_proxy(&self) -> Result<Vec<(String, SocketAddr)>> {
         ensure_image(&self.client, PROXY_IMAGE).await?;
 
-        let container_name = self.proxy_container_name(service);
-        let cmd = vec![
-            "--pair".to_string(),
-            format!(
-                "0.0.0.0:{port}={upstream}:{port}",
-                port = service.port,
-                upstream = Self::backing_alias(service)
-            ),
-        ];
-        let exposed_port = format!("{}/tcp", service.port);
+        // The proxy binds one listener per service port. Distinct ports map
+        // through unchanged; a shared port cannot be disambiguated on the single
+        // container IP, so reject it rather than misroute.
+        let mut seen = std::collections::HashSet::new();
+        for service in self.fleet.services {
+            if !seen.insert(service.port) {
+                return Err(Error::PortCollision(service.port));
+            }
+        }
 
+        let container_name = self.proxy_container_name();
+
+        let mut cmd = Vec::with_capacity(self.fleet.services.len() * 2);
+        for service in self.fleet.services {
+            cmd.push("--pair".to_string());
+            cmd.push(format!(
+                "{name}=0.0.0.0:{port}={upstream}:{port}",
+                name = service.name,
+                port = service.port,
+                upstream = Self::backing_alias(service),
+            ));
+        }
+
+        let exposed_ports: Vec<String> = self
+            .fleet
+            .services
+            .iter()
+            .map(|s| format!("{}/tcp", s.port))
+            .collect();
+
+        let aliases: Vec<String> = self
+            .fleet
+            .services
+            .iter()
+            .map(|s| s.name.to_string())
+            .collect();
         let mut endpoints_config = HashMap::new();
         endpoints_config.insert(
             self.network.clone(),
             EndpointSettings {
-                aliases: Some(vec![service.name.to_string()]),
+                aliases: Some(aliases),
                 ..Default::default()
             },
         );
@@ -294,7 +346,7 @@ impl Docker {
         let config = ContainerCreateBody {
             image: Some(PROXY_IMAGE.to_string()),
             cmd: Some(cmd),
-            exposed_ports: Some(vec![exposed_port]),
+            exposed_ports: Some(exposed_ports),
             host_config: Some(HostConfig {
                 publish_all_ports: Some(true),
                 ..Default::default()
@@ -320,11 +372,15 @@ impl Docker {
             .start_container(&container_name, None::<StartContainerOptions>)
             .await?;
 
-        let host_port = published_port(&self.client, &container_name, service.port).await?;
-        Ok((
-            service.name.to_string(),
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), host_port),
-        ))
+        let mut endpoints = Vec::with_capacity(self.fleet.services.len());
+        for service in self.fleet.services {
+            let host_port = published_port(&self.client, &container_name, service.port).await?;
+            endpoints.push((
+                service.name.to_string(),
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), host_port),
+            ));
+        }
+        Ok(endpoints)
     }
 }
 
@@ -341,42 +397,47 @@ impl Deployment for Docker {
             })
             .await?;
 
-        // Bring every service (backing + its proxy) up concurrently; they wire
-        // to each other lazily at runtime, so create order does not matter.
+        // Bring up every backing container concurrently, then the one proxy that
+        // fronts the whole fleet. The proxy resolves its upstreams lazily, so the
+        // backings need not be ready first.
         let docker = &*self;
-        let endpoints = futures_util::future::try_join_all(docker.fleet.services.iter().map(
-            |service| async move {
-                docker.start_service(service).await?;
-                docker.start_proxy_for(service).await
-            },
-        ))
+        futures_util::future::try_join_all(
+            docker
+                .fleet
+                .services
+                .iter()
+                .map(|s| docker.start_service(s)),
+        )
         .await?;
+        let endpoints = docker.start_proxy().await?;
         self.endpoints.extend(endpoints);
         Ok(())
     }
 
     async fn wait_ready(&self) -> Result<()> {
-        let probes = self
+        let mut names: Vec<String> = self
             .fleet
             .services
             .iter()
-            .flat_map(|s| [self.backing_container_name(s), self.proxy_container_name(s)])
-            .map(|container_name| async move {
-                let start = tokio::time::Instant::now();
-                loop {
-                    if start.elapsed() >= READINESS_TIMEOUT {
-                        return Err(Error::ReadinessTimeout {
-                            name: container_name,
-                            addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
-                            timeout: READINESS_TIMEOUT,
-                        });
-                    }
-                    if container_ready(&self.client, &container_name).await? {
-                        return Ok(());
-                    }
-                    sleep(READINESS_POLL).await;
+            .map(|s| self.backing_container_name(s))
+            .collect();
+        names.push(self.proxy_container_name());
+        let probes = names.into_iter().map(|container_name| async move {
+            let start = tokio::time::Instant::now();
+            loop {
+                if start.elapsed() >= READINESS_TIMEOUT {
+                    return Err(Error::ReadinessTimeout {
+                        name: container_name,
+                        addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+                        timeout: READINESS_TIMEOUT,
+                    });
                 }
-            });
+                if container_ready(&self.client, &container_name).await? {
+                    return Ok(());
+                }
+                sleep(READINESS_POLL).await;
+            }
+        });
         futures_util::future::try_join_all(probes).await?;
         Ok(())
     }
@@ -384,12 +445,13 @@ impl Deployment for Docker {
     async fn teardown(&mut self) -> Result<()> {
         let opts = RemoveContainerOptionsBuilder::default().force(true).build();
         let mut failures = TeardownFailures::new();
-        let names: Vec<String> = self
+        let mut names: Vec<String> = self
             .fleet
             .services
             .iter()
-            .flat_map(|s| [self.backing_container_name(s), self.proxy_container_name(s)])
+            .map(|s| self.backing_container_name(s))
             .collect();
+        names.push(self.proxy_container_name());
         let removals = futures_util::future::join_all(names.into_iter().map(|name| {
             let client = &self.client;
             let opts = opts.clone();
@@ -537,6 +599,8 @@ mod tests {
         assert_eq!(failures.to_string(), "container `api`: boom");
     }
 
+    // Distinct ports: the single proxy container binds one listener per service
+    // port, so two services must not share one (see `Error::PortCollision`).
     const LIFECYCLE_TEST_FLEET: Fleet = Fleet {
         services: &[
             Service {
@@ -547,9 +611,9 @@ mod tests {
                 healthcheck: &[],
             },
             Service {
-                name: "web-b",
-                image: "nginx:alpine",
-                port: 80,
+                name: "cache-b",
+                image: "redis:alpine",
+                port: 6379,
                 env: &[],
                 healthcheck: &[],
             },

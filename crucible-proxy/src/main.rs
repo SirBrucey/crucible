@@ -44,9 +44,16 @@ async fn main() -> Result<()> {
     spawn_pause_control(pause_tx);
 
     for spec in cli.pairs {
-        let (listen_str, upstream_str) = spec
-            .split_once('=')
-            .ok_or_else(|| Error::MalformedPair { pair: spec.clone() })?;
+        // `SERVICE=LISTEN=UPSTREAM`. One process fronts the whole fleet, so every
+        // pair tags its events with its service; the runner attributes the
+        // interleaved stream by that tag.
+        let mut parts = spec.splitn(3, '=');
+        let (Some(service), Some(listen_str), Some(upstream_str)) =
+            (parts.next(), parts.next(), parts.next())
+        else {
+            return Err(Error::MalformedPair { pair: spec.clone() });
+        };
+        let service = service.to_string();
         let listen: SocketAddr = listen_str.parse().map_err(|source| Error::ParseListen {
             addr: listen_str.to_string(),
             source,
@@ -60,7 +67,7 @@ async fn main() -> Result<()> {
                 })?;
         let (proxy, _local_addr, mut events) =
             Proxy::bind(listen, upstream, pause_rx.clone()).await?;
-        tracing::info!(%listen, %upstream, "proxy pair up");
+        tracing::info!(%service, %listen, %upstream, "proxy pair up");
 
         tokio::spawn(async move {
             if let Err(e) = proxy.run().await {
@@ -71,7 +78,7 @@ async fn main() -> Result<()> {
             while let Some(event) = events.recv().await {
                 match serde_json::to_string(&event) {
                     Ok(line) => {
-                        println!("{line}");
+                        println!("{service}\t{line}");
                         let _ = std::io::stdout().flush();
                     }
                     Err(e) => tracing::error!(?e, "serialize conn event"),
