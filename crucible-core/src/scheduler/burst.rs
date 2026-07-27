@@ -1,64 +1,61 @@
-//! Burst scheduler: N×T grid where N is a service's work burst and T is a
-//! sample within it.
+//! Burst scheduler: for each work burst it observed, emit `SAMPLES_PER_BURST`
+//! evenly-spaced kill offsets. The schedule count is decoupled from the run
+//! budget (the runner caps wall-clock, see `crucible/src/main.rs`); schedules
+//! are emitted round-robin across bursts so a budget-truncated campaign still
+//! samples every burst evenly rather than exhausting one service and never
+//! reaching another.
 
-use std::{collections::BTreeMap, time::Duration};
+use std::collections::BTreeMap;
 
 use crucible_protocol::{HISTOGRAM_BIN_NS, ServiceProfile};
 
 use super::{Schedule, Scheduler};
 
 const BURST_BYTE_THRESHOLD: u64 = 64;
-const MIN_SAMPLES_PER_BURST: usize = 3;
+const SAMPLES_PER_BURST: usize = 5;
 
 pub struct BurstScheduler {
+    total: usize,
     schedules: std::vec::IntoIter<Schedule>,
 }
 
 impl BurstScheduler {
     /// Build schedules from per-service byte-over-time profiles produced by
     /// Learn. Bins above `BURST_BYTE_THRESHOLD` are clustered into contiguous
-    /// bursts; each burst gets at least `MIN_SAMPLES_PER_BURST` schedules,
-    /// bounded by the budget/cost ratio.
-    pub fn new(profiles: &[ServiceProfile], run_cost: Duration, total_budget: Duration) -> Self {
-        if profiles.is_empty() {
-            return Self {
-                schedules: Vec::new().into_iter(),
-            };
-        }
-        let bursts_per_service = detect_bursts(profiles);
-        if bursts_per_service.is_empty() {
-            return Self {
-                schedules: Vec::new().into_iter(),
-            };
-        }
-        let total_bursts: usize = bursts_per_service.values().map(Vec::len).sum();
-        let budget_ns = total_budget.as_nanos();
-        let cost_ns = run_cost.as_nanos().max(1);
-        let total_schedules =
-            usize::try_from((budget_ns / cost_ns).max(1)).expect("total schedules fits usize");
-        let raw_per_burst = total_schedules.saturating_div(total_bursts.max(1));
-        let t_per_burst = raw_per_burst.max(MIN_SAMPLES_PER_BURST);
+    /// bursts; each burst gets `SAMPLES_PER_BURST` evenly-spaced kill offsets.
+    pub fn new(profiles: &[ServiceProfile]) -> Self {
+        // Flatten to (service, burst) in a stable order (BTreeMap sorts by
+        // service) so round-robin emission is deterministic.
+        let bursts: Vec<(String, Burst)> = detect_bursts(profiles)
+            .into_iter()
+            .flat_map(|(service, bursts)| bursts.into_iter().map(move |b| (service.clone(), b)))
+            .collect();
 
-        let mut schedules: Vec<Schedule> = Vec::new();
+        let mut schedules: Vec<Schedule> = Vec::with_capacity(bursts.len() * SAMPLES_PER_BURST);
         let mut next_id: u32 = 0;
-        for (service, bursts) in bursts_per_service {
-            for burst in bursts {
+        for sample in 0..SAMPLES_PER_BURST {
+            for (service, burst) in &bursts {
                 let duration = burst.end_ns.saturating_sub(burst.start_ns).max(1);
-                for i in 0..t_per_burst {
-                    let offset = burst.start_ns + duration * i as u128 / t_per_burst as u128;
-                    schedules.push(Schedule {
-                        schedule_id: next_id,
-                        service: service.clone(),
-                        fault_offset_ns: offset,
-                        payload: Vec::new(),
-                    });
-                    next_id += 1;
-                }
+                let offset = burst.start_ns + duration * sample as u128 / SAMPLES_PER_BURST as u128;
+                schedules.push(Schedule {
+                    schedule_id: next_id,
+                    service: service.clone(),
+                    fault_offset_ns: offset,
+                    payload: Vec::new(),
+                });
+                next_id += 1;
             }
         }
         Self {
+            total: schedules.len(),
             schedules: schedules.into_iter(),
         }
+    }
+
+    /// Total schedules generated, for coverage reporting against how many the
+    /// runner actually dispatched within its wall-clock budget.
+    pub fn total(&self) -> usize {
+        self.total
     }
 }
 
@@ -124,53 +121,53 @@ mod tests {
 
     #[test]
     fn empty_profiles_yield_nothing() {
-        let mut s = BurstScheduler::new(&[], Duration::from_millis(10), Duration::from_millis(100));
+        let mut s = BurstScheduler::new(&[]);
+        assert_eq!(s.total(), 0);
         assert!(s.next().is_none());
     }
 
     #[test]
-    fn single_burst_becomes_min_samples() {
+    fn single_burst_gets_samples_per_burst() {
         // One 10ms bin above threshold.
-        let profiles = vec![profile("db", vec![(10, 500)])];
-        let scheduler = BurstScheduler::new(
-            &profiles,
-            Duration::from_millis(10),
-            Duration::from_millis(10),
-        );
+        let scheduler = BurstScheduler::new(&[profile("db", vec![(10, 500)])]);
+        assert_eq!(scheduler.total(), SAMPLES_PER_BURST);
         let all: Vec<_> = std::iter::from_fn({
             let mut s = scheduler;
             move || s.next()
         })
         .collect();
-        assert_eq!(all.len(), MIN_SAMPLES_PER_BURST);
-        for schedule in &all {
-            assert_eq!(schedule.service, "db");
-        }
+        assert_eq!(all.len(), SAMPLES_PER_BURST);
+        assert!(all.iter().all(|s| s.service == "db"));
     }
 
     #[test]
     fn silent_bin_splits_bursts() {
-        let profiles = vec![profile("db", vec![(10, 500), (20, 500)])];
-        let count = std::iter::from_fn({
-            let mut s = BurstScheduler::new(
-                &profiles,
-                Duration::from_millis(10),
-                Duration::from_millis(60),
-            );
-            move || s.next()
-        })
-        .count();
-        assert_eq!(count, MIN_SAMPLES_PER_BURST * 2);
+        let scheduler = BurstScheduler::new(&[profile("db", vec![(10, 500), (20, 500)])]);
+        assert_eq!(scheduler.total(), SAMPLES_PER_BURST * 2);
     }
 
     #[test]
     fn below_threshold_bins_ignored() {
-        let profiles = vec![profile("db", vec![(10, 5)])];
-        let mut s = BurstScheduler::new(
-            &profiles,
-            Duration::from_millis(10),
-            Duration::from_millis(30),
-        );
+        let mut s = BurstScheduler::new(&[profile("db", vec![(10, 5)])]);
         assert!(s.next().is_none());
+    }
+
+    #[test]
+    fn emission_is_round_robin_across_bursts() {
+        // Two services, one burst each: the first two schedules should cover
+        // both services, so a truncated campaign samples both.
+        let scheduler = BurstScheduler::new(&[
+            profile("api", vec![(10, 500)]),
+            profile("db", vec![(10, 500)]),
+        ]);
+        let first_two: Vec<_> = std::iter::from_fn({
+            let mut s = scheduler;
+            move || s.next()
+        })
+        .take(2)
+        .map(|s| s.service)
+        .collect();
+        assert!(first_two.contains(&"api".to_string()));
+        assert!(first_two.contains(&"db".to_string()));
     }
 }
