@@ -133,6 +133,17 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn roundtrips_run_result_with_fail_reason() {
+        roundtrip(WorkerToRunner::RunResult {
+            schedule_id: 7,
+            verdict: Verdict::Fail {
+                reason: "acked order 3 (book x4) is absent from persisted state after heal".into(),
+            },
+        })
+        .await;
+    }
+
+    #[tokio::test]
     async fn roundtrips_event_log() {
         roundtrip(WorkerToRunner::Event(WorkerEvent::Log("hello".into()))).await;
     }

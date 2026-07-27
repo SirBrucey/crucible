@@ -202,7 +202,7 @@ impl Worker<Executing> {
             &mut self.stream,
             &WorkerToRunner::RunResult {
                 schedule_id,
-                verdict,
+                verdict: verdict.clone(),
             },
         )
         .await?;
