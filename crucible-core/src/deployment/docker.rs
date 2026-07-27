@@ -128,6 +128,16 @@ impl Docker {
         &self.network
     }
 
+    /// Reclaim, by worker id alone, any fleet a worker left behind. The runner
+    /// calls this after force-killing a worker so a replica the worker never got
+    /// to tear down does not leak. It needs no live worker state (container and
+    /// network names are derived from the id), and is a no-op once the fleet is
+    /// already gone.
+    pub async fn reclaim(worker_id: u32, fleet: &'static Fleet) -> Result<()> {
+        let mut docker = Self::new(worker_id, fleet)?;
+        docker.teardown().await
+    }
+
     fn service_by_name(&self, name: &str) -> Result<&'static Service> {
         self.fleet
             .services
