@@ -201,9 +201,10 @@ impl Outcomes {
     /// Record a worker that never produced a verdict. `schedule_id` is `None`
     /// only when the task panicked before it could report which schedule it ran.
     fn record_error(&mut self, schedule_id: Option<u32>, error: impl std::fmt::Display) {
-        match schedule_id {
-            Some(schedule_id) => tracing::warn!(schedule_id, %error, "schedule failed"),
-            None => tracing::warn!(%error, "schedule task panicked"),
+        if let Some(schedule_id) = schedule_id {
+            tracing::warn!(schedule_id, %error, "schedule failed");
+        } else {
+            tracing::warn!(%error, "schedule task panicked");
         }
         self.errored += 1;
     }
