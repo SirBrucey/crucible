@@ -5,7 +5,7 @@ use std::{
     net::SocketAddr,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     },
 };
 
@@ -13,22 +13,103 @@ use crucible_protocol::{ConnEvent, ConnId, Direction};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    sync::mpsc,
+    sync::{mpsc, watch},
 };
+
+/// The fault anchor for a pair: once `k` packets have been forwarded on
+/// `direction` (counted across all this pair's connections), trip the shared
+/// pause gate so the whole fleet freezes at exactly that packet.
+///
+/// Dormant until [`arm`](Self::arm), so it counts only scenario traffic, not the
+/// fleet's own bring-up handshakes. The runner arms it once the scenario starts,
+/// which resets the count to zero; that shared origin is what makes the count
+/// match the scenario-relative one the learn pass measured.
+#[derive(Clone)]
+pub struct Anchor {
+    direction: Direction,
+    k: u32,
+    count: Arc<AtomicU32>,
+    active: Arc<AtomicBool>,
+    tripwire: watch::Sender<bool>,
+}
+
+impl Anchor {
+    pub fn new(direction: Direction, k: u32, tripwire: watch::Sender<bool>) -> Self {
+        Self {
+            direction,
+            k,
+            count: Arc::new(AtomicU32::new(0)),
+            active: Arc::new(AtomicBool::new(false)),
+            tripwire,
+        }
+    }
+
+    /// Arm at scenario start: reset the count and begin counting. `k == 0`
+    /// (freeze before the first scenario packet) freezes right away, now that
+    /// the fleet is up rather than mid-bring-up.
+    pub fn arm(&self) {
+        self.count.store(0, Ordering::SeqCst);
+        self.active.store(true, Ordering::SeqCst);
+        if self.k == 0 {
+            // FIXME: propagate once arm can report failure. The pause watch keeps
+            // a receiver for the whole process (main holds one), so this cannot
+            // fail; a silent failure would leave the gate unset and the fleet
+            // never frozen, so assert rather than drop it.
+            self.tripwire
+                .send(true)
+                .expect("pause watch has a live receiver");
+        }
+    }
+
+    /// Count one forwarded packet; freeze the fleet on the one that reaches `k`.
+    /// A no-op until armed, so bring-up traffic is not counted. Returns whether
+    /// this call tripped the freeze, so the caller can announce it.
+    fn record(&self) -> bool {
+        if !self.active.load(Ordering::SeqCst) {
+            return false;
+        }
+        let crossed = self.count.fetch_add(1, Ordering::SeqCst) + 1;
+        if crossed == self.k {
+            // FIXME: as in arm(); this cannot fail while the pause watch has a
+            // receiver. Dropping it silently would leave the fleet unfrozen while
+            // record still reports the trip, reopening the kill-before-freeze race.
+            self.tripwire
+                .send(true)
+                .expect("pause watch has a live receiver");
+            return true;
+        }
+        false
+    }
+
+    /// Disarm: stop counting so the anchor cannot trip again. Paired with resume
+    /// on the give-up paths (the scenario ended, or the anchor timed out, before
+    /// `k` was reached), so a late packet cannot re-trip the gate after the flow
+    /// has been released with no one left to release it again.
+    pub fn disarm(&self) {
+        self.active.store(false, Ordering::SeqCst);
+    }
+}
 
 pub struct Proxy {
     listener: TcpListener,
     upstream: SocketAddr,
     events_tx: mpsc::UnboundedSender<ConnEvent>,
     next_id: Arc<AtomicU64>,
+    pause: watch::Receiver<bool>,
+    anchor: Option<Anchor>,
 }
 
 impl Proxy {
     /// Bind to `listen` and prepare to forward every accepted connection to `upstream`.
+    /// `pause` gates forwarding: while it holds `true`, every connection holds its
+    /// bytes (delivering none) until it flips back to `false`. `anchor`, if set,
+    /// freezes the fleet once this pair has forwarded `k` packets on its direction.
     /// Returns the proxy, its bound local address, and the receiver for connection events.
     pub async fn bind(
         listen: SocketAddr,
         upstream: SocketAddr,
+        pause: watch::Receiver<bool>,
+        anchor: Option<Anchor>,
     ) -> io::Result<(Self, SocketAddr, mpsc::UnboundedReceiver<ConnEvent>)> {
         let listener = TcpListener::bind(listen).await?;
         let local_addr = listener.local_addr()?;
@@ -38,6 +119,8 @@ impl Proxy {
             upstream,
             events_tx,
             next_id: Arc::new(AtomicU64::new(0)),
+            pause,
+            anchor,
         };
         Ok((proxy, local_addr, events_rx))
     }
@@ -53,9 +136,32 @@ impl Proxy {
                 peer,
                 self.upstream,
                 self.events_tx.clone(),
+                self.pause.clone(),
+                self.anchor.clone(),
             ));
         }
     }
+}
+
+/// Block while the pause gate holds `true`, returning as soon as it is `false`
+/// (or the sender is dropped, so forwarding never wedges if control goes away).
+async fn wait_while_paused(pause: &mut watch::Receiver<bool>) {
+    while *pause.borrow() {
+        if pause.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
+/// Send a connection event to the drain task in `main`, which holds the receiver
+/// for as long as any forward task (or the accept loop) holds a sender.
+// FIXME: propagate this for real recovery once the forward tasks report failures
+// upward; a send failure means the drain task died unexpectedly, so until then
+// assert that invariant rather than drop the event silently.
+fn emit(events: &mpsc::UnboundedSender<ConnEvent>, event: ConnEvent) {
+    events
+        .send(event)
+        .expect("event drain outlives the forward tasks");
 }
 
 async fn forward(
@@ -64,24 +170,32 @@ async fn forward(
     peer: SocketAddr,
     upstream: SocketAddr,
     events_tx: mpsc::UnboundedSender<ConnEvent>,
+    pause: watch::Receiver<bool>,
+    anchor: Option<Anchor>,
 ) {
     let upstream_conn = match TcpStream::connect(upstream).await {
         Ok(s) => s,
         Err(e) => {
-            let _ = events_tx.send(ConnEvent::failed(
-                id,
-                format!("dial upstream {upstream}: {e}"),
-            ));
+            emit(
+                &events_tx,
+                ConnEvent::failed(id, format!("dial upstream {upstream}: {e}")),
+            );
             return;
         }
     };
 
-    let _ = events_tx.send(ConnEvent::opened(id, peer));
+    emit(&events_tx, ConnEvent::opened(id, peer));
 
     let (mut client_r, mut client_w) = client.into_split();
     let (mut upstream_r, mut upstream_w) = upstream_conn.into_split();
 
+    let anchor_c2u = anchor
+        .clone()
+        .filter(|a| a.direction == Direction::ClientToUpstream);
+    let anchor_u2c = anchor.filter(|a| a.direction == Direction::UpstreamToClient);
+
     let events_tx_c2u = events_tx.clone();
+    let mut pause_c2u = pause.clone();
     let c2u = tokio::spawn(async move {
         let mut bytes_total: u64 = 0;
         let mut buf = vec![0u8; 4096];
@@ -91,15 +205,25 @@ async fn forward(
                 Ok(n) => n,
                 Err(e) => break Err(format!("client_read: {e}")),
             };
-            let _ = events_tx_c2u.send(ConnEvent::wrote(id, Direction::ClientToUpstream, n as u64));
+            emit(
+                &events_tx_c2u,
+                ConnEvent::wrote(id, Direction::ClientToUpstream, n as u64),
+            );
+            wait_while_paused(&mut pause_c2u).await;
             if let Err(e) = upstream_w.write_all(&buf[..n]).await {
                 break Err(format!("upstream_write: {e}"));
             }
             bytes_total += n as u64;
+            if let Some(anchor) = &anchor_c2u
+                && anchor.record()
+            {
+                emit(&events_tx_c2u, ConnEvent::froze(id, anchor.k));
+            }
         }
     });
 
     let events_tx_u2c = events_tx.clone();
+    let mut pause_u2c = pause;
     let u2c = tokio::spawn(async move {
         let mut bytes_total: u64 = 0;
         let mut buf = vec![0u8; 4096];
@@ -109,11 +233,20 @@ async fn forward(
                 Ok(n) => n,
                 Err(e) => break Err(format!("upstream_read: {e}")),
             };
-            let _ = events_tx_u2c.send(ConnEvent::wrote(id, Direction::UpstreamToClient, n as u64));
+            emit(
+                &events_tx_u2c,
+                ConnEvent::wrote(id, Direction::UpstreamToClient, n as u64),
+            );
+            wait_while_paused(&mut pause_u2c).await;
             if let Err(e) = client_w.write_all(&buf[..n]).await {
                 break Err(format!("client_write: {e}"));
             }
             bytes_total += n as u64;
+            if let Some(anchor) = &anchor_u2c
+                && anchor.record()
+            {
+                emit(&events_tx_u2c, ConnEvent::froze(id, anchor.k));
+            }
         }
     });
 
@@ -125,7 +258,7 @@ async fn forward(
         (Ok(up), Ok(down)) => ConnEvent::closed(id, up, down),
         (Err(e), _) | (_, Err(e)) => ConnEvent::failed(id, format!("forwarding: {e}")),
     };
-    let _ = events_tx.send(event);
+    emit(&events_tx, event);
 }
 
 #[cfg(test)]
@@ -140,6 +273,11 @@ mod tests {
     };
 
     use super::*;
+
+    /// A pause receiver that never pauses, for tests that do not exercise the gate.
+    fn never_paused() -> watch::Receiver<bool> {
+        watch::channel(false).1
+    }
 
     async fn spawn_echo() -> SocketAddr {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
@@ -172,9 +310,10 @@ mod tests {
     #[tokio::test]
     async fn two_concurrent_connections_round_trip_and_emit_distinct_events() {
         let echo = spawn_echo().await;
-        let (proxy, proxy_addr, mut events) = Proxy::bind((Ipv4Addr::LOCALHOST, 0).into(), echo)
-            .await
-            .unwrap();
+        let (proxy, proxy_addr, mut events) =
+            Proxy::bind((Ipv4Addr::LOCALHOST, 0).into(), echo, never_paused(), None)
+                .await
+                .unwrap();
         tokio::spawn(proxy.run());
 
         let mut a = TcpStream::connect(proxy_addr).await.unwrap();
@@ -217,6 +356,7 @@ mod tests {
                     );
                 }
                 ConnEventKind::Failed { reason } => panic!("unexpected Failed: {reason}"),
+                ConnEventKind::Froze { k } => panic!("unexpected Froze without an anchor: k={k}"),
             }
         }
 
@@ -232,14 +372,171 @@ mod tests {
             let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
             listener.local_addr().unwrap()
         };
-        let (proxy, proxy_addr, mut events) = Proxy::bind((Ipv4Addr::LOCALHOST, 0).into(), unused)
-            .await
-            .unwrap();
+        let (proxy, proxy_addr, mut events) = Proxy::bind(
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            unused,
+            never_paused(),
+            None,
+        )
+        .await
+        .unwrap();
         tokio::spawn(proxy.run());
 
         let _client = TcpStream::connect(proxy_addr).await.unwrap();
 
         let event = recv(&mut events).await;
         assert!(matches!(event.kind, ConnEventKind::Failed { .. }));
+    }
+
+    #[tokio::test]
+    async fn paused_proxy_holds_bytes_until_resumed() {
+        let echo = spawn_echo().await;
+        let (pause_tx, pause_rx) = watch::channel(false);
+        let (proxy, proxy_addr, _events) =
+            Proxy::bind((Ipv4Addr::LOCALHOST, 0).into(), echo, pause_rx, None)
+                .await
+                .unwrap();
+        tokio::spawn(proxy.run());
+
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+
+        // Pause, then send: the proxy reads the bytes but must hold them, so the
+        // echo upstream never sees them and nothing comes back.
+        pause_tx.send(true).unwrap();
+        client.write_all(b"ping").await.unwrap();
+        let mut buf = [0u8; 4];
+        let held = timeout(Duration::from_millis(300), client.read_exact(&mut buf)).await;
+        assert!(held.is_err(), "bytes should be held while paused");
+
+        // Resume: the held bytes flow, echo replies, and the round trip completes.
+        pause_tx.send(false).unwrap();
+        timeout(Duration::from_secs(2), client.read_exact(&mut buf))
+            .await
+            .expect("echo within 2s after resume")
+            .expect("read succeeds");
+        assert_eq!(&buf, b"ping");
+    }
+
+    #[test]
+    fn a_dormant_anchor_does_not_count() {
+        // Before arm, record is a no-op, so the fleet's bring-up traffic never
+        // moves the counter or trips the gate.
+        let (tx, rx) = watch::channel(false);
+        let anchor = Anchor::new(Direction::ClientToUpstream, 1, tx);
+        assert!(!anchor.record(), "an unarmed record must not trip");
+        assert!(!*rx.borrow(), "gate stays open while dormant");
+        anchor.arm();
+        assert!(
+            anchor.record(),
+            "the first armed packet reaches k=1 and trips"
+        );
+        assert!(*rx.borrow(), "gate tripped once armed");
+    }
+
+    #[test]
+    fn a_zero_k_anchor_trips_on_arm() {
+        // k=0 means freeze before the first scenario packet, so arming (after
+        // bring-up) trips the gate immediately.
+        let (tx, rx) = watch::channel(false);
+        let anchor = Anchor::new(Direction::ClientToUpstream, 0, tx);
+        assert!(!*rx.borrow(), "not tripped before arm");
+        anchor.arm();
+        assert!(*rx.borrow(), "k=0 trips the gate on arm");
+    }
+
+    #[test]
+    fn a_disarmed_anchor_does_not_refreeze() {
+        // On a give-up path the runner releases the gate but the anchor stays
+        // armed; a trailing packet that reaches k must not trip it again (there
+        // would be no one left to resume). Disarming makes each arm a one-shot.
+        let (tx, rx) = watch::channel(false);
+        let anchor = Anchor::new(Direction::ClientToUpstream, 2, tx);
+        anchor.arm();
+        anchor.record(); // count 1, below k
+        assert!(!*rx.borrow(), "must not trip below k");
+        anchor.disarm();
+        anchor.record(); // would be count 2 == k, but disarmed
+        anchor.record();
+        assert!(!*rx.borrow(), "a disarmed anchor must not re-trip the gate");
+    }
+
+    #[tokio::test]
+    async fn anchor_emits_a_froze_event_when_it_trips() {
+        let echo = spawn_echo().await;
+        let (pause_tx, pause_rx) = watch::channel(false);
+        let anchor = Anchor::new(Direction::ClientToUpstream, 2, pause_tx);
+        let (proxy, proxy_addr, mut events) = Proxy::bind(
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            echo,
+            pause_rx,
+            Some(anchor.clone()),
+        )
+        .await
+        .unwrap();
+        tokio::spawn(proxy.run());
+        anchor.arm();
+
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+        // First packet is below K; forwarded and echoed normally.
+        client.write_all(b"a").await.unwrap();
+        let mut buf = [0u8; 1];
+        client.read_exact(&mut buf).await.unwrap();
+        // Second packet reaches K=2 and trips the anchor.
+        client.write_all(b"b").await.unwrap();
+
+        // The proxy must announce the freeze with a Froze event carrying k.
+        let k = loop {
+            let event = recv(&mut events).await;
+            if let ConnEventKind::Froze { k } = event.kind {
+                break k;
+            }
+        };
+        assert_eq!(k, 2);
+    }
+
+    #[tokio::test]
+    async fn anchor_trips_the_gate_after_k_packets() {
+        let echo = spawn_echo().await;
+        let (pause_tx, mut pause_rx) = watch::channel(false);
+        let anchor = Anchor::new(Direction::ClientToUpstream, 2, pause_tx);
+        let (proxy, proxy_addr, _events) = Proxy::bind(
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            echo,
+            pause_rx.clone(),
+            Some(anchor.clone()),
+        )
+        .await
+        .unwrap();
+        tokio::spawn(proxy.run());
+        // Arm at "scenario start"; before this the anchor is dormant.
+        anchor.arm();
+
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+
+        // First client->upstream packet: below the anchor, still forwarding.
+        client.write_all(b"a").await.unwrap();
+        let mut buf = [0u8; 1];
+        timeout(Duration::from_secs(2), client.read_exact(&mut buf))
+            .await
+            .expect("first packet echoes back")
+            .expect("read succeeds");
+        assert!(
+            !*pause_rx.borrow_and_update(),
+            "gate not tripped after one packet"
+        );
+
+        // Second client->upstream packet reaches K=2 and trips the shared gate.
+        client.write_all(b"b").await.unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if *pause_rx.borrow_and_update() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "anchor should have tripped the gate by K=2"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
     }
 }

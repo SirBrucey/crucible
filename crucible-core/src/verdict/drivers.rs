@@ -138,7 +138,8 @@ mod tests {
             schedule_id: 0,
             service: "db".into(),
             result: KillResult::Fired {
-                requested_offset_ns: 0,
+                requested_direction: crucible_protocol::Direction::ClientToUpstream,
+                requested_packet_index: 1,
                 actual_offset_ns: 0,
                 killed_at_ns: 0,
             },
@@ -204,7 +205,7 @@ mod tests {
             schedule_id: 0,
             service: "db".into(),
             result: KillResult::Missed(
-                crucible_protocol::KillMissReason::ScenarioEndedBeforeOffset,
+                crucible_protocol::KillMissReason::ScenarioEndedBeforeAnchor,
             ),
         });
         obs.db_state = Some(DbState::default());

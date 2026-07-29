@@ -1,4 +1,4 @@
-pub use crucible_protocol::{KillReport, ServiceProfile, Session};
+pub use crucible_protocol::{Direction, KillReport, ServiceProfile, Session};
 
 /// Messages passed from one of the worker processes to the main runner.
 #[derive(Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -19,8 +19,8 @@ pub enum WorkerToRunner {
         /// Outcome of the run, carrying the driver's explanation.
         verdict: Verdict,
     },
-    /// Worker returns per-service byte-over-time histograms derived from the
-    /// Learn run's observed sidecar traffic, already scenario-relative.
+    /// Worker returns the per-service fault anchors the Learn run derived from
+    /// its observed traffic, already scenario-relative.
     SessionCatalogue { services: Vec<ServiceProfile> },
     /// Worker emits an observational event for the runner to record.
     Event(WorkerEvent),
@@ -65,8 +65,10 @@ pub enum RunnerToWorker {
         schedule_id: u32,
         /// Target service for the kill fault.
         service: String,
-        /// Nanoseconds from scenario start when the kill should fire.
-        fault_offset_ns: u128,
+        /// Direction whose packets the anchor counts.
+        direction: Direction,
+        /// Freeze and kill once this many packets have crossed on `direction`.
+        fault_packet_index: u32,
         /// Serialized schedule spec.
         #[serde(with = "base64_bytes")]
         payload: Vec<u8>,

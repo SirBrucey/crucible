@@ -4,7 +4,7 @@ pub mod db;
 pub mod session;
 
 pub use db::DbObserver;
-pub use session::SessionObserver;
+pub use session::{EventIndex, SessionObserver};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

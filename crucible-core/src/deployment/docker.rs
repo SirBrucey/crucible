@@ -17,12 +17,21 @@ use bollard::{
         RemoveContainerOptionsBuilder, StartContainerOptions,
     },
 };
-use crucible_protocol::now_ns;
+use crucible_protocol::{Direction, now_ns};
 use futures_util::TryStreamExt;
 use tokio::time::sleep;
 
 use super::Deployment;
 use crate::fleet::{Fleet, Service};
+
+/// A fault anchor to arm the proxy with at fleet startup: freeze the fleet once
+/// `service` has forwarded `k` packets on `direction`. Passed on the proxy
+/// command line so it counts in-process, with no runtime control channel.
+pub struct ProxyAnchor {
+    pub service: String,
+    pub direction: Direction,
+    pub k: u32,
+}
 
 const READINESS_TIMEOUT: Duration = Duration::from_mins(1);
 const READINESS_POLL: Duration = Duration::from_millis(500);
@@ -49,6 +58,11 @@ pub enum Error {
     TeardownIncomplete(TeardownFailures),
     #[error("unknown service `{0}`")]
     UnknownService(String),
+    #[error(
+        "two services share port {0}; the single-container proxy would need to remap it and \
+         rewrite the consumer's endpoint, which is not wired yet"
+    )]
+    PortCollision(u16),
 }
 
 /// Items teardown could not remove, paired with the daemon's reason.
@@ -111,16 +125,18 @@ pub struct Docker {
     network: String,
     fleet: &'static Fleet,
     endpoints: HashMap<String, SocketAddr>,
+    anchor: Option<ProxyAnchor>,
 }
 
 impl Docker {
-    pub fn new(worker_id: u32, fleet: &'static Fleet) -> Result<Self> {
+    pub fn new(worker_id: u32, fleet: &'static Fleet, anchor: Option<ProxyAnchor>) -> Result<Self> {
         let client = DockerClient::connect_with_socket_defaults()?;
         Ok(Self {
             client,
             network: format!("crucible-{worker_id}"),
             fleet,
             endpoints: HashMap::new(),
+            anchor,
         })
     }
 
@@ -134,7 +150,7 @@ impl Docker {
     /// network names are derived from the id), and is a no-op once the fleet is
     /// already gone.
     pub async fn reclaim(worker_id: u32, fleet: &'static Fleet) -> Result<()> {
-        let mut docker = Self::new(worker_id, fleet)?;
+        let mut docker = Self::new(worker_id, fleet, None)?;
         docker.teardown().await
     }
 
@@ -146,69 +162,38 @@ impl Docker {
             .ok_or_else(|| Error::UnknownService(name.to_string()))
     }
 
-    /// SIGKILL the service's backing container. Returns the wall-clock
-    /// nanoseconds since the Unix epoch of the moment bollard's kill returned.
-    pub async fn kill_service(&self, name: &str) -> Result<u128> {
-        let service = self.service_by_name(name)?;
-        let container = self.backing_container_name(service);
+    async fn signal_proxy(&self, signal: &str) -> Result<()> {
         let options = KillContainerOptionsBuilder::default()
-            .signal("SIGKILL")
+            .signal(signal)
             .build();
         self.client
-            .kill_container(&container, Some(options))
+            .kill_container(&self.proxy_container_name(), Some(options))
             .await?;
-        Ok(now_ns())
-    }
-
-    /// Start the previously-killed backing container and wait for its
-    /// healthcheck to report healthy. The caller waits for fleet quiescence
-    /// (see `SessionObserver::wait_for_quiescence`) before collecting the
-    /// verdict. Returns wall-clock nanoseconds when the service was ready.
-    pub async fn restart_service(&self, name: &str) -> Result<u128> {
-        let service = self.service_by_name(name)?;
-        let container = self.backing_container_name(service);
-        self.client
-            .start_container(&container, None::<StartContainerOptions>)
-            .await?;
-        let deadline = tokio::time::Instant::now() + READINESS_TIMEOUT;
-        loop {
-            if tokio::time::Instant::now() >= deadline {
-                return Err(Error::ReadinessTimeout {
-                    name: container,
-                    addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
-                    timeout: READINESS_TIMEOUT,
-                });
-            }
-            if container_ready(&self.client, &container).await? {
-                break;
-            }
-            sleep(READINESS_POLL).await;
-        }
-        Ok(now_ns())
+        Ok(())
     }
 
     pub fn start_session_observer(&self) -> crate::observer::SessionObserver {
-        let sidecars = self
-            .fleet
-            .services
-            .iter()
-            .map(|s| (s.name.to_string(), self.proxy_container_name(s)))
-            .collect();
-        crate::observer::SessionObserver::start(&self.client, sidecars)
+        crate::observer::SessionObserver::start(&self.client, self.proxy_container_name())
     }
 
+    /// Network-scoped name of a service's backing container: its in-network
+    /// alias prefixed with the per-worker network.
     fn backing_container_name(&self, service: &Service) -> String {
-        format!("{}-{}-{}", self.network, service.name, BACKING_SUFFIX)
+        format!("{}-{}", self.network, Self::backing_alias(service))
     }
 
-    fn proxy_container_name(&self, service: &Service) -> String {
-        format!("{}-{}-{}", self.network, service.name, PROXY_SUFFIX)
+    /// The single proxy container that fronts every service in the fleet.
+    fn proxy_container_name(&self) -> String {
+        format!("{}-{}", self.network, PROXY_SUFFIX)
     }
 
+    /// In-network alias a backing container is reached by (via the proxy).
     fn backing_alias(service: &Service) -> String {
         format!("{}-{}", service.name, BACKING_SUFFIX)
     }
 
+    /// Start a service's backing container. It is reached only through the proxy
+    /// (via its `service-actual` network alias), so it publishes no host port.
     async fn start_service(&self, service: &Service) -> Result<()> {
         ensure_image(&self.client, service.image).await?;
 
@@ -266,27 +251,63 @@ impl Docker {
         Ok(())
     }
 
-    /// Start the sidecar proxy for `service` and return its published host
-    /// endpoint keyed by service name, for the caller to record.
-    async fn start_proxy_for(&self, service: &Service) -> Result<(String, SocketAddr)> {
+    /// Start the single proxy container fronting the whole fleet: one pair per
+    /// service (`service=0.0.0.0:port=service-actual:port`), every service name
+    /// as a network alias, and all ports published to the host. Returns each
+    /// service's published host endpoint. Every pair shares one process-wide
+    /// pause gate, so a single signal freezes the whole fleet atomically.
+    async fn start_proxy(&self) -> Result<Vec<(String, SocketAddr)>> {
         ensure_image(&self.client, PROXY_IMAGE).await?;
 
-        let container_name = self.proxy_container_name(service);
-        let cmd = vec![
-            "--pair".to_string(),
-            format!(
-                "0.0.0.0:{port}={upstream}:{port}",
-                port = service.port,
-                upstream = Self::backing_alias(service)
-            ),
-        ];
-        let exposed_port = format!("{}/tcp", service.port);
+        // The proxy binds one listener per service port. Distinct ports map
+        // through unchanged; a shared port cannot be disambiguated on the single
+        // container IP, so reject it rather than misroute.
+        let mut seen = std::collections::HashSet::new();
+        for service in self.fleet.services {
+            if !seen.insert(service.port) {
+                return Err(Error::PortCollision(service.port));
+            }
+        }
 
+        let container_name = self.proxy_container_name();
+
+        let mut cmd = Vec::with_capacity(self.fleet.services.len() * 2 + 2);
+        for service in self.fleet.services {
+            cmd.push("--pair".to_string());
+            cmd.push(format!(
+                "{name}=0.0.0.0:{port}={upstream}:{port}",
+                name = service.name,
+                port = service.port,
+                upstream = Self::backing_alias(service),
+            ));
+        }
+        if let Some(anchor) = &self.anchor {
+            let direction = match anchor.direction {
+                Direction::ClientToUpstream => "c2u",
+                Direction::UpstreamToClient => "u2c",
+            };
+            cmd.push("--freeze-at".to_string());
+            cmd.push(format!("{}={}={}", anchor.service, direction, anchor.k));
+        }
+
+        let exposed_ports: Vec<String> = self
+            .fleet
+            .services
+            .iter()
+            .map(|s| format!("{}/tcp", s.port))
+            .collect();
+
+        let aliases: Vec<String> = self
+            .fleet
+            .services
+            .iter()
+            .map(|s| s.name.to_string())
+            .collect();
         let mut endpoints_config = HashMap::new();
         endpoints_config.insert(
             self.network.clone(),
             EndpointSettings {
-                aliases: Some(vec![service.name.to_string()]),
+                aliases: Some(aliases),
                 ..Default::default()
             },
         );
@@ -294,7 +315,7 @@ impl Docker {
         let config = ContainerCreateBody {
             image: Some(PROXY_IMAGE.to_string()),
             cmd: Some(cmd),
-            exposed_ports: Some(vec![exposed_port]),
+            exposed_ports: Some(exposed_ports),
             host_config: Some(HostConfig {
                 publish_all_ports: Some(true),
                 ..Default::default()
@@ -320,16 +341,75 @@ impl Docker {
             .start_container(&container_name, None::<StartContainerOptions>)
             .await?;
 
-        let host_port = published_port(&self.client, &container_name, service.port).await?;
-        Ok((
-            service.name.to_string(),
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), host_port),
-        ))
+        let mut endpoints = Vec::with_capacity(self.fleet.services.len());
+        for service in self.fleet.services {
+            let host_port = published_port(&self.client, &container_name, service.port).await?;
+            endpoints.push((
+                service.name.to_string(),
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), host_port),
+            ));
+        }
+        Ok(endpoints)
     }
 }
 
 impl Deployment for Docker {
     type Error = Error;
+
+    /// SIGUSR1 the proxy: it resets its packet counter and begins counting, so
+    /// the anchor lands relative to scenario traffic rather than the fleet's
+    /// bring-up. When it reaches the scheduled packet the proxy freezes the
+    /// fleet itself.
+    async fn arm_anchor(&self) -> Result<()> {
+        self.signal_proxy("SIGUSR1").await
+    }
+
+    /// SIGUSR2 the proxy to release the freeze, letting the held bytes flow
+    /// again.
+    async fn resume_proxy(&self) -> Result<()> {
+        self.signal_proxy("SIGUSR2").await
+    }
+
+    /// SIGKILL the service's backing container. Returns the wall-clock
+    /// nanoseconds since the Unix epoch of the moment bollard's kill returned.
+    async fn kill_service(&self, name: &str) -> Result<u128> {
+        let service = self.service_by_name(name)?;
+        let container = self.backing_container_name(service);
+        let options = KillContainerOptionsBuilder::default()
+            .signal("SIGKILL")
+            .build();
+        self.client
+            .kill_container(&container, Some(options))
+            .await?;
+        Ok(now_ns())
+    }
+
+    /// Start the previously-killed backing container and wait for its
+    /// healthcheck to report healthy. The caller waits for fleet quiescence
+    /// (see `SessionObserver::wait_for_quiescence`) before collecting the
+    /// verdict. Returns wall-clock nanoseconds when the service was ready.
+    async fn restart_service(&self, name: &str) -> Result<u128> {
+        let service = self.service_by_name(name)?;
+        let container = self.backing_container_name(service);
+        self.client
+            .start_container(&container, None::<StartContainerOptions>)
+            .await?;
+        let deadline = tokio::time::Instant::now() + READINESS_TIMEOUT;
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                return Err(Error::ReadinessTimeout {
+                    name: container,
+                    addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+                    timeout: READINESS_TIMEOUT,
+                });
+            }
+            if container_ready(&self.client, &container).await? {
+                break;
+            }
+            sleep(READINESS_POLL).await;
+        }
+        Ok(now_ns())
+    }
 
     async fn setup(&mut self) -> Result<()> {
         self.teardown().await?;
@@ -341,42 +421,47 @@ impl Deployment for Docker {
             })
             .await?;
 
-        // Bring every service (backing + its proxy) up concurrently; they wire
-        // to each other lazily at runtime, so create order does not matter.
+        // Bring up every backing container concurrently, then the one proxy that
+        // fronts the whole fleet. The proxy resolves its upstreams lazily, so the
+        // backings need not be ready first.
         let docker = &*self;
-        let endpoints = futures_util::future::try_join_all(docker.fleet.services.iter().map(
-            |service| async move {
-                docker.start_service(service).await?;
-                docker.start_proxy_for(service).await
-            },
-        ))
+        futures_util::future::try_join_all(
+            docker
+                .fleet
+                .services
+                .iter()
+                .map(|s| docker.start_service(s)),
+        )
         .await?;
+        let endpoints = docker.start_proxy().await?;
         self.endpoints.extend(endpoints);
         Ok(())
     }
 
     async fn wait_ready(&self) -> Result<()> {
-        let probes = self
+        let mut names: Vec<String> = self
             .fleet
             .services
             .iter()
-            .flat_map(|s| [self.backing_container_name(s), self.proxy_container_name(s)])
-            .map(|container_name| async move {
-                let start = tokio::time::Instant::now();
-                loop {
-                    if start.elapsed() >= READINESS_TIMEOUT {
-                        return Err(Error::ReadinessTimeout {
-                            name: container_name,
-                            addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
-                            timeout: READINESS_TIMEOUT,
-                        });
-                    }
-                    if container_ready(&self.client, &container_name).await? {
-                        return Ok(());
-                    }
-                    sleep(READINESS_POLL).await;
+            .map(|s| self.backing_container_name(s))
+            .collect();
+        names.push(self.proxy_container_name());
+        let probes = names.into_iter().map(|container_name| async move {
+            let start = tokio::time::Instant::now();
+            loop {
+                if start.elapsed() >= READINESS_TIMEOUT {
+                    return Err(Error::ReadinessTimeout {
+                        name: container_name,
+                        addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+                        timeout: READINESS_TIMEOUT,
+                    });
                 }
-            });
+                if container_ready(&self.client, &container_name).await? {
+                    return Ok(());
+                }
+                sleep(READINESS_POLL).await;
+            }
+        });
         futures_util::future::try_join_all(probes).await?;
         Ok(())
     }
@@ -384,12 +469,13 @@ impl Deployment for Docker {
     async fn teardown(&mut self) -> Result<()> {
         let opts = RemoveContainerOptionsBuilder::default().force(true).build();
         let mut failures = TeardownFailures::new();
-        let names: Vec<String> = self
+        let mut names: Vec<String> = self
             .fleet
             .services
             .iter()
-            .flat_map(|s| [self.backing_container_name(s), self.proxy_container_name(s)])
+            .map(|s| self.backing_container_name(s))
             .collect();
+        names.push(self.proxy_container_name());
         let removals = futures_util::future::join_all(names.into_iter().map(|name| {
             let client = &self.client;
             let opts = opts.clone();
@@ -537,6 +623,8 @@ mod tests {
         assert_eq!(failures.to_string(), "container `api`: boom");
     }
 
+    // Distinct ports: the single proxy container binds one listener per service
+    // port, so two services must not share one (see `Error::PortCollision`).
     const LIFECYCLE_TEST_FLEET: Fleet = Fleet {
         services: &[
             Service {
@@ -547,9 +635,9 @@ mod tests {
                 healthcheck: &[],
             },
             Service {
-                name: "web-b",
-                image: "nginx:alpine",
-                port: 80,
+                name: "cache-b",
+                image: "redis:alpine",
+                port: 6379,
                 env: &[],
                 healthcheck: &[],
             },
@@ -560,7 +648,8 @@ mod tests {
     #[ignore = "requires docker daemon"]
     async fn deployment_lifecycle_brings_up_and_tears_down_every_service() {
         let worker_id = std::process::id();
-        let mut docker = Docker::new(worker_id, &LIFECYCLE_TEST_FLEET).expect("connect to docker");
+        let mut docker =
+            Docker::new(worker_id, &LIFECYCLE_TEST_FLEET, None).expect("connect to docker");
 
         let setup_outcome = docker.setup().await;
         for service in LIFECYCLE_TEST_FLEET.services {
@@ -623,7 +712,8 @@ mod tests {
             .await
             .expect("plant orphan");
 
-        let mut docker = Docker::new(worker_id, &ORPHAN_TEST_FLEET).expect("connect to docker");
+        let mut docker =
+            Docker::new(worker_id, &ORPHAN_TEST_FLEET, None).expect("connect to docker");
         let setup_outcome = docker.setup().await;
         let teardown_outcome = docker.teardown().await;
 

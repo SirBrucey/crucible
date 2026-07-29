@@ -1,75 +1,190 @@
 //! `SessionObserver`: streams sidecar proxy events into an authoritative log.
 
 use std::{
+    collections::HashMap,
     sync::{Arc, Mutex},
     time::Duration,
 };
 
 use bollard::{Docker as DockerClient, query_parameters::LogsOptionsBuilder};
-use crucible_protocol::{ConnEvent, now_ns};
+use crucible_protocol::{ConnEvent, ConnEventKind, Direction, Session, now_ns};
 use futures_util::StreamExt;
 use tokio::{sync::mpsc, task::JoinHandle};
 
 use crate::{proxy_log::Sessions, verdict::Observations};
 
 const QUIESCENCE_POLL: Duration = Duration::from_millis(200);
+/// How often the kill waiter re-checks for the proxy's freeze signal.
+const ANCHOR_POLL: Duration = Duration::from_millis(5);
+
+/// Per-service running packet tallies, one counter per direction.
+#[derive(Default, Clone, Copy)]
+struct DirectionCounts {
+    client_to_upstream: u32,
+    upstream_to_client: u32,
+}
+
+impl DirectionCounts {
+    fn get(&self, direction: Direction) -> u32 {
+        match direction {
+            Direction::ClientToUpstream => self.client_to_upstream,
+            Direction::UpstreamToClient => self.upstream_to_client,
+        }
+    }
+
+    fn increment(&mut self, direction: Direction) {
+        match direction {
+            Direction::ClientToUpstream => self.client_to_upstream += 1,
+            Direction::UpstreamToClient => self.upstream_to_client += 1,
+        }
+    }
+}
+
+/// In-memory index of the proxy events the observer has recorded. Keeps the raw
+/// event log (for session correlation) alongside incremental aggregates so the
+/// hot-path lookups stay O(1) as the log grows: the anchor waiter re-reads
+/// [`EventIndex::packet_count`] every few milliseconds and the quiescence waiter
+/// re-reads [`EventIndex::last_event_ns`] several times a second, so neither can
+/// afford to rescan the whole log each time.
+#[derive(Default)]
+pub struct EventIndex {
+    events: Vec<(String, ConnEvent)>,
+    packet_counts: HashMap<String, DirectionCounts>,
+    freezes: u32,
+    last_ts: Option<u128>,
+}
+
+impl EventIndex {
+    /// Record one observed event, folding it into the aggregates before storing
+    /// it. `Wrote` events count as packets and `Froze` events as freezes; every
+    /// event advances the last seen timestamp.
+    pub fn record(&mut self, service: String, event: ConnEvent) {
+        self.last_ts = Some(match self.last_ts {
+            Some(prev) => prev.max(event.ts_ns),
+            None => event.ts_ns,
+        });
+        if let ConnEventKind::Wrote { direction, .. } = event.kind {
+            self.packet_counts
+                .entry(service.clone())
+                .or_default()
+                .increment(direction);
+        }
+        if matches!(event.kind, ConnEventKind::Froze { .. }) {
+            self.freezes += 1;
+        }
+        self.events.push((service, event));
+    }
+
+    /// How many packets `service` has written on `direction` so far. O(1).
+    pub fn packet_count(&self, service: &str, direction: Direction) -> u32 {
+        self.packet_counts
+            .get(service)
+            .map_or(0, |counts| counts.get(direction))
+    }
+
+    /// How many times the proxy has reported the fleet freezing (the fault
+    /// anchor tripping) so far. O(1).
+    pub fn freeze_count(&self) -> u32 {
+        self.freezes
+    }
+
+    /// Wall-clock nanoseconds of the most recent event, or `None` if nothing has
+    /// been recorded yet. O(1).
+    pub fn last_event_ns(&self) -> Option<u128> {
+        self.last_ts
+    }
+
+    /// Correlate every recorded event into `Session` records.
+    pub fn sessions(&self) -> Vec<Session> {
+        let mut sessions = Sessions::new();
+        for (service, event) in &self.events {
+            sessions.accept_event(service, event.clone());
+        }
+        sessions.into_iter().collect()
+    }
+}
 
 pub struct SessionObserver {
-    buffer: Arc<Mutex<Vec<(String, ConnEvent)>>>,
+    index: Arc<Mutex<EventIndex>>,
     tasks: Vec<JoinHandle<()>>,
 }
 
 impl SessionObserver {
-    pub fn start(client: &DockerClient, sidecars: Vec<(String, String)>) -> Self {
+    /// Stream the fleet's single proxy container. Every pair in that proxy tags
+    /// its event lines with its service, so the interleaved stream stays
+    /// attributable per service.
+    pub fn start(client: &DockerClient, proxy_container: String) -> Self {
         let (mpsc_tx, mut mpsc_rx) = mpsc::unbounded_channel::<(String, ConnEvent)>();
-        let buffer: Arc<Mutex<Vec<(String, ConnEvent)>>> = Arc::new(Mutex::new(Vec::new()));
+        let index: Arc<Mutex<EventIndex>> = Arc::new(Mutex::new(EventIndex::default()));
 
-        let agg_buffer = buffer.clone();
+        let agg_index = index.clone();
         let aggregator = tokio::spawn(async move {
-            while let Some(pair) = mpsc_rx.recv().await {
-                agg_buffer
+            while let Some((service, event)) = mpsc_rx.recv().await {
+                agg_index
                     .lock()
-                    .expect("session observer buffer mutex")
-                    .push(pair);
+                    .expect("session observer index mutex")
+                    .record(service, event);
             }
         });
 
-        let mut tasks = vec![aggregator];
-        for (service, container) in sidecars {
+        let stream = {
             let client = client.clone();
-            let tx = mpsc_tx.clone();
-            tasks.push(tokio::spawn(async move {
-                stream_sidecar(client, service, container, tx).await;
-            }));
-        }
+            tokio::spawn(async move {
+                stream_sidecar(client, proxy_container, mpsc_tx).await;
+            })
+        };
 
-        Self { buffer, tasks }
+        Self {
+            index,
+            tasks: vec![aggregator, stream],
+        }
     }
 
     /// Snapshot every event the observer has recorded so far, correlate them
     /// into `Session` records, and place the result in `observations.sessions`.
     pub fn observe(&self, observations: &mut Observations) {
-        let events = self
-            .buffer
+        observations.sessions = self
+            .index
             .lock()
-            .expect("session observer buffer mutex")
-            .clone();
-        let mut sessions = Sessions::new();
-        for (service, event) in events {
-            sessions.accept_event(&service, event);
+            .expect("session observer index mutex")
+            .sessions();
+    }
+
+    /// Block until the proxy reports the fleet has frozen (the fault anchor
+    /// tripped) since this call began, or until `timeout` elapses; returns
+    /// whether the freeze was observed. The baseline is captured at call time,
+    /// which the caller aligns with scenario start (the same moment it arms the
+    /// anchor). Because the freeze is a held state, released only by an explicit
+    /// resume, observing it even late still means the fleet is currently frozen,
+    /// so gating the kill on this cannot fire before the freeze is in place.
+    pub async fn wait_for_freeze(&self, timeout: Duration) -> bool {
+        let baseline = self.freeze_count();
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if self.freeze_count() > baseline {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(ANCHOR_POLL).await;
         }
-        observations.sessions = sessions.into_iter().collect();
+    }
+
+    fn freeze_count(&self) -> u32 {
+        self.index
+            .lock()
+            .expect("session observer index mutex")
+            .freeze_count()
     }
 
     /// Wall-clock nanoseconds of the most recent event the observer has
     /// recorded, or `None` if nothing has been observed yet.
     pub fn last_event_ns(&self) -> Option<u128> {
-        self.buffer
+        self.index
             .lock()
-            .expect("session observer buffer mutex")
-            .iter()
-            .map(|(_, event)| event.ts_ns)
-            .max()
+            .expect("session observer index mutex")
+            .last_event_ns()
     }
 
     /// Block until no sidecar has forwarded traffic for `idle`, or until
@@ -108,7 +223,6 @@ impl SessionObserver {
 
 async fn stream_sidecar(
     client: DockerClient,
-    service: String,
     container: String,
     tx: mpsc::UnboundedSender<(String, ConnEvent)>,
 ) {
@@ -124,7 +238,7 @@ async fn stream_sidecar(
         let chunk = match chunk_result {
             Ok(c) => c,
             Err(e) => {
-                tracing::warn!(target: "session_observer", %service, %container, error = %e, "log stream error");
+                tracing::warn!(target: "session_observer", %container, error = %e, "log stream error");
                 return;
             }
         };
@@ -136,16 +250,114 @@ async fn stream_sidecar(
             if trimmed.is_empty() {
                 continue;
             }
-            match serde_json::from_str::<ConnEvent>(trimmed) {
+            // Each line is `service\tjson`: the proxy tags every event with the
+            // pair's service so one interleaved stream stays attributable.
+            let Some((service, json)) = trimmed.split_once('\t') else {
+                tracing::warn!(target: "session_observer", %container, line = %trimmed, "conn event line missing service tag");
+                continue;
+            };
+            match serde_json::from_str::<ConnEvent>(json) {
                 Ok(event) => {
-                    if tx.send((service.clone(), event)).is_err() {
+                    if tx.send((service.to_string(), event)).is_err() {
                         return;
                     }
                 }
                 Err(e) => {
-                    tracing::warn!(target: "session_observer", %service, %container, error = %e, line = %trimmed, "parse conn event");
+                    tracing::warn!(target: "session_observer", %container, error = %e, line = %json, "parse conn event");
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn packet_count_tracks_service_and_direction() {
+        let mut index = EventIndex::default();
+        for (svc, ts, dir) in [
+            ("db", 10, Direction::ClientToUpstream),
+            ("db", 20, Direction::ClientToUpstream),
+            ("db", 30, Direction::UpstreamToClient),
+            ("api", 40, Direction::ClientToUpstream),
+        ] {
+            index.record(svc.into(), ConnEvent::wrote_at(0, ts, dir, 1));
+        }
+        assert_eq!(index.packet_count("db", Direction::ClientToUpstream), 2);
+        assert_eq!(index.packet_count("db", Direction::UpstreamToClient), 1);
+        assert_eq!(index.packet_count("api", Direction::ClientToUpstream), 1);
+        assert_eq!(index.packet_count("api", Direction::UpstreamToClient), 0);
+        assert_eq!(
+            index.packet_count("missing", Direction::ClientToUpstream),
+            0
+        );
+    }
+
+    #[test]
+    fn only_wrote_events_count_as_packets() {
+        let mut index = EventIndex::default();
+        index.record(
+            "db".into(),
+            ConnEvent::opened_at(0, 5, "127.0.0.1:1".parse().unwrap()),
+        );
+        index.record("db".into(), ConnEvent::closed_at(0, 15, 0, 0));
+        assert_eq!(index.packet_count("db", Direction::ClientToUpstream), 0);
+        assert_eq!(index.packet_count("db", Direction::UpstreamToClient), 0);
+    }
+
+    #[test]
+    fn freeze_count_tracks_only_froze_events() {
+        let mut index = EventIndex::default();
+        assert_eq!(index.freeze_count(), 0);
+        // Traffic is not a freeze.
+        index.record(
+            "db".into(),
+            ConnEvent::wrote_at(0, 10, Direction::ClientToUpstream, 1),
+        );
+        assert_eq!(index.freeze_count(), 0);
+        index.record("db".into(), ConnEvent::froze_at(0, 20, 3));
+        assert_eq!(index.freeze_count(), 1);
+        index.record("db".into(), ConnEvent::froze_at(0, 30, 5));
+        assert_eq!(index.freeze_count(), 2);
+    }
+
+    #[test]
+    fn last_event_ns_is_the_max_timestamp() {
+        let mut index = EventIndex::default();
+        assert_eq!(index.last_event_ns(), None);
+        // Record out of order; the latest timestamp must win regardless.
+        index.record(
+            "db".into(),
+            ConnEvent::wrote_at(0, 30, Direction::ClientToUpstream, 1),
+        );
+        index.record(
+            "db".into(),
+            ConnEvent::wrote_at(0, 10, Direction::UpstreamToClient, 1),
+        );
+        index.record(
+            "db".into(),
+            ConnEvent::wrote_at(0, 20, Direction::ClientToUpstream, 1),
+        );
+        assert_eq!(index.last_event_ns(), Some(30));
+    }
+
+    #[test]
+    fn sessions_correlates_recorded_events() {
+        let mut index = EventIndex::default();
+        index.record(
+            "db".into(),
+            ConnEvent::opened_at(0, 100, "127.0.0.1:1".parse().unwrap()),
+        );
+        index.record(
+            "db".into(),
+            ConnEvent::wrote_at(0, 120, Direction::ClientToUpstream, 8),
+        );
+        index.record("db".into(), ConnEvent::closed_at(0, 140, 0, 0));
+        let sessions = index.sessions();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].service, "db");
+        assert_eq!(sessions[0].writes.len(), 1);
     }
 }

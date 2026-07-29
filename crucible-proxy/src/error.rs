@@ -4,8 +4,10 @@ use std::{io, net::AddrParseError};
 pub enum Error {
     #[error(transparent)]
     Io(#[from] io::Error),
-    #[error("pair `{pair}` must be in the form LISTEN=UPSTREAM")]
+    #[error("pair `{pair}` must be in the form SERVICE=LISTEN=UPSTREAM")]
     MalformedPair { pair: String },
+    #[error("freeze-at `{spec}` must be in the form SERVICE=DIRECTION=K (DIRECTION is c2u or u2c)")]
+    MalformedFreezeAt { spec: String },
     #[error("parse listen `{addr}`: {source}")]
     ParseListen {
         addr: String,

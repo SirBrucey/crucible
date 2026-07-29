@@ -4,14 +4,20 @@ pub mod burst;
 
 pub use burst::BurstScheduler;
 
+use crucible_protocol::Direction;
+
 use crate::ipc::RunnerToWorker;
 
-/// A schedule the runner hands to a worker to execute.
+/// A schedule the runner hands to a worker to execute. The fault fires once the
+/// target service's proxy has observed `fault_packet_index` packets on
+/// `direction`, so it lands relative to observed traffic rather than a clock.
 pub struct Schedule {
     pub schedule_id: u32,
     pub service: String,
-    /// Nanoseconds from scenario start at which the fault should fire.
-    pub fault_offset_ns: u128,
+    /// Direction whose packets the anchor counts.
+    pub direction: Direction,
+    /// Freeze and kill once this many packets have crossed on `direction`.
+    pub fault_packet_index: u32,
     pub payload: Vec<u8>,
 }
 
@@ -20,7 +26,8 @@ impl From<Schedule> for RunnerToWorker {
         RunnerToWorker::Schedule {
             schedule_id: schedule.schedule_id,
             service: schedule.service,
-            fault_offset_ns: schedule.fault_offset_ns,
+            direction: schedule.direction,
+            fault_packet_index: schedule.fault_packet_index,
             payload: schedule.payload,
         }
     }
