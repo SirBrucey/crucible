@@ -73,6 +73,9 @@ impl Sessions {
             ConnEventKind::Failed { .. } => {
                 self.opened.remove(&(service.to_string(), id));
             }
+            // A control signal about the fault anchor, not part of a session's
+            // byte accounting; the freeze waiter consumes it elsewhere.
+            ConnEventKind::Froze { .. } => {}
         }
     }
 

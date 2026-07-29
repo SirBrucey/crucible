@@ -83,6 +83,18 @@ impl ConnEvent {
             kind: ConnEventKind::Wrote { direction, bytes },
         }
     }
+
+    pub fn froze(id: ConnId, k: u32) -> Self {
+        Self::froze_at(id, now_ns(), k)
+    }
+
+    pub fn froze_at(id: ConnId, ts_ns: u128, k: u32) -> Self {
+        Self {
+            id,
+            ts_ns,
+            kind: ConnEventKind::Froze { k },
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -102,6 +114,13 @@ pub enum ConnEventKind {
     },
     Failed {
         reason: String,
+    },
+    /// The fault anchor tripped: this pair has forwarded `k` packets on its
+    /// direction and the proxy has frozen the fleet. Emitted once per arm, at the
+    /// trip, so a consumer can gate an action on the freeze actually being in
+    /// place rather than on its own independent packet count.
+    Froze {
+        k: u32,
     },
 }
 

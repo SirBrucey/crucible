@@ -56,15 +56,18 @@ impl Anchor {
     }
 
     /// Count one forwarded packet; freeze the fleet on the one that reaches `k`.
-    /// A no-op until armed, so bring-up traffic is not counted.
-    fn record(&self) {
+    /// A no-op until armed, so bring-up traffic is not counted. Returns whether
+    /// this call tripped the freeze, so the caller can announce it.
+    fn record(&self) -> bool {
         if !self.active.load(Ordering::SeqCst) {
-            return;
+            return false;
         }
         let crossed = self.count.fetch_add(1, Ordering::SeqCst) + 1;
         if crossed == self.k {
             let _ = self.tripwire.send(true);
+            return true;
         }
+        false
     }
 
     /// Disarm: stop counting so the anchor cannot trip again. Paired with resume
@@ -187,7 +190,16 @@ async fn forward(
             }
             bytes_total += n as u64;
             if let Some(anchor) = &anchor_c2u {
-                anchor.record();
+                if anchor.record() {
+                    // FIXME: propagate this for real recovery once the forward
+                    // tasks report failures upward. The drain task in main holds
+                    // the receiver for as long as any forward task holds a sender,
+                    // so a send failure means it died unexpectedly; until then,
+                    // assert that rather than drop the freeze signal silently.
+                    events_tx_c2u
+                        .send(ConnEvent::froze(id, anchor.k))
+                        .expect("event drain outlives the forward tasks");
+                }
             }
         }
     });
@@ -210,7 +222,16 @@ async fn forward(
             }
             bytes_total += n as u64;
             if let Some(anchor) = &anchor_u2c {
-                anchor.record();
+                if anchor.record() {
+                    // FIXME: propagate this for real recovery once the forward
+                    // tasks report failures upward. The drain task in main holds
+                    // the receiver for as long as any forward task holds a sender,
+                    // so a send failure means it died unexpectedly; until then,
+                    // assert that rather than drop the freeze signal silently.
+                    events_tx_u2c
+                        .send(ConnEvent::froze(id, anchor.k))
+                        .expect("event drain outlives the forward tasks");
+                }
             }
         }
     });
@@ -321,6 +342,7 @@ mod tests {
                     );
                 }
                 ConnEventKind::Failed { reason } => panic!("unexpected Failed: {reason}"),
+                ConnEventKind::Froze { k } => panic!("unexpected Froze without an anchor: k={k}"),
             }
         }
 
@@ -395,6 +417,40 @@ mod tests {
         anchor.record(); // would be count 2 == k, but disarmed
         anchor.record();
         assert!(!*rx.borrow(), "a disarmed anchor must not re-trip the gate");
+    }
+
+    #[tokio::test]
+    async fn anchor_emits_a_froze_event_when_it_trips() {
+        let echo = spawn_echo().await;
+        let (pause_tx, pause_rx) = watch::channel(false);
+        let anchor = Anchor::new(Direction::ClientToUpstream, 2, pause_tx);
+        let (proxy, proxy_addr, mut events) = Proxy::bind(
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            echo,
+            pause_rx,
+            Some(anchor.clone()),
+        )
+        .await
+        .unwrap();
+        tokio::spawn(proxy.run());
+        anchor.arm();
+
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+        // First packet is below K; forwarded and echoed normally.
+        client.write_all(b"a").await.unwrap();
+        let mut buf = [0u8; 1];
+        client.read_exact(&mut buf).await.unwrap();
+        // Second packet reaches K=2 and trips the anchor.
+        client.write_all(b"b").await.unwrap();
+
+        // The proxy must announce the freeze with a Froze event carrying k.
+        let k = loop {
+            let event = recv(&mut events).await;
+            if let ConnEventKind::Froze { k } = event.kind {
+                break k;
+            }
+        };
+        assert_eq!(k, 2);
     }
 
     #[tokio::test]
