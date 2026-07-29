@@ -32,6 +32,7 @@ pub struct Sessions {
 }
 
 impl Sessions {
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -79,6 +80,12 @@ impl Sessions {
         }
     }
 
+    /// Parse one proxy log line and fold its connection event into the session
+    /// state. Blank lines are ignored.
+    ///
+    /// # Errors
+    /// Returns `Error::Parse` if the line is non-empty but fails to deserialize
+    /// into a [`ConnEvent`].
     pub fn accept_line(&mut self, service: &str, line: &str) -> Result<()> {
         let line = line.trim();
         if line.is_empty() {
@@ -106,6 +113,7 @@ const MAX_TOTAL_ANCHORS: usize = 400;
 /// start are ignored). Each direction's packets are clustered into bursts and
 /// reduced to their before/during/after anchor packet-counts, then the whole
 /// catalogue is sampled down if it would not fit the IPC frame.
+#[must_use]
 pub fn service_profiles_from_sessions(
     sessions: &[Session],
     scenario_start_ns: u128,

@@ -17,10 +17,12 @@ pub struct ConnEvent {
 }
 
 impl ConnEvent {
+    #[must_use]
     pub fn opened(id: ConnId, peer: SocketAddr) -> Self {
         Self::opened_at(id, now_ns(), peer)
     }
 
+    #[must_use]
     pub fn opened_at(id: ConnId, ts_ns: u128, peer: SocketAddr) -> Self {
         Self {
             id,
@@ -29,6 +31,7 @@ impl ConnEvent {
         }
     }
 
+    #[must_use]
     pub fn closed(
         id: ConnId,
         bytes_client_to_upstream: u64,
@@ -42,6 +45,7 @@ impl ConnEvent {
         )
     }
 
+    #[must_use]
     pub fn closed_at(
         id: ConnId,
         ts_ns: u128,
@@ -72,10 +76,12 @@ impl ConnEvent {
         }
     }
 
+    #[must_use]
     pub fn wrote(id: ConnId, direction: Direction, bytes: u64) -> Self {
         Self::wrote_at(id, now_ns(), direction, bytes)
     }
 
+    #[must_use]
     pub fn wrote_at(id: ConnId, ts_ns: u128, direction: Direction, bytes: u64) -> Self {
         Self {
             id,
@@ -84,10 +90,12 @@ impl ConnEvent {
         }
     }
 
+    #[must_use]
     pub fn froze(id: ConnId, k: u32) -> Self {
         Self::froze_at(id, now_ns(), k)
     }
 
+    #[must_use]
     pub fn froze_at(id: ConnId, ts_ns: u128, k: u32) -> Self {
         Self {
             id,

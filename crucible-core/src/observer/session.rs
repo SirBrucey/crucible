@@ -25,7 +25,7 @@ struct DirectionCounts {
 }
 
 impl DirectionCounts {
-    fn get(&self, direction: Direction) -> u32 {
+    fn get(self, direction: Direction) -> u32 {
         match direction {
             Direction::ClientToUpstream => self.client_to_upstream,
             Direction::UpstreamToClient => self.upstream_to_client,
@@ -76,6 +76,7 @@ impl EventIndex {
     }
 
     /// How many packets `service` has written on `direction` so far. O(1).
+    #[must_use]
     pub fn packet_count(&self, service: &str, direction: Direction) -> u32 {
         self.packet_counts
             .get(service)
@@ -84,17 +85,20 @@ impl EventIndex {
 
     /// How many times the proxy has reported the fleet freezing (the fault
     /// anchor tripping) so far. O(1).
+    #[must_use]
     pub fn freeze_count(&self) -> u32 {
         self.freezes
     }
 
     /// Wall-clock nanoseconds of the most recent event, or `None` if nothing has
     /// been recorded yet. O(1).
+    #[must_use]
     pub fn last_event_ns(&self) -> Option<u128> {
         self.last_ts
     }
 
     /// Correlate every recorded event into `Session` records.
+    #[must_use]
     pub fn sessions(&self) -> Vec<Session> {
         let mut sessions = Sessions::new();
         for (service, event) in &self.events {
@@ -113,6 +117,7 @@ impl SessionObserver {
     /// Stream the fleet's single proxy container. Every pair in that proxy tags
     /// its event lines with its service, so the interleaved stream stays
     /// attributable per service.
+    #[must_use]
     pub fn start(client: &DockerClient, proxy_container: String) -> Self {
         let (mpsc_tx, mut mpsc_rx) = mpsc::unbounded_channel::<(String, ConnEvent)>();
         let index: Arc<Mutex<EventIndex>> = Arc::new(Mutex::new(EventIndex::default()));
@@ -122,7 +127,7 @@ impl SessionObserver {
             while let Some((service, event)) = mpsc_rx.recv().await {
                 agg_index
                     .lock()
-                    .expect("session observer index mutex")
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .record(service, event);
             }
         });
@@ -146,7 +151,7 @@ impl SessionObserver {
         observations.sessions = self
             .index
             .lock()
-            .expect("session observer index mutex")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .sessions();
     }
 
@@ -174,16 +179,17 @@ impl SessionObserver {
     fn freeze_count(&self) -> u32 {
         self.index
             .lock()
-            .expect("session observer index mutex")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .freeze_count()
     }
 
     /// Wall-clock nanoseconds of the most recent event the observer has
     /// recorded, or `None` if nothing has been observed yet.
+    #[must_use]
     pub fn last_event_ns(&self) -> Option<u128> {
         self.index
             .lock()
-            .expect("session observer index mutex")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .last_event_ns()
     }
 

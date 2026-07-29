@@ -11,6 +11,8 @@ use crate::verdict::{HttpOutcome, Observations};
 pub enum Error {
     #[error(transparent)]
     Http(#[from] reqwest::Error),
+    #[error(transparent)]
+    Serialize(#[from] serde_json::Error),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -20,11 +22,18 @@ pub struct Orders {
 }
 
 impl Orders {
+    /// # Errors
+    /// Errors if the HTTP client cannot be built.
     pub fn new() -> Result<Self> {
         let client = Client::builder().timeout(Duration::from_secs(10)).build()?;
         Ok(Self { client })
     }
 
+    /// Run the orders sequence against `api`, capturing each request and response.
+    /// Transport failures are recorded as outcomes rather than aborting the run.
+    ///
+    /// # Errors
+    /// Errors if a request body cannot be serialized to JSON.
     pub async fn run(&self, api: SocketAddr) -> Result<Observations> {
         let mut observations = Observations::empty();
         for (item, quantity) in [("book", 4), ("noodles", 10), ("usb-c cable", 1)] {
@@ -32,8 +41,7 @@ impl Orders {
                 item: item.to_string(),
                 quantity,
             };
-            let request_body =
-                serde_json::to_vec(&request).expect("OrderRequest serializes cleanly");
+            let request_body = serde_json::to_vec(&request)?;
             let outcome = match self
                 .client
                 .post(format!("http://{api}/orders"))

@@ -19,6 +19,11 @@ use tokio::{
 use crate::event_bus::RunnerEvent;
 
 /// Drain the receiver, appending each event to `path` as JSON.
+///
+/// # Errors
+/// Returns an [`io::Error`] if the parent directory cannot be created, `path`
+/// cannot be opened for append, an event cannot be serialized to JSON, or a line
+/// or the final flush cannot be written.
 pub async fn run(mut rx: mpsc::Receiver<Arc<RunnerEvent>>, path: PathBuf) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;
@@ -39,12 +44,14 @@ pub async fn run(mut rx: mpsc::Receiver<Arc<RunnerEvent>>, path: PathBuf) -> io:
 }
 
 /// Default journal path under `$XDG_STATE_HOME/crucible/logs/{pid}/journal.ndjson`,
-/// falling back to `$HOME/.local/state/...` when `XDG_STATE_HOME` is unset.
+/// falling back to `$HOME/.local/state/...`, then the system temp directory, when
+/// neither environment variable is set.
+#[must_use]
 pub fn default_path(pid: u32) -> PathBuf {
-    let base = std::env::var_os("XDG_STATE_HOME").map_or_else(
-        || PathBuf::from(std::env::var_os("HOME").expect("HOME must be set")).join(".local/state"),
-        PathBuf::from,
-    );
+    let base = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))
+        .unwrap_or_else(std::env::temp_dir);
     base.join("crucible")
         .join("logs")
         .join(pid.to_string())
