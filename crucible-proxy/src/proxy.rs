@@ -26,8 +26,8 @@ use tokio::{
 /// match the scenario-relative one the learn pass measured.
 #[derive(Clone)]
 pub struct Anchor {
-    pub direction: Direction,
-    pub k: u32,
+    direction: Direction,
+    k: u32,
     count: Arc<AtomicU32>,
     active: Arc<AtomicBool>,
     tripwire: watch::Sender<bool>,
