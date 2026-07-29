@@ -8,9 +8,11 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 /// Maximum size of a single frame. Anything larger is refused as malformed.
 ///
 /// Kept small on purpose. The handshake is tens of bytes; the biggest current
-/// message is `SessionCatalogue` carrying compact per-service histograms,
-/// which comfortably fits.
-const MAX_FRAME_SIZE: usize = 4096;
+/// message is [`WorkerToRunner::SessionCatalogue`](crate::ipc::WorkerToRunner::SessionCatalogue),
+/// whose per-service anchor lists are sampled down to a fixed cap on the learn
+/// side so it always fits (see
+/// [`crate::proxy_log::service_profiles_from_sessions`]).
+pub(crate) const MAX_FRAME_SIZE: usize = 4096;
 
 /// Errors returned by the codec.
 #[derive(Debug, thiserror::Error)]

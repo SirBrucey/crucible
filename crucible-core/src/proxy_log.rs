@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use crucible_protocol::{
     ConnEvent, ConnEventKind, ConnId, Direction, ServiceProfile, Session, WriteRecord,
 };
+use rand::seq::SliceRandom;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -89,50 +90,128 @@ impl Sessions {
     }
 }
 
-/// Collect per-service packet timestamps from a session catalogue, split by
-/// direction and made scenario-relative to `scenario_start_ns`. Writes before
-/// scenario start are ignored. The scheduler clusters these into bursts and
-/// anchors kills on the Kth packet of a direction.
+/// Consecutive packets more than this far apart start a new burst.
+const BURST_GAP_NS: u128 = 20_000_000; // 20 ms
+
+/// Cap on the total anchors in one catalogue so it always fits the IPC frame. A
+/// learn run with more anchors than this is randomly sampled down (seeded
+/// sampling for cross-run reproducibility is a future refinement).
+const MAX_TOTAL_ANCHORS: usize = 400;
+
+/// Derive per-service fault anchors from a session catalogue, split by direction
+/// and made scenario-relative to `scenario_start_ns` (writes before scenario
+/// start are ignored). Each direction's packets are clustered into bursts and
+/// reduced to their before/during/after anchor packet-counts, then the whole
+/// catalogue is sampled down if it would not fit the IPC frame.
 pub fn service_profiles_from_sessions(
     sessions: &[Session],
     scenario_start_ns: u128,
 ) -> Vec<ServiceProfile> {
-    let mut c2u: BTreeMap<String, Vec<u128>> = BTreeMap::new();
-    let mut u2c: BTreeMap<String, Vec<u128>> = BTreeMap::new();
+    // Per service: (client-to-upstream timestamps, upstream-to-client timestamps).
+    let mut by_service: BTreeMap<String, (Vec<u128>, Vec<u128>)> = BTreeMap::new();
     for session in sessions {
         for write in &session.writes {
             if write.ts_ns < scenario_start_ns {
                 continue;
             }
             let rel = write.ts_ns - scenario_start_ns;
-            let by_service = match write.direction {
-                Direction::ClientToUpstream => &mut c2u,
-                Direction::UpstreamToClient => &mut u2c,
-            };
-            by_service
-                .entry(session.service.clone())
-                .or_default()
-                .push(rel);
+            let entry = by_service.entry(session.service.clone()).or_default();
+            match write.direction {
+                Direction::ClientToUpstream => entry.0.push(rel),
+                Direction::UpstreamToClient => entry.1.push(rel),
+            }
         }
     }
 
-    let mut services: BTreeSet<String> = BTreeSet::new();
-    services.extend(c2u.keys().cloned());
-    services.extend(u2c.keys().cloned());
-    services
+    let mut profiles: Vec<ServiceProfile> = by_service
         .into_iter()
-        .map(|service| {
-            let mut client_to_upstream = c2u.remove(&service).unwrap_or_default();
-            let mut upstream_to_client = u2c.remove(&service).unwrap_or_default();
-            client_to_upstream.sort_unstable();
-            upstream_to_client.sort_unstable();
+        .map(|(service, (mut c2u, mut u2c))| {
+            c2u.sort_unstable();
+            u2c.sort_unstable();
             ServiceProfile {
                 service,
-                client_to_upstream,
-                upstream_to_client,
+                client_to_upstream: burst_anchors(&c2u),
+                upstream_to_client: burst_anchors(&u2c),
             }
         })
-        .collect()
+        .collect();
+    sample_to_frame(&mut profiles);
+    profiles
+}
+
+/// Cluster `packets` (sorted timestamps) into bursts by inter-packet gap and
+/// return the before / during / after anchor packet-counts, sorted and deduped.
+/// A count `K` means "freeze once `K` packets have crossed": `K = first - 1`
+/// lands just before a burst, `K = last` just after it.
+///
+/// `K = 0` (before the very first packet) is dropped. Armed on the proxy's
+/// command line it freezes at boot, which holds the fleet's own bring-up traffic
+/// (the apps connecting to their dependencies through the proxy), so the fleet
+/// never becomes healthy. Doing "kill before the first packet" properly needs
+/// the freeze deferred until after bring-up, which boot-time arming cannot do.
+fn burst_anchors(packets: &[u128]) -> Vec<u32> {
+    let n = packets.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let mut anchors: BTreeSet<u32> = BTreeSet::new();
+    let mut start = 0usize; // 0-based index of the current burst's first packet
+    for j in 0..n {
+        let ends_burst = j + 1 == n || packets[j + 1] - packets[j] > BURST_GAP_NS;
+        if ends_burst {
+            // 1-based packet counts; a single learn run should never approach u32.
+            let first_count = u32::try_from(start + 1).expect("packet count fits in u32");
+            let last_count = u32::try_from(j + 1).expect("packet count fits in u32");
+            anchors.insert(first_count - 1); // before
+            anchors.insert(u32::midpoint(first_count, last_count)); // during
+            anchors.insert(last_count); // after
+            start = j + 1;
+        }
+    }
+    anchors.into_iter().filter(|&k| k > 0).collect()
+}
+
+/// Randomly sample the catalogue's anchors down to `MAX_TOTAL_ANCHORS` if it has
+/// more, so the serialized catalogue always fits the IPC frame. A no-op for a
+/// normal-sized run; only a pathologically busy learn (very many bursts) is
+/// trimmed, and the drop is logged.
+fn sample_to_frame(profiles: &mut [ServiceProfile]) {
+    let total: usize = profiles
+        .iter()
+        .map(|p| p.client_to_upstream.len() + p.upstream_to_client.len())
+        .sum();
+    if total <= MAX_TOTAL_ANCHORS {
+        return;
+    }
+    // Flatten to (profile index, is-client-to-upstream, K), keep a random subset,
+    // then rebuild each profile's per-direction vectors.
+    let mut flat: Vec<(usize, bool, u32)> = Vec::with_capacity(total);
+    for (i, profile) in profiles.iter().enumerate() {
+        flat.extend(profile.client_to_upstream.iter().map(|&k| (i, true, k)));
+        flat.extend(profile.upstream_to_client.iter().map(|&k| (i, false, k)));
+    }
+    flat.shuffle(&mut rand::rng());
+    flat.truncate(MAX_TOTAL_ANCHORS);
+    for profile in profiles.iter_mut() {
+        profile.client_to_upstream.clear();
+        profile.upstream_to_client.clear();
+    }
+    for (i, is_c2u, k) in flat {
+        if is_c2u {
+            profiles[i].client_to_upstream.push(k);
+        } else {
+            profiles[i].upstream_to_client.push(k);
+        }
+    }
+    for profile in profiles.iter_mut() {
+        profile.client_to_upstream.sort_unstable();
+        profile.upstream_to_client.sort_unstable();
+    }
+    tracing::warn!(
+        total,
+        cap = MAX_TOTAL_ANCHORS,
+        "learn produced more anchors than fit the catalogue; sampled down"
+    );
 }
 
 impl Extend<(String, ConnEvent)> for Sessions {
@@ -175,8 +254,56 @@ impl IntoIterator for Sessions {
 #[cfg(test)]
 mod tests {
     use crucible_protocol::Direction;
+    use proptest::prelude::*;
 
     use super::*;
+    use crate::ipc::{WorkerToRunner, codec::MAX_FRAME_SIZE};
+
+    fn a_write() -> impl Strategy<Value = WriteRecord> {
+        (any::<bool>(), any::<u128>()).prop_map(|(c2u, ts_ns)| WriteRecord {
+            ts_ns,
+            direction: if c2u {
+                Direction::ClientToUpstream
+            } else {
+                Direction::UpstreamToClient
+            },
+            bytes: 1,
+        })
+    }
+
+    fn a_session() -> impl Strategy<Value = Session> {
+        ("[a-z]{1,12}", prop::collection::vec(a_write(), 0..3000)).prop_map(|(service, writes)| {
+            Session {
+                service,
+                conn_id: 0,
+                peer: "127.0.0.1:1".to_string(),
+                opened_ns: 0,
+                closed_ns: None,
+                writes,
+            }
+        })
+    }
+
+    proptest! {
+        /// The session catalogue must always fit the IPC frame, however much
+        /// traffic a learn run observed. Grounds the bound on the wire type.
+        #[test]
+        fn catalogue_always_fits_the_frame(
+            sessions in prop::collection::vec(a_session(), 0..8),
+        ) {
+            let profiles = service_profiles_from_sessions(&sessions, 0);
+            let catalogue = WorkerToRunner::SessionCatalogue { services: profiles };
+            let mut buf = vec![0u8; 2_000_000];
+            let encoded = postcard::to_slice(&catalogue, &mut buf)
+                .expect("catalogue fits the oversized test buffer");
+            prop_assert!(
+                encoded.len() <= MAX_FRAME_SIZE,
+                "catalogue is {} bytes, exceeds frame {}",
+                encoded.len(),
+                MAX_FRAME_SIZE,
+            );
+        }
+    }
 
     #[test]
     fn writes_are_folded_into_session() {

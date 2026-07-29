@@ -12,18 +12,20 @@ pub use session::{Session, WriteRecord};
 
 use serde::{Deserialize, Serialize};
 
-/// Per-service packet timestamps observed during a Learn run, split by
-/// direction. Each entry is a write's nanoseconds-from-scenario-start, in
-/// order. The scheduler clusters these into bursts and anchors kills on the
-/// Kth packet of a direction, so faults land relative to observed traffic
-/// rather than a wall clock.
+/// Per-service fault anchors derived by the Learn run, split by direction. Each
+/// entry is a packet count `K`: freeze once the service has forwarded `K`
+/// packets on that direction. The learn pass clusters observed packets into
+/// bursts and keeps only the before/during/after edge of each burst (sampling
+/// down if a run is unusually busy), so this is bounded by the number of anchors
+/// rather than raw packet count and the catalogue always fits the IPC frame.
+/// Faults land relative to observed traffic rather than a wall clock.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct ServiceProfile {
     pub service: String,
-    /// Client-to-upstream write timestamps (requests reaching the service).
-    pub client_to_upstream: Vec<u128>,
-    /// Upstream-to-client write timestamps (responses leaving the service).
-    pub upstream_to_client: Vec<u128>,
+    /// Anchor packet-counts on the client-to-upstream direction (requests in).
+    pub client_to_upstream: Vec<u32>,
+    /// Anchor packet-counts on the upstream-to-client direction (responses out).
+    pub upstream_to_client: Vec<u32>,
 }
 
 pub fn now_ns() -> u128 {
