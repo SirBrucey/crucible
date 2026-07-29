@@ -214,10 +214,10 @@ async fn forward(
                 break Err(format!("upstream_write: {e}"));
             }
             bytes_total += n as u64;
-            if let Some(anchor) = &anchor_c2u {
-                if anchor.record() {
-                    emit(&events_tx_c2u, ConnEvent::froze(id, anchor.k));
-                }
+            if let Some(anchor) = &anchor_c2u
+                && anchor.record()
+            {
+                emit(&events_tx_c2u, ConnEvent::froze(id, anchor.k));
             }
         }
     });
@@ -242,10 +242,10 @@ async fn forward(
                 break Err(format!("client_write: {e}"));
             }
             bytes_total += n as u64;
-            if let Some(anchor) = &anchor_u2c {
-                if anchor.record() {
-                    emit(&events_tx_u2c, ConnEvent::froze(id, anchor.k));
-                }
+            if let Some(anchor) = &anchor_u2c
+                && anchor.record()
+            {
+                emit(&events_tx_u2c, ConnEvent::froze(id, anchor.k));
             }
         }
     });
