@@ -3,7 +3,7 @@ mod session;
 
 use std::{
     path::{Path, PathBuf},
-    process::Stdio,
+    process::{ExitCode, Stdio},
     time::{Duration, Instant},
 };
 
@@ -73,7 +73,7 @@ fn worker_bin_path() -> Result<PathBuf> {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -82,14 +82,16 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    let result = run().await;
-    if let Err(e) = &result {
-        tracing::error!(error = %e, "runner exiting with error");
+    match run().await {
+        Ok(outcome) => outcome.exit_code(),
+        Err(e) => {
+            tracing::error!(error = %e, "runner exiting with error");
+            ExitCode::from(2)
+        }
     }
-    result
 }
 
-async fn run() -> Result<()> {
+async fn run() -> Result<CampaignOutcome> {
     let (bus, journal_rx) = EventBus::new();
 
     let journal_path = journal::default_path(std::process::id());
@@ -133,6 +135,29 @@ fn cleanup_sockets() {
             if entry.file_name().to_string_lossy().starts_with(&prefix) {
                 let _ = std::fs::remove_file(entry.path());
             }
+        }
+    }
+}
+
+/// The campaign's overall outcome, mapped to the process exit code so automation
+/// can tell a real fault from a run that could not render a clean verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CampaignOutcome {
+    /// Every schedule that ran passed.
+    Clean,
+    /// At least one fault was found.
+    FaultsFound,
+    /// No fault, but some schedule could not be decided (a worker errored or a
+    /// verdict was inconclusive).
+    Indecisive,
+}
+
+impl CampaignOutcome {
+    fn exit_code(self) -> ExitCode {
+        match self {
+            CampaignOutcome::Clean => ExitCode::SUCCESS,
+            CampaignOutcome::FaultsFound => ExitCode::from(1),
+            CampaignOutcome::Indecisive => ExitCode::from(2),
         }
     }
 }
@@ -182,9 +207,50 @@ impl Outcomes {
     fn completed(&self) -> usize {
         self.passed + self.faults.len() + self.inconclusive + self.errored
     }
+
+    /// The campaign's overall outcome: a found fault dominates; failing that, any
+    /// worker error or inconclusive verdict means some schedule could not be
+    /// decided.
+    fn outcome(&self) -> CampaignOutcome {
+        if !self.faults.is_empty() {
+            CampaignOutcome::FaultsFound
+        } else if self.errored > 0 || self.inconclusive > 0 {
+            CampaignOutcome::Indecisive
+        } else {
+            CampaignOutcome::Clean
+        }
+    }
+
+    /// Log the end-of-campaign summary. `total` is how many schedules the
+    /// scheduler produced; fewer completed means the wall-clock budget cut the
+    /// run short.
+    fn report(&self, total: usize, elapsed_s: u64) {
+        if self.completed() < total {
+            tracing::warn!(
+                passed = self.passed,
+                faults = self.faults.len(),
+                inconclusive = self.inconclusive,
+                errored = self.errored,
+                total,
+                elapsed_s,
+                budget_s = TOTAL_BUDGET.as_secs(),
+                "campaign hit its wall-clock budget; remaining schedules skipped"
+            );
+        } else {
+            tracing::info!(
+                passed = self.passed,
+                faults = self.faults.len(),
+                inconclusive = self.inconclusive,
+                errored = self.errored,
+                total,
+                elapsed_s,
+                "campaign complete"
+            );
+        }
+    }
 }
 
-async fn drive(bus: &EventBus) -> Result<()> {
+async fn drive(bus: &EventBus) -> Result<CampaignOutcome> {
     let campaign_start = Instant::now();
     let mut worker_id: u32 = 0;
 
@@ -236,31 +302,8 @@ async fn drive(bus: &EventBus) -> Result<()> {
         }
     }
 
-    let elapsed_s = campaign_start.elapsed().as_secs();
-    if outcomes.completed() < total {
-        tracing::warn!(
-            passed = outcomes.passed,
-            faults = outcomes.faults.len(),
-            inconclusive = outcomes.inconclusive,
-            errored = outcomes.errored,
-            total,
-            elapsed_s,
-            budget_s = TOTAL_BUDGET.as_secs(),
-            "campaign hit its wall-clock budget; remaining schedules skipped"
-        );
-    } else {
-        tracing::info!(
-            passed = outcomes.passed,
-            faults = outcomes.faults.len(),
-            inconclusive = outcomes.inconclusive,
-            errored = outcomes.errored,
-            total,
-            elapsed_s,
-            "campaign complete"
-        );
-    }
-
-    Ok(())
+    outcomes.report(total, campaign_start.elapsed().as_secs());
+    Ok(outcomes.outcome())
 }
 
 /// Run the fault-free learn pass on its own worker and return the observed
@@ -462,5 +505,36 @@ mod tests {
                 (4, "duplicate applied".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn all_pass_is_clean() {
+        let mut outcomes = Outcomes::default();
+        outcomes.record_verdict(1, Verdict::Pass);
+        assert_eq!(outcomes.outcome(), CampaignOutcome::Clean);
+    }
+
+    #[test]
+    fn a_fault_dominates_even_with_errors() {
+        let mut outcomes = Outcomes::default();
+        outcomes.record_verdict(1, Verdict::Pass);
+        outcomes.record_verdict(2, Verdict::Fail { reason: "x".into() });
+        outcomes.record_error(Some(3), "boom");
+        assert_eq!(outcomes.outcome(), CampaignOutcome::FaultsFound);
+    }
+
+    #[test]
+    fn a_worker_error_is_indecisive() {
+        let mut outcomes = Outcomes::default();
+        outcomes.record_verdict(1, Verdict::Pass);
+        outcomes.record_error(Some(2), "boom");
+        assert_eq!(outcomes.outcome(), CampaignOutcome::Indecisive);
+    }
+
+    #[test]
+    fn an_inconclusive_verdict_is_indecisive() {
+        let mut outcomes = Outcomes::default();
+        outcomes.record_verdict(1, Verdict::Inconclusive { reason: "y".into() });
+        assert_eq!(outcomes.outcome(), CampaignOutcome::Indecisive);
     }
 }
