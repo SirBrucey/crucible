@@ -78,6 +78,8 @@ mod tests {
     use tokio::io::AsyncWriteExt;
 
     use super::*;
+    use crucible_protocol::Direction;
+
     use crate::ipc::{RunnerToWorker, Verdict, WorkerEvent, WorkerToRunner};
 
     /// Encode `msg`, decode it, and assert the decoded value equals the original.
@@ -117,7 +119,8 @@ mod tests {
         roundtrip(RunnerToWorker::Schedule {
             schedule_id: 7,
             service: "db".into(),
-            fault_offset_ns: 1_500_000,
+            direction: Direction::ClientToUpstream,
+            fault_packet_index: 3,
             payload: vec![0u8; 128],
         })
         .await;

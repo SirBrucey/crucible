@@ -1,9 +1,9 @@
 //! Reconstruct `Session` records from sidecar proxy log lines.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crucible_protocol::{
-    ConnEvent, ConnEventKind, ConnId, HISTOGRAM_BIN_NS, ServiceProfile, Session, WriteRecord,
+    ConnEvent, ConnEventKind, ConnId, Direction, ServiceProfile, Session, WriteRecord,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -89,33 +89,48 @@ impl Sessions {
     }
 }
 
-/// Bin the write events across a session catalogue into per-service
-/// `ServiceProfile`s scenario-relative to `scenario_start_ns`. Writes before
-/// scenario start are ignored.
+/// Collect per-service packet timestamps from a session catalogue, split by
+/// direction and made scenario-relative to `scenario_start_ns`. Writes before
+/// scenario start are ignored. The scheduler clusters these into bursts and
+/// anchors kills on the Kth packet of a direction.
 pub fn service_profiles_from_sessions(
     sessions: &[Session],
     scenario_start_ns: u128,
 ) -> Vec<ServiceProfile> {
-    let mut by_service: BTreeMap<String, BTreeMap<u128, u64>> = BTreeMap::new();
+    let mut c2u: BTreeMap<String, Vec<u128>> = BTreeMap::new();
+    let mut u2c: BTreeMap<String, Vec<u128>> = BTreeMap::new();
     for session in sessions {
         for write in &session.writes {
             if write.ts_ns < scenario_start_ns {
                 continue;
             }
-            let bin = (write.ts_ns - scenario_start_ns) / HISTOGRAM_BIN_NS;
-            let entry = by_service
+            let rel = write.ts_ns - scenario_start_ns;
+            let by_service = match write.direction {
+                Direction::ClientToUpstream => &mut c2u,
+                Direction::UpstreamToClient => &mut u2c,
+            };
+            by_service
                 .entry(session.service.clone())
                 .or_default()
-                .entry(bin)
-                .or_insert(0);
-            *entry = entry.saturating_add(write.bytes);
+                .push(rel);
         }
     }
-    by_service
+
+    let mut services: BTreeSet<String> = BTreeSet::new();
+    services.extend(c2u.keys().cloned());
+    services.extend(u2c.keys().cloned());
+    services
         .into_iter()
-        .map(|(service, bins)| ServiceProfile {
-            service,
-            bins: bins.into_iter().collect(),
+        .map(|service| {
+            let mut client_to_upstream = c2u.remove(&service).unwrap_or_default();
+            let mut upstream_to_client = u2c.remove(&service).unwrap_or_default();
+            client_to_upstream.sort_unstable();
+            upstream_to_client.sort_unstable();
+            ServiceProfile {
+                service,
+                client_to_upstream,
+                upstream_to_client,
+            }
         })
         .collect()
 }

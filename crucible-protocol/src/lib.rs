@@ -10,18 +10,20 @@ pub use kill::{KillMissReason, KillReport, KillResult};
 pub use proxy::{ConnEvent, ConnEventKind, ConnId, Direction};
 pub use session::{Session, WriteRecord};
 
-/// Nanoseconds per histogram bin in `ServiceProfile`.
-pub const HISTOGRAM_BIN_NS: u128 = 10_000_000; // 10 ms
-
 use serde::{Deserialize, Serialize};
 
-/// Per-service byte-over-time histogram derived from a Learn run.
+/// Per-service packet timestamps observed during a Learn run, split by
+/// direction. Each entry is a write's nanoseconds-from-scenario-start, in
+/// order. The scheduler clusters these into bursts and anchors kills on the
+/// Kth packet of a direction, so faults land relative to observed traffic
+/// rather than a wall clock.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct ServiceProfile {
     pub service: String,
-    /// Sparse: only bins with bytes > 0. Each entry is
-    /// `(bin_offset_ns_from_scenario_start, total_bytes_in_bin)`.
-    pub bins: Vec<(u128, u64)>,
+    /// Client-to-upstream write timestamps (requests reaching the service).
+    pub client_to_upstream: Vec<u128>,
+    /// Upstream-to-client write timestamps (responses leaving the service).
+    pub upstream_to_client: Vec<u128>,
 }
 
 pub fn now_ns() -> u128 {
