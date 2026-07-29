@@ -14,6 +14,11 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 /// [`crate::proxy_log::service_profiles_from_sessions`]).
 pub(crate) const MAX_FRAME_SIZE: usize = 4096;
 
+// The frame header stores the payload length as a big-endian u32, so the cap
+// must fit in a u32. Pinned at compile time, which lets `write_frame` convert
+// the length with no run-time panic path.
+const _: () = assert!(MAX_FRAME_SIZE <= u32::MAX as usize);
+
 /// Errors returned by the codec.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -32,6 +37,12 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// The frame is a 4-byte big-endian length header followed by the postcard payload.
 /// Encoding uses a stack-allocated buffer of `MAX_FRAME_SIZE` bytes; larger
 /// messages are rejected as `Error::TooLarge`.
+///
+/// # Errors
+/// Returns `Error::TooLarge` if the encoded message overflows the
+/// `MAX_FRAME_SIZE` buffer, `Error::Postcard` for any other serialization
+/// failure, and `Error::Io` if writing the length header or payload to `writer`
+/// fails.
 pub async fn write_frame<T, W>(writer: &mut W, message: &T) -> Result<()>
 where
     T: Serialize,
@@ -48,13 +59,21 @@ where
         }
         Err(e) => return Err(e.into()),
     };
-    let len = u32::try_from(bytes.len()).expect("size <= MAX_FRAME_SIZE fits in u32");
+    // Safe by construction: `bytes` never exceeds MAX_FRAME_SIZE, which the
+    // compile-time assertion above pins within u32 range.
+    #[allow(clippy::cast_possible_truncation)]
+    let len = bytes.len() as u32;
     writer.write_all(&len.to_be_bytes()).await?;
     writer.write_all(bytes).await?;
     Ok(())
 }
 
 /// Read one length-prefixed frame and deserialize it with postcard.
+///
+/// # Errors
+/// Returns `Error::Io` if reading the length header or the frame body fails,
+/// `Error::TooLarge` if the declared length exceeds `MAX_FRAME_SIZE`, and
+/// `Error::Postcard` if the payload fails to decode into `T`.
 pub async fn read_frame<T, R>(reader: &mut R) -> Result<T>
 where
     T: DeserializeOwned,

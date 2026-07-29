@@ -17,10 +17,6 @@ unsafe_op_in_unsafe_fn = "warn"
 all = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
 undocumented_unsafe_blocks = "warn"
-# FIXME(#73): drop the three allows below once the documentation and must_use pass lands.
-missing_errors_doc = "allow"
-missing_panics_doc = "allow"
-must_use_candidate = "allow"
 
 [workspace.dependencies]
 base64 = "0.22"

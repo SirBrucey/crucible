@@ -58,6 +58,8 @@ pub enum Error {
     TeardownIncomplete(TeardownFailures),
     #[error("unknown service `{0}`")]
     UnknownService(String),
+    #[error("service `{0}` has no published endpoint after setup")]
+    EndpointMissing(String),
     #[error(
         "two services share port {0}; the single-container proxy would need to remap it and \
          rewrite the consumer's endpoint, which is not wired yet"
@@ -73,6 +75,7 @@ pub struct TeardownFailures {
 }
 
 impl TeardownFailures {
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -85,14 +88,17 @@ impl TeardownFailures {
         self.network = Some(reason.into());
     }
 
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.containers.is_empty() && self.network.is_none()
     }
 
+    #[must_use]
     pub fn containers(&self) -> &[(String, String)] {
         &self.containers
     }
 
+    #[must_use]
     pub fn network(&self) -> Option<&str> {
         self.network.as_deref()
     }
@@ -129,6 +135,11 @@ pub struct Docker {
 }
 
 impl Docker {
+    /// Connect to the local Docker daemon and prepare a per-worker deployment
+    /// handle (nothing is created until [`Docker::setup`]).
+    ///
+    /// # Errors
+    /// Errors if connecting to the Docker daemon socket fails.
     pub fn new(worker_id: u32, fleet: &'static Fleet, anchor: Option<ProxyAnchor>) -> Result<Self> {
         let client = DockerClient::connect_with_socket_defaults()?;
         Ok(Self {
@@ -140,6 +151,7 @@ impl Docker {
         })
     }
 
+    #[must_use]
     pub fn network(&self) -> &str {
         &self.network
     }
@@ -149,6 +161,10 @@ impl Docker {
     /// to tear down does not leak. It needs no live worker state (container and
     /// network names are derived from the id), and is a no-op once the fleet is
     /// already gone.
+    ///
+    /// # Errors
+    /// Errors if connecting to the Docker daemon fails, or if teardown cannot
+    /// remove the worker's containers or network.
     pub async fn reclaim(worker_id: u32, fleet: &'static Fleet) -> Result<()> {
         let mut docker = Self::new(worker_id, fleet, None)?;
         docker.teardown().await
@@ -172,6 +188,7 @@ impl Docker {
         Ok(())
     }
 
+    #[must_use]
     pub fn start_session_observer(&self) -> crate::observer::SessionObserver {
         crate::observer::SessionObserver::start(&self.client, self.proxy_container_name())
     }

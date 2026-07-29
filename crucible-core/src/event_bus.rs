@@ -47,6 +47,7 @@ impl EventBus {
     /// The caller hands the receiver to the journal task (or a stand-in) so
     /// the mpsc drains. Without a consumer, publishers eventually block on
     /// [`EventBus::publish`].
+    #[must_use]
     pub fn new() -> (Self, mpsc::Receiver<Arc<RunnerEvent>>) {
         let (mpsc_tx, mpsc_rx) = mpsc::channel(MPSC_CAPACITY);
         let (broadcast_tx, _) = broadcast::channel(BROADCAST_CAPACITY);
@@ -61,6 +62,9 @@ impl EventBus {
 
     /// Publish an event. Awaits mpsc capacity for the journal; fire-and-forget
     /// on the observer broadcast.
+    ///
+    /// # Errors
+    /// Errors if the journal's mpsc consumer has been dropped.
     pub async fn publish(&self, event: RunnerEvent) -> Result<(), PublishError> {
         let event = Arc::new(event);
         self.mpsc_tx.send(event.clone()).await?;
@@ -69,6 +73,7 @@ impl EventBus {
     }
 
     /// Subscribe a live observer to the broadcast channel.
+    #[must_use]
     pub fn subscribe(&self) -> broadcast::Receiver<Arc<RunnerEvent>> {
         self.broadcast_tx.subscribe()
     }

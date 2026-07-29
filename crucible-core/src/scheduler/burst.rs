@@ -18,6 +18,7 @@ pub struct BurstScheduler {
 impl BurstScheduler {
     /// Build one schedule per anchor the learn pass produced, round-robin across
     /// `(service, direction)` so a truncated campaign covers every edge.
+    #[must_use]
     pub fn new(profiles: &[ServiceProfile]) -> Self {
         let anchored: Vec<(&str, Direction, &[u32])> = profiles
             .iter()
@@ -63,6 +64,7 @@ impl BurstScheduler {
 
     /// Total schedules generated, for coverage reporting against how many the
     /// runner actually dispatched within its wall-clock budget.
+    #[must_use]
     pub fn total(&self) -> usize {
         self.total
     }

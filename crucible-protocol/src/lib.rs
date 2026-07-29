@@ -28,6 +28,11 @@ pub struct ServiceProfile {
     pub upstream_to_client: Vec<u32>,
 }
 
+/// Wall-clock nanoseconds since the Unix epoch, read from the host kernel clock.
+///
+/// # Panics
+/// Panics if the system clock is set before the Unix epoch.
+#[must_use]
 pub fn now_ns() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

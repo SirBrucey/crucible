@@ -28,6 +28,7 @@ pub struct Observations {
 }
 
 impl Observations {
+    #[must_use]
     pub fn empty() -> Self {
         Self::default()
     }
@@ -69,6 +70,7 @@ pub trait Driver {
 }
 
 /// Return the stub driver for the given invariant.
+#[must_use]
 pub fn driver_for(invariant: Invariant) -> Box<dyn Driver> {
     match invariant {
         Invariant::Idempotent => Box::new(Idempotent),
