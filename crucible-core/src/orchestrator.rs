@@ -33,70 +33,124 @@ pub enum Error {
     Observer(#[from] observer::Error),
     #[error(transparent)]
     Docker(#[from] docker::Error),
-    #[error("observer not installed; call set_observer after setup")]
-    ObserverMissing,
 }
 
-/// Per-worker orchestrator that owns the replica lifecycle around each schedule.
-pub struct Orchestrator {
+/// Per-worker orchestrator that owns the replica lifecycle around one scenario,
+/// modelled as a typestate so a phase can only reach for what earlier phases
+/// produced. `New` holds just the deployment and scenario; [`setup`] brings up
+/// the fleet and its session observer to reach [`Ready`], from which the replica
+/// runs exactly one scenario, fault-free via [`learn`] or with a fault via
+/// [`execute`], leaving the orchestrator [`Done`] with only teardown remaining.
+///
+/// [`setup`]: Orchestrator::<New>::setup
+/// [`learn`]: Orchestrator::<Ready>::learn
+/// [`execute`]: Orchestrator::<Ready>::execute
+pub struct Orchestrator<S> {
     deployment: Docker,
     scenario: Orders,
-    // FIXME(#84): stopgap until an orchestrator state machine models the phases;
-    // the observers only exist after setup.
-    db_observer: Option<DbObserver>,
-    session_observer: Option<SessionObserver>,
+    state: S,
 }
 
-impl Orchestrator {
+/// Before the fleet is up.
+pub struct New;
+
+/// Fleet up and the session observer streaming: ready to run one scenario.
+pub struct Ready {
+    session_observer: SessionObserver,
+}
+
+/// The scenario has run; only teardown remains.
+pub struct Done {
+    session_observer: SessionObserver,
+}
+
+impl Orchestrator<New> {
     pub fn new(deployment: Docker, scenario: Orders) -> Self {
         Self {
             deployment,
             scenario,
-            db_observer: None,
-            session_observer: None,
+            state: New,
         }
     }
 
-    pub async fn setup(&mut self) -> Result<(), docker::Error> {
-        self.deployment.setup().await?;
-        self.session_observer = Some(self.deployment.start_session_observer());
-        self.deployment.wait_ready().await?;
-        Ok(())
+    /// Bring up the fleet and start streaming its session observer. Tears the
+    /// replica down on any failure so a half-built fleet does not leak.
+    pub async fn setup(mut self) -> Result<Orchestrator<Ready>, docker::Error> {
+        if let Err(e) = self.deployment.setup().await {
+            let _ = self.deployment.teardown().await;
+            return Err(e);
+        }
+        let session_observer = self.deployment.start_session_observer();
+        if let Err(e) = self.deployment.wait_ready().await {
+            session_observer.shutdown().await;
+            let _ = self.deployment.teardown().await;
+            return Err(e);
+        }
+        Ok(Orchestrator {
+            deployment: self.deployment,
+            scenario: self.scenario,
+            state: Ready { session_observer },
+        })
     }
+}
 
-    pub fn set_db_observer(&mut self, observer: DbObserver) {
-        self.db_observer = Some(observer);
-    }
-
+impl Orchestrator<Ready> {
     pub fn deployment(&self) -> &Docker {
         &self.deployment
     }
 
-    /// Run the scenario; the proxy self-freezes the fleet once the target has
-    /// forwarded the schedule's `fault_packet_index` packets on its direction,
-    /// then the kill lands against that held flow. Produce a verdict and report.
-    pub async fn execute(&mut self, schedule: &Schedule) -> Result<(Verdict, KillReport), Error> {
+    /// Run the scenario fault-free and return per-service profiles so the
+    /// scheduler can cluster them into bursts.
+    pub async fn learn(self) -> Result<(Vec<ServiceProfile>, Orchestrator<Done>), Error> {
         let api = self
             .deployment
             .endpoint("api")
             .expect("api endpoint present after setup");
-        let db_observer = self.db_observer.as_ref().ok_or(Error::ObserverMissing)?;
-        let session_observer = self
-            .session_observer
-            .as_ref()
-            .ok_or(Error::ObserverMissing)?;
+        let scenario_start_ns = now_ns();
+        let mut observations: Observations = self.scenario.run(api).await?;
+        self.state.session_observer.observe(&mut observations);
+        let profiles = service_profiles_from_sessions(&observations.sessions, scenario_start_ns);
+        let done = Orchestrator {
+            deployment: self.deployment,
+            scenario: self.scenario,
+            state: Done {
+                session_observer: self.state.session_observer,
+            },
+        };
+        Ok((profiles, done))
+    }
+
+    /// Run the scenario; the proxy self-freezes the fleet once the target has
+    /// forwarded the schedule's `fault_packet_index` packets on its direction,
+    /// then the kill lands against that held flow. `db_observer` reads the
+    /// durability state after the fleet settles. Produce a verdict and report,
+    /// leaving the orchestrator [`Done`].
+    pub async fn execute(
+        self,
+        schedule: &Schedule,
+        db_observer: DbObserver,
+    ) -> Result<((Verdict, KillReport), Orchestrator<Done>), Error> {
+        let Orchestrator {
+            deployment,
+            scenario,
+            state: Ready { session_observer },
+        } = self;
+
+        let api = deployment
+            .endpoint("api")
+            .expect("api endpoint present after setup");
 
         // Arm the anchor as the scenario starts: the proxy resets and counts
-        // scenario packets from here, and wait_for_packet captures its observer
+        // scenario packets from here, and wait_for_freeze captures its observer
         // baseline at the same moment, so both share the scenario-start origin.
         // A failed arm means the proxy never freezes, so the whole run would be
         // meaningless; surface it rather than pressing on.
-        self.deployment.arm_anchor().await?;
+        deployment.arm_anchor().await?;
 
         let (scenario_end_tx, mut scenario_end_rx) = tokio::sync::oneshot::channel::<()>();
         let scenario_start = Instant::now();
         let scenario_fut = async {
-            let result = self.scenario.run(api).await;
+            let result = scenario.run(api).await;
             let _ = scenario_end_tx.send(());
             result
         };
@@ -115,7 +169,7 @@ impl Orchestrator {
                         // The proxy never reported freezing (the target did not
                         // reach its Kth packet); release the freeze in case it is
                         // mid-flight and record a miss.
-                        self.deployment.resume_proxy().await?;
+                        deployment.resume_proxy().await?;
                         return Ok::<_, Error>(missed(KillMissReason::ScenarioEndedBeforeAnchor));
                     }
                     // The proxy froze the fleet to place the kill precisely on the
@@ -126,12 +180,12 @@ impl Orchestrator {
                     // fail; ops once it is back succeed) rather than the world
                     // stopping while we heal.
                     let actual = scenario_start.elapsed().as_nanos();
-                    Ok(fire_kill(&self.deployment, schedule, actual).await?)
+                    Ok(fire_kill(&deployment, schedule, actual).await?)
                 }
                 _ = &mut scenario_end_rx => {
                     // Scenario finished before the target reached its Kth packet;
                     // release the freeze so nothing is left wedged.
-                    self.deployment.resume_proxy().await?;
+                    deployment.resume_proxy().await?;
                     Ok(missed(KillMissReason::ScenarioEndedBeforeAnchor))
                 }
             }
@@ -154,35 +208,32 @@ impl Orchestrator {
         db_observer.observe(&mut observations).await?;
         session_observer.observe(&mut observations);
         let verdict = driver_for(Invariant::Durable).drive(&observations);
-        Ok((verdict, kill_report))
+        let done = Orchestrator {
+            deployment,
+            scenario,
+            state: Done { session_observer },
+        };
+        Ok(((verdict, kill_report), done))
     }
 
-    /// Run the scenario fault-free and return per-service work histograms so
-    /// the scheduler can bin+cluster into bursts.
-    pub async fn learn(&mut self) -> Result<Vec<ServiceProfile>, Error> {
-        let api = self
-            .deployment
-            .endpoint("api")
-            .expect("api endpoint present after setup");
-        let session_observer = self
-            .session_observer
-            .as_ref()
-            .ok_or(Error::ObserverMissing)?;
-        let scenario_start_ns = now_ns();
-        let mut observations: Observations = self.scenario.run(api).await?;
-        session_observer.observe(&mut observations);
-        Ok(service_profiles_from_sessions(
-            &observations.sessions,
-            scenario_start_ns,
-        ))
+    pub async fn teardown(self) -> Result<(), docker::Error> {
+        teardown_replica(self.deployment, self.state.session_observer).await
     }
+}
 
-    pub async fn teardown(&mut self) -> Result<(), docker::Error> {
-        if let Some(observer) = self.session_observer.take() {
-            observer.shutdown().await;
-        }
-        self.deployment.teardown().await
+impl Orchestrator<Done> {
+    pub async fn teardown(self) -> Result<(), docker::Error> {
+        teardown_replica(self.deployment, self.state.session_observer).await
     }
+}
+
+/// Shut down the session observer, then remove the fleet replica.
+async fn teardown_replica(
+    mut deployment: Docker,
+    session_observer: SessionObserver,
+) -> Result<(), docker::Error> {
+    session_observer.shutdown().await;
+    deployment.teardown().await
 }
 
 /// Apply the kill against the already-frozen fleet and produce its report. Kill

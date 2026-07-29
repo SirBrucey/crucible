@@ -15,7 +15,7 @@ use crucible_core::{
         codec::{read_frame, write_frame},
     },
     observer::DbObserver,
-    orchestrator::Orchestrator,
+    orchestrator::{Done, Orchestrator, Ready},
     scenario::Orders,
     scheduler::Schedule,
 };
@@ -41,7 +41,7 @@ pub struct Executing {
 }
 
 pub struct ShuttingDown {
-    orchestrator: Orchestrator,
+    orchestrator: Orchestrator<Done>,
 }
 
 pub enum IdleNext {
@@ -52,15 +52,13 @@ pub enum IdleNext {
 /// Build the fleet and the orchestrator, arming the proxy with `anchor` if set.
 /// Tears the replica down on any bring-up failure so a worker that dies here (a
 /// flaky readiness timeout, a crash) does not leak its containers.
-async fn bring_up(worker_id: u32, anchor: Option<ProxyAnchor>) -> Result<Orchestrator> {
-    let mut orchestrator = Orchestrator::new(
+async fn bring_up(worker_id: u32, anchor: Option<ProxyAnchor>) -> Result<Orchestrator<Ready>> {
+    let orchestrator = Orchestrator::new(
         Docker::new(worker_id, &fleet::EXAMPLE, anchor)?,
         Orders::new()?,
-    );
-    if let Err(e) = orchestrator.setup().await {
-        let _ = orchestrator.teardown().await;
-        return Err(e.into());
-    }
+    )
+    .setup()
+    .await?;
     Ok(orchestrator)
 }
 
@@ -158,8 +156,8 @@ impl Worker<Idle> {
 
 impl Worker<Learning> {
     pub async fn execute_learn(mut self) -> Result<Worker<ShuttingDown>> {
-        let mut orchestrator = bring_up(self.id, None).await?;
-        let services = orchestrator
+        let orchestrator = bring_up(self.id, None).await?;
+        let (services, orchestrator) = orchestrator
             .learn()
             .await
             .inspect_err(|e| tracing::error!(worker_id = self.id, error = %e, "learn failed"))?;
@@ -188,7 +186,7 @@ impl Worker<Executing> {
             direction: schedule.direction,
             k: schedule.fault_packet_index,
         };
-        let mut orchestrator = bring_up(self.id, Some(anchor)).await?;
+        let orchestrator = bring_up(self.id, Some(anchor)).await?;
 
         // Read the database through the proxy's stable host port: it survives the
         // db being killed and restarted (the alias re-resolves to the new
@@ -207,10 +205,9 @@ impl Worker<Executing> {
                 return Err(e.into());
             }
         };
-        orchestrator.set_db_observer(db_observer);
 
-        let (verdict, kill_report) = orchestrator
-            .execute(&self.state.schedule)
+        let ((verdict, kill_report), orchestrator) = orchestrator
+            .execute(&self.state.schedule, db_observer)
             .await
             .inspect_err(
                 |e| tracing::error!(worker_id = self.id, schedule_id, error = %e, "execute failed"),
@@ -250,7 +247,7 @@ impl Worker<Executing> {
 }
 
 impl Worker<ShuttingDown> {
-    pub async fn teardown(mut self) -> Result<()> {
+    pub async fn teardown(self) -> Result<()> {
         self.state.orchestrator.teardown().await?;
         tracing::info!(worker_id = self.id, "teardown complete");
         Ok(())
