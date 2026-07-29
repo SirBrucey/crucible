@@ -5,7 +5,7 @@ use std::{
     net::SocketAddr,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     },
 };
 
@@ -16,23 +16,78 @@ use tokio::{
     sync::{mpsc, watch},
 };
 
+/// The fault anchor for a pair: once `k` packets have been forwarded on
+/// `direction` (counted across all this pair's connections), trip the shared
+/// pause gate so the whole fleet freezes at exactly that packet.
+///
+/// Dormant until [`arm`](Self::arm), so it counts only scenario traffic, not the
+/// fleet's own bring-up handshakes. The runner arms it once the scenario starts,
+/// which resets the count to zero; that shared origin is what makes the count
+/// match the scenario-relative one the learn pass measured.
+#[derive(Clone)]
+pub struct Anchor {
+    pub direction: Direction,
+    pub k: u32,
+    count: Arc<AtomicU32>,
+    active: Arc<AtomicBool>,
+    tripwire: watch::Sender<bool>,
+}
+
+impl Anchor {
+    pub fn new(direction: Direction, k: u32, tripwire: watch::Sender<bool>) -> Self {
+        Self {
+            direction,
+            k,
+            count: Arc::new(AtomicU32::new(0)),
+            active: Arc::new(AtomicBool::new(false)),
+            tripwire,
+        }
+    }
+
+    /// Arm at scenario start: reset the count and begin counting. `k == 0`
+    /// (freeze before the first scenario packet) freezes right away, now that
+    /// the fleet is up rather than mid-bring-up.
+    pub fn arm(&self) {
+        self.count.store(0, Ordering::SeqCst);
+        self.active.store(true, Ordering::SeqCst);
+        if self.k == 0 {
+            let _ = self.tripwire.send(true);
+        }
+    }
+
+    /// Count one forwarded packet; freeze the fleet on the one that reaches `k`.
+    /// A no-op until armed, so bring-up traffic is not counted.
+    fn record(&self) {
+        if !self.active.load(Ordering::SeqCst) {
+            return;
+        }
+        let crossed = self.count.fetch_add(1, Ordering::SeqCst) + 1;
+        if crossed == self.k {
+            let _ = self.tripwire.send(true);
+        }
+    }
+}
+
 pub struct Proxy {
     listener: TcpListener,
     upstream: SocketAddr,
     events_tx: mpsc::UnboundedSender<ConnEvent>,
     next_id: Arc<AtomicU64>,
     pause: watch::Receiver<bool>,
+    anchor: Option<Anchor>,
 }
 
 impl Proxy {
     /// Bind to `listen` and prepare to forward every accepted connection to `upstream`.
     /// `pause` gates forwarding: while it holds `true`, every connection holds its
-    /// bytes (delivering none) until it flips back to `false`. Returns the proxy,
-    /// its bound local address, and the receiver for connection events.
+    /// bytes (delivering none) until it flips back to `false`. `anchor`, if set,
+    /// freezes the fleet once this pair has forwarded `k` packets on its direction.
+    /// Returns the proxy, its bound local address, and the receiver for connection events.
     pub async fn bind(
         listen: SocketAddr,
         upstream: SocketAddr,
         pause: watch::Receiver<bool>,
+        anchor: Option<Anchor>,
     ) -> io::Result<(Self, SocketAddr, mpsc::UnboundedReceiver<ConnEvent>)> {
         let listener = TcpListener::bind(listen).await?;
         let local_addr = listener.local_addr()?;
@@ -43,6 +98,7 @@ impl Proxy {
             events_tx,
             next_id: Arc::new(AtomicU64::new(0)),
             pause,
+            anchor,
         };
         Ok((proxy, local_addr, events_rx))
     }
@@ -59,6 +115,7 @@ impl Proxy {
                 self.upstream,
                 self.events_tx.clone(),
                 self.pause.clone(),
+                self.anchor.clone(),
             ));
         }
     }
@@ -81,6 +138,7 @@ async fn forward(
     upstream: SocketAddr,
     events_tx: mpsc::UnboundedSender<ConnEvent>,
     pause: watch::Receiver<bool>,
+    anchor: Option<Anchor>,
 ) {
     let upstream_conn = match TcpStream::connect(upstream).await {
         Ok(s) => s,
@@ -97,6 +155,11 @@ async fn forward(
 
     let (mut client_r, mut client_w) = client.into_split();
     let (mut upstream_r, mut upstream_w) = upstream_conn.into_split();
+
+    let anchor_c2u = anchor
+        .clone()
+        .filter(|a| a.direction == Direction::ClientToUpstream);
+    let anchor_u2c = anchor.filter(|a| a.direction == Direction::UpstreamToClient);
 
     let events_tx_c2u = events_tx.clone();
     let mut pause_c2u = pause.clone();
@@ -115,6 +178,9 @@ async fn forward(
                 break Err(format!("upstream_write: {e}"));
             }
             bytes_total += n as u64;
+            if let Some(anchor) = &anchor_c2u {
+                anchor.record();
+            }
         }
     });
 
@@ -135,6 +201,9 @@ async fn forward(
                 break Err(format!("client_write: {e}"));
             }
             bytes_total += n as u64;
+            if let Some(anchor) = &anchor_u2c {
+                anchor.record();
+            }
         }
     });
 
@@ -199,7 +268,7 @@ mod tests {
     async fn two_concurrent_connections_round_trip_and_emit_distinct_events() {
         let echo = spawn_echo().await;
         let (proxy, proxy_addr, mut events) =
-            Proxy::bind((Ipv4Addr::LOCALHOST, 0).into(), echo, never_paused())
+            Proxy::bind((Ipv4Addr::LOCALHOST, 0).into(), echo, never_paused(), None)
                 .await
                 .unwrap();
         tokio::spawn(proxy.run());
@@ -259,10 +328,14 @@ mod tests {
             let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
             listener.local_addr().unwrap()
         };
-        let (proxy, proxy_addr, mut events) =
-            Proxy::bind((Ipv4Addr::LOCALHOST, 0).into(), unused, never_paused())
-                .await
-                .unwrap();
+        let (proxy, proxy_addr, mut events) = Proxy::bind(
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            unused,
+            never_paused(),
+            None,
+        )
+        .await
+        .unwrap();
         tokio::spawn(proxy.run());
 
         let _client = TcpStream::connect(proxy_addr).await.unwrap();
@@ -276,7 +349,7 @@ mod tests {
         let echo = spawn_echo().await;
         let (pause_tx, pause_rx) = watch::channel(false);
         let (proxy, proxy_addr, _events) =
-            Proxy::bind((Ipv4Addr::LOCALHOST, 0).into(), echo, pause_rx)
+            Proxy::bind((Ipv4Addr::LOCALHOST, 0).into(), echo, pause_rx, None)
                 .await
                 .unwrap();
         tokio::spawn(proxy.run());
@@ -298,5 +371,51 @@ mod tests {
             .expect("echo within 2s after resume")
             .expect("read succeeds");
         assert_eq!(&buf, b"ping");
+    }
+
+    #[tokio::test]
+    async fn anchor_trips_the_gate_after_k_packets() {
+        let echo = spawn_echo().await;
+        let (pause_tx, mut pause_rx) = watch::channel(false);
+        let anchor = Anchor::new(Direction::ClientToUpstream, 2, pause_tx);
+        let (proxy, proxy_addr, _events) = Proxy::bind(
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            echo,
+            pause_rx.clone(),
+            Some(anchor.clone()),
+        )
+        .await
+        .unwrap();
+        tokio::spawn(proxy.run());
+        // Arm at "scenario start"; before this the anchor is dormant.
+        anchor.arm();
+
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+
+        // First client->upstream packet: below the anchor, still forwarding.
+        client.write_all(b"a").await.unwrap();
+        let mut buf = [0u8; 1];
+        timeout(Duration::from_secs(2), client.read_exact(&mut buf))
+            .await
+            .expect("first packet echoes back")
+            .expect("read succeeds");
+        assert!(
+            !*pause_rx.borrow_and_update(),
+            "gate not tripped after one packet"
+        );
+
+        // Second client->upstream packet reaches K=2 and trips the shared gate.
+        client.write_all(b"b").await.unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if *pause_rx.borrow_and_update() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "anchor should have tripped the gate by K=2"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
     }
 }
