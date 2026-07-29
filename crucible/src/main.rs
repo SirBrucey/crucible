@@ -3,7 +3,7 @@ mod session;
 
 use std::{
     path::{Path, PathBuf},
-    process::Stdio,
+    process::{ExitCode, Stdio},
     time::{Duration, Instant},
 };
 
@@ -73,7 +73,7 @@ fn worker_bin_path() -> Result<PathBuf> {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -82,14 +82,16 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    let result = run().await;
-    if let Err(e) = &result {
-        tracing::error!(error = %e, "runner exiting with error");
+    match run().await {
+        Ok(outcome) => outcome.exit_code(),
+        Err(e) => {
+            tracing::error!(error = %e, "runner exiting with error");
+            ExitCode::from(2)
+        }
     }
-    result
 }
 
-async fn run() -> Result<()> {
+async fn run() -> Result<CampaignOutcome> {
     let (bus, journal_rx) = EventBus::new();
 
     let journal_path = journal::default_path(std::process::id());
@@ -137,7 +139,118 @@ fn cleanup_sockets() {
     }
 }
 
-async fn drive(bus: &EventBus) -> Result<()> {
+/// The campaign's overall outcome, mapped to the process exit code so automation
+/// can tell a real fault from a run that could not render a clean verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CampaignOutcome {
+    /// Every schedule that ran passed.
+    Clean,
+    /// At least one fault was found.
+    FaultsFound,
+    /// No fault, but some schedule could not be decided (a worker errored or a
+    /// verdict was inconclusive).
+    Indecisive,
+}
+
+impl CampaignOutcome {
+    fn exit_code(self) -> ExitCode {
+        match self {
+            CampaignOutcome::Clean => ExitCode::SUCCESS,
+            CampaignOutcome::FaultsFound => ExitCode::from(1),
+            CampaignOutcome::Indecisive => ExitCode::from(2),
+        }
+    }
+}
+
+/// Running tally of schedule outcomes across the campaign. A `Fail` verdict is a
+/// fault the framework found (the point of the run), kept with its schedule id
+/// and reason; `errored` counts workers that never produced a verdict (crash,
+/// timeout, panic).
+#[derive(Default)]
+struct Outcomes {
+    passed: usize,
+    faults: Vec<(u32, String)>,
+    inconclusive: usize,
+    errored: usize,
+}
+
+impl Outcomes {
+    fn record_verdict(&mut self, schedule_id: u32, verdict: Verdict) {
+        match verdict {
+            Verdict::Pass => {
+                tracing::info!(schedule_id, "pass");
+                self.passed += 1;
+            }
+            Verdict::Fail { reason } => {
+                tracing::warn!(schedule_id, %reason, "fault found");
+                self.faults.push((schedule_id, reason));
+            }
+            Verdict::Inconclusive { reason } => {
+                tracing::info!(schedule_id, %reason, "inconclusive");
+                self.inconclusive += 1;
+            }
+        }
+    }
+
+    /// Record a worker that never produced a verdict. `schedule_id` is `None`
+    /// only when the task panicked before it could report which schedule it ran.
+    fn record_error(&mut self, schedule_id: Option<u32>, error: impl std::fmt::Display) {
+        match schedule_id {
+            Some(schedule_id) => tracing::warn!(schedule_id, %error, "schedule failed"),
+            None => tracing::warn!(%error, "schedule task panicked"),
+        }
+        self.errored += 1;
+    }
+
+    /// Schedules that produced any outcome (verdict or error), i.e. were
+    /// dispatched and joined.
+    fn completed(&self) -> usize {
+        self.passed + self.faults.len() + self.inconclusive + self.errored
+    }
+
+    /// The campaign's overall outcome: a found fault dominates; failing that, any
+    /// worker error or inconclusive verdict means some schedule could not be
+    /// decided.
+    fn outcome(&self) -> CampaignOutcome {
+        if !self.faults.is_empty() {
+            CampaignOutcome::FaultsFound
+        } else if self.errored > 0 || self.inconclusive > 0 {
+            CampaignOutcome::Indecisive
+        } else {
+            CampaignOutcome::Clean
+        }
+    }
+
+    /// Log the end-of-campaign summary. `total` is how many schedules the
+    /// scheduler produced; fewer completed means the wall-clock budget cut the
+    /// run short.
+    fn report(&self, total: usize, elapsed_s: u64) {
+        if self.completed() < total {
+            tracing::warn!(
+                passed = self.passed,
+                faults = self.faults.len(),
+                inconclusive = self.inconclusive,
+                errored = self.errored,
+                total,
+                elapsed_s,
+                budget_s = TOTAL_BUDGET.as_secs(),
+                "campaign hit its wall-clock budget; remaining schedules skipped"
+            );
+        } else {
+            tracing::info!(
+                passed = self.passed,
+                faults = self.faults.len(),
+                inconclusive = self.inconclusive,
+                errored = self.errored,
+                total,
+                elapsed_s,
+                "campaign complete"
+            );
+        }
+    }
+}
+
+async fn drive(bus: &EventBus) -> Result<CampaignOutcome> {
     let campaign_start = Instant::now();
     let mut worker_id: u32 = 0;
 
@@ -154,8 +267,7 @@ async fn drive(bus: &EventBus) -> Result<()> {
     let max_inflight = concurrency();
     let mut scheduler = BurstScheduler::new(&services);
     let total = scheduler.total();
-    let mut ran: usize = 0;
-    let mut failed: usize = 0;
+    let mut outcomes = Outcomes::default();
 
     // Run up to `max_inflight` schedule workers at once, each on its own isolated
     // fleet replica. TOTAL_BUDGET caps when we stop dispatching; the in-flight
@@ -184,36 +296,14 @@ async fn drive(bus: &EventBus) -> Result<()> {
             break;
         };
         match joined {
-            Ok((schedule_id, Ok(verdict))) => {
-                tracing::info!(schedule_id, ?verdict, "run result");
-                ran += 1;
-            }
-            Ok((schedule_id, Err(e))) => {
-                tracing::warn!(schedule_id, error = %e, "schedule failed; continuing campaign");
-                failed += 1;
-            }
-            Err(join_err) => {
-                tracing::warn!(error = %join_err, "schedule task panicked; continuing campaign");
-                failed += 1;
-            }
+            Ok((schedule_id, Ok(verdict))) => outcomes.record_verdict(schedule_id, verdict),
+            Ok((schedule_id, Err(e))) => outcomes.record_error(Some(schedule_id), e),
+            Err(join_err) => outcomes.record_error(None, join_err),
         }
     }
 
-    let elapsed_s = campaign_start.elapsed().as_secs();
-    if ran + failed < total {
-        tracing::warn!(
-            ran,
-            failed,
-            total,
-            elapsed_s,
-            budget_s = TOTAL_BUDGET.as_secs(),
-            "campaign hit its wall-clock budget; remaining schedules skipped"
-        );
-    } else {
-        tracing::info!(ran, failed, total, elapsed_s, "campaign complete");
-    }
-
-    Ok(())
+    outcomes.report(total, campaign_start.elapsed().as_secs());
+    Ok(outcomes.outcome())
 }
 
 /// Run the fault-free learn pass on its own worker and return the observed
@@ -371,5 +461,80 @@ async fn wait_worker(
         Ok(())
     } else {
         Err(Error::WorkerExitedNonZero(status))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn outcomes_tally_by_verdict_kind() {
+        let mut outcomes = Outcomes::default();
+        outcomes.record_verdict(1, Verdict::Pass);
+        outcomes.record_verdict(
+            2,
+            Verdict::Fail {
+                reason: "acked write missing".into(),
+            },
+        );
+        outcomes.record_verdict(
+            3,
+            Verdict::Inconclusive {
+                reason: "never quiesced".into(),
+            },
+        );
+        outcomes.record_verdict(
+            4,
+            Verdict::Fail {
+                reason: "duplicate applied".into(),
+            },
+        );
+        outcomes.record_error(Some(5), "worker exited non-zero");
+        outcomes.record_error(None, "task panicked");
+
+        assert_eq!(outcomes.passed, 1);
+        assert_eq!(outcomes.inconclusive, 1);
+        assert_eq!(outcomes.errored, 2);
+        assert_eq!(outcomes.completed(), 6);
+        // Faults keep their schedule id and reason, in arrival order.
+        assert_eq!(
+            outcomes.faults,
+            vec![
+                (2, "acked write missing".to_string()),
+                (4, "duplicate applied".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn all_pass_is_clean() {
+        let mut outcomes = Outcomes::default();
+        outcomes.record_verdict(1, Verdict::Pass);
+        assert_eq!(outcomes.outcome(), CampaignOutcome::Clean);
+    }
+
+    #[test]
+    fn a_fault_dominates_even_with_errors() {
+        let mut outcomes = Outcomes::default();
+        outcomes.record_verdict(1, Verdict::Pass);
+        outcomes.record_verdict(2, Verdict::Fail { reason: "x".into() });
+        outcomes.record_error(Some(3), "boom");
+        assert_eq!(outcomes.outcome(), CampaignOutcome::FaultsFound);
+    }
+
+    #[test]
+    fn a_worker_error_is_indecisive() {
+        let mut outcomes = Outcomes::default();
+        outcomes.record_verdict(1, Verdict::Pass);
+        outcomes.record_error(Some(2), "boom");
+        assert_eq!(outcomes.outcome(), CampaignOutcome::Indecisive);
+    }
+
+    #[test]
+    fn an_inconclusive_verdict_is_indecisive() {
+        let mut outcomes = Outcomes::default();
+        outcomes.record_verdict(1, Verdict::Inconclusive { reason: "y".into() });
+        assert_eq!(outcomes.outcome(), CampaignOutcome::Indecisive);
     }
 }
