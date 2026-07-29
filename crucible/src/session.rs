@@ -7,12 +7,12 @@
 use crucible_core::{
     event_bus::{EventBus, RunnerEvent},
     ipc::{
-        RunnerToWorker, ServiceProfile, Verdict, WorkerToRunner,
+        HEARTBEAT_TIMEOUT, RunnerToWorker, ServiceProfile, Verdict, WorkerToRunner,
         codec::{read_frame, write_frame},
     },
     scheduler::Schedule,
 };
-use tokio::net::UnixStream;
+use tokio::{net::UnixStream, time::timeout};
 
 use crate::error::{Error, Result};
 
@@ -105,7 +105,7 @@ impl Session<Dispatching> {
         .await
         .expect("journal receiver alive");
 
-        let msg = read_frame::<WorkerToRunner, _>(&mut self.stream).await?;
+        let msg = read_live(&mut self.stream).await?;
         let services = match &msg {
             WorkerToRunner::SessionCatalogue { services } => services.clone(),
             other => {
@@ -167,15 +167,13 @@ impl Session<Dispatching> {
 
 impl Session<AwaitingResult> {
     /// Read frames until `RunResult`; every intervening `Event(_)` is journaled
-    /// via the bus.
-    ///
-    /// SAFETY: an ill-behaved worker could stream `Event`s indefinitely and
-    /// hang this loop. The runner runs each schedule inside a per-schedule
-    /// wall-clock deadline (see [`crate::wait_worker`]), so an unbounded
-    /// worker gets killed at the parent level.
+    /// via the bus, and heartbeats are consumed to reset the watchdog. A worker
+    /// that sends nothing for [`HEARTBEAT_TIMEOUT`] is deemed unresponsive; an
+    /// ill-behaved worker streaming frames forever is still bounded by the
+    /// per-schedule deadline (see [`crate::wait_worker`]).
     pub async fn await_result(mut self, bus: &EventBus) -> Result<Verdict> {
         loop {
-            let msg = read_frame::<WorkerToRunner, _>(&mut self.stream).await?;
+            let msg = read_live(&mut self.stream).await?;
             let verdict = match &msg {
                 WorkerToRunner::RunResult { verdict, .. } => Some(verdict.clone()),
                 WorkerToRunner::Event(_) => None,
@@ -196,6 +194,24 @@ impl Session<AwaitingResult> {
             if let Some(v) = verdict {
                 return Ok(v);
             }
+        }
+    }
+}
+
+/// Read the next non-heartbeat frame, treating each heartbeat as proof of life
+/// that resets the watchdog. Returns [`Error::WorkerUnresponsive`] if nothing
+/// arrives within [`HEARTBEAT_TIMEOUT`], i.e. the worker has hung or died.
+async fn read_live(stream: &mut UnixStream) -> Result<WorkerToRunner> {
+    loop {
+        match timeout(HEARTBEAT_TIMEOUT, read_frame::<WorkerToRunner, _>(stream)).await {
+            Ok(frame) => {
+                let msg = frame?;
+                if matches!(msg, WorkerToRunner::Heartbeat) {
+                    continue;
+                }
+                return Ok(msg);
+            }
+            Err(_) => return Err(Error::WorkerUnresponsive(HEARTBEAT_TIMEOUT)),
         }
     }
 }

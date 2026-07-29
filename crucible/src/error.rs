@@ -18,6 +18,8 @@ pub enum Error {
     WorkerExitedNonZero(ExitStatus),
     #[error("worker did not exit within {0:?}")]
     WorkerTimeout(Duration),
+    #[error("worker sent no heartbeat within {0:?}")]
+    WorkerUnresponsive(Duration),
     #[error("runner session in state `{state}` expected `{expected}`, got `{got}`")]
     UnexpectedMessage {
         state: &'static str,
