@@ -32,6 +32,12 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const TOTAL_BUDGET: Duration = Duration::from_mins(5);
 const SCHEDULE_MARGIN: Duration = Duration::from_secs(30);
 const LEARN_MARGIN: Duration = Duration::from_secs(30);
+/// A failed schedule is respawned on a fresh worker up to this many total
+/// attempts before it is recorded as errored.
+const MAX_ATTEMPTS: u32 = 3;
+/// If this many schedules fail every attempt back to back, the campaign gives
+/// up: something is systemically wrong (e.g. Docker is unavailable).
+const GIVE_UP_AFTER: u32 = 3;
 /// Number of schedule workers (each with its own fleet replica) to run at once.
 /// Overridable with `CRUCIBLE_CONCURRENCY`.
 const DEFAULT_CONCURRENCY: usize = 3;
@@ -250,6 +256,37 @@ impl Outcomes {
     }
 }
 
+/// Tracks respawn attempts and consecutive whole-schedule failures, so the
+/// campaign retries transient worker deaths but abandons a systemically broken
+/// run.
+#[derive(Default)]
+struct Recovery {
+    consecutive_failures: u32,
+}
+
+impl Recovery {
+    /// Whether a schedule that has just failed its `attempt`th try (1-based) has
+    /// attempts left to respawn.
+    fn may_respawn(&self, attempt: u32) -> bool {
+        attempt < MAX_ATTEMPTS
+    }
+
+    /// A schedule produced a verdict; the failure streak resets.
+    fn reset(&mut self) {
+        self.consecutive_failures = 0;
+    }
+
+    /// Record a schedule that failed every attempt, extending the streak.
+    fn record_failure(&mut self) {
+        self.consecutive_failures += 1;
+    }
+
+    /// Whether enough schedules have failed in a row to abandon the campaign.
+    fn is_exhausted(&self) -> bool {
+        self.consecutive_failures >= GIVE_UP_AFTER
+    }
+}
+
 async fn drive(bus: &EventBus) -> Result<CampaignOutcome> {
     let campaign_start = Instant::now();
     let mut worker_id: u32 = 0;
@@ -274,10 +311,15 @@ async fn drive(bus: &EventBus) -> Result<CampaignOutcome> {
     // workers run to completion. Schedules are emitted round-robin across bursts,
     // so a budget-truncated campaign still samples every burst evenly, and a
     // worker's failure is recorded against its schedule while the others carry on.
-    let mut inflight: JoinSet<(u32, Result<Verdict>)> = JoinSet::new();
+    let mut inflight: JoinSet<(Schedule, u32, Result<Verdict>)> = JoinSet::new();
+    let mut recovery = Recovery::default();
     let mut exhausted = false;
+    let mut gave_up = false;
     loop {
-        while inflight.len() < max_inflight && !exhausted && campaign_start.elapsed() < TOTAL_BUDGET
+        while inflight.len() < max_inflight
+            && !exhausted
+            && !gave_up
+            && campaign_start.elapsed() < TOTAL_BUDGET
         {
             match scheduler.next() {
                 Some(schedule) => {
@@ -285,6 +327,7 @@ async fn drive(bus: &EventBus) -> Result<CampaignOutcome> {
                         bus.clone(),
                         worker_id,
                         schedule,
+                        1,
                         schedule_budget,
                     ));
                     worker_id += 1;
@@ -296,9 +339,60 @@ async fn drive(bus: &EventBus) -> Result<CampaignOutcome> {
             break;
         };
         match joined {
-            Ok((schedule_id, Ok(verdict))) => outcomes.record_verdict(schedule_id, verdict),
-            Ok((schedule_id, Err(e))) => outcomes.record_error(Some(schedule_id), e),
-            Err(join_err) => outcomes.record_error(None, join_err),
+            Ok((schedule, _attempt, Ok(verdict))) => {
+                recovery.reset();
+                outcomes.record_verdict(schedule.schedule_id, verdict);
+            }
+            // A worker that outran its budget did not crash; we simply have no
+            // verdict in the time allowed. Record it inconclusive rather than
+            // retrying into the campaign's hard cap.
+            Ok((schedule, _attempt, Err(Error::WorkerTimeout(budget)))) => {
+                recovery.reset();
+                outcomes.record_verdict(
+                    schedule.schedule_id,
+                    Verdict::Inconclusive {
+                        reason: format!("worker exceeded its {budget:?} budget"),
+                    },
+                );
+            }
+            Ok((schedule, attempt, Err(e)))
+                if !gave_up
+                    && campaign_start.elapsed() < TOTAL_BUDGET
+                    && recovery.may_respawn(attempt) =>
+            {
+                tracing::warn!(
+                    schedule_id = schedule.schedule_id,
+                    attempt,
+                    error = %e,
+                    "worker failed; respawning on a fresh replica"
+                );
+                inflight.spawn(run_one_schedule(
+                    bus.clone(),
+                    worker_id,
+                    schedule,
+                    attempt + 1,
+                    schedule_budget,
+                ));
+                worker_id += 1;
+            }
+            Ok((schedule, attempt, Err(e))) => {
+                let schedule_id = schedule.schedule_id;
+                tracing::warn!(schedule_id, attempts = attempt, error = %e, "worker failed and will not be retried");
+                outcomes.record_error(Some(schedule_id), e);
+                recovery.record_failure();
+            }
+            Err(join_err) => {
+                // A panicked task loses its schedule, so it cannot be respawned.
+                outcomes.record_error(None, join_err);
+                recovery.record_failure();
+            }
+        }
+        if recovery.is_exhausted() && !gave_up {
+            gave_up = true;
+            tracing::error!(
+                consecutive = GIVE_UP_AFTER,
+                "too many schedules failed in a row; abandoning the campaign"
+            );
         }
     }
 
@@ -326,19 +420,20 @@ async fn execute_learn(bus: &EventBus, worker_id: u32) -> Result<(Vec<ServicePro
     Ok((services, run_cost))
 }
 
-/// Run one schedule and pair its verdict (or the error that ended it) with the
-/// schedule id, so the pool can match completions that arrive out of order.
-/// Owns everything it needs, so it can be spawned onto a `JoinSet`.
+/// Run one schedule and hand back the schedule and its `attempt` alongside the
+/// verdict (or the error that ended it), so the pool can match out-of-order
+/// completions and respawn a failed schedule on a fresh worker. Owns everything
+/// it needs, so it can be spawned onto a `JoinSet`.
 async fn run_one_schedule(
     bus: EventBus,
     worker_id: u32,
     schedule: Schedule,
+    attempt: u32,
     schedule_budget: Duration,
-) -> (u32, Result<Verdict>) {
-    let schedule_id = schedule.schedule_id;
-    let verdict = run_worker(&bus, worker_id, schedule, schedule_budget).await;
+) -> (Schedule, u32, Result<Verdict>) {
+    let verdict = run_worker(&bus, worker_id, schedule.clone(), schedule_budget).await;
     reclaim_fleet(worker_id).await;
-    (schedule_id, verdict)
+    (schedule, attempt, verdict)
 }
 
 /// Bring up a worker on its own socket and fleet replica, run the schedule, and
@@ -536,5 +631,34 @@ mod tests {
         let mut outcomes = Outcomes::default();
         outcomes.record_verdict(1, Verdict::Inconclusive { reason: "y".into() });
         assert_eq!(outcomes.outcome(), CampaignOutcome::Indecisive);
+    }
+
+    #[test]
+    fn a_schedule_respawns_until_the_attempt_cap() {
+        let recovery = Recovery::default();
+        assert!(recovery.may_respawn(1));
+        assert!(recovery.may_respawn(MAX_ATTEMPTS - 1));
+        assert!(!recovery.may_respawn(MAX_ATTEMPTS));
+    }
+
+    #[test]
+    fn the_campaign_is_exhausted_after_consecutive_failures() {
+        let mut recovery = Recovery::default();
+        for _ in 0..GIVE_UP_AFTER - 1 {
+            recovery.record_failure();
+            assert!(!recovery.is_exhausted());
+        }
+        recovery.record_failure();
+        assert!(recovery.is_exhausted());
+    }
+
+    #[test]
+    fn a_verdict_resets_the_failure_streak() {
+        let mut recovery = Recovery::default();
+        for _ in 0..GIVE_UP_AFTER {
+            recovery.record_failure();
+        }
+        recovery.reset();
+        assert!(!recovery.is_exhausted());
     }
 }

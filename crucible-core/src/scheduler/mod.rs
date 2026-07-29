@@ -11,6 +11,7 @@ use crate::ipc::RunnerToWorker;
 /// A schedule the runner hands to a worker to execute. The fault fires once the
 /// target service's proxy has observed `fault_packet_index` packets on
 /// `direction`, so it lands relative to observed traffic rather than a clock.
+#[derive(Clone)]
 pub struct Schedule {
     pub schedule_id: u32,
     pub service: String,
