@@ -14,7 +14,7 @@ use tokio::{sync::mpsc, task::JoinHandle};
 use crate::{proxy_log::Sessions, verdict::Observations};
 
 const QUIESCENCE_POLL: Duration = Duration::from_millis(200);
-/// How often the fault anchor re-checks the observed packet count.
+/// How often the kill waiter re-checks for the proxy's freeze signal.
 const ANCHOR_POLL: Duration = Duration::from_millis(5);
 
 /// Per-service running packet tallies, one counter per direction.
@@ -50,13 +50,14 @@ impl DirectionCounts {
 pub struct EventIndex {
     events: Vec<(String, ConnEvent)>,
     packet_counts: HashMap<String, DirectionCounts>,
+    freezes: u32,
     last_ts: Option<u128>,
 }
 
 impl EventIndex {
     /// Record one observed event, folding it into the aggregates before storing
-    /// it. Only `Wrote` events count as packets; every event advances the last
-    /// seen timestamp.
+    /// it. `Wrote` events count as packets and `Froze` events as freezes; every
+    /// event advances the last seen timestamp.
     pub fn record(&mut self, service: String, event: ConnEvent) {
         self.last_ts = Some(match self.last_ts {
             Some(prev) => prev.max(event.ts_ns),
@@ -68,6 +69,9 @@ impl EventIndex {
                 .or_default()
                 .increment(direction);
         }
+        if matches!(event.kind, ConnEventKind::Froze { .. }) {
+            self.freezes += 1;
+        }
         self.events.push((service, event));
     }
 
@@ -76,6 +80,12 @@ impl EventIndex {
         self.packet_counts
             .get(service)
             .map_or(0, |counts| counts.get(direction))
+    }
+
+    /// How many times the proxy has reported the fleet freezing (the fault
+    /// anchor tripping) so far. O(1).
+    pub fn freeze_count(&self) -> u32 {
+        self.freezes
     }
 
     /// Wall-clock nanoseconds of the most recent event, or `None` if nothing has
@@ -140,30 +150,18 @@ impl SessionObserver {
             .sessions();
     }
 
-    /// Block until `service` has written `count` more packets on `direction`
-    /// than it had when this call began, or until `timeout` elapses; returns
-    /// whether the count was reached. The baseline is captured at call time,
+    /// Block until the proxy reports the fleet has frozen (the fault anchor
+    /// tripped) since this call began, or until `timeout` elapses; returns
+    /// whether the freeze was observed. The baseline is captured at call time,
     /// which the caller aligns with scenario start (the same moment it arms the
-    /// proxy), so both count scenario traffic from the same origin. This detects
-    /// the proxy's own freeze; `count == 0` returns immediately.
-    pub async fn wait_for_packet(
-        &self,
-        service: &str,
-        direction: Direction,
-        count: u32,
-        timeout: Duration,
-    ) -> bool {
-        let baseline = self.packet_count(service, direction);
-        if count == 0 {
-            return true;
-        }
+    /// anchor). Because the freeze is a held state, released only by an explicit
+    /// resume, observing it even late still means the fleet is currently frozen,
+    /// so gating the kill on this cannot fire before the freeze is in place.
+    pub async fn wait_for_freeze(&self, timeout: Duration) -> bool {
+        let baseline = self.freeze_count();
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
-            if self
-                .packet_count(service, direction)
-                .saturating_sub(baseline)
-                >= count
-            {
+            if self.freeze_count() > baseline {
                 return true;
             }
             if tokio::time::Instant::now() >= deadline {
@@ -173,11 +171,11 @@ impl SessionObserver {
         }
     }
 
-    fn packet_count(&self, service: &str, direction: Direction) -> u32 {
+    fn freeze_count(&self) -> u32 {
         self.index
             .lock()
             .expect("session observer index mutex")
-            .packet_count(service, direction)
+            .freeze_count()
     }
 
     /// Wall-clock nanoseconds of the most recent event the observer has
@@ -307,6 +305,22 @@ mod tests {
         index.record("db".into(), ConnEvent::closed_at(0, 15, 0, 0));
         assert_eq!(index.packet_count("db", Direction::ClientToUpstream), 0);
         assert_eq!(index.packet_count("db", Direction::UpstreamToClient), 0);
+    }
+
+    #[test]
+    fn freeze_count_tracks_only_froze_events() {
+        let mut index = EventIndex::default();
+        assert_eq!(index.freeze_count(), 0);
+        // Traffic is not a freeze.
+        index.record(
+            "db".into(),
+            ConnEvent::wrote_at(0, 10, Direction::ClientToUpstream, 1),
+        );
+        assert_eq!(index.freeze_count(), 0);
+        index.record("db".into(), ConnEvent::froze_at(0, 20, 3));
+        assert_eq!(index.freeze_count(), 1);
+        index.record("db".into(), ConnEvent::froze_at(0, 30, 5));
+        assert_eq!(index.freeze_count(), 2);
     }
 
     #[test]

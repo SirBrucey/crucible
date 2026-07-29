@@ -110,15 +110,11 @@ impl Orchestrator {
         let kill_fut = async {
             tokio::select! {
                 biased;
-                reached = session_observer.wait_for_packet(
-                    &schedule.service,
-                    schedule.direction,
-                    schedule.fault_packet_index,
-                    ANCHOR_TIMEOUT,
-                ) => {
-                    if !reached {
-                        // The target never reached its Kth packet; release the
-                        // freeze and record a miss.
+                frozen = session_observer.wait_for_freeze(ANCHOR_TIMEOUT) => {
+                    if !frozen {
+                        // The proxy never reported freezing (the target did not
+                        // reach its Kth packet); release the freeze in case it is
+                        // mid-flight and record a miss.
                         self.deployment.resume_proxies().await?;
                         return Ok::<_, Error>(missed(KillMissReason::ScenarioEndedBeforeAnchor));
                     }
