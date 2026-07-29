@@ -137,6 +137,53 @@ fn cleanup_sockets() {
     }
 }
 
+/// Running tally of schedule outcomes across the campaign. A `Fail` verdict is a
+/// fault the framework found (the point of the run), kept with its schedule id
+/// and reason; `errored` counts workers that never produced a verdict (crash,
+/// timeout, panic).
+#[derive(Default)]
+struct Outcomes {
+    passed: usize,
+    faults: Vec<(u32, String)>,
+    inconclusive: usize,
+    errored: usize,
+}
+
+impl Outcomes {
+    fn record_verdict(&mut self, schedule_id: u32, verdict: Verdict) {
+        match verdict {
+            Verdict::Pass => {
+                tracing::info!(schedule_id, "pass");
+                self.passed += 1;
+            }
+            Verdict::Fail { reason } => {
+                tracing::warn!(schedule_id, %reason, "fault found");
+                self.faults.push((schedule_id, reason));
+            }
+            Verdict::Inconclusive { reason } => {
+                tracing::info!(schedule_id, %reason, "inconclusive");
+                self.inconclusive += 1;
+            }
+        }
+    }
+
+    /// Record a worker that never produced a verdict. `schedule_id` is `None`
+    /// only when the task panicked before it could report which schedule it ran.
+    fn record_error(&mut self, schedule_id: Option<u32>, error: impl std::fmt::Display) {
+        match schedule_id {
+            Some(schedule_id) => tracing::warn!(schedule_id, %error, "schedule failed"),
+            None => tracing::warn!(%error, "schedule task panicked"),
+        }
+        self.errored += 1;
+    }
+
+    /// Schedules that produced any outcome (verdict or error), i.e. were
+    /// dispatched and joined.
+    fn completed(&self) -> usize {
+        self.passed + self.faults.len() + self.inconclusive + self.errored
+    }
+}
+
 async fn drive(bus: &EventBus) -> Result<()> {
     let campaign_start = Instant::now();
     let mut worker_id: u32 = 0;
@@ -154,8 +201,7 @@ async fn drive(bus: &EventBus) -> Result<()> {
     let max_inflight = concurrency();
     let mut scheduler = BurstScheduler::new(&services);
     let total = scheduler.total();
-    let mut ran: usize = 0;
-    let mut failed: usize = 0;
+    let mut outcomes = Outcomes::default();
 
     // Run up to `max_inflight` schedule workers at once, each on its own isolated
     // fleet replica. TOTAL_BUDGET caps when we stop dispatching; the in-flight
@@ -184,33 +230,34 @@ async fn drive(bus: &EventBus) -> Result<()> {
             break;
         };
         match joined {
-            Ok((schedule_id, Ok(verdict))) => {
-                tracing::info!(schedule_id, ?verdict, "run result");
-                ran += 1;
-            }
-            Ok((schedule_id, Err(e))) => {
-                tracing::warn!(schedule_id, error = %e, "schedule failed; continuing campaign");
-                failed += 1;
-            }
-            Err(join_err) => {
-                tracing::warn!(error = %join_err, "schedule task panicked; continuing campaign");
-                failed += 1;
-            }
+            Ok((schedule_id, Ok(verdict))) => outcomes.record_verdict(schedule_id, verdict),
+            Ok((schedule_id, Err(e))) => outcomes.record_error(Some(schedule_id), e),
+            Err(join_err) => outcomes.record_error(None, join_err),
         }
     }
 
     let elapsed_s = campaign_start.elapsed().as_secs();
-    if ran + failed < total {
+    if outcomes.completed() < total {
         tracing::warn!(
-            ran,
-            failed,
+            passed = outcomes.passed,
+            faults = outcomes.faults.len(),
+            inconclusive = outcomes.inconclusive,
+            errored = outcomes.errored,
             total,
             elapsed_s,
             budget_s = TOTAL_BUDGET.as_secs(),
             "campaign hit its wall-clock budget; remaining schedules skipped"
         );
     } else {
-        tracing::info!(ran, failed, total, elapsed_s, "campaign complete");
+        tracing::info!(
+            passed = outcomes.passed,
+            faults = outcomes.faults.len(),
+            inconclusive = outcomes.inconclusive,
+            errored = outcomes.errored,
+            total,
+            elapsed_s,
+            "campaign complete"
+        );
     }
 
     Ok(())
@@ -371,5 +418,49 @@ async fn wait_worker(
         Ok(())
     } else {
         Err(Error::WorkerExitedNonZero(status))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn outcomes_tally_by_verdict_kind() {
+        let mut outcomes = Outcomes::default();
+        outcomes.record_verdict(1, Verdict::Pass);
+        outcomes.record_verdict(
+            2,
+            Verdict::Fail {
+                reason: "acked write missing".into(),
+            },
+        );
+        outcomes.record_verdict(
+            3,
+            Verdict::Inconclusive {
+                reason: "never quiesced".into(),
+            },
+        );
+        outcomes.record_verdict(
+            4,
+            Verdict::Fail {
+                reason: "duplicate applied".into(),
+            },
+        );
+        outcomes.record_error(Some(5), "worker exited non-zero");
+        outcomes.record_error(None, "task panicked");
+
+        assert_eq!(outcomes.passed, 1);
+        assert_eq!(outcomes.inconclusive, 1);
+        assert_eq!(outcomes.errored, 2);
+        assert_eq!(outcomes.completed(), 6);
+        // Faults keep their schedule id and reason, in arrival order.
+        assert_eq!(
+            outcomes.faults,
+            vec![
+                (2, "acked write missing".to_string()),
+                (4, "duplicate applied".to_string()),
+            ]
+        );
     }
 }
