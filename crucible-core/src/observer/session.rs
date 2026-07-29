@@ -25,7 +25,7 @@ struct DirectionCounts {
 }
 
 impl DirectionCounts {
-    fn get(&self, direction: Direction) -> u32 {
+    fn get(self, direction: Direction) -> u32 {
         match direction {
             Direction::ClientToUpstream => self.client_to_upstream,
             Direction::UpstreamToClient => self.upstream_to_client,
