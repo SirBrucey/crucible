@@ -166,6 +166,11 @@ fn spawn_pause_control(pause_tx: watch::Sender<bool>, anchor: Option<Anchor>) {
                     }
                 }
                 _ = resume.recv() => {
+                    // Disarm before releasing: the anchor is one-shot, so a late
+                    // packet cannot re-trip the gate after we have resumed.
+                    if let Some(anchor) = &anchor {
+                        anchor.disarm();
+                    }
                     let _ = pause_tx.send(false);
                     tracing::info!("forwarding resumed (SIGUSR2)");
                 }

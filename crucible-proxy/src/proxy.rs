@@ -66,6 +66,14 @@ impl Anchor {
             let _ = self.tripwire.send(true);
         }
     }
+
+    /// Disarm: stop counting so the anchor cannot trip again. Paired with resume
+    /// on the give-up paths (the scenario ended, or the anchor timed out, before
+    /// `k` was reached), so a late packet cannot re-trip the gate after the flow
+    /// has been released with no one left to release it again.
+    pub fn disarm(&self) {
+        self.active.store(false, Ordering::SeqCst);
+    }
 }
 
 pub struct Proxy {
@@ -371,6 +379,22 @@ mod tests {
             .expect("echo within 2s after resume")
             .expect("read succeeds");
         assert_eq!(&buf, b"ping");
+    }
+
+    #[test]
+    fn a_disarmed_anchor_does_not_refreeze() {
+        // On a give-up path the runner releases the gate but the anchor stays
+        // armed; a trailing packet that reaches k must not trip it again (there
+        // would be no one left to resume). Disarming makes each arm a one-shot.
+        let (tx, rx) = watch::channel(false);
+        let anchor = Anchor::new(Direction::ClientToUpstream, 2, tx);
+        anchor.arm();
+        anchor.record(); // count 1, below k
+        assert!(!*rx.borrow(), "must not trip below k");
+        anchor.disarm();
+        anchor.record(); // would be count 2 == k, but disarmed
+        anchor.record();
+        assert!(!*rx.borrow(), "a disarmed anchor must not re-trip the gate");
     }
 
     #[tokio::test]
