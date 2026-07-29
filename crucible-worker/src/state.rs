@@ -3,9 +3,12 @@
 //! `Worker<S>` carries per-worker identity and the IPC stream across states;
 //! `state: S` holds what changes. Transitions consume `self` and return the
 //! next `Worker<_>`; illegal sequences are compile errors.
+//!
+//! The fleet is brought up only after the worker knows its work, so a schedule
+//! can arm the proxy's fault anchor on its command line at startup.
 
 use crucible_core::{
-    deployment::{Deployment, Docker},
+    deployment::{Deployment, Docker, ProxyAnchor},
     fleet,
     ipc::{
         RunnerToWorker, WorkerEvent, WorkerToRunner,
@@ -29,16 +32,11 @@ pub struct Worker<S> {
 
 pub struct Handshaking;
 
-pub struct Idle {
-    orchestrator: Orchestrator,
-}
+pub struct Idle;
 
-pub struct Learning {
-    orchestrator: Orchestrator,
-}
+pub struct Learning;
 
 pub struct Executing {
-    orchestrator: Orchestrator,
     schedule: Schedule,
 }
 
@@ -49,6 +47,21 @@ pub struct ShuttingDown {
 pub enum IdleNext {
     Learn(Worker<Learning>),
     Work(Worker<Executing>),
+}
+
+/// Build the fleet and the orchestrator, arming the proxy with `anchor` if set.
+/// Tears the replica down on any bring-up failure so a worker that dies here (a
+/// flaky readiness timeout, a crash) does not leak its containers.
+async fn bring_up(worker_id: u32, anchor: Option<ProxyAnchor>) -> Result<Orchestrator> {
+    let mut orchestrator = Orchestrator::new(
+        Docker::new(worker_id, &fleet::EXAMPLE, anchor)?,
+        Orders::new()?,
+    );
+    if let Err(e) = orchestrator.setup().await {
+        let _ = orchestrator.teardown().await;
+        return Err(e.into());
+    }
+    Ok(orchestrator)
 }
 
 impl Worker<Handshaking> {
@@ -73,33 +86,11 @@ impl Worker<Handshaking> {
         match read_frame::<RunnerToWorker, _>(&mut self.stream).await? {
             RunnerToWorker::HelloAck { runner_version } => {
                 tracing::info!(worker_id = self.id, %runner_version, "handshake ok");
-                let mut orchestrator =
-                    Orchestrator::new(Docker::new(self.id, &fleet::EXAMPLE)?, Orders::new()?);
-                // Tear the replica down on any bring-up failure so a worker that
-                // dies here (a flaky readiness timeout, a crash) does not leak
-                // its containers.
-                if let Err(e) = orchestrator.setup().await {
-                    let _ = orchestrator.teardown().await;
-                    return Err(e.into());
-                }
-                let db_addr = orchestrator
-                    .deployment()
-                    .endpoint("db")
-                    .expect("db endpoint present after setup");
-                let db_url = format!("mysql://root@{db_addr}/orders");
-                let db_observer = match DbObserver::connect(&db_url).await {
-                    Ok(observer) => observer,
-                    Err(e) => {
-                        let _ = orchestrator.teardown().await;
-                        return Err(e.into());
-                    }
-                };
-                orchestrator.set_db_observer(db_observer);
                 Ok(Worker {
                     id: self.id,
                     version: self.version,
                     stream: self.stream,
-                    state: Idle { orchestrator },
+                    state: Idle,
                 })
             }
             other => Err(Error::UnexpectedMessage {
@@ -123,22 +114,22 @@ impl Worker<Idle> {
                     id: self.id,
                     version: self.version,
                     stream: self.stream,
-                    state: Learning {
-                        orchestrator: self.state.orchestrator,
-                    },
+                    state: Learning,
                 }))
             }
             RunnerToWorker::Schedule {
                 schedule_id,
                 service,
-                fault_offset_ns,
+                direction,
+                fault_packet_index,
                 payload,
             } => {
                 tracing::info!(
                     worker_id = self.id,
                     schedule_id,
                     %service,
-                    fault_offset_ns,
+                    ?direction,
+                    fault_packet_index,
                     "received schedule"
                 );
                 Ok(IdleNext::Work(Worker {
@@ -146,11 +137,11 @@ impl Worker<Idle> {
                     version: self.version,
                     stream: self.stream,
                     state: Executing {
-                        orchestrator: self.state.orchestrator,
                         schedule: Schedule {
                             schedule_id,
                             service,
-                            fault_offset_ns,
+                            direction,
+                            fault_packet_index,
                             payload,
                         },
                     },
@@ -167,10 +158,11 @@ impl Worker<Idle> {
 
 impl Worker<Learning> {
     pub async fn execute_learn(mut self) -> Result<Worker<ShuttingDown>> {
-        let services =
-            self.state.orchestrator.learn().await.inspect_err(
-                |e| tracing::error!(worker_id = self.id, error = %e, "learn failed"),
-            )?;
+        let mut orchestrator = bring_up(self.id, None).await?;
+        let services = orchestrator
+            .learn()
+            .await
+            .inspect_err(|e| tracing::error!(worker_id = self.id, error = %e, "learn failed"))?;
         let count = services.len();
         write_frame(
             &mut self.stream,
@@ -182,19 +174,42 @@ impl Worker<Learning> {
             id: self.id,
             version: self.version,
             stream: self.stream,
-            state: ShuttingDown {
-                orchestrator: self.state.orchestrator,
-            },
+            state: ShuttingDown { orchestrator },
         })
     }
 }
 
 impl Worker<Executing> {
     pub async fn execute_and_report(mut self) -> Result<Worker<ShuttingDown>> {
-        let schedule_id = self.state.schedule.schedule_id;
-        let (verdict, kill_report) = self
-            .state
-            .orchestrator
+        let schedule = &self.state.schedule;
+        let schedule_id = schedule.schedule_id;
+        let anchor = ProxyAnchor {
+            service: schedule.service.clone(),
+            direction: schedule.direction,
+            k: schedule.fault_packet_index,
+        };
+        let mut orchestrator = bring_up(self.id, Some(anchor)).await?;
+
+        // Read the database through the proxy's stable host port: it survives the
+        // db being killed and restarted (the alias re-resolves to the new
+        // container), where a direct ephemeral port would not. The anchor is
+        // dormant during setup and released before this observer queries, so the
+        // proxy path is never actually frozen under it.
+        let db_addr = orchestrator
+            .deployment()
+            .endpoint("db")
+            .expect("db endpoint present after setup");
+        let db_url = format!("mysql://root@{db_addr}/orders");
+        let db_observer = match DbObserver::connect(&db_url).await {
+            Ok(observer) => observer,
+            Err(e) => {
+                let _ = orchestrator.teardown().await;
+                return Err(e.into());
+            }
+        };
+        orchestrator.set_db_observer(db_observer);
+
+        let (verdict, kill_report) = orchestrator
             .execute(&self.state.schedule)
             .await
             .inspect_err(
@@ -229,9 +244,7 @@ impl Worker<Executing> {
             id: self.id,
             version: self.version,
             stream: self.stream,
-            state: ShuttingDown {
-                orchestrator: self.state.orchestrator,
-            },
+            state: ShuttingDown { orchestrator },
         })
     }
 }

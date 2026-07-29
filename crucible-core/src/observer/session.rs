@@ -6,13 +6,15 @@ use std::{
 };
 
 use bollard::{Docker as DockerClient, query_parameters::LogsOptionsBuilder};
-use crucible_protocol::{ConnEvent, now_ns};
+use crucible_protocol::{ConnEvent, ConnEventKind, Direction, now_ns};
 use futures_util::StreamExt;
 use tokio::{sync::mpsc, task::JoinHandle};
 
 use crate::{proxy_log::Sessions, verdict::Observations};
 
 const QUIESCENCE_POLL: Duration = Duration::from_millis(200);
+/// How often the fault anchor re-checks the observed packet count.
+const ANCHOR_POLL: Duration = Duration::from_millis(5);
 
 pub struct SessionObserver {
     buffer: Arc<Mutex<Vec<(String, ConnEvent)>>>,
@@ -63,6 +65,53 @@ impl SessionObserver {
             sessions.accept_event(&service, event);
         }
         observations.sessions = sessions.into_iter().collect();
+    }
+
+    /// Block until `service` has written `count` more packets on `direction`
+    /// than it had when this call began, or until `timeout` elapses; returns
+    /// whether the count was reached. The baseline is captured at call time,
+    /// which the caller aligns with scenario start (the same moment it arms the
+    /// proxy), so both count scenario traffic from the same origin. This detects
+    /// the proxy's own freeze; `count == 0` returns immediately.
+    pub async fn wait_for_packet(
+        &self,
+        service: &str,
+        direction: Direction,
+        count: u32,
+        timeout: Duration,
+    ) -> bool {
+        let baseline = self.packet_count(service, direction);
+        if count == 0 {
+            return true;
+        }
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if self
+                .packet_count(service, direction)
+                .saturating_sub(baseline)
+                >= count
+            {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(ANCHOR_POLL).await;
+        }
+    }
+
+    fn packet_count(&self, service: &str, direction: Direction) -> u32 {
+        let count = self
+            .buffer
+            .lock()
+            .expect("session observer buffer mutex")
+            .iter()
+            .filter(|(svc, event)| {
+                svc == service
+                    && matches!(event.kind, ConnEventKind::Wrote { direction: d, .. } if d == direction)
+            })
+            .count();
+        u32::try_from(count).expect("observed packet count fits in u32")
     }
 
     /// Wall-clock nanoseconds of the most recent event the observer has

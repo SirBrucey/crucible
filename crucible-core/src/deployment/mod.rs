@@ -4,7 +4,7 @@ pub mod docker;
 
 use std::{future::Future, net::SocketAddr};
 
-pub use docker::Docker;
+pub use docker::{Docker, ProxyAnchor};
 
 /// A per-worker fleet replica the orchestrator can bring up, probe, and remove.
 pub trait Deployment {

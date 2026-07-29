@@ -17,12 +17,21 @@ use bollard::{
         RemoveContainerOptionsBuilder, StartContainerOptions,
     },
 };
-use crucible_protocol::now_ns;
+use crucible_protocol::{Direction, now_ns};
 use futures_util::TryStreamExt;
 use tokio::time::sleep;
 
 use super::Deployment;
 use crate::fleet::{Fleet, Service};
+
+/// A fault anchor to arm the proxy with at fleet startup: freeze the fleet once
+/// `service` has forwarded `k` packets on `direction`. Passed on the proxy
+/// command line so it counts in-process, with no runtime control channel.
+pub struct ProxyAnchor {
+    pub service: String,
+    pub direction: Direction,
+    pub k: u32,
+}
 
 const READINESS_TIMEOUT: Duration = Duration::from_mins(1);
 const READINESS_POLL: Duration = Duration::from_millis(500);
@@ -116,16 +125,18 @@ pub struct Docker {
     network: String,
     fleet: &'static Fleet,
     endpoints: HashMap<String, SocketAddr>,
+    anchor: Option<ProxyAnchor>,
 }
 
 impl Docker {
-    pub fn new(worker_id: u32, fleet: &'static Fleet) -> Result<Self> {
+    pub fn new(worker_id: u32, fleet: &'static Fleet, anchor: Option<ProxyAnchor>) -> Result<Self> {
         let client = DockerClient::connect_with_socket_defaults()?;
         Ok(Self {
             client,
             network: format!("crucible-{worker_id}"),
             fleet,
             endpoints: HashMap::new(),
+            anchor,
         })
     }
 
@@ -139,7 +150,7 @@ impl Docker {
     /// network names are derived from the id), and is a no-op once the fleet is
     /// already gone.
     pub async fn reclaim(worker_id: u32, fleet: &'static Fleet) -> Result<()> {
-        let mut docker = Self::new(worker_id, fleet)?;
+        let mut docker = Self::new(worker_id, fleet, None)?;
         docker.teardown().await
     }
 
@@ -165,16 +176,16 @@ impl Docker {
         Ok(now_ns())
     }
 
-    /// Freeze forwarding on the fleet proxy (SIGUSR1) so a fault lands against a
-    /// held flow. One process fronts every service behind a shared pause gate, so
-    /// this freezes all pairs atomically; [`resume_proxies`](Self::resume_proxies)
-    /// releases the held bytes.
-    pub async fn pause_proxies(&self) -> Result<()> {
+    /// Arm the proxy's fault anchor at scenario start (SIGUSR1). The proxy resets
+    /// its packet counter and begins counting, so the anchor lands relative to
+    /// scenario traffic rather than the fleet's bring-up. When it reaches the
+    /// scheduled packet the proxy freezes the fleet itself.
+    pub async fn arm_anchor(&self) -> Result<()> {
         self.signal_proxy("SIGUSR1").await
     }
 
-    /// Release forwarding on the fleet proxy (SIGUSR2), letting the bytes held
-    /// since [`pause_proxies`](Self::pause_proxies) flow again.
+    /// Release the freeze on the fleet proxy (SIGUSR2) after the kill, letting the
+    /// held bytes flow again.
     pub async fn resume_proxies(&self) -> Result<()> {
         self.signal_proxy("SIGUSR2").await
     }
@@ -233,6 +244,8 @@ impl Docker {
         format!("{}-{}", service.name, BACKING_SUFFIX)
     }
 
+    /// Start a service's backing container. It is reached only through the proxy
+    /// (via its `service-actual` network alias), so it publishes no host port.
     async fn start_service(&self, service: &Service) -> Result<()> {
         ensure_image(&self.client, service.image).await?;
 
@@ -310,7 +323,7 @@ impl Docker {
 
         let container_name = self.proxy_container_name();
 
-        let mut cmd = Vec::with_capacity(self.fleet.services.len() * 2);
+        let mut cmd = Vec::with_capacity(self.fleet.services.len() * 2 + 2);
         for service in self.fleet.services {
             cmd.push("--pair".to_string());
             cmd.push(format!(
@@ -319,6 +332,14 @@ impl Docker {
                 port = service.port,
                 upstream = Self::backing_alias(service),
             ));
+        }
+        if let Some(anchor) = &self.anchor {
+            let direction = match anchor.direction {
+                Direction::ClientToUpstream => "c2u",
+                Direction::UpstreamToClient => "u2c",
+            };
+            cmd.push("--freeze-at".to_string());
+            cmd.push(format!("{}={}={}", anchor.service, direction, anchor.k));
         }
 
         let exposed_ports: Vec<String> = self
@@ -624,7 +645,8 @@ mod tests {
     #[ignore = "requires docker daemon"]
     async fn deployment_lifecycle_brings_up_and_tears_down_every_service() {
         let worker_id = std::process::id();
-        let mut docker = Docker::new(worker_id, &LIFECYCLE_TEST_FLEET).expect("connect to docker");
+        let mut docker =
+            Docker::new(worker_id, &LIFECYCLE_TEST_FLEET, None).expect("connect to docker");
 
         let setup_outcome = docker.setup().await;
         for service in LIFECYCLE_TEST_FLEET.services {
@@ -687,7 +709,8 @@ mod tests {
             .await
             .expect("plant orphan");
 
-        let mut docker = Docker::new(worker_id, &ORPHAN_TEST_FLEET).expect("connect to docker");
+        let mut docker =
+            Docker::new(worker_id, &ORPHAN_TEST_FLEET, None).expect("connect to docker");
         let setup_outcome = docker.setup().await;
         let teardown_outcome = docker.teardown().await;
 

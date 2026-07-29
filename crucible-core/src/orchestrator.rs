@@ -20,6 +20,10 @@ const HEAL_MIN_SETTLE: Duration = Duration::from_millis(500);
 /// Consider the fleet quiescent once no sidecar has forwarded traffic for this
 /// long. Comfortably larger than a DB write plus docker-log delivery latency.
 const HEAL_QUIESCENCE_IDLE: Duration = Duration::from_secs(1);
+/// Backstop for the fault anchor: if the target never reaches its Kth packet,
+/// stop waiting. In practice the scenario ending fires first (a shorter path to
+/// the same "missed" outcome); this only guards a pathological hang.
+const ANCHOR_TIMEOUT: Duration = Duration::from_mins(1);
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -68,8 +72,9 @@ impl Orchestrator {
         &self.deployment
     }
 
-    /// Run the scenario with the schedule's kill fault firing at
-    /// `fault_offset_ns` after scenario start; produce a verdict and report.
+    /// Run the scenario; the proxy self-freezes the fleet once the target has
+    /// forwarded the schedule's `fault_packet_index` packets on its direction,
+    /// then the kill lands against that held flow. Produce a verdict and report.
     pub async fn execute(&mut self, schedule: &Schedule) -> Result<(Verdict, KillReport), Error> {
         let api = self
             .deployment
@@ -81,6 +86,11 @@ impl Orchestrator {
             .as_ref()
             .ok_or(Error::ObserverMissing)?;
 
+        // Arm the anchor as the scenario starts: the proxy resets and counts
+        // scenario packets from here, and wait_for_packet captures its observer
+        // baseline at the same moment, so both share the scenario-start origin.
+        let _ = self.deployment.arm_anchor().await;
+
         let (scenario_end_tx, mut scenario_end_rx) = tokio::sync::oneshot::channel::<()>();
         let scenario_start = Instant::now();
         let scenario_fut = async {
@@ -89,46 +99,63 @@ impl Orchestrator {
             result
         };
 
+        let missed = |reason| KillReport {
+            schedule_id: schedule.schedule_id,
+            service: schedule.service.clone(),
+            result: KillResult::Missed(reason),
+        };
+
         let kill_fut = async {
-            let sleep = Duration::from_nanos(
-                u64::try_from(schedule.fault_offset_ns).expect("offset fits in u64"),
-            );
             tokio::select! {
                 biased;
-                () = tokio::time::sleep(sleep) => {
-                    // Freeze the whole fleet atomically, kill the target against
-                    // the held flow, then release so the fault manifests: the
-                    // held bytes reach the now-dead service. Freezing pins the
-                    // kill to a fixed point instead of racing whatever chunk was
-                    // mid-flight.
-                    let _ = self.deployment.pause_proxies().await;
+                reached = session_observer.wait_for_packet(
+                    &schedule.service,
+                    schedule.direction,
+                    schedule.fault_packet_index,
+                    ANCHOR_TIMEOUT,
+                ) => {
+                    if !reached {
+                        // The target never reached its Kth packet; release any
+                        // partial freeze and record a miss.
+                        let _ = self.deployment.resume_proxies().await;
+                        return missed(KillMissReason::ScenarioEndedBeforeAnchor);
+                    }
+                    // The proxy froze the fleet to place the kill precisely on the
+                    // anchored packet. Kill the target, then release the flow
+                    // immediately and bring the target back concurrently: the
+                    // scenario runs against the dead-then-recovering service in real
+                    // time. Its real recovery time is part of the fault (ops in the
+                    // outage window fail; ops once it is back succeed) rather than
+                    // the world stopping while we heal.
                     let killed = self.deployment.kill_service(&schedule.service).await;
-                    let _ = self.deployment.resume_proxies().await;
                     match killed {
                         Ok(killed_at_ns) => {
                             let actual = scenario_start.elapsed().as_nanos();
+                            let _ = self.deployment.resume_proxies().await;
+                            let _ = self.deployment.restart_service(&schedule.service).await;
                             KillReport {
                                 schedule_id: schedule.schedule_id,
                                 service: schedule.service.clone(),
                                 result: KillResult::Fired {
-                                    requested_offset_ns: schedule.fault_offset_ns,
+                                    requested_direction: schedule.direction,
+                                    requested_packet_index: schedule.fault_packet_index,
                                     actual_offset_ns: actual,
                                     killed_at_ns,
                                 },
                             }
                         }
-                        Err(e) => KillReport {
-                            schedule_id: schedule.schedule_id,
-                            service: schedule.service.clone(),
-                            result: KillResult::Missed(KillMissReason::KillFailed(e.to_string())),
-                        },
+                        Err(e) => {
+                            let _ = self.deployment.resume_proxies().await;
+                            missed(KillMissReason::KillFailed(e.to_string()))
+                        }
                     }
                 }
-                _ = &mut scenario_end_rx => KillReport {
-                    schedule_id: schedule.schedule_id,
-                    service: schedule.service.clone(),
-                    result: KillResult::Missed(KillMissReason::ScenarioEndedBeforeOffset),
-                },
+                _ = &mut scenario_end_rx => {
+                    // Scenario finished before the target reached its Kth packet;
+                    // release any freeze so nothing is left wedged.
+                    let _ = self.deployment.resume_proxies().await;
+                    missed(KillMissReason::ScenarioEndedBeforeAnchor)
+                }
             }
         };
 
@@ -137,9 +164,9 @@ impl Orchestrator {
         observations.kill = Some(kill_report.clone());
 
         if matches!(kill_report.result, KillResult::Fired { .. }) {
-            self.deployment
-                .restart_service(&kill_report.service)
-                .await?;
+            // The target was restarted concurrently with the scenario; just wait
+            // for the fleet to settle (giving any outbox redelivery its chance)
+            // before reading the durability state.
             session_observer
                 .wait_for_quiescence(HEAL_MIN_SETTLE, HEAL_QUIESCENCE_IDLE, HEAL_BUDGET)
                 .await;
