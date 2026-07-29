@@ -115,7 +115,7 @@ impl Orchestrator {
                         // The proxy never reported freezing (the target did not
                         // reach its Kth packet); release the freeze in case it is
                         // mid-flight and record a miss.
-                        self.deployment.resume_proxies().await?;
+                        self.deployment.resume_proxy().await?;
                         return Ok::<_, Error>(missed(KillMissReason::ScenarioEndedBeforeAnchor));
                     }
                     // The proxy froze the fleet to place the kill precisely on the
@@ -131,7 +131,7 @@ impl Orchestrator {
                 _ = &mut scenario_end_rx => {
                     // Scenario finished before the target reached its Kth packet;
                     // release the freeze so nothing is left wedged.
-                    self.deployment.resume_proxies().await?;
+                    self.deployment.resume_proxy().await?;
                     Ok(missed(KillMissReason::ScenarioEndedBeforeAnchor))
                 }
             }
@@ -215,11 +215,11 @@ where
             // The kill never landed, so nothing is dead; release the freeze the
             // proxy is holding and report the miss. A resume failure here still
             // leaves the fleet wedged, so it is fatal.
-            deployment.resume_proxies().await?;
+            deployment.resume_proxy().await?;
             return Ok(missed(KillMissReason::KillFailed(e.to_string())));
         }
     };
-    deployment.resume_proxies().await?;
+    deployment.resume_proxy().await?;
     deployment.restart_service(&schedule.service).await?;
     Ok(KillReport {
         schedule_id: schedule.schedule_id,
@@ -277,7 +277,7 @@ mod tests {
         async fn arm_anchor(&self) -> Result<(), FakeError> {
             Ok(())
         }
-        async fn resume_proxies(&self) -> Result<(), FakeError> {
+        async fn resume_proxy(&self) -> Result<(), FakeError> {
             if self.resume_fails {
                 Err(FakeError("resume failed"))
             } else {

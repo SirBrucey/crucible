@@ -20,7 +20,7 @@ pub trait Deployment {
     /// traffic and freezes the fleet once the target reaches the anchored packet.
     fn arm_anchor(&self) -> impl Future<Output = Result<(), Self::Error>> + Send;
     /// Release the freeze the proxy is holding on the fleet.
-    fn resume_proxies(&self) -> impl Future<Output = Result<(), Self::Error>> + Send;
+    fn resume_proxy(&self) -> impl Future<Output = Result<(), Self::Error>> + Send;
     /// Kill the named service. Returns the wall-clock nanoseconds when the kill
     /// returned.
     fn kill_service(&self, name: &str) -> impl Future<Output = Result<u128, Self::Error>> + Send;

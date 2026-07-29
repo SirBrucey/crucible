@@ -363,7 +363,7 @@ impl Deployment for Docker {
 
     /// SIGUSR2 the proxy to release the freeze, letting the held bytes flow
     /// again.
-    async fn resume_proxies(&self) -> Result<()> {
+    async fn resume_proxy(&self) -> Result<()> {
         self.signal_proxy("SIGUSR2").await
     }
 
