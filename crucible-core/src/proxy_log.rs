@@ -306,6 +306,70 @@ mod tests {
     }
 
     #[test]
+    fn single_packet_yields_only_the_after_anchor() {
+        // before is K=0 (dropped); during and after both collapse to K=1.
+        assert_eq!(burst_anchors(&[1_000]), vec![1]);
+    }
+
+    #[test]
+    fn k_zero_is_never_an_anchor() {
+        assert!(!burst_anchors(&[1_000]).contains(&0));
+        assert!(!burst_anchors(&[1_000, 2_000, 3_000]).contains(&0));
+    }
+
+    #[test]
+    fn contiguous_packets_are_one_burst() {
+        // Four packets inside the gap: one burst, during=midpoint(1,4)=2, after=4.
+        assert_eq!(burst_anchors(&[1_000, 2_000, 3_000, 4_000]), vec![2, 4]);
+    }
+
+    #[test]
+    fn a_gap_splits_bursts_and_shares_the_boundary_anchor() {
+        // Packets 1-2 form the first burst, 3-4 the second (gap > BURST_GAP_NS).
+        // Burst 1 -> {during 1, after 2}; burst 2 -> {before 2, during 3, after 4}.
+        // The shared boundary count 2 is deduped away by the anchor set.
+        let packets = [1_000, 2_000, 100_000_000, 101_000_000];
+        assert_eq!(burst_anchors(&packets), vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn service_profiles_split_by_direction_and_skip_pre_scenario_writes() {
+        let session = Session {
+            service: "db".into(),
+            conn_id: 0,
+            peer: "127.0.0.1:1".to_string(),
+            opened_ns: 0,
+            closed_ns: None,
+            writes: vec![
+                // Before scenario start (50): ignored.
+                WriteRecord {
+                    ts_ns: 10,
+                    direction: Direction::ClientToUpstream,
+                    bytes: 1,
+                },
+                // One client-to-upstream packet after start.
+                WriteRecord {
+                    ts_ns: 100,
+                    direction: Direction::ClientToUpstream,
+                    bytes: 1,
+                },
+                // One upstream-to-client packet after start.
+                WriteRecord {
+                    ts_ns: 120,
+                    direction: Direction::UpstreamToClient,
+                    bytes: 1,
+                },
+            ],
+        };
+        let profiles = service_profiles_from_sessions(&[session], 50);
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].service, "db");
+        // A single post-start packet each direction -> the after anchor (K=1).
+        assert_eq!(profiles[0].client_to_upstream, vec![1]);
+        assert_eq!(profiles[0].upstream_to_client, vec![1]);
+    }
+
+    #[test]
     fn writes_are_folded_into_session() {
         let mut sessions = Sessions::new();
         sessions.accept_event(
