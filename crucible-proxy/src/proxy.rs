@@ -142,6 +142,17 @@ async fn wait_while_paused(pause: &mut watch::Receiver<bool>) {
     }
 }
 
+/// Send a connection event to the drain task in `main`, which holds the receiver
+/// for as long as any forward task (or the accept loop) holds a sender.
+// FIXME: propagate this for real recovery once the forward tasks report failures
+// upward; a send failure means the drain task died unexpectedly, so until then
+// assert that invariant rather than drop the event silently.
+fn emit(events: &mpsc::UnboundedSender<ConnEvent>, event: ConnEvent) {
+    events
+        .send(event)
+        .expect("event drain outlives the forward tasks");
+}
+
 async fn forward(
     id: ConnId,
     client: TcpStream,
@@ -154,15 +165,15 @@ async fn forward(
     let upstream_conn = match TcpStream::connect(upstream).await {
         Ok(s) => s,
         Err(e) => {
-            let _ = events_tx.send(ConnEvent::failed(
-                id,
-                format!("dial upstream {upstream}: {e}"),
-            ));
+            emit(
+                &events_tx,
+                ConnEvent::failed(id, format!("dial upstream {upstream}: {e}")),
+            );
             return;
         }
     };
 
-    let _ = events_tx.send(ConnEvent::opened(id, peer));
+    emit(&events_tx, ConnEvent::opened(id, peer));
 
     let (mut client_r, mut client_w) = client.into_split();
     let (mut upstream_r, mut upstream_w) = upstream_conn.into_split();
@@ -183,7 +194,10 @@ async fn forward(
                 Ok(n) => n,
                 Err(e) => break Err(format!("client_read: {e}")),
             };
-            let _ = events_tx_c2u.send(ConnEvent::wrote(id, Direction::ClientToUpstream, n as u64));
+            emit(
+                &events_tx_c2u,
+                ConnEvent::wrote(id, Direction::ClientToUpstream, n as u64),
+            );
             wait_while_paused(&mut pause_c2u).await;
             if let Err(e) = upstream_w.write_all(&buf[..n]).await {
                 break Err(format!("upstream_write: {e}"));
@@ -191,14 +205,7 @@ async fn forward(
             bytes_total += n as u64;
             if let Some(anchor) = &anchor_c2u {
                 if anchor.record() {
-                    // FIXME: propagate this for real recovery once the forward
-                    // tasks report failures upward. The drain task in main holds
-                    // the receiver for as long as any forward task holds a sender,
-                    // so a send failure means it died unexpectedly; until then,
-                    // assert that rather than drop the freeze signal silently.
-                    events_tx_c2u
-                        .send(ConnEvent::froze(id, anchor.k))
-                        .expect("event drain outlives the forward tasks");
+                    emit(&events_tx_c2u, ConnEvent::froze(id, anchor.k));
                 }
             }
         }
@@ -215,7 +222,10 @@ async fn forward(
                 Ok(n) => n,
                 Err(e) => break Err(format!("upstream_read: {e}")),
             };
-            let _ = events_tx_u2c.send(ConnEvent::wrote(id, Direction::UpstreamToClient, n as u64));
+            emit(
+                &events_tx_u2c,
+                ConnEvent::wrote(id, Direction::UpstreamToClient, n as u64),
+            );
             wait_while_paused(&mut pause_u2c).await;
             if let Err(e) = client_w.write_all(&buf[..n]).await {
                 break Err(format!("client_write: {e}"));
@@ -223,14 +233,7 @@ async fn forward(
             bytes_total += n as u64;
             if let Some(anchor) = &anchor_u2c {
                 if anchor.record() {
-                    // FIXME: propagate this for real recovery once the forward
-                    // tasks report failures upward. The drain task in main holds
-                    // the receiver for as long as any forward task holds a sender,
-                    // so a send failure means it died unexpectedly; until then,
-                    // assert that rather than drop the freeze signal silently.
-                    events_tx_u2c
-                        .send(ConnEvent::froze(id, anchor.k))
-                        .expect("event drain outlives the forward tasks");
+                    emit(&events_tx_u2c, ConnEvent::froze(id, anchor.k));
                 }
             }
         }
@@ -244,7 +247,7 @@ async fn forward(
         (Ok(up), Ok(down)) => ConnEvent::closed(id, up, down),
         (Err(e), _) | (_, Err(e)) => ConnEvent::failed(id, format!("forwarding: {e}")),
     };
-    let _ = events_tx.send(event);
+    emit(&events_tx, event);
 }
 
 #[cfg(test)]
