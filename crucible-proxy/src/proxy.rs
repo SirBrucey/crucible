@@ -51,7 +51,13 @@ impl Anchor {
         self.count.store(0, Ordering::SeqCst);
         self.active.store(true, Ordering::SeqCst);
         if self.k == 0 {
-            let _ = self.tripwire.send(true);
+            // FIXME: propagate once arm can report failure. The pause watch keeps
+            // a receiver for the whole process (main holds one), so this cannot
+            // fail; a silent failure would leave the gate unset and the fleet
+            // never frozen, so assert rather than drop it.
+            self.tripwire
+                .send(true)
+                .expect("pause watch has a live receiver");
         }
     }
 
@@ -64,7 +70,12 @@ impl Anchor {
         }
         let crossed = self.count.fetch_add(1, Ordering::SeqCst) + 1;
         if crossed == self.k {
-            let _ = self.tripwire.send(true);
+            // FIXME: as in arm(); this cannot fail while the pause watch has a
+            // receiver. Dropping it silently would leave the fleet unfrozen while
+            // record still reports the trip, reopening the kill-before-freeze race.
+            self.tripwire
+                .send(true)
+                .expect("pause watch has a live receiver");
             return true;
         }
         false

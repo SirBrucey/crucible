@@ -171,7 +171,12 @@ fn spawn_pause_control(pause_tx: watch::Sender<bool>, anchor: Option<Anchor>) {
                     if let Some(anchor) = &anchor {
                         anchor.disarm();
                     }
-                    let _ = pause_tx.send(false);
+                    // FIXME: propagate once the signal loop can report failure.
+                    // main holds a pause receiver for the process lifetime, so
+                    // this cannot fail; assert rather than drop it.
+                    pause_tx
+                        .send(false)
+                        .expect("pause watch has a live receiver");
                     tracing::info!("forwarding resumed (SIGUSR2)");
                 }
             }
