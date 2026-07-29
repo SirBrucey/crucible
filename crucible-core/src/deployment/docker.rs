@@ -162,34 +162,6 @@ impl Docker {
             .ok_or_else(|| Error::UnknownService(name.to_string()))
     }
 
-    /// SIGKILL the service's backing container. Returns the wall-clock
-    /// nanoseconds since the Unix epoch of the moment bollard's kill returned.
-    pub async fn kill_service(&self, name: &str) -> Result<u128> {
-        let service = self.service_by_name(name)?;
-        let container = self.backing_container_name(service);
-        let options = KillContainerOptionsBuilder::default()
-            .signal("SIGKILL")
-            .build();
-        self.client
-            .kill_container(&container, Some(options))
-            .await?;
-        Ok(now_ns())
-    }
-
-    /// Arm the proxy's fault anchor at scenario start (SIGUSR1). The proxy resets
-    /// its packet counter and begins counting, so the anchor lands relative to
-    /// scenario traffic rather than the fleet's bring-up. When it reaches the
-    /// scheduled packet the proxy freezes the fleet itself.
-    pub async fn arm_anchor(&self) -> Result<()> {
-        self.signal_proxy("SIGUSR1").await
-    }
-
-    /// Release the freeze on the fleet proxy (SIGUSR2) after the kill, letting the
-    /// held bytes flow again.
-    pub async fn resume_proxies(&self) -> Result<()> {
-        self.signal_proxy("SIGUSR2").await
-    }
-
     async fn signal_proxy(&self, signal: &str) -> Result<()> {
         let options = KillContainerOptionsBuilder::default()
             .signal(signal)
@@ -198,33 +170,6 @@ impl Docker {
             .kill_container(&self.proxy_container_name(), Some(options))
             .await?;
         Ok(())
-    }
-
-    /// Start the previously-killed backing container and wait for its
-    /// healthcheck to report healthy. The caller waits for fleet quiescence
-    /// (see `SessionObserver::wait_for_quiescence`) before collecting the
-    /// verdict. Returns wall-clock nanoseconds when the service was ready.
-    pub async fn restart_service(&self, name: &str) -> Result<u128> {
-        let service = self.service_by_name(name)?;
-        let container = self.backing_container_name(service);
-        self.client
-            .start_container(&container, None::<StartContainerOptions>)
-            .await?;
-        let deadline = tokio::time::Instant::now() + READINESS_TIMEOUT;
-        loop {
-            if tokio::time::Instant::now() >= deadline {
-                return Err(Error::ReadinessTimeout {
-                    name: container,
-                    addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
-                    timeout: READINESS_TIMEOUT,
-                });
-            }
-            if container_ready(&self.client, &container).await? {
-                break;
-            }
-            sleep(READINESS_POLL).await;
-        }
-        Ok(now_ns())
     }
 
     pub fn start_session_observer(&self) -> crate::observer::SessionObserver {
@@ -407,6 +352,61 @@ impl Docker {
 
 impl Deployment for Docker {
     type Error = Error;
+
+    /// SIGUSR1 the proxy: it resets its packet counter and begins counting, so
+    /// the anchor lands relative to scenario traffic rather than the fleet's
+    /// bring-up. When it reaches the scheduled packet the proxy freezes the
+    /// fleet itself.
+    async fn arm_anchor(&self) -> Result<()> {
+        self.signal_proxy("SIGUSR1").await
+    }
+
+    /// SIGUSR2 the proxy to release the freeze, letting the held bytes flow
+    /// again.
+    async fn resume_proxies(&self) -> Result<()> {
+        self.signal_proxy("SIGUSR2").await
+    }
+
+    /// SIGKILL the service's backing container. Returns the wall-clock
+    /// nanoseconds since the Unix epoch of the moment bollard's kill returned.
+    async fn kill_service(&self, name: &str) -> Result<u128> {
+        let service = self.service_by_name(name)?;
+        let container = self.backing_container_name(service);
+        let options = KillContainerOptionsBuilder::default()
+            .signal("SIGKILL")
+            .build();
+        self.client
+            .kill_container(&container, Some(options))
+            .await?;
+        Ok(now_ns())
+    }
+
+    /// Start the previously-killed backing container and wait for its
+    /// healthcheck to report healthy. The caller waits for fleet quiescence
+    /// (see `SessionObserver::wait_for_quiescence`) before collecting the
+    /// verdict. Returns wall-clock nanoseconds when the service was ready.
+    async fn restart_service(&self, name: &str) -> Result<u128> {
+        let service = self.service_by_name(name)?;
+        let container = self.backing_container_name(service);
+        self.client
+            .start_container(&container, None::<StartContainerOptions>)
+            .await?;
+        let deadline = tokio::time::Instant::now() + READINESS_TIMEOUT;
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                return Err(Error::ReadinessTimeout {
+                    name: container,
+                    addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+                    timeout: READINESS_TIMEOUT,
+                });
+            }
+            if container_ready(&self.client, &container).await? {
+                break;
+            }
+            sleep(READINESS_POLL).await;
+        }
+        Ok(now_ns())
+    }
 
     async fn setup(&mut self) -> Result<()> {
         self.teardown().await?;
