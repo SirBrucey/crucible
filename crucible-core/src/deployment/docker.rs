@@ -176,8 +176,10 @@ impl Docker {
         crate::observer::SessionObserver::start(&self.client, self.proxy_container_name())
     }
 
+    /// Network-scoped name of a service's backing container: its in-network
+    /// alias prefixed with the per-worker network.
     fn backing_container_name(&self, service: &Service) -> String {
-        format!("{}-{}-{}", self.network, service.name, BACKING_SUFFIX)
+        format!("{}-{}", self.network, Self::backing_alias(service))
     }
 
     /// The single proxy container that fronts every service in the fleet.
@@ -185,6 +187,7 @@ impl Docker {
         format!("{}-{}", self.network, PROXY_SUFFIX)
     }
 
+    /// In-network alias a backing container is reached by (via the proxy).
     fn backing_alias(service: &Service) -> String {
         format!("{}-{}", service.name, BACKING_SUFFIX)
     }
