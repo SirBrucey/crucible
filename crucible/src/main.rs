@@ -268,7 +268,7 @@ struct Recovery {
 impl Recovery {
     /// Whether a schedule that has just failed its `attempt`th try (1-based) has
     /// attempts left to respawn.
-    fn may_respawn(&self, attempt: u32) -> bool {
+    fn may_respawn(attempt: u32) -> bool {
         attempt < MAX_ATTEMPTS
     }
 
@@ -359,7 +359,7 @@ async fn drive(bus: &EventBus) -> Result<CampaignOutcome> {
             Ok((schedule, attempt, Err(e)))
                 if !gave_up
                     && campaign_start.elapsed() < TOTAL_BUDGET
-                    && recovery.may_respawn(attempt) =>
+                    && Recovery::may_respawn(attempt) =>
             {
                 tracing::warn!(
                     schedule_id = schedule.schedule_id,
@@ -636,10 +636,9 @@ mod tests {
 
     #[test]
     fn a_schedule_respawns_until_the_attempt_cap() {
-        let recovery = Recovery::default();
-        assert!(recovery.may_respawn(1));
-        assert!(recovery.may_respawn(MAX_ATTEMPTS - 1));
-        assert!(!recovery.may_respawn(MAX_ATTEMPTS));
+        assert!(Recovery::may_respawn(1));
+        assert!(Recovery::may_respawn(MAX_ATTEMPTS - 1));
+        assert!(!Recovery::may_respawn(MAX_ATTEMPTS));
     }
 
     #[test]
