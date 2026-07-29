@@ -178,3 +178,39 @@ fn spawn_pause_control(pause_tx: watch::Sender<bool>, anchor: Option<Anchor>) {
         }
     });
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_a_client_to_upstream_anchor() {
+        let freeze = parse_freeze_at("db=c2u=3").expect("valid spec");
+        assert_eq!(freeze.service, "db");
+        assert_eq!(freeze.direction, Direction::ClientToUpstream);
+        assert_eq!(freeze.k, 3);
+    }
+
+    #[test]
+    fn parses_an_upstream_to_client_anchor() {
+        let freeze = parse_freeze_at("api=u2c=0").expect("valid spec");
+        assert_eq!(freeze.service, "api");
+        assert_eq!(freeze.direction, Direction::UpstreamToClient);
+        assert_eq!(freeze.k, 0);
+    }
+
+    #[test]
+    fn rejects_an_unknown_direction() {
+        assert!(parse_freeze_at("db=sideways=3").is_err());
+    }
+
+    #[test]
+    fn rejects_a_non_numeric_k() {
+        assert!(parse_freeze_at("db=c2u=three").is_err());
+    }
+
+    #[test]
+    fn rejects_a_missing_field() {
+        assert!(parse_freeze_at("db=c2u").is_err());
+    }
+}

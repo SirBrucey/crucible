@@ -407,6 +407,33 @@ mod tests {
     }
 
     #[test]
+    fn a_dormant_anchor_does_not_count() {
+        // Before arm, record is a no-op, so the fleet's bring-up traffic never
+        // moves the counter or trips the gate.
+        let (tx, rx) = watch::channel(false);
+        let anchor = Anchor::new(Direction::ClientToUpstream, 1, tx);
+        assert!(!anchor.record(), "an unarmed record must not trip");
+        assert!(!*rx.borrow(), "gate stays open while dormant");
+        anchor.arm();
+        assert!(
+            anchor.record(),
+            "the first armed packet reaches k=1 and trips"
+        );
+        assert!(*rx.borrow(), "gate tripped once armed");
+    }
+
+    #[test]
+    fn a_zero_k_anchor_trips_on_arm() {
+        // k=0 means freeze before the first scenario packet, so arming (after
+        // bring-up) trips the gate immediately.
+        let (tx, rx) = watch::channel(false);
+        let anchor = Anchor::new(Direction::ClientToUpstream, 0, tx);
+        assert!(!*rx.borrow(), "not tripped before arm");
+        anchor.arm();
+        assert!(*rx.borrow(), "k=0 trips the gate on arm");
+    }
+
+    #[test]
     fn a_disarmed_anchor_does_not_refreeze() {
         // On a give-up path the runner releases the gate but the anchor stays
         // armed; a trailing packet that reaches k must not trip it again (there
