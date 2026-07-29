@@ -24,6 +24,9 @@ pub enum WorkerToRunner {
     SessionCatalogue { services: Vec<ServiceProfile> },
     /// Worker emits an observational event for the runner to record.
     Event(WorkerEvent),
+    /// Periodic liveness ping the worker sends while it works, so the runner's
+    /// watchdog can tell a slow-but-alive worker from a hung or dead one.
+    Heartbeat,
 }
 
 /// Observational events streamed from a worker to the runner.
