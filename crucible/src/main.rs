@@ -114,8 +114,17 @@ async fn run() -> Result<CampaignOutcome> {
 
     let mut observer_rx = bus.subscribe();
     let observer_task = tokio::spawn(async move {
-        while let Ok(event) = observer_rx.recv().await {
-            tracing::info!(target: "observer", event = ?event, "");
+        loop {
+            match observer_rx.recv().await {
+                Ok(event) => tracing::info!(target: "observer", event = ?event, ""),
+                // Lagging drops only these log lines; the journal (an mpsc) still
+                // records every event, so keep going rather than losing the
+                // observer log for the rest of the run.
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    tracing::warn!(target: "observer", skipped, "observer lagged behind; dropped events");
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
         }
     });
 
