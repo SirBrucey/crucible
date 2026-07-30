@@ -7,6 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use clap::{Parser, Subcommand};
 use crucible_core::{
     deployment::docker::{Docker, HEAL_BUDGET},
     event_bus::EventBus,
@@ -86,8 +87,35 @@ fn worker_bin_path() -> Result<PathBuf> {
     Ok(path)
 }
 
+/// Crucible: fault-injection testing for event-driven microservice fleets.
+#[derive(Parser)]
+#[command(version)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Cmd>,
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// Run a fault-injection campaign against the example fleet.
+    Run,
+    /// Parse and check a `.cru` scenario file, reporting diagnostics.
+    Check {
+        /// Path to the scenario file.
+        file: PathBuf,
+    },
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
+    match Cli::parse().command.unwrap_or(Cmd::Run) {
+        Cmd::Check { file } => run_check(&file),
+        Cmd::Run => run_campaign().await,
+    }
+}
+
+/// Initialise logging and run a fault-injection campaign to completion.
+async fn run_campaign() -> ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -103,6 +131,40 @@ async fn main() -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+/// Lex a `.cru` file, rendering diagnostics on failure. Exits 0 if it lexes
+/// cleanly, 1 if there are diagnostics, and 2 if the file is not a readable
+/// `.cru` file.
+fn run_check(file: &Path) -> ExitCode {
+    if file.extension().and_then(std::ffi::OsStr::to_str) != Some("cru") {
+        eprintln!(
+            "crucible check: expected a `.cru` file, got `{}`",
+            file.display()
+        );
+        return ExitCode::from(2);
+    }
+    let name = file.display().to_string();
+    let src = match std::fs::read_to_string(file) {
+        Ok(src) => src,
+        Err(e) => {
+            eprintln!("crucible check: cannot read {name}: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let (tokens, errors) = crucible_dsl::lexer::lex(&src);
+    if errors.is_empty() {
+        println!("{name}: lexed {} tokens", tokens.len());
+        return ExitCode::SUCCESS;
+    }
+    let diags: Vec<_> = errors
+        .iter()
+        .map(|e| crucible_dsl::diagnostics::Diag::new(e.span, e.message.clone()))
+        .collect();
+    if let Err(e) = crucible_dsl::diagnostics::emit_to_stderr(&name, &src, &diags) {
+        eprintln!("crucible check: failed to render diagnostics: {e}");
+    }
+    ExitCode::from(1)
 }
 
 async fn run() -> Result<CampaignOutcome> {
