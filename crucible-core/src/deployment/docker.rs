@@ -48,12 +48,8 @@ pub enum Error {
     Docker(#[from] bollard::errors::Error),
     #[error("service `{name}` did not publish port {port}")]
     MissingPort { name: String, port: u16 },
-    #[error("service `{name}` at {addr} did not become ready within {timeout:?}")]
-    ReadinessTimeout {
-        name: String,
-        addr: SocketAddr,
-        timeout: Duration,
-    },
+    #[error("service `{name}` did not become ready within {timeout:?}")]
+    ReadinessTimeout { name: String, timeout: Duration },
     #[error("teardown incomplete: {0}")]
     TeardownIncomplete(TeardownFailures),
     #[error("unknown service `{0}`")]
@@ -187,6 +183,19 @@ impl Docker {
     /// The single proxy container that fronts every service in the fleet.
     fn proxy_container_name(&self) -> String {
         format!("{}-{}", self.network, PROXY_SUFFIX)
+    }
+
+    /// The names of every container in a replica: each backing service plus the
+    /// fronting proxy.
+    fn container_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .fleet
+            .services
+            .iter()
+            .map(|s| self.backing_container_name(s))
+            .collect();
+        names.push(self.proxy_container_name());
+        names
     }
 
     /// In-network alias a backing container is reached by (via the proxy).
@@ -396,20 +405,7 @@ impl Deployment for Docker {
         self.client
             .start_container(&container, None::<StartContainerOptions>)
             .await?;
-        let deadline = tokio::time::Instant::now() + READINESS_TIMEOUT;
-        loop {
-            if tokio::time::Instant::now() >= deadline {
-                return Err(Error::ReadinessTimeout {
-                    name: container,
-                    addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
-                    timeout: READINESS_TIMEOUT,
-                });
-            }
-            if container_ready(&self.client, &container).await? {
-                break;
-            }
-            sleep(READINESS_POLL).await;
-        }
+        wait_container_ready(&self.client, &container).await?;
         Ok(now_ns())
     }
 
@@ -441,29 +437,10 @@ impl Deployment for Docker {
     }
 
     async fn wait_ready(&self) -> Result<()> {
-        let mut names: Vec<String> = self
-            .fleet
-            .services
-            .iter()
-            .map(|s| self.backing_container_name(s))
-            .collect();
-        names.push(self.proxy_container_name());
-        let probes = names.into_iter().map(|container_name| async move {
-            let start = tokio::time::Instant::now();
-            loop {
-                if start.elapsed() >= READINESS_TIMEOUT {
-                    return Err(Error::ReadinessTimeout {
-                        name: container_name,
-                        addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
-                        timeout: READINESS_TIMEOUT,
-                    });
-                }
-                if container_ready(&self.client, &container_name).await? {
-                    return Ok(());
-                }
-                sleep(READINESS_POLL).await;
-            }
-        });
+        let probes = self
+            .container_names()
+            .into_iter()
+            .map(|name| async move { wait_container_ready(&self.client, &name).await });
         futures_util::future::try_join_all(probes).await?;
         Ok(())
     }
@@ -471,22 +448,16 @@ impl Deployment for Docker {
     async fn teardown(&mut self) -> Result<()> {
         let opts = RemoveContainerOptionsBuilder::default().force(true).build();
         let mut failures = TeardownFailures::new();
-        let mut names: Vec<String> = self
-            .fleet
-            .services
-            .iter()
-            .map(|s| self.backing_container_name(s))
-            .collect();
-        names.push(self.proxy_container_name());
-        let removals = futures_util::future::join_all(names.into_iter().map(|name| {
-            let client = &self.client;
-            let opts = opts.clone();
-            async move {
-                let result = client.remove_container(&name, Some(opts)).await;
-                (name, result)
-            }
-        }))
-        .await;
+        let removals =
+            futures_util::future::join_all(self.container_names().into_iter().map(|name| {
+                let client = &self.client;
+                let opts = opts.clone();
+                async move {
+                    let result = client.remove_container(&name, Some(opts)).await;
+                    (name, result)
+                }
+            }))
+            .await;
         for (name, result) in removals {
             match result {
                 Ok(()) => {}
@@ -514,6 +485,24 @@ impl Deployment for Docker {
 
 fn nanos(d: Duration) -> i64 {
     i64::try_from(d.as_nanos()).expect("healthcheck duration fits in i64")
+}
+
+/// Poll `container` until it reports ready, or return [`Error::ReadinessTimeout`]
+/// once [`READINESS_TIMEOUT`] elapses.
+async fn wait_container_ready(client: &DockerClient, container: &str) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + READINESS_TIMEOUT;
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(Error::ReadinessTimeout {
+                name: container.to_string(),
+                timeout: READINESS_TIMEOUT,
+            });
+        }
+        if container_ready(client, container).await? {
+            return Ok(());
+        }
+        sleep(READINESS_POLL).await;
+    }
 }
 
 async fn container_ready(docker: &DockerClient, container: &str) -> Result<bool> {
