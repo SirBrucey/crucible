@@ -12,18 +12,27 @@ use std::{
 use crucible_protocol::{ConnEvent, ConnId, Direction};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
+    net::{
+        TcpListener, TcpStream,
+        tcp::{OwnedReadHalf, OwnedWriteHalf},
+    },
     sync::{mpsc, watch},
 };
 
 /// The fault anchor for a pair: once `k` packets have been forwarded on
 /// `direction` (counted across all this pair's connections), trip the shared
-/// pause gate so the whole fleet freezes at exactly that packet.
+/// pause gate so the whole fleet freezes on that packet.
 ///
 /// Dormant until [`arm`](Self::arm), so it counts only scenario traffic, not the
 /// fleet's own bring-up handshakes. The runner arms it once the scenario starts,
 /// which resets the count to zero; that shared origin is what makes the count
 /// match the scenario-relative one the learn pass measured.
+///
+/// The count is shared across the pair's connections. With a single connection
+/// on `direction` (the common case) the freeze lands exactly on the k-th packet.
+/// With several connections forwarding at once, one that has already passed the
+/// pause gate can write a packet or two past `k` before it next observes the
+/// freeze, so under that contention the anchor freezes slightly late, never early.
 #[derive(Clone)]
 pub struct Anchor {
     direction: Direction,
@@ -186,69 +195,32 @@ async fn forward(
 
     emit(&events_tx, ConnEvent::opened(id, peer));
 
-    let (mut client_r, mut client_w) = client.into_split();
-    let (mut upstream_r, mut upstream_w) = upstream_conn.into_split();
+    let (client_r, client_w) = client.into_split();
+    let (upstream_r, upstream_w) = upstream_conn.into_split();
 
     let anchor_c2u = anchor
         .clone()
         .filter(|a| a.direction == Direction::ClientToUpstream);
     let anchor_u2c = anchor.filter(|a| a.direction == Direction::UpstreamToClient);
 
-    let events_tx_c2u = events_tx.clone();
-    let mut pause_c2u = pause.clone();
-    let c2u = tokio::spawn(async move {
-        let mut bytes_total: u64 = 0;
-        let mut buf = vec![0u8; 4096];
-        loop {
-            let n = match client_r.read(&mut buf).await {
-                Ok(0) => break Ok(bytes_total),
-                Ok(n) => n,
-                Err(e) => break Err(format!("client_read: {e}")),
-            };
-            emit(
-                &events_tx_c2u,
-                ConnEvent::wrote(id, Direction::ClientToUpstream, n as u64),
-            );
-            wait_while_paused(&mut pause_c2u).await;
-            if let Err(e) = upstream_w.write_all(&buf[..n]).await {
-                break Err(format!("upstream_write: {e}"));
-            }
-            bytes_total += n as u64;
-            if let Some(anchor) = &anchor_c2u
-                && anchor.record()
-            {
-                emit(&events_tx_c2u, ConnEvent::froze(id, anchor.k));
-            }
-        }
-    });
-
-    let events_tx_u2c = events_tx.clone();
-    let mut pause_u2c = pause;
-    let u2c = tokio::spawn(async move {
-        let mut bytes_total: u64 = 0;
-        let mut buf = vec![0u8; 4096];
-        loop {
-            let n = match upstream_r.read(&mut buf).await {
-                Ok(0) => break Ok(bytes_total),
-                Ok(n) => n,
-                Err(e) => break Err(format!("upstream_read: {e}")),
-            };
-            emit(
-                &events_tx_u2c,
-                ConnEvent::wrote(id, Direction::UpstreamToClient, n as u64),
-            );
-            wait_while_paused(&mut pause_u2c).await;
-            if let Err(e) = client_w.write_all(&buf[..n]).await {
-                break Err(format!("client_write: {e}"));
-            }
-            bytes_total += n as u64;
-            if let Some(anchor) = &anchor_u2c
-                && anchor.record()
-            {
-                emit(&events_tx_u2c, ConnEvent::froze(id, anchor.k));
-            }
-        }
-    });
+    let c2u = tokio::spawn(forward_bytes(
+        id,
+        client_r,
+        upstream_w,
+        Direction::ClientToUpstream,
+        events_tx.clone(),
+        pause.clone(),
+        anchor_c2u,
+    ));
+    let u2c = tokio::spawn(forward_bytes(
+        id,
+        upstream_r,
+        client_w,
+        Direction::UpstreamToClient,
+        events_tx.clone(),
+        pause,
+        anchor_u2c,
+    ));
 
     let (c2u_res, u2c_res) = tokio::join!(c2u, u2c);
     let event = match (
@@ -259,6 +231,45 @@ async fn forward(
         (Err(e), _) | (_, Err(e)) => ConnEvent::failed(id, format!("forwarding: {e}")),
     };
     emit(&events_tx, event);
+}
+
+/// Forward the byte stream flowing one way (`direction`) of a connection: read a
+/// chunk from `read`, hold it while the fleet is paused, write it to `write`, and
+/// count each chunk against `anchor`. Returns the total bytes forwarded, or the
+/// error that ended it.
+async fn forward_bytes(
+    id: ConnId,
+    mut read: OwnedReadHalf,
+    mut write: OwnedWriteHalf,
+    direction: Direction,
+    events: mpsc::UnboundedSender<ConnEvent>,
+    mut pause: watch::Receiver<bool>,
+    anchor: Option<Anchor>,
+) -> Result<u64, String> {
+    let (read_label, write_label) = match direction {
+        Direction::ClientToUpstream => ("client_read", "upstream_write"),
+        Direction::UpstreamToClient => ("upstream_read", "client_write"),
+    };
+    let mut bytes_total: u64 = 0;
+    let mut buf = vec![0u8; 4096];
+    loop {
+        let n = match read.read(&mut buf).await {
+            Ok(0) => break Ok(bytes_total),
+            Ok(n) => n,
+            Err(e) => break Err(format!("{read_label}: {e}")),
+        };
+        emit(&events, ConnEvent::wrote(id, direction, n as u64));
+        wait_while_paused(&mut pause).await;
+        if let Err(e) = write.write_all(&buf[..n]).await {
+            break Err(format!("{write_label}: {e}"));
+        }
+        bytes_total += n as u64;
+        if let Some(anchor) = &anchor
+            && anchor.record()
+        {
+            emit(&events, ConnEvent::froze(id, anchor.k));
+        }
+    }
 }
 
 #[cfg(test)]
