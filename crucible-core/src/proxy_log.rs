@@ -7,17 +7,6 @@ use crucible_protocol::{
 };
 use rand::seq::SliceRandom;
 
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-    #[error("parse conn event: {source} in line: {line}")]
-    Parse {
-        source: serde_json::Error,
-        line: String,
-    },
-}
-
-pub type Result<T> = std::result::Result<T, Error>;
-
 struct Pending {
     opened_ns: u128,
     peer: String,
@@ -78,25 +67,6 @@ impl Sessions {
             // byte accounting; the freeze waiter consumes it elsewhere.
             ConnEventKind::Froze { .. } => {}
         }
-    }
-
-    /// Parse one proxy log line and fold its connection event into the session
-    /// state. Blank lines are ignored.
-    ///
-    /// # Errors
-    /// Returns `Error::Parse` if the line is non-empty but fails to deserialize
-    /// into a [`ConnEvent`].
-    pub fn accept_line(&mut self, service: &str, line: &str) -> Result<()> {
-        let line = line.trim();
-        if line.is_empty() {
-            return Ok(());
-        }
-        let event: ConnEvent = serde_json::from_str(line).map_err(|source| Error::Parse {
-            source,
-            line: line.to_string(),
-        })?;
-        self.accept_event(service, event);
-        Ok(())
     }
 }
 
