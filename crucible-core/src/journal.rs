@@ -5,8 +5,10 @@
 // JSON was chosen for human greppability; write throughput is not a bottleneck
 // at journal cadence.
 //
-// No `fsync` is called after each write; the OS buffer is adequate at current
-// scope.
+// Each line is flushed to the OS as it is written, so an abnormal exit loses at
+// most the line in flight rather than a whole in-process buffer. No `fsync` is
+// called, so a power loss can still drop lines sitting in the OS page cache;
+// that degree of durability is beyond the journal's scope.
 
 use std::{io, path::PathBuf, sync::Arc};
 
@@ -23,7 +25,7 @@ use crate::event_bus::RunnerEvent;
 /// # Errors
 /// Returns an [`io::Error`] if the parent directory cannot be created, `path`
 /// cannot be opened for append, an event cannot be serialized to JSON, or a line
-/// or the final flush cannot be written.
+/// cannot be written or flushed.
 pub async fn run(mut rx: mpsc::Receiver<Arc<RunnerEvent>>, path: PathBuf) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;
@@ -38,8 +40,8 @@ pub async fn run(mut rx: mpsc::Receiver<Arc<RunnerEvent>>, path: PathBuf) -> io:
         let line = serde_json::to_string(&*event).map_err(io::Error::other)?;
         writer.write_all(line.as_bytes()).await?;
         writer.write_all(b"\n").await?;
+        writer.flush().await?;
     }
-    writer.flush().await?;
     Ok(())
 }
 
