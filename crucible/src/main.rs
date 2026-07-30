@@ -133,9 +133,9 @@ async fn run_campaign() -> ExitCode {
     }
 }
 
-/// Lex a `.cru` file, rendering diagnostics on failure. Exits 0 if it lexes
-/// cleanly, 1 if there are diagnostics, and 2 if the file is not a readable
-/// `.cru` file.
+/// Lex and parse a `.cru` file, rendering diagnostics on failure. Exits 0 on
+/// success, 1 on lexing or parsing diagnostics, and 2 if the file is not a
+/// readable `.cru` file.
 fn run_check(file: &Path) -> ExitCode {
     if file.extension().and_then(std::ffi::OsStr::to_str) != Some("cru") {
         eprintln!(
@@ -152,16 +152,34 @@ fn run_check(file: &Path) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let (tokens, errors) = crucible_dsl::lexer::lex(&src);
-    if errors.is_empty() {
-        println!("{name}: lexed {} tokens", tokens.len());
-        return ExitCode::SUCCESS;
+
+    let (tokens, lex_errors) = crucible_dsl::lexer::lex(&src);
+    if !lex_errors.is_empty() {
+        let diags: Vec<_> = lex_errors
+            .iter()
+            .map(|e| crucible_dsl::diagnostics::Diag::new(e.span, e.message.clone()))
+            .collect();
+        return render_and_fail(&name, &src, &diags);
     }
-    let diags: Vec<_> = errors
-        .iter()
-        .map(|e| crucible_dsl::diagnostics::Diag::new(e.span, e.message.clone()))
-        .collect();
-    if let Err(e) = crucible_dsl::diagnostics::emit_to_stderr(&name, &src, &diags) {
+
+    match crucible_dsl::parser::parse(tokens) {
+        Ok(ast) => {
+            let fleet = &ast.fleet.node;
+            println!(
+                "{name}: ok (fleet `{}`, {} service(s), {} scenario(s))",
+                fleet.name.node,
+                fleet.services.len(),
+                ast.scenarios.len(),
+            );
+            ExitCode::SUCCESS
+        }
+        Err(diags) => render_and_fail(&name, &src, &diags),
+    }
+}
+
+/// Render diagnostics to stderr and return the check-failed exit code.
+fn render_and_fail(name: &str, src: &str, diags: &[crucible_dsl::diagnostics::Diag]) -> ExitCode {
+    if let Err(e) = crucible_dsl::diagnostics::emit_to_stderr(name, src, diags) {
         eprintln!("crucible check: failed to render diagnostics: {e}");
     }
     ExitCode::from(1)
