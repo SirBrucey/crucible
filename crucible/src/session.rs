@@ -44,7 +44,21 @@ impl Session<Handshaking> {
     pub async fn handshake(mut self, bus: &EventBus) -> Result<Session<Dispatching>> {
         let hello = read_frame::<WorkerToRunner, _>(&mut self.stream).await?;
         let worker_id = match &hello {
-            WorkerToRunner::Hello { worker_id, .. } => *worker_id,
+            WorkerToRunner::Hello {
+                worker_id,
+                worker_version,
+            } => {
+                // A worker built against a different framework version speaks a
+                // protocol we cannot rely on; reject it with a clear error
+                // rather than letting it fail later with an opaque decode error.
+                if *worker_version != self.runner_version {
+                    return Err(Error::VersionMismatch {
+                        ours: self.runner_version.clone(),
+                        theirs: worker_version.clone(),
+                    });
+                }
+                *worker_id
+            }
             other => {
                 return Err(Error::UnexpectedMessage {
                     state: "Handshaking",

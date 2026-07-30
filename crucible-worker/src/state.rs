@@ -160,6 +160,15 @@ impl Worker<Handshaking> {
             .await?;
         match self.conn.recv().await? {
             RunnerToWorker::HelloAck { runner_version } => {
+                // A runner built against a different framework version speaks a
+                // protocol we cannot rely on; reject it with a clear error
+                // rather than failing later with an opaque decode error.
+                if runner_version != self.version {
+                    return Err(Error::VersionMismatch {
+                        ours: self.version,
+                        theirs: runner_version,
+                    });
+                }
                 tracing::info!(worker_id = self.id, %runner_version, "handshake ok");
                 Ok(Worker {
                     id: self.id,
