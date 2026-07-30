@@ -7,17 +7,6 @@ use crucible_protocol::{
 };
 use rand::seq::SliceRandom;
 
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-    #[error("parse conn event: {source} in line: {line}")]
-    Parse {
-        source: serde_json::Error,
-        line: String,
-    },
-}
-
-pub type Result<T> = std::result::Result<T, Error>;
-
 struct Pending {
     opened_ns: u128,
     peer: String,
@@ -79,25 +68,6 @@ impl Sessions {
             ConnEventKind::Froze { .. } => {}
         }
     }
-
-    /// Parse one proxy log line and fold its connection event into the session
-    /// state. Blank lines are ignored.
-    ///
-    /// # Errors
-    /// Returns `Error::Parse` if the line is non-empty but fails to deserialize
-    /// into a [`ConnEvent`].
-    pub fn accept_line(&mut self, service: &str, line: &str) -> Result<()> {
-        let line = line.trim();
-        if line.is_empty() {
-            return Ok(());
-        }
-        let event: ConnEvent = serde_json::from_str(line).map_err(|source| Error::Parse {
-            source,
-            line: line.to_string(),
-        })?;
-        self.accept_event(service, event);
-        Ok(())
-    }
 }
 
 /// Consecutive packets more than this far apart start a new burst.
@@ -155,11 +125,12 @@ pub fn service_profiles_from_sessions(
 /// A count `K` means "freeze once `K` packets have crossed": `K = first - 1`
 /// lands just before a burst, `K = last` just after it.
 ///
-/// `K = 0` (before the very first packet) is dropped. Armed on the proxy's
-/// command line it freezes at boot, which holds the fleet's own bring-up traffic
-/// (the apps connecting to their dependencies through the proxy), so the fleet
-/// never becomes healthy. Doing "kill before the first packet" properly needs
-/// the freeze deferred until after bring-up, which boot-time arming cannot do.
+/// `K = 0` (before the very first packet on the edge) is dropped. The anchor is
+/// now armed at scenario start rather than at boot, so freezing there is
+/// achievable, but it kills the target before the scenario has driven any
+/// traffic across the edge, so it probes no point within that edge's traffic the
+/// way the `K >= 1` anchors do. "Kill before first contact" would be a deliberate
+/// fault to add, not a by-product of this enumeration.
 fn burst_anchors(packets: &[u128]) -> Vec<u32> {
     let n = packets.len();
     if n == 0 {

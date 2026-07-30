@@ -22,6 +22,8 @@ pub enum Error {
         expected: &'static str,
         got: String,
     },
+    #[error("version mismatch: worker is `{ours}` but runner is `{theirs}`")]
+    VersionMismatch { ours: String, theirs: String },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

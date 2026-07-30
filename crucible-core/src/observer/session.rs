@@ -185,8 +185,7 @@ impl SessionObserver {
 
     /// Wall-clock nanoseconds of the most recent event the observer has
     /// recorded, or `None` if nothing has been observed yet.
-    #[must_use]
-    pub fn last_event_ns(&self) -> Option<u128> {
+    fn last_event_ns(&self) -> Option<u128> {
         self.index
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)

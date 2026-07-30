@@ -104,12 +104,24 @@ impl Drop for Heartbeat {
 
 pub struct Worker<S> {
     id: u32,
-    version: String,
     conn: Conn,
     state: S,
 }
 
-pub struct Handshaking;
+impl<S> Worker<S> {
+    /// Advance to the next state, carrying the worker's identity and connection.
+    fn transition<T>(self, state: T) -> Worker<T> {
+        Worker {
+            id: self.id,
+            conn: self.conn,
+            state,
+        }
+    }
+}
+
+pub struct Handshaking {
+    version: String,
+}
 
 pub struct Idle;
 
@@ -145,28 +157,31 @@ impl Worker<Handshaking> {
     pub fn new(stream: UnixStream, id: u32, version: String) -> Self {
         Self {
             id,
-            version,
             conn: Conn::new(stream),
-            state: Handshaking,
+            state: Handshaking { version },
         }
     }
 
     pub async fn handshake(mut self) -> Result<Worker<Idle>> {
         self.conn
             .send(&WorkerToRunner::Hello {
-                worker_version: self.version.clone(),
+                worker_version: self.state.version.clone(),
                 worker_id: self.id,
             })
             .await?;
         match self.conn.recv().await? {
             RunnerToWorker::HelloAck { runner_version } => {
+                // A runner built against a different framework version speaks a
+                // protocol we cannot rely on; reject it with a clear error
+                // rather than failing later with an opaque decode error.
+                if runner_version != self.state.version {
+                    return Err(Error::VersionMismatch {
+                        ours: self.state.version,
+                        theirs: runner_version,
+                    });
+                }
                 tracing::info!(worker_id = self.id, %runner_version, "handshake ok");
-                Ok(Worker {
-                    id: self.id,
-                    version: self.version,
-                    conn: self.conn,
-                    state: Idle,
-                })
+                Ok(self.transition(Idle))
             }
             other => Err(Error::UnexpectedMessage {
                 state: "Handshaking",
@@ -185,12 +200,7 @@ impl Worker<Idle> {
         match self.conn.recv().await? {
             RunnerToWorker::Learn => {
                 tracing::info!(worker_id = self.id, "received learn");
-                Ok(IdleNext::Learn(Worker {
-                    id: self.id,
-                    version: self.version,
-                    conn: self.conn,
-                    state: Learning,
-                }))
+                Ok(IdleNext::Learn(self.transition(Learning)))
             }
             RunnerToWorker::Schedule {
                 schedule_id,
@@ -207,20 +217,15 @@ impl Worker<Idle> {
                     fault_packet_index,
                     "received schedule"
                 );
-                Ok(IdleNext::Work(Worker {
-                    id: self.id,
-                    version: self.version,
-                    conn: self.conn,
-                    state: Executing {
-                        schedule: Schedule {
-                            schedule_id,
-                            service,
-                            direction,
-                            fault_packet_index,
-                            payload,
-                        },
+                Ok(IdleNext::Work(self.transition(Executing {
+                    schedule: Schedule {
+                        schedule_id,
+                        service,
+                        direction,
+                        fault_packet_index,
+                        payload,
                     },
-                }))
+                })))
             }
             other @ RunnerToWorker::HelloAck { .. } => Err(Error::UnexpectedMessage {
                 state: "Idle",
@@ -245,12 +250,7 @@ impl Worker<Learning> {
             .send(&WorkerToRunner::SessionCatalogue { services })
             .await?;
         tracing::info!(worker_id = self.id, count, "sent session catalogue");
-        Ok(Worker {
-            id: self.id,
-            version: self.version,
-            conn: self.conn,
-            state: ShuttingDown { orchestrator },
-        })
+        Ok(self.transition(ShuttingDown { orchestrator }))
     }
 }
 
@@ -314,12 +314,7 @@ impl Worker<Executing> {
             ?verdict,
             "sent run result"
         );
-        Ok(Worker {
-            id: self.id,
-            version: self.version,
-            conn: self.conn,
-            state: ShuttingDown { orchestrator },
-        })
+        Ok(self.transition(ShuttingDown { orchestrator }))
     }
 }
 

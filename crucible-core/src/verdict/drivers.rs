@@ -71,28 +71,34 @@ impl Driver for Durable {
             });
         }
 
-        // Every acked write must be present in the DB with the same fields.
+        // Every acked write must be present in the DB, and no un-acked write may
+        // be (a zombie). Consume one matching row per acked order so duplicates
+        // pair one-to-one with distinct rows; whatever remains is unaccounted for.
+        let mut remaining: Vec<_> = db.orders.iter().collect();
         for ack in &acked {
-            let matched = db.orders.iter().any(|row| {
+            let matched = remaining.iter().position(|row| {
                 row.id == ack.order_id && row.item == ack.item && row.quantity == ack.quantity
             });
-            if !matched {
-                return Verdict::Fail {
-                    reason: format!(
-                        "acked order {} ({} x{}) is absent from persisted state after heal",
-                        ack.order_id, ack.item, ack.quantity
-                    ),
-                };
+            match matched {
+                Some(i) => {
+                    remaining.swap_remove(i);
+                }
+                None => {
+                    return Verdict::Fail {
+                        reason: format!(
+                            "acked order {} ({} x{}) is absent from persisted state after heal",
+                            ack.order_id, ack.item, ack.quantity
+                        ),
+                    };
+                }
             }
         }
 
-        // No un-acked writes should have made it to the DB (zombie state).
-        if db.orders.len() > acked.len() {
+        if !remaining.is_empty() {
             return Verdict::Fail {
                 reason: format!(
-                    "persisted {} orders but only {} were acked (zombie writes)",
-                    db.orders.len(),
-                    acked.len()
+                    "{} persisted order(s) were never acked (zombie writes)",
+                    remaining.len()
                 ),
             };
         }
@@ -250,6 +256,22 @@ mod tests {
         obs.kill = Some(fired_kill());
         obs.http_outcomes.push(ack("book", 4, 1));
         obs.http_outcomes.push(err("noodles", 10));
+        obs.db_state = Some(DbState {
+            orders: vec![row(1, "book", 4), row(2, "noodles", 10)],
+            stock: vec![],
+        });
+        assert!(matches!(Durable.drive(&obs), Verdict::Fail { .. }));
+    }
+
+    #[test]
+    fn a_duplicate_ack_cannot_mask_a_zombie() {
+        // Two acks resolve to the same (order_id, item, quantity), so a count of
+        // rows-versus-acks would treat the one matching row as covering both and
+        // miss the second, zombie row. Consuming one row per ack surfaces it.
+        let mut obs = Observations::empty();
+        obs.kill = Some(fired_kill());
+        obs.http_outcomes.push(ack("book", 4, 1));
+        obs.http_outcomes.push(ack("book", 4, 1));
         obs.db_state = Some(DbState {
             orders: vec![row(1, "book", 4), row(2, "noodles", 10)],
             stock: vec![],

@@ -20,6 +20,8 @@ pub enum Error {
     WorkerTimeout(Duration),
     #[error("worker sent no heartbeat within {0:?}")]
     WorkerUnresponsive(Duration),
+    #[error("version mismatch: runner is `{ours}` but worker is `{theirs}`")]
+    VersionMismatch { ours: String, theirs: String },
     #[error("runner session in state `{state}` expected `{expected}`, got `{got}`")]
     UnexpectedMessage {
         state: &'static str,

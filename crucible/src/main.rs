@@ -19,7 +19,8 @@ use tokio::{
     io::{AsyncBufReadExt, BufReader},
     net::UnixListener,
     process::{Child, Command},
-    task::{JoinHandle, JoinSet},
+    signal::unix::{SignalKind, signal},
+    task::{JoinError, JoinHandle, JoinSet},
     time::timeout,
 };
 
@@ -32,6 +33,13 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const TOTAL_BUDGET: Duration = Duration::from_mins(5);
 const SCHEDULE_MARGIN: Duration = Duration::from_secs(30);
 const LEARN_MARGIN: Duration = Duration::from_secs(30);
+/// Bound for one learn attempt. A healthy learn brings the fleet up (bounded by
+/// the deployment's own readiness timeout), runs the scenario, and settles well
+/// inside this, so exceeding it means a hung worker rather than a slow one.
+const LEARN_BUDGET: Duration = Duration::from_secs(150);
+/// Learn is a barrier the whole campaign depends on, so a transient failure is
+/// retried on a fresh replica up to this many total attempts before giving up.
+const LEARN_MAX_ATTEMPTS: u32 = 2;
 /// A failed schedule is respawned on a fresh worker up to this many total
 /// attempts before it is recorded as errored.
 const MAX_ATTEMPTS: u32 = 3;
@@ -106,8 +114,17 @@ async fn run() -> Result<CampaignOutcome> {
 
     let mut observer_rx = bus.subscribe();
     let observer_task = tokio::spawn(async move {
-        while let Ok(event) = observer_rx.recv().await {
-            tracing::info!(target: "observer", event = ?event, "");
+        loop {
+            match observer_rx.recv().await {
+                Ok(event) => tracing::info!(target: "observer", event = ?event, ""),
+                // Lagging drops only these log lines; the journal (an mpsc) still
+                // records every event, so keep going rather than losing the
+                // observer log for the rest of the run.
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    tracing::warn!(target: "observer", skipped, "observer lagged behind; dropped events");
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
         }
     });
 
@@ -288,68 +305,93 @@ impl Recovery {
     }
 }
 
-async fn drive(bus: &EventBus) -> Result<CampaignOutcome> {
-    let campaign_start = Instant::now();
-    let mut worker_id: u32 = 0;
+/// The schedule dispatch pool: the in-flight schedule workers, kept filled up to
+/// the concurrency cap, plus the running tally and the counters that respawn and
+/// give-up decisions read. Each schedule runs on its own isolated fleet replica,
+/// and one worker's failure is recorded against its schedule while the others
+/// carry on.
+struct Pool<'a> {
+    bus: &'a EventBus,
+    inflight: JoinSet<(Schedule, u32, Result<Verdict>)>,
+    outcomes: Outcomes,
+    recovery: Recovery,
+    worker_id: u32,
+    schedule_budget: Duration,
+    campaign_start: Instant,
+    max_inflight: usize,
+    exhausted: bool,
+    gave_up: bool,
+}
 
-    // Learn is a barrier: schedules derive from its observed traffic profiles.
-    let (services, run_cost) = run_learn(bus, worker_id).await?;
-    worker_id += 1;
-    tracing::info!(
-        services = services.len(),
-        run_cost_ms = run_cost.as_millis(),
-        "session catalogue received"
-    );
+impl<'a> Pool<'a> {
+    fn new(
+        bus: &'a EventBus,
+        worker_id: u32,
+        schedule_budget: Duration,
+        campaign_start: Instant,
+        max_inflight: usize,
+    ) -> Self {
+        Self {
+            bus,
+            inflight: JoinSet::new(),
+            outcomes: Outcomes::default(),
+            recovery: Recovery::default(),
+            worker_id,
+            schedule_budget,
+            campaign_start,
+            max_inflight,
+            exhausted: false,
+            gave_up: false,
+        }
+    }
 
-    let schedule_budget = run_cost + HEAL_BUDGET + SCHEDULE_MARGIN;
-    let max_inflight = concurrency();
-    let mut scheduler = BurstScheduler::new(&services);
-    let total = scheduler.total();
-    let mut outcomes = Outcomes::default();
+    /// Whether the campaign's wall-clock budget still allows dispatching.
+    fn within_budget(&self) -> bool {
+        self.campaign_start.elapsed() < TOTAL_BUDGET
+    }
 
-    // Run up to `max_inflight` schedule workers at once, each on its own isolated
-    // fleet replica. TOTAL_BUDGET caps when we stop dispatching; the in-flight
-    // workers run to completion. Schedules are emitted round-robin across bursts,
-    // so a budget-truncated campaign still samples every burst evenly, and a
-    // worker's failure is recorded against its schedule while the others carry on.
-    let mut inflight: JoinSet<(Schedule, u32, Result<Verdict>)> = JoinSet::new();
-    let mut recovery = Recovery::default();
-    let mut exhausted = false;
-    let mut gave_up = false;
-    loop {
-        while inflight.len() < max_inflight
-            && !exhausted
-            && !gave_up
-            && campaign_start.elapsed() < TOTAL_BUDGET
+    /// Spawn one schedule attempt on the next worker id and its own replica.
+    fn spawn(&mut self, schedule: Schedule, attempt: u32) {
+        self.inflight.spawn(run_one_schedule(
+            self.bus.clone(),
+            self.worker_id,
+            schedule,
+            attempt,
+            self.schedule_budget,
+        ));
+        self.worker_id += 1;
+    }
+
+    /// Fill the in-flight set up to the concurrency cap, until the scheduler
+    /// drains, the campaign gives up, or the wall-clock budget runs out.
+    fn fill(&mut self, scheduler: &mut BurstScheduler) {
+        while self.inflight.len() < self.max_inflight
+            && !self.exhausted
+            && !self.gave_up
+            && self.within_budget()
         {
             match scheduler.next() {
-                Some(schedule) => {
-                    inflight.spawn(run_one_schedule(
-                        bus.clone(),
-                        worker_id,
-                        schedule,
-                        1,
-                        schedule_budget,
-                    ));
-                    worker_id += 1;
-                }
-                None => exhausted = true,
+                Some(schedule) => self.spawn(schedule, 1),
+                None => self.exhausted = true,
             }
         }
-        let Some(joined) = inflight.join_next().await else {
-            break;
-        };
+    }
+
+    /// Record one completed (or panicked) schedule: tally its verdict, retry a
+    /// transient failure on a fresh replica while attempts and budget remain, or
+    /// record it errored. Enough failures back to back give the campaign up.
+    fn record(&mut self, joined: std::result::Result<(Schedule, u32, Result<Verdict>), JoinError>) {
         match joined {
             Ok((schedule, _attempt, Ok(verdict))) => {
-                recovery.reset();
-                outcomes.record_verdict(schedule.schedule_id, verdict);
+                self.recovery.reset();
+                self.outcomes.record_verdict(schedule.schedule_id, verdict);
             }
             // A worker that outran its budget did not crash; we simply have no
             // verdict in the time allowed. Record it inconclusive rather than
             // retrying into the campaign's hard cap.
             Ok((schedule, _attempt, Err(Error::WorkerTimeout(budget)))) => {
-                recovery.reset();
-                outcomes.record_verdict(
+                self.recovery.reset();
+                self.outcomes.record_verdict(
                     schedule.schedule_id,
                     Verdict::Inconclusive {
                         reason: format!("worker exceeded its {budget:?} budget"),
@@ -357,9 +399,7 @@ async fn drive(bus: &EventBus) -> Result<CampaignOutcome> {
                 );
             }
             Ok((schedule, attempt, Err(e)))
-                if !gave_up
-                    && campaign_start.elapsed() < TOTAL_BUDGET
-                    && Recovery::may_respawn(attempt) =>
+                if !self.gave_up && self.within_budget() && Recovery::may_respawn(attempt) =>
             {
                 tracing::warn!(
                     schedule_id = schedule.schedule_id,
@@ -367,29 +407,22 @@ async fn drive(bus: &EventBus) -> Result<CampaignOutcome> {
                     error = %e,
                     "worker failed; respawning on a fresh replica"
                 );
-                inflight.spawn(run_one_schedule(
-                    bus.clone(),
-                    worker_id,
-                    schedule,
-                    attempt + 1,
-                    schedule_budget,
-                ));
-                worker_id += 1;
+                self.spawn(schedule, attempt + 1);
             }
             Ok((schedule, attempt, Err(e))) => {
                 let schedule_id = schedule.schedule_id;
                 tracing::warn!(schedule_id, attempts = attempt, error = %e, "worker failed and will not be retried");
-                outcomes.record_error(Some(schedule_id), e);
-                recovery.record_failure();
+                self.outcomes.record_error(Some(schedule_id), e);
+                self.recovery.record_failure();
             }
             Err(join_err) => {
                 // A panicked task loses its schedule, so it cannot be respawned.
-                outcomes.record_error(None, join_err);
-                recovery.record_failure();
+                self.outcomes.record_error(None, join_err);
+                self.recovery.record_failure();
             }
         }
-        if recovery.is_exhausted() && !gave_up {
-            gave_up = true;
+        if self.recovery.is_exhausted() && !self.gave_up {
+            self.gave_up = true;
             tracing::error!(
                 consecutive = GIVE_UP_AFTER,
                 "too many schedules failed in a row; abandoning the campaign"
@@ -397,28 +430,129 @@ async fn drive(bus: &EventBus) -> Result<CampaignOutcome> {
         }
     }
 
-    outcomes.report(total, campaign_start.elapsed().as_secs());
-    Ok(outcomes.outcome())
+    /// Stop the in-flight tasks and force-reclaim every replica spawned this run.
+    /// Reclaiming an already-torn-down id is a no-op, so this covers the
+    /// still-running workers without tracking which are which.
+    async fn reclaim_all(&mut self) {
+        self.inflight.shutdown().await;
+        for id in 0..self.worker_id {
+            reclaim_fleet(id).await;
+        }
+    }
 }
 
-/// Run the fault-free learn pass on its own worker and return the observed
-/// service profiles plus how long the pass took, always reclaiming the worker's
-/// replica afterwards so a killed learn worker leaves nothing behind.
-async fn run_learn(bus: &EventBus, worker_id: u32) -> Result<(Vec<ServiceProfile>, Duration)> {
-    let outcome = execute_learn(bus, worker_id).await;
-    reclaim_fleet(worker_id).await;
-    outcome
+async fn drive(bus: &EventBus) -> Result<CampaignOutcome> {
+    let campaign_start = Instant::now();
+    let mut worker_id: u32 = 0;
+
+    // Learn is a barrier: schedules derive from its observed traffic profiles.
+    let (services, run_cost) = run_learn(bus, &mut worker_id).await?;
+    tracing::info!(
+        services = services.len(),
+        run_cost_ms = run_cost.as_millis(),
+        "session catalogue received"
+    );
+
+    let mut scheduler = BurstScheduler::new(&services);
+    let total = scheduler.total();
+    let mut pool = Pool::new(
+        bus,
+        worker_id,
+        run_cost + HEAL_BUDGET + SCHEDULE_MARGIN,
+        campaign_start,
+        concurrency(),
+    );
+
+    // Interrupting a run must not orphan its in-flight replicas or sockets, so
+    // catch SIGINT/SIGTERM, stop dispatching, and reclaim on the way out rather
+    // than letting the default handler kill the runner mid-campaign.
+    let mut sigint = signal(SignalKind::interrupt())?;
+    let mut sigterm = signal(SignalKind::terminate())?;
+    let mut interrupted = false;
+    loop {
+        pool.fill(&mut scheduler);
+        tokio::select! {
+            biased;
+            _ = sigint.recv() => { interrupted = true; break; }
+            _ = sigterm.recv() => { interrupted = true; break; }
+            joined = pool.inflight.join_next() => {
+                let Some(joined) = joined else {
+                    break;
+                };
+                pool.record(joined);
+            }
+        }
+    }
+
+    if interrupted {
+        tracing::warn!("interrupted; stopping dispatch and reclaiming replicas");
+        pool.reclaim_all().await;
+    }
+
+    pool.outcomes
+        .report(total, campaign_start.elapsed().as_secs());
+    Ok(pool.outcomes.outcome())
 }
 
+/// Run the fault-free learn pass, retrying on a fresh replica up to
+/// `LEARN_MAX_ATTEMPTS` so a single transient failure does not abort the whole
+/// campaign. Each attempt runs on its own worker and is reclaimed afterwards,
+/// whatever the outcome, so a killed learn worker leaves nothing behind.
+/// Advances `worker_id` past every attempt so each gets its own socket and fleet.
+async fn run_learn(bus: &EventBus, worker_id: &mut u32) -> Result<(Vec<ServiceProfile>, Duration)> {
+    let mut attempt = 1;
+    loop {
+        let id = *worker_id;
+        *worker_id += 1;
+        let outcome = execute_learn(bus, id).await;
+        reclaim_fleet(id).await;
+        match outcome {
+            Ok(result) => return Ok(result),
+            Err(e) if attempt < LEARN_MAX_ATTEMPTS => {
+                tracing::warn!(attempt, error = %e, "learn failed; retrying on a fresh replica");
+                attempt += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Run one learn attempt on its own worker, bounding the whole pipeline so a
+/// hung worker (for instance one that connects but never sends `Ready`) cannot
+/// wedge the campaign, and reaping the child on every path so a failure leaves
+/// no zombie.
 async fn execute_learn(bus: &EventBus, worker_id: u32) -> Result<(Vec<ServiceProfile>, Duration)> {
     let (socket_path, listener) = bind_worker_listener(worker_id).await?;
     let (mut child, stderr_relay) = spawn_worker(&socket_path, worker_id)?;
     let learn_start = Instant::now();
-    let session = accept_and_handshake(&listener, bus).await?;
-    let services = session.learn(bus).await?;
-    let run_cost = learn_start.elapsed();
-    wait_worker(&mut child, stderr_relay, run_cost + LEARN_MARGIN).await?;
-    Ok((services, run_cost))
+    let pipeline = async {
+        let session = accept_and_handshake(&listener, bus).await?;
+        let services = session.learn(bus).await?;
+        Ok::<_, Error>((services, learn_start.elapsed()))
+    };
+    match tokio::time::timeout(LEARN_BUDGET, pipeline).await {
+        Ok(Ok((services, run_cost))) => {
+            // The catalogue is in hand; a failure while the worker finishes
+            // teardown must not discard it. wait_worker has already reaped the
+            // child on every error path, so here we only log and keep it.
+            if let Err(e) = wait_worker(&mut child, stderr_relay, run_cost + LEARN_MARGIN).await {
+                tracing::warn!(
+                    worker_id,
+                    error = %e,
+                    "learn worker teardown failed after delivering its catalogue; keeping it"
+                );
+            }
+            Ok((services, run_cost))
+        }
+        Ok(Err(e)) => {
+            reap_worker(&mut child, stderr_relay).await;
+            Err(e)
+        }
+        Err(_) => {
+            reap_worker(&mut child, stderr_relay).await;
+            Err(Error::WorkerTimeout(LEARN_BUDGET))
+        }
+    }
 }
 
 /// Run one schedule and hand back the schedule and its `attempt` alongside the
@@ -458,8 +592,21 @@ async fn run_worker(
     };
     match tokio::time::timeout(schedule_budget, pipeline).await {
         Ok(Ok(verdict)) => {
-            // Success: let the worker finish its teardown and exit cleanly.
-            wait_worker(&mut child, stderr_relay, schedule_budget).await?;
+            // The worker already delivered its verdict; a failure while it
+            // finishes teardown must not discard it, or a found fault would be
+            // mis-tallied as an error and flip the campaign's exit code. A
+            // fault-perturbed fleet is also the most likely to hit a docker
+            // teardown race, so this correlates with exactly the runs that found
+            // something. wait_worker has already reaped the child on every error
+            // path, and reclaim_fleet removes the replica afterwards, so here we
+            // only log and keep the verdict.
+            if let Err(e) = wait_worker(&mut child, stderr_relay, schedule_budget).await {
+                tracing::warn!(
+                    worker_id,
+                    error = %e,
+                    "worker teardown failed after delivering its verdict; keeping the verdict"
+                );
+            }
             Ok(verdict)
         }
         Ok(Err(e)) => {

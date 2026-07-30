@@ -14,19 +14,27 @@ use crate::{
     proxy_log::service_profiles_from_sessions,
     scenario::{self, Orders},
     scheduler::Schedule,
-    verdict::{Invariant, Observations, driver_for},
+    verdict::{Invariant, driver_for},
 };
 
 /// After a restart, wait this long before judging the fleet quiescent, so
 /// recovery traffic has a chance to start.
 const HEAL_MIN_SETTLE: Duration = Duration::from_millis(500);
+/// Before the learn snapshot, wait at least this long so post-ack async writes
+/// have a chance to begin before the fleet can be judged quiescent.
+const LEARN_SETTLE: Duration = Duration::from_millis(100);
 /// Consider the fleet quiescent once no sidecar has forwarded traffic for this
 /// long. Comfortably larger than a DB write plus docker-log delivery latency.
-const HEAL_QUIESCENCE_IDLE: Duration = Duration::from_secs(1);
+const QUIESCENCE_IDLE: Duration = Duration::from_secs(1);
 /// Backstop for the fault anchor: if the target never reaches its Kth packet,
 /// stop waiting. In practice the scenario ending fires first (a shorter path to
 /// the same "missed" outcome); this only guards a pathological hang.
 const ANCHOR_TIMEOUT: Duration = Duration::from_mins(1);
+/// A freeze is observed through the docker log stream, which lags real traffic.
+/// If the scenario ends before a freeze has been seen, wait this long for a
+/// freeze triggered by a post-ack edge to become visible before concluding the
+/// anchor was missed. Comfortably larger than docker-log delivery latency.
+const FREEZE_GRACE: Duration = Duration::from_secs(1);
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -126,16 +134,38 @@ impl Orchestrator<Ready> {
     /// # Errors
     /// Errors if the scenario fails to run against the fleet.
     pub async fn learn(self) -> Result<(Vec<ServiceProfile>, Orchestrator<Done>), Error> {
+        let Orchestrator {
+            deployment,
+            scenario,
+            state: Ready {
+                session_observer,
+                api,
+            },
+        } = self;
         let scenario_start_ns = now_ns();
-        let mut observations: Observations = self.scenario.run(self.state.api).await?;
-        self.state.session_observer.observe(&mut observations);
+        let mut observations = match scenario.run(api).await {
+            Ok(observations) => observations,
+            Err(e) => {
+                // A failed scenario leaves the replica up; tear it down rather
+                // than dropping the only handle to it and its observer tasks.
+                let _ = teardown_replica(deployment, session_observer).await;
+                return Err(e.into());
+            }
+        };
+        // Let the fleet fall quiescent before snapshotting, so writes that land
+        // after their HTTP response is acked (the async consumer path) are
+        // observed and yield anchors. Without this the snapshot is taken while
+        // that traffic is still in flight, so the async write path gets no
+        // anchors and the scheduler never faults it.
+        session_observer
+            .wait_for_quiescence(LEARN_SETTLE, QUIESCENCE_IDLE, HEAL_BUDGET)
+            .await;
+        session_observer.observe(&mut observations);
         let profiles = service_profiles_from_sessions(&observations.sessions, scenario_start_ns);
         let done = Orchestrator {
-            deployment: self.deployment,
-            scenario: self.scenario,
-            state: Done {
-                session_observer: self.state.session_observer,
-            },
+            deployment,
+            scenario,
+            state: Done { session_observer },
         };
         Ok((profiles, done))
     }
@@ -163,80 +193,101 @@ impl Orchestrator<Ready> {
             },
         } = self;
 
-        // Arm the anchor as the scenario starts: the proxy resets and counts
-        // scenario packets from here, and wait_for_freeze captures its observer
-        // baseline at the same moment, so both share the scenario-start origin.
-        // A failed arm means the proxy never freezes, so the whole run would be
-        // meaningless; surface it rather than pressing on.
-        deployment.arm_anchor().await?;
+        // Run the fault sequence borrowing the replica handles, so whatever the
+        // outcome we still own them afterwards: on success they move into `Done`
+        // for the caller to tear down, on error we tear down here rather than
+        // dropping the only handle to the replica and its observer tasks.
+        let outcome: Result<(Verdict, KillReport), Error> = async {
+            // Arm the anchor as the scenario starts: the proxy resets and counts
+            // scenario packets from here, and wait_for_freeze captures its observer
+            // baseline at the same moment, so both share the scenario-start origin.
+            // A failed arm means the proxy never freezes, so the whole run would be
+            // meaningless; surface it rather than pressing on.
+            deployment.arm_anchor().await?;
 
-        let (scenario_end_tx, mut scenario_end_rx) = tokio::sync::oneshot::channel::<()>();
-        let scenario_start = Instant::now();
-        let scenario_fut = async {
-            let result = scenario.run(api).await;
-            let _ = scenario_end_tx.send(());
-            result
-        };
+            let (scenario_end_tx, mut scenario_end_rx) = tokio::sync::oneshot::channel::<()>();
+            let scenario_start = Instant::now();
+            let scenario_fut = async {
+                let result = scenario.run(api).await;
+                let _ = scenario_end_tx.send(());
+                result
+            };
 
-        let missed = |reason| KillReport {
-            schedule_id: schedule.schedule_id,
-            service: schedule.service.clone(),
-            result: KillResult::Missed(reason),
-        };
-
-        let kill_fut = async {
-            tokio::select! {
-                biased;
-                frozen = session_observer.wait_for_freeze(ANCHOR_TIMEOUT) => {
-                    if !frozen {
-                        // The proxy never reported freezing (the target did not
-                        // reach its Kth packet); release the freeze in case it is
-                        // mid-flight and record a miss.
-                        deployment.resume_proxy().await?;
-                        return Ok::<_, Error>(missed(KillMissReason::ScenarioEndedBeforeAnchor));
+            let kill_fut = async {
+                tokio::select! {
+                    biased;
+                    frozen = session_observer.wait_for_freeze(ANCHOR_TIMEOUT) => {
+                        if !frozen {
+                            // The proxy never reported freezing (the target did not
+                            // reach its Kth packet); release the freeze in case it is
+                            // mid-flight and record a miss.
+                            deployment.resume_proxy().await?;
+                            return Ok::<_, Error>(missed(schedule, KillMissReason::ScenarioEndedBeforeAnchor));
+                        }
+                        // The proxy froze the fleet to place the kill precisely on the
+                        // anchored packet. Kill the target, then release the flow and
+                        // bring the target back concurrently: the scenario runs against
+                        // the dead-then-recovering service in real time. Its real
+                        // recovery time is part of the fault (ops in the outage window
+                        // fail; ops once it is back succeed) rather than the world
+                        // stopping while we heal.
+                        let actual = scenario_start.elapsed().as_nanos();
+                        Ok(fire_kill(&deployment, schedule, actual).await?)
                     }
-                    // The proxy froze the fleet to place the kill precisely on the
-                    // anchored packet. Kill the target, then release the flow and
-                    // bring the target back concurrently: the scenario runs against
-                    // the dead-then-recovering service in real time. Its real
-                    // recovery time is part of the fault (ops in the outage window
-                    // fail; ops once it is back succeed) rather than the world
-                    // stopping while we heal.
-                    let actual = scenario_start.elapsed().as_nanos();
-                    Ok(fire_kill(&deployment, schedule, actual).await?)
+                    _ = &mut scenario_end_rx => {
+                        // The scenario finished before a freeze was seen. The freeze
+                        // is observed through the docker log stream, which lags real
+                        // traffic, so a freeze triggered by a post-ack edge may just
+                        // not be visible yet. Give it a short grace window before
+                        // concluding the anchor was missed.
+                        if session_observer.wait_for_freeze(FREEZE_GRACE).await {
+                            let actual = scenario_start.elapsed().as_nanos();
+                            Ok(fire_kill(&deployment, schedule, actual).await?)
+                        } else {
+                            // Genuinely no freeze; release it in case one is
+                            // mid-flight and record the miss.
+                            deployment.resume_proxy().await?;
+                            Ok(missed(schedule, KillMissReason::ScenarioEndedBeforeAnchor))
+                        }
+                    }
                 }
-                _ = &mut scenario_end_rx => {
-                    // Scenario finished before the target reached its Kth packet;
-                    // release the freeze so nothing is left wedged.
-                    deployment.resume_proxy().await?;
-                    Ok(missed(KillMissReason::ScenarioEndedBeforeAnchor))
-                }
+            };
+
+            let (scenario_result, kill_result) = tokio::join!(scenario_fut, kill_fut);
+            let kill_report = kill_result?;
+            let mut observations = scenario_result?;
+            observations.kill = Some(kill_report.clone());
+
+            if matches!(kill_report.result, KillResult::Fired { .. }) {
+                // The target was restarted concurrently with the scenario; just wait
+                // for the fleet to settle (giving any outbox redelivery its chance)
+                // before reading the durability state.
+                session_observer
+                    .wait_for_quiescence(HEAL_MIN_SETTLE, QUIESCENCE_IDLE, HEAL_BUDGET)
+                    .await;
             }
-        };
 
-        let (scenario_result, kill_result) = tokio::join!(scenario_fut, kill_fut);
-        let kill_report = kill_result?;
-        let mut observations = scenario_result?;
-        observations.kill = Some(kill_report.clone());
-
-        if matches!(kill_report.result, KillResult::Fired { .. }) {
-            // The target was restarted concurrently with the scenario; just wait
-            // for the fleet to settle (giving any outbox redelivery its chance)
-            // before reading the durability state.
-            session_observer
-                .wait_for_quiescence(HEAL_MIN_SETTLE, HEAL_QUIESCENCE_IDLE, HEAL_BUDGET)
-                .await;
+            db_observer.observe(&mut observations).await?;
+            session_observer.observe(&mut observations);
+            let verdict = driver_for(Invariant::Durable).drive(&observations);
+            Ok((verdict, kill_report))
         }
+        .await;
 
-        db_observer.observe(&mut observations).await?;
-        session_observer.observe(&mut observations);
-        let verdict = driver_for(Invariant::Durable).drive(&observations);
-        let done = Orchestrator {
-            deployment,
-            scenario,
-            state: Done { session_observer },
-        };
-        Ok(((verdict, kill_report), done))
+        match outcome {
+            Ok((verdict, kill_report)) => {
+                let done = Orchestrator {
+                    deployment,
+                    scenario,
+                    state: Done { session_observer },
+                };
+                Ok(((verdict, kill_report), done))
+            }
+            Err(e) => {
+                let _ = teardown_replica(deployment, session_observer).await;
+                Err(e)
+            }
+        }
     }
 
     /// Shut down the observer and remove the fleet replica.
@@ -267,6 +318,15 @@ async fn teardown_replica(
     deployment.teardown().await
 }
 
+/// A [`KillReport`] for a fault that did not fire, for the given reason.
+fn missed(schedule: &Schedule, reason: KillMissReason) -> KillReport {
+    KillReport {
+        schedule_id: schedule.schedule_id,
+        service: schedule.service.clone(),
+        result: KillResult::Missed(reason),
+    }
+}
+
 /// Apply the kill against the already-frozen fleet and produce its report. Kill
 /// the target, then release the freeze and bring the target back so the scenario
 /// runs against the dead-then-recovering service.
@@ -285,12 +345,6 @@ where
     D: Deployment,
     D::Error: std::fmt::Display,
 {
-    let missed = |reason| KillReport {
-        schedule_id: schedule.schedule_id,
-        service: schedule.service.clone(),
-        result: KillResult::Missed(reason),
-    };
-
     let killed_at_ns = match deployment.kill_service(&schedule.service).await {
         Ok(killed_at_ns) => killed_at_ns,
         Err(e) => {
@@ -298,7 +352,7 @@ where
             // proxy is holding and report the miss. A resume failure here still
             // leaves the fleet wedged, so it is fatal.
             deployment.resume_proxy().await?;
-            return Ok(missed(KillMissReason::KillFailed(e.to_string())));
+            return Ok(missed(schedule, KillMissReason::KillFailed(e.to_string())));
         }
     };
     deployment.resume_proxy().await?;

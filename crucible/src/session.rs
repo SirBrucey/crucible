@@ -1,8 +1,8 @@
 //! Typestate machine driving the runner's side of one worker session.
 //!
-//! `Session<S>` carries the IPC stream and this runner's version across states;
-//! `state: S` holds what changes. Transitions consume `self` and return the
-//! next `Session<_>`; illegal sequences are compile errors.
+//! `Session<S>` carries the IPC stream across states; `state: S` holds what
+//! changes. Transitions consume `self` and return the next `Session<_>`; illegal
+//! sequences are compile errors.
 
 use crucible_core::{
     event_bus::{EventBus, RunnerEvent},
@@ -18,11 +18,22 @@ use crate::error::{Error, Result};
 
 pub struct Session<S> {
     stream: UnixStream,
-    runner_version: String,
     state: S,
 }
 
-pub struct Handshaking;
+impl<S> Session<S> {
+    /// Advance to the next state, carrying the IPC stream.
+    fn transition<T>(self, state: T) -> Session<T> {
+        Session {
+            stream: self.stream,
+            state,
+        }
+    }
+}
+
+pub struct Handshaking {
+    runner_version: String,
+}
 
 pub struct Dispatching {
     worker_id: u32,
@@ -36,15 +47,28 @@ impl Session<Handshaking> {
     pub fn new(stream: UnixStream, runner_version: String) -> Self {
         Self {
             stream,
-            runner_version,
-            state: Handshaking,
+            state: Handshaking { runner_version },
         }
     }
 
     pub async fn handshake(mut self, bus: &EventBus) -> Result<Session<Dispatching>> {
         let hello = read_frame::<WorkerToRunner, _>(&mut self.stream).await?;
         let worker_id = match &hello {
-            WorkerToRunner::Hello { worker_id, .. } => *worker_id,
+            WorkerToRunner::Hello {
+                worker_id,
+                worker_version,
+            } => {
+                // A worker built against a different framework version speaks a
+                // protocol we cannot rely on; reject it with a clear error
+                // rather than letting it fail later with an opaque decode error.
+                if *worker_version != self.state.runner_version {
+                    return Err(Error::VersionMismatch {
+                        ours: self.state.runner_version.clone(),
+                        theirs: worker_version.clone(),
+                    });
+                }
+                *worker_id
+            }
             other => {
                 return Err(Error::UnexpectedMessage {
                     state: "Handshaking",
@@ -53,57 +77,40 @@ impl Session<Handshaking> {
                 });
             }
         };
-        bus.publish(RunnerEvent::WorkerMessage {
-            worker_id,
-            message: hello,
-        })
-        .await
-        .expect("journal receiver alive");
+        journal_in(bus, worker_id, hello).await;
 
         let ack = RunnerToWorker::HelloAck {
-            runner_version: self.runner_version.clone(),
+            runner_version: self.state.runner_version.clone(),
         };
         write_frame(&mut self.stream, &ack).await?;
-        bus.publish(RunnerEvent::RunnerMessage {
-            worker_id,
-            message: ack,
-        })
-        .await
-        .expect("journal receiver alive");
+        journal_out(bus, worker_id, ack).await;
 
-        Ok(Session {
-            stream: self.stream,
-            runner_version: self.runner_version,
-            state: Dispatching { worker_id },
-        })
+        Ok(self.transition(Dispatching { worker_id }))
     }
 }
 
 impl Session<Dispatching> {
-    pub async fn learn(mut self, bus: &EventBus) -> Result<Vec<ServiceProfile>> {
+    /// Read the next frame, requiring it to be `Ready`, and journal it. `state`
+    /// names the caller's state for the error message.
+    async fn read_ready(&mut self, bus: &EventBus, state: &'static str) -> Result<()> {
         let ready = read_frame::<WorkerToRunner, _>(&mut self.stream).await?;
         if !matches!(&ready, WorkerToRunner::Ready) {
             return Err(Error::UnexpectedMessage {
-                state: "Learning",
+                state,
                 expected: "Ready",
                 got: format!("{ready:?}"),
             });
         }
-        bus.publish(RunnerEvent::WorkerMessage {
-            worker_id: self.state.worker_id,
-            message: ready,
-        })
-        .await
-        .expect("journal receiver alive");
+        journal_in(bus, self.state.worker_id, ready).await;
+        Ok(())
+    }
+
+    pub async fn learn(mut self, bus: &EventBus) -> Result<Vec<ServiceProfile>> {
+        self.read_ready(bus, "Learning").await?;
 
         let outbound = RunnerToWorker::Learn;
         write_frame(&mut self.stream, &outbound).await?;
-        bus.publish(RunnerEvent::RunnerMessage {
-            worker_id: self.state.worker_id,
-            message: outbound,
-        })
-        .await
-        .expect("journal receiver alive");
+        journal_out(bus, self.state.worker_id, outbound).await;
 
         let msg = read_live(&mut self.stream).await?;
         let services = match &msg {
@@ -116,12 +123,7 @@ impl Session<Dispatching> {
                 });
             }
         };
-        bus.publish(RunnerEvent::WorkerMessage {
-            worker_id: self.state.worker_id,
-            message: msg,
-        })
-        .await
-        .expect("journal receiver alive");
+        journal_in(bus, self.state.worker_id, msg).await;
 
         Ok(services)
     }
@@ -131,37 +133,14 @@ impl Session<Dispatching> {
         bus: &EventBus,
         schedule: Schedule,
     ) -> Result<Session<AwaitingResult>> {
-        let ready = read_frame::<WorkerToRunner, _>(&mut self.stream).await?;
-        if !matches!(&ready, WorkerToRunner::Ready) {
-            return Err(Error::UnexpectedMessage {
-                state: "Dispatching",
-                expected: "Ready",
-                got: format!("{ready:?}"),
-            });
-        }
-        bus.publish(RunnerEvent::WorkerMessage {
-            worker_id: self.state.worker_id,
-            message: ready,
-        })
-        .await
-        .expect("journal receiver alive");
+        self.read_ready(bus, "Dispatching").await?;
 
         let outbound = RunnerToWorker::from(schedule);
         write_frame(&mut self.stream, &outbound).await?;
-        bus.publish(RunnerEvent::RunnerMessage {
-            worker_id: self.state.worker_id,
-            message: outbound,
-        })
-        .await
-        .expect("journal receiver alive");
+        journal_out(bus, self.state.worker_id, outbound).await;
 
-        Ok(Session {
-            stream: self.stream,
-            runner_version: self.runner_version,
-            state: AwaitingResult {
-                worker_id: self.state.worker_id,
-            },
-        })
+        let worker_id = self.state.worker_id;
+        Ok(self.transition(AwaitingResult { worker_id }))
     }
 }
 
@@ -185,17 +164,26 @@ impl Session<AwaitingResult> {
                     });
                 }
             };
-            bus.publish(RunnerEvent::WorkerMessage {
-                worker_id: self.state.worker_id,
-                message: msg,
-            })
-            .await
-            .expect("journal receiver alive");
+            journal_in(bus, self.state.worker_id, msg).await;
             if let Some(v) = verdict {
                 return Ok(v);
             }
         }
     }
+}
+
+/// Record a frame received from the worker in the journal.
+async fn journal_in(bus: &EventBus, worker_id: u32, message: WorkerToRunner) {
+    bus.publish(RunnerEvent::WorkerMessage { worker_id, message })
+        .await
+        .expect("journal receiver alive");
+}
+
+/// Record a frame sent to the worker in the journal.
+async fn journal_out(bus: &EventBus, worker_id: u32, message: RunnerToWorker) {
+    bus.publish(RunnerEvent::RunnerMessage { worker_id, message })
+        .await
+        .expect("journal receiver alive");
 }
 
 /// Read the next non-heartbeat frame, treating each heartbeat as proof of life
