@@ -37,6 +37,13 @@ struct FreezeAt {
     k: u32,
 }
 
+/// Whether some pair spec fronts `service` (the part before its first `=`).
+fn is_fronted(service: &str, pairs: &[String]) -> bool {
+    pairs
+        .iter()
+        .any(|spec| spec.split('=').next() == Some(service))
+}
+
 fn parse_freeze_at(spec: &str) -> Result<FreezeAt> {
     let mut parts = spec.splitn(3, '=');
     let (Some(service), Some(dir), Some(k)) = (parts.next(), parts.next(), parts.next()) else {
@@ -77,6 +84,16 @@ async fn main() -> Result<()> {
     // Build the fault anchor (if any) once, so the same handle both counts on the
     // matching pair and is armed by the SIGUSR1 handler.
     let freeze = cli.freeze_at.as_deref().map(parse_freeze_at).transpose()?;
+    // A freeze-at must name a service some pair fronts. Otherwise it would
+    // silently never count (k>0, no pair increments it) or, on arm, freeze the
+    // whole fleet for a target that is not even fronted (k=0).
+    if let Some(f) = &freeze
+        && !is_fronted(&f.service, &cli.pairs)
+    {
+        return Err(Error::UnknownFreezeService {
+            service: f.service.clone(),
+        });
+    }
     let anchor = freeze
         .as_ref()
         .map(|f| Anchor::new(f.direction, f.k, pause_tx.clone()));
@@ -217,5 +234,12 @@ mod tests {
     #[test]
     fn rejects_a_missing_field() {
         assert!(parse_freeze_at("db=c2u").is_err());
+    }
+
+    #[test]
+    fn a_freeze_service_must_front_a_pair() {
+        let pairs = vec!["db=0.0.0.0:3306=db-actual:3306".to_string()];
+        assert!(is_fronted("db", &pairs));
+        assert!(!is_fronted("api", &pairs));
     }
 }
