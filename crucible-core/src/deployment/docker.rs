@@ -92,16 +92,6 @@ impl TeardownFailures {
     pub fn is_empty(&self) -> bool {
         self.containers.is_empty() && self.network.is_none()
     }
-
-    #[must_use]
-    pub fn containers(&self) -> &[(String, String)] {
-        &self.containers
-    }
-
-    #[must_use]
-    pub fn network(&self) -> Option<&str> {
-        self.network.as_deref()
-    }
 }
 
 impl std::fmt::Display for TeardownFailures {
@@ -149,11 +139,6 @@ impl Docker {
             endpoints: HashMap::new(),
             anchor,
         })
-    }
-
-    #[must_use]
-    pub fn network(&self) -> &str {
-        &self.network
     }
 
     /// Reclaim, by worker id alone, any fleet a worker left behind. The runner
