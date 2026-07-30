@@ -1,0 +1,3 @@
+scenario "x" {
+  do { http POST api "/orders" ? };
+}

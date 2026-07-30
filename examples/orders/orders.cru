@@ -1,0 +1,22 @@
+// The `orders` example fleet: an HTTP API, a broker, a database, and an
+// inventory consumer, with a durability scenario that posts three orders and
+// asserts all three persist.
+
+fleet "orders" {
+  service api       { kind: http; image: "crucible-example/orders-api:0.1"; port: 8080 };
+  service broker    { kind: amqp; image: "rabbitmq:3.13-management"; port: 5672 };
+  service db        { kind: sql;  image: "mariadb:11.4"; port: 3306 };
+  service inventory { kind: amqp; image: "crucible-example/orders-inventory:0.1"; port: 8081 };
+}
+
+scenario "orders_durability" {
+  consistent_within: 15s;
+
+  do { http POST api "/orders" body { item: "book", quantity: 4 } };
+  do { http POST api "/orders" body { item: "noodles", quantity: 10 } };
+  do { http POST api "/orders" body { item: "usb-c cable", quantity: 1 } };
+
+  expect {
+    db.orders.count == 3;
+  }
+}
