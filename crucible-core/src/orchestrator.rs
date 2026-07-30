@@ -20,13 +20,21 @@ use crate::{
 /// After a restart, wait this long before judging the fleet quiescent, so
 /// recovery traffic has a chance to start.
 const HEAL_MIN_SETTLE: Duration = Duration::from_millis(500);
+/// Before the learn snapshot, wait at least this long so post-ack async writes
+/// have a chance to begin before the fleet can be judged quiescent.
+const LEARN_SETTLE: Duration = Duration::from_millis(100);
 /// Consider the fleet quiescent once no sidecar has forwarded traffic for this
 /// long. Comfortably larger than a DB write plus docker-log delivery latency.
-const HEAL_QUIESCENCE_IDLE: Duration = Duration::from_secs(1);
+const QUIESCENCE_IDLE: Duration = Duration::from_secs(1);
 /// Backstop for the fault anchor: if the target never reaches its Kth packet,
 /// stop waiting. In practice the scenario ending fires first (a shorter path to
 /// the same "missed" outcome); this only guards a pathological hang.
 const ANCHOR_TIMEOUT: Duration = Duration::from_mins(1);
+/// A freeze is observed through the docker log stream, which lags real traffic.
+/// If the scenario ends before a freeze has been seen, wait this long for a
+/// freeze triggered by a post-ack edge to become visible before concluding the
+/// anchor was missed. Comfortably larger than docker-log delivery latency.
+const FREEZE_GRACE: Duration = Duration::from_secs(1);
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -144,6 +152,14 @@ impl Orchestrator<Ready> {
                 return Err(e.into());
             }
         };
+        // Let the fleet fall quiescent before snapshotting, so writes that land
+        // after their HTTP response is acked (the async consumer path) are
+        // observed and yield anchors. Without this the snapshot is taken while
+        // that traffic is still in flight, so the async write path gets no
+        // anchors and the scheduler never faults it.
+        session_observer
+            .wait_for_quiescence(LEARN_SETTLE, QUIESCENCE_IDLE, HEAL_BUDGET)
+            .await;
         session_observer.observe(&mut observations);
         let profiles = service_profiles_from_sessions(&observations.sessions, scenario_start_ns);
         let done = Orchestrator {
@@ -225,10 +241,20 @@ impl Orchestrator<Ready> {
                         Ok(fire_kill(&deployment, schedule, actual).await?)
                     }
                     _ = &mut scenario_end_rx => {
-                        // Scenario finished before the target reached its Kth packet;
-                        // release the freeze so nothing is left wedged.
-                        deployment.resume_proxy().await?;
-                        Ok(missed(KillMissReason::ScenarioEndedBeforeAnchor))
+                        // The scenario finished before a freeze was seen. The freeze
+                        // is observed through the docker log stream, which lags real
+                        // traffic, so a freeze triggered by a post-ack edge may just
+                        // not be visible yet. Give it a short grace window before
+                        // concluding the anchor was missed.
+                        if session_observer.wait_for_freeze(FREEZE_GRACE).await {
+                            let actual = scenario_start.elapsed().as_nanos();
+                            Ok(fire_kill(&deployment, schedule, actual).await?)
+                        } else {
+                            // Genuinely no freeze; release it in case one is
+                            // mid-flight and record the miss.
+                            deployment.resume_proxy().await?;
+                            Ok(missed(KillMissReason::ScenarioEndedBeforeAnchor))
+                        }
                     }
                 }
             };
@@ -243,7 +269,7 @@ impl Orchestrator<Ready> {
                 // for the fleet to settle (giving any outbox redelivery its chance)
                 // before reading the durability state.
                 session_observer
-                    .wait_for_quiescence(HEAL_MIN_SETTLE, HEAL_QUIESCENCE_IDLE, HEAL_BUDGET)
+                    .wait_for_quiescence(HEAL_MIN_SETTLE, QUIESCENCE_IDLE, HEAL_BUDGET)
                     .await;
             }
 
