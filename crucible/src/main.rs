@@ -19,7 +19,8 @@ use tokio::{
     io::{AsyncBufReadExt, BufReader},
     net::UnixListener,
     process::{Child, Command},
-    task::{JoinHandle, JoinSet},
+    signal::unix::{SignalKind, signal},
+    task::{JoinError, JoinHandle, JoinSet},
     time::timeout,
 };
 
@@ -295,6 +296,142 @@ impl Recovery {
     }
 }
 
+/// The schedule dispatch pool: the in-flight schedule workers, kept filled up to
+/// the concurrency cap, plus the running tally and the counters that respawn and
+/// give-up decisions read. Each schedule runs on its own isolated fleet replica,
+/// and one worker's failure is recorded against its schedule while the others
+/// carry on.
+struct Pool<'a> {
+    bus: &'a EventBus,
+    inflight: JoinSet<(Schedule, u32, Result<Verdict>)>,
+    outcomes: Outcomes,
+    recovery: Recovery,
+    worker_id: u32,
+    schedule_budget: Duration,
+    campaign_start: Instant,
+    max_inflight: usize,
+    exhausted: bool,
+    gave_up: bool,
+}
+
+impl<'a> Pool<'a> {
+    fn new(
+        bus: &'a EventBus,
+        worker_id: u32,
+        schedule_budget: Duration,
+        campaign_start: Instant,
+        max_inflight: usize,
+    ) -> Self {
+        Self {
+            bus,
+            inflight: JoinSet::new(),
+            outcomes: Outcomes::default(),
+            recovery: Recovery::default(),
+            worker_id,
+            schedule_budget,
+            campaign_start,
+            max_inflight,
+            exhausted: false,
+            gave_up: false,
+        }
+    }
+
+    /// Whether the campaign's wall-clock budget still allows dispatching.
+    fn within_budget(&self) -> bool {
+        self.campaign_start.elapsed() < TOTAL_BUDGET
+    }
+
+    /// Spawn one schedule attempt on the next worker id and its own replica.
+    fn spawn(&mut self, schedule: Schedule, attempt: u32) {
+        self.inflight.spawn(run_one_schedule(
+            self.bus.clone(),
+            self.worker_id,
+            schedule,
+            attempt,
+            self.schedule_budget,
+        ));
+        self.worker_id += 1;
+    }
+
+    /// Fill the in-flight set up to the concurrency cap, until the scheduler
+    /// drains, the campaign gives up, or the wall-clock budget runs out.
+    fn fill(&mut self, scheduler: &mut BurstScheduler) {
+        while self.inflight.len() < self.max_inflight
+            && !self.exhausted
+            && !self.gave_up
+            && self.within_budget()
+        {
+            match scheduler.next() {
+                Some(schedule) => self.spawn(schedule, 1),
+                None => self.exhausted = true,
+            }
+        }
+    }
+
+    /// Record one completed (or panicked) schedule: tally its verdict, retry a
+    /// transient failure on a fresh replica while attempts and budget remain, or
+    /// record it errored. Enough failures back to back give the campaign up.
+    fn record(&mut self, joined: std::result::Result<(Schedule, u32, Result<Verdict>), JoinError>) {
+        match joined {
+            Ok((schedule, _attempt, Ok(verdict))) => {
+                self.recovery.reset();
+                self.outcomes.record_verdict(schedule.schedule_id, verdict);
+            }
+            // A worker that outran its budget did not crash; we simply have no
+            // verdict in the time allowed. Record it inconclusive rather than
+            // retrying into the campaign's hard cap.
+            Ok((schedule, _attempt, Err(Error::WorkerTimeout(budget)))) => {
+                self.recovery.reset();
+                self.outcomes.record_verdict(
+                    schedule.schedule_id,
+                    Verdict::Inconclusive {
+                        reason: format!("worker exceeded its {budget:?} budget"),
+                    },
+                );
+            }
+            Ok((schedule, attempt, Err(e)))
+                if !self.gave_up && self.within_budget() && Recovery::may_respawn(attempt) =>
+            {
+                tracing::warn!(
+                    schedule_id = schedule.schedule_id,
+                    attempt,
+                    error = %e,
+                    "worker failed; respawning on a fresh replica"
+                );
+                self.spawn(schedule, attempt + 1);
+            }
+            Ok((schedule, attempt, Err(e))) => {
+                let schedule_id = schedule.schedule_id;
+                tracing::warn!(schedule_id, attempts = attempt, error = %e, "worker failed and will not be retried");
+                self.outcomes.record_error(Some(schedule_id), e);
+                self.recovery.record_failure();
+            }
+            Err(join_err) => {
+                // A panicked task loses its schedule, so it cannot be respawned.
+                self.outcomes.record_error(None, join_err);
+                self.recovery.record_failure();
+            }
+        }
+        if self.recovery.is_exhausted() && !self.gave_up {
+            self.gave_up = true;
+            tracing::error!(
+                consecutive = GIVE_UP_AFTER,
+                "too many schedules failed in a row; abandoning the campaign"
+            );
+        }
+    }
+
+    /// Stop the in-flight tasks and force-reclaim every replica spawned this run.
+    /// Reclaiming an already-torn-down id is a no-op, so this covers the
+    /// still-running workers without tracking which are which.
+    async fn reclaim_all(&mut self) {
+        self.inflight.shutdown().await;
+        for id in 0..self.worker_id {
+            reclaim_fleet(id).await;
+        }
+    }
+}
+
 async fn drive(bus: &EventBus) -> Result<CampaignOutcome> {
     let campaign_start = Instant::now();
     let mut worker_id: u32 = 0;
@@ -307,104 +444,45 @@ async fn drive(bus: &EventBus) -> Result<CampaignOutcome> {
         "session catalogue received"
     );
 
-    let schedule_budget = run_cost + HEAL_BUDGET + SCHEDULE_MARGIN;
-    let max_inflight = concurrency();
     let mut scheduler = BurstScheduler::new(&services);
     let total = scheduler.total();
-    let mut outcomes = Outcomes::default();
+    let mut pool = Pool::new(
+        bus,
+        worker_id,
+        run_cost + HEAL_BUDGET + SCHEDULE_MARGIN,
+        campaign_start,
+        concurrency(),
+    );
 
-    // Run up to `max_inflight` schedule workers at once, each on its own isolated
-    // fleet replica. TOTAL_BUDGET caps when we stop dispatching; the in-flight
-    // workers run to completion. Schedules are emitted round-robin across bursts,
-    // so a budget-truncated campaign still samples every burst evenly, and a
-    // worker's failure is recorded against its schedule while the others carry on.
-    let mut inflight: JoinSet<(Schedule, u32, Result<Verdict>)> = JoinSet::new();
-    let mut recovery = Recovery::default();
-    let mut exhausted = false;
-    let mut gave_up = false;
+    // Interrupting a run must not orphan its in-flight replicas or sockets, so
+    // catch SIGINT/SIGTERM, stop dispatching, and reclaim on the way out rather
+    // than letting the default handler kill the runner mid-campaign.
+    let mut sigint = signal(SignalKind::interrupt())?;
+    let mut sigterm = signal(SignalKind::terminate())?;
+    let mut interrupted = false;
     loop {
-        while inflight.len() < max_inflight
-            && !exhausted
-            && !gave_up
-            && campaign_start.elapsed() < TOTAL_BUDGET
-        {
-            match scheduler.next() {
-                Some(schedule) => {
-                    inflight.spawn(run_one_schedule(
-                        bus.clone(),
-                        worker_id,
-                        schedule,
-                        1,
-                        schedule_budget,
-                    ));
-                    worker_id += 1;
-                }
-                None => exhausted = true,
+        pool.fill(&mut scheduler);
+        tokio::select! {
+            biased;
+            _ = sigint.recv() => { interrupted = true; break; }
+            _ = sigterm.recv() => { interrupted = true; break; }
+            joined = pool.inflight.join_next() => {
+                let Some(joined) = joined else {
+                    break;
+                };
+                pool.record(joined);
             }
-        }
-        let Some(joined) = inflight.join_next().await else {
-            break;
-        };
-        match joined {
-            Ok((schedule, _attempt, Ok(verdict))) => {
-                recovery.reset();
-                outcomes.record_verdict(schedule.schedule_id, verdict);
-            }
-            // A worker that outran its budget did not crash; we simply have no
-            // verdict in the time allowed. Record it inconclusive rather than
-            // retrying into the campaign's hard cap.
-            Ok((schedule, _attempt, Err(Error::WorkerTimeout(budget)))) => {
-                recovery.reset();
-                outcomes.record_verdict(
-                    schedule.schedule_id,
-                    Verdict::Inconclusive {
-                        reason: format!("worker exceeded its {budget:?} budget"),
-                    },
-                );
-            }
-            Ok((schedule, attempt, Err(e)))
-                if !gave_up
-                    && campaign_start.elapsed() < TOTAL_BUDGET
-                    && Recovery::may_respawn(attempt) =>
-            {
-                tracing::warn!(
-                    schedule_id = schedule.schedule_id,
-                    attempt,
-                    error = %e,
-                    "worker failed; respawning on a fresh replica"
-                );
-                inflight.spawn(run_one_schedule(
-                    bus.clone(),
-                    worker_id,
-                    schedule,
-                    attempt + 1,
-                    schedule_budget,
-                ));
-                worker_id += 1;
-            }
-            Ok((schedule, attempt, Err(e))) => {
-                let schedule_id = schedule.schedule_id;
-                tracing::warn!(schedule_id, attempts = attempt, error = %e, "worker failed and will not be retried");
-                outcomes.record_error(Some(schedule_id), e);
-                recovery.record_failure();
-            }
-            Err(join_err) => {
-                // A panicked task loses its schedule, so it cannot be respawned.
-                outcomes.record_error(None, join_err);
-                recovery.record_failure();
-            }
-        }
-        if recovery.is_exhausted() && !gave_up {
-            gave_up = true;
-            tracing::error!(
-                consecutive = GIVE_UP_AFTER,
-                "too many schedules failed in a row; abandoning the campaign"
-            );
         }
     }
 
-    outcomes.report(total, campaign_start.elapsed().as_secs());
-    Ok(outcomes.outcome())
+    if interrupted {
+        tracing::warn!("interrupted; stopping dispatch and reclaiming replicas");
+        pool.reclaim_all().await;
+    }
+
+    pool.outcomes
+        .report(total, campaign_start.elapsed().as_secs());
+    Ok(pool.outcomes.outcome())
 }
 
 /// Run the fault-free learn pass, retrying on a fresh replica up to
