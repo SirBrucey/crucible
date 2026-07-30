@@ -458,8 +458,21 @@ async fn run_worker(
     };
     match tokio::time::timeout(schedule_budget, pipeline).await {
         Ok(Ok(verdict)) => {
-            // Success: let the worker finish its teardown and exit cleanly.
-            wait_worker(&mut child, stderr_relay, schedule_budget).await?;
+            // The worker already delivered its verdict; a failure while it
+            // finishes teardown must not discard it, or a found fault would be
+            // mis-tallied as an error and flip the campaign's exit code. A
+            // fault-perturbed fleet is also the most likely to hit a docker
+            // teardown race, so this correlates with exactly the runs that found
+            // something. wait_worker has already reaped the child on every error
+            // path, and reclaim_fleet removes the replica afterwards, so here we
+            // only log and keep the verdict.
+            if let Err(e) = wait_worker(&mut child, stderr_relay, schedule_budget).await {
+                tracing::warn!(
+                    worker_id,
+                    error = %e,
+                    "worker teardown failed after delivering its verdict; keeping the verdict"
+                );
+            }
             Ok(verdict)
         }
         Ok(Err(e)) => {
