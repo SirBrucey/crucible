@@ -14,7 +14,7 @@ use crate::{
     proxy_log::service_profiles_from_sessions,
     scenario::{self, Orders},
     scheduler::Schedule,
-    verdict::{Invariant, Observations, driver_for},
+    verdict::{Invariant, driver_for},
 };
 
 /// After a restart, wait this long before judging the fleet quiescent, so
@@ -126,16 +126,30 @@ impl Orchestrator<Ready> {
     /// # Errors
     /// Errors if the scenario fails to run against the fleet.
     pub async fn learn(self) -> Result<(Vec<ServiceProfile>, Orchestrator<Done>), Error> {
+        let Orchestrator {
+            deployment,
+            scenario,
+            state: Ready {
+                session_observer,
+                api,
+            },
+        } = self;
         let scenario_start_ns = now_ns();
-        let mut observations: Observations = self.scenario.run(self.state.api).await?;
-        self.state.session_observer.observe(&mut observations);
+        let mut observations = match scenario.run(api).await {
+            Ok(observations) => observations,
+            Err(e) => {
+                // A failed scenario leaves the replica up; tear it down rather
+                // than dropping the only handle to it and its observer tasks.
+                let _ = teardown_replica(deployment, session_observer).await;
+                return Err(e.into());
+            }
+        };
+        session_observer.observe(&mut observations);
         let profiles = service_profiles_from_sessions(&observations.sessions, scenario_start_ns);
         let done = Orchestrator {
-            deployment: self.deployment,
-            scenario: self.scenario,
-            state: Done {
-                session_observer: self.state.session_observer,
-            },
+            deployment,
+            scenario,
+            state: Done { session_observer },
         };
         Ok((profiles, done))
     }
@@ -163,80 +177,97 @@ impl Orchestrator<Ready> {
             },
         } = self;
 
-        // Arm the anchor as the scenario starts: the proxy resets and counts
-        // scenario packets from here, and wait_for_freeze captures its observer
-        // baseline at the same moment, so both share the scenario-start origin.
-        // A failed arm means the proxy never freezes, so the whole run would be
-        // meaningless; surface it rather than pressing on.
-        deployment.arm_anchor().await?;
+        // Run the fault sequence borrowing the replica handles, so whatever the
+        // outcome we still own them afterwards: on success they move into `Done`
+        // for the caller to tear down, on error we tear down here rather than
+        // dropping the only handle to the replica and its observer tasks.
+        let outcome: Result<(Verdict, KillReport), Error> = async {
+            // Arm the anchor as the scenario starts: the proxy resets and counts
+            // scenario packets from here, and wait_for_freeze captures its observer
+            // baseline at the same moment, so both share the scenario-start origin.
+            // A failed arm means the proxy never freezes, so the whole run would be
+            // meaningless; surface it rather than pressing on.
+            deployment.arm_anchor().await?;
 
-        let (scenario_end_tx, mut scenario_end_rx) = tokio::sync::oneshot::channel::<()>();
-        let scenario_start = Instant::now();
-        let scenario_fut = async {
-            let result = scenario.run(api).await;
-            let _ = scenario_end_tx.send(());
-            result
-        };
+            let (scenario_end_tx, mut scenario_end_rx) = tokio::sync::oneshot::channel::<()>();
+            let scenario_start = Instant::now();
+            let scenario_fut = async {
+                let result = scenario.run(api).await;
+                let _ = scenario_end_tx.send(());
+                result
+            };
 
-        let missed = |reason| KillReport {
-            schedule_id: schedule.schedule_id,
-            service: schedule.service.clone(),
-            result: KillResult::Missed(reason),
-        };
+            let missed = |reason| KillReport {
+                schedule_id: schedule.schedule_id,
+                service: schedule.service.clone(),
+                result: KillResult::Missed(reason),
+            };
 
-        let kill_fut = async {
-            tokio::select! {
-                biased;
-                frozen = session_observer.wait_for_freeze(ANCHOR_TIMEOUT) => {
-                    if !frozen {
-                        // The proxy never reported freezing (the target did not
-                        // reach its Kth packet); release the freeze in case it is
-                        // mid-flight and record a miss.
-                        deployment.resume_proxy().await?;
-                        return Ok::<_, Error>(missed(KillMissReason::ScenarioEndedBeforeAnchor));
+            let kill_fut = async {
+                tokio::select! {
+                    biased;
+                    frozen = session_observer.wait_for_freeze(ANCHOR_TIMEOUT) => {
+                        if !frozen {
+                            // The proxy never reported freezing (the target did not
+                            // reach its Kth packet); release the freeze in case it is
+                            // mid-flight and record a miss.
+                            deployment.resume_proxy().await?;
+                            return Ok::<_, Error>(missed(KillMissReason::ScenarioEndedBeforeAnchor));
+                        }
+                        // The proxy froze the fleet to place the kill precisely on the
+                        // anchored packet. Kill the target, then release the flow and
+                        // bring the target back concurrently: the scenario runs against
+                        // the dead-then-recovering service in real time. Its real
+                        // recovery time is part of the fault (ops in the outage window
+                        // fail; ops once it is back succeed) rather than the world
+                        // stopping while we heal.
+                        let actual = scenario_start.elapsed().as_nanos();
+                        Ok(fire_kill(&deployment, schedule, actual).await?)
                     }
-                    // The proxy froze the fleet to place the kill precisely on the
-                    // anchored packet. Kill the target, then release the flow and
-                    // bring the target back concurrently: the scenario runs against
-                    // the dead-then-recovering service in real time. Its real
-                    // recovery time is part of the fault (ops in the outage window
-                    // fail; ops once it is back succeed) rather than the world
-                    // stopping while we heal.
-                    let actual = scenario_start.elapsed().as_nanos();
-                    Ok(fire_kill(&deployment, schedule, actual).await?)
+                    _ = &mut scenario_end_rx => {
+                        // Scenario finished before the target reached its Kth packet;
+                        // release the freeze so nothing is left wedged.
+                        deployment.resume_proxy().await?;
+                        Ok(missed(KillMissReason::ScenarioEndedBeforeAnchor))
+                    }
                 }
-                _ = &mut scenario_end_rx => {
-                    // Scenario finished before the target reached its Kth packet;
-                    // release the freeze so nothing is left wedged.
-                    deployment.resume_proxy().await?;
-                    Ok(missed(KillMissReason::ScenarioEndedBeforeAnchor))
-                }
+            };
+
+            let (scenario_result, kill_result) = tokio::join!(scenario_fut, kill_fut);
+            let kill_report = kill_result?;
+            let mut observations = scenario_result?;
+            observations.kill = Some(kill_report.clone());
+
+            if matches!(kill_report.result, KillResult::Fired { .. }) {
+                // The target was restarted concurrently with the scenario; just wait
+                // for the fleet to settle (giving any outbox redelivery its chance)
+                // before reading the durability state.
+                session_observer
+                    .wait_for_quiescence(HEAL_MIN_SETTLE, HEAL_QUIESCENCE_IDLE, HEAL_BUDGET)
+                    .await;
             }
-        };
 
-        let (scenario_result, kill_result) = tokio::join!(scenario_fut, kill_fut);
-        let kill_report = kill_result?;
-        let mut observations = scenario_result?;
-        observations.kill = Some(kill_report.clone());
-
-        if matches!(kill_report.result, KillResult::Fired { .. }) {
-            // The target was restarted concurrently with the scenario; just wait
-            // for the fleet to settle (giving any outbox redelivery its chance)
-            // before reading the durability state.
-            session_observer
-                .wait_for_quiescence(HEAL_MIN_SETTLE, HEAL_QUIESCENCE_IDLE, HEAL_BUDGET)
-                .await;
+            db_observer.observe(&mut observations).await?;
+            session_observer.observe(&mut observations);
+            let verdict = driver_for(Invariant::Durable).drive(&observations);
+            Ok((verdict, kill_report))
         }
+        .await;
 
-        db_observer.observe(&mut observations).await?;
-        session_observer.observe(&mut observations);
-        let verdict = driver_for(Invariant::Durable).drive(&observations);
-        let done = Orchestrator {
-            deployment,
-            scenario,
-            state: Done { session_observer },
-        };
-        Ok(((verdict, kill_report), done))
+        match outcome {
+            Ok((verdict, kill_report)) => {
+                let done = Orchestrator {
+                    deployment,
+                    scenario,
+                    state: Done { session_observer },
+                };
+                Ok(((verdict, kill_report), done))
+            }
+            Err(e) => {
+                let _ = teardown_replica(deployment, session_observer).await;
+                Err(e)
+            }
+        }
     }
 
     /// Shut down the observer and remove the fleet replica.
