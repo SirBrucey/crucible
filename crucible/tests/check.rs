@@ -12,7 +12,7 @@ fn check(path: &str) -> Output {
 }
 
 #[test]
-fn the_example_scenario_lexes_cleanly() {
+fn the_example_scenario_checks_cleanly() {
     let out = check(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../examples/orders/orders.cru"
@@ -34,6 +34,20 @@ fn a_lexing_error_exits_one_with_a_diagnostic() {
     assert_eq!(out.status.code(), Some(1));
     assert!(
         String::from_utf8_lossy(&out.stderr).contains("unexpected character"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+}
+
+#[test]
+fn a_parse_error_exits_one_with_a_diagnostic() {
+    let out = check(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/parse_error.cru"
+    ));
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("fleet name"),
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr),
     );
