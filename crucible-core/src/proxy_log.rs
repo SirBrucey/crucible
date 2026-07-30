@@ -155,11 +155,12 @@ pub fn service_profiles_from_sessions(
 /// A count `K` means "freeze once `K` packets have crossed": `K = first - 1`
 /// lands just before a burst, `K = last` just after it.
 ///
-/// `K = 0` (before the very first packet) is dropped. Armed on the proxy's
-/// command line it freezes at boot, which holds the fleet's own bring-up traffic
-/// (the apps connecting to their dependencies through the proxy), so the fleet
-/// never becomes healthy. Doing "kill before the first packet" properly needs
-/// the freeze deferred until after bring-up, which boot-time arming cannot do.
+/// `K = 0` (before the very first packet on the edge) is dropped. The anchor is
+/// now armed at scenario start rather than at boot, so freezing there is
+/// achievable, but it kills the target before the scenario has driven any
+/// traffic across the edge, so it probes no point within that edge's traffic the
+/// way the `K >= 1` anchors do. "Kill before first contact" would be a deliberate
+/// fault to add, not a by-product of this enumeration.
 fn burst_anchors(packets: &[u128]) -> Vec<u32> {
     let n = packets.len();
     if n == 0 {
