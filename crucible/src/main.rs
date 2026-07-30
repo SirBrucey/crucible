@@ -32,6 +32,13 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const TOTAL_BUDGET: Duration = Duration::from_mins(5);
 const SCHEDULE_MARGIN: Duration = Duration::from_secs(30);
 const LEARN_MARGIN: Duration = Duration::from_secs(30);
+/// Bound for one learn attempt. A healthy learn brings the fleet up (bounded by
+/// the deployment's own readiness timeout), runs the scenario, and settles well
+/// inside this, so exceeding it means a hung worker rather than a slow one.
+const LEARN_BUDGET: Duration = Duration::from_secs(150);
+/// Learn is a barrier the whole campaign depends on, so a transient failure is
+/// retried on a fresh replica up to this many total attempts before giving up.
+const LEARN_MAX_ATTEMPTS: u32 = 2;
 /// A failed schedule is respawned on a fresh worker up to this many total
 /// attempts before it is recorded as errored.
 const MAX_ATTEMPTS: u32 = 3;
@@ -293,8 +300,7 @@ async fn drive(bus: &EventBus) -> Result<CampaignOutcome> {
     let mut worker_id: u32 = 0;
 
     // Learn is a barrier: schedules derive from its observed traffic profiles.
-    let (services, run_cost) = run_learn(bus, worker_id).await?;
-    worker_id += 1;
+    let (services, run_cost) = run_learn(bus, &mut worker_id).await?;
     tracing::info!(
         services = services.len(),
         run_cost_ms = run_cost.as_millis(),
@@ -401,24 +407,65 @@ async fn drive(bus: &EventBus) -> Result<CampaignOutcome> {
     Ok(outcomes.outcome())
 }
 
-/// Run the fault-free learn pass on its own worker and return the observed
-/// service profiles plus how long the pass took, always reclaiming the worker's
-/// replica afterwards so a killed learn worker leaves nothing behind.
-async fn run_learn(bus: &EventBus, worker_id: u32) -> Result<(Vec<ServiceProfile>, Duration)> {
-    let outcome = execute_learn(bus, worker_id).await;
-    reclaim_fleet(worker_id).await;
-    outcome
+/// Run the fault-free learn pass, retrying on a fresh replica up to
+/// `LEARN_MAX_ATTEMPTS` so a single transient failure does not abort the whole
+/// campaign. Each attempt runs on its own worker and is reclaimed afterwards,
+/// whatever the outcome, so a killed learn worker leaves nothing behind.
+/// Advances `worker_id` past every attempt so each gets its own socket and fleet.
+async fn run_learn(bus: &EventBus, worker_id: &mut u32) -> Result<(Vec<ServiceProfile>, Duration)> {
+    let mut attempt = 1;
+    loop {
+        let id = *worker_id;
+        *worker_id += 1;
+        let outcome = execute_learn(bus, id).await;
+        reclaim_fleet(id).await;
+        match outcome {
+            Ok(result) => return Ok(result),
+            Err(e) if attempt < LEARN_MAX_ATTEMPTS => {
+                tracing::warn!(attempt, error = %e, "learn failed; retrying on a fresh replica");
+                attempt += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
 }
 
+/// Run one learn attempt on its own worker, bounding the whole pipeline so a
+/// hung worker (for instance one that connects but never sends `Ready`) cannot
+/// wedge the campaign, and reaping the child on every path so a failure leaves
+/// no zombie.
 async fn execute_learn(bus: &EventBus, worker_id: u32) -> Result<(Vec<ServiceProfile>, Duration)> {
     let (socket_path, listener) = bind_worker_listener(worker_id).await?;
     let (mut child, stderr_relay) = spawn_worker(&socket_path, worker_id)?;
     let learn_start = Instant::now();
-    let session = accept_and_handshake(&listener, bus).await?;
-    let services = session.learn(bus).await?;
-    let run_cost = learn_start.elapsed();
-    wait_worker(&mut child, stderr_relay, run_cost + LEARN_MARGIN).await?;
-    Ok((services, run_cost))
+    let pipeline = async {
+        let session = accept_and_handshake(&listener, bus).await?;
+        let services = session.learn(bus).await?;
+        Ok::<_, Error>((services, learn_start.elapsed()))
+    };
+    match tokio::time::timeout(LEARN_BUDGET, pipeline).await {
+        Ok(Ok((services, run_cost))) => {
+            // The catalogue is in hand; a failure while the worker finishes
+            // teardown must not discard it. wait_worker has already reaped the
+            // child on every error path, so here we only log and keep it.
+            if let Err(e) = wait_worker(&mut child, stderr_relay, run_cost + LEARN_MARGIN).await {
+                tracing::warn!(
+                    worker_id,
+                    error = %e,
+                    "learn worker teardown failed after delivering its catalogue; keeping it"
+                );
+            }
+            Ok((services, run_cost))
+        }
+        Ok(Err(e)) => {
+            reap_worker(&mut child, stderr_relay).await;
+            Err(e)
+        }
+        Err(_) => {
+            reap_worker(&mut child, stderr_relay).await;
+            Err(Error::WorkerTimeout(LEARN_BUDGET))
+        }
+    }
 }
 
 /// Run one schedule and hand back the schedule and its `attempt` alongside the
