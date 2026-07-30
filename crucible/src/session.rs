@@ -1,8 +1,8 @@
 //! Typestate machine driving the runner's side of one worker session.
 //!
-//! `Session<S>` carries the IPC stream and this runner's version across states;
-//! `state: S` holds what changes. Transitions consume `self` and return the
-//! next `Session<_>`; illegal sequences are compile errors.
+//! `Session<S>` carries the IPC stream across states; `state: S` holds what
+//! changes. Transitions consume `self` and return the next `Session<_>`; illegal
+//! sequences are compile errors.
 
 use crucible_core::{
     event_bus::{EventBus, RunnerEvent},
@@ -18,11 +18,22 @@ use crate::error::{Error, Result};
 
 pub struct Session<S> {
     stream: UnixStream,
-    runner_version: String,
     state: S,
 }
 
-pub struct Handshaking;
+impl<S> Session<S> {
+    /// Advance to the next state, carrying the IPC stream.
+    fn transition<T>(self, state: T) -> Session<T> {
+        Session {
+            stream: self.stream,
+            state,
+        }
+    }
+}
+
+pub struct Handshaking {
+    runner_version: String,
+}
 
 pub struct Dispatching {
     worker_id: u32,
@@ -36,8 +47,7 @@ impl Session<Handshaking> {
     pub fn new(stream: UnixStream, runner_version: String) -> Self {
         Self {
             stream,
-            runner_version,
-            state: Handshaking,
+            state: Handshaking { runner_version },
         }
     }
 
@@ -51,9 +61,9 @@ impl Session<Handshaking> {
                 // A worker built against a different framework version speaks a
                 // protocol we cannot rely on; reject it with a clear error
                 // rather than letting it fail later with an opaque decode error.
-                if *worker_version != self.runner_version {
+                if *worker_version != self.state.runner_version {
                     return Err(Error::VersionMismatch {
-                        ours: self.runner_version.clone(),
+                        ours: self.state.runner_version.clone(),
                         theirs: worker_version.clone(),
                     });
                 }
@@ -75,7 +85,7 @@ impl Session<Handshaking> {
         .expect("journal receiver alive");
 
         let ack = RunnerToWorker::HelloAck {
-            runner_version: self.runner_version.clone(),
+            runner_version: self.state.runner_version.clone(),
         };
         write_frame(&mut self.stream, &ack).await?;
         bus.publish(RunnerEvent::RunnerMessage {
@@ -85,11 +95,7 @@ impl Session<Handshaking> {
         .await
         .expect("journal receiver alive");
 
-        Ok(Session {
-            stream: self.stream,
-            runner_version: self.runner_version,
-            state: Dispatching { worker_id },
-        })
+        Ok(self.transition(Dispatching { worker_id }))
     }
 }
 
@@ -169,13 +175,8 @@ impl Session<Dispatching> {
         .await
         .expect("journal receiver alive");
 
-        Ok(Session {
-            stream: self.stream,
-            runner_version: self.runner_version,
-            state: AwaitingResult {
-                worker_id: self.state.worker_id,
-            },
-        })
+        let worker_id = self.state.worker_id;
+        Ok(self.transition(AwaitingResult { worker_id }))
     }
 }
 
