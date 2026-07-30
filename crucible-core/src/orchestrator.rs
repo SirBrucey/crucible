@@ -213,12 +213,6 @@ impl Orchestrator<Ready> {
                 result
             };
 
-            let missed = |reason| KillReport {
-                schedule_id: schedule.schedule_id,
-                service: schedule.service.clone(),
-                result: KillResult::Missed(reason),
-            };
-
             let kill_fut = async {
                 tokio::select! {
                     biased;
@@ -228,7 +222,7 @@ impl Orchestrator<Ready> {
                             // reach its Kth packet); release the freeze in case it is
                             // mid-flight and record a miss.
                             deployment.resume_proxy().await?;
-                            return Ok::<_, Error>(missed(KillMissReason::ScenarioEndedBeforeAnchor));
+                            return Ok::<_, Error>(missed(schedule, KillMissReason::ScenarioEndedBeforeAnchor));
                         }
                         // The proxy froze the fleet to place the kill precisely on the
                         // anchored packet. Kill the target, then release the flow and
@@ -253,7 +247,7 @@ impl Orchestrator<Ready> {
                             // Genuinely no freeze; release it in case one is
                             // mid-flight and record the miss.
                             deployment.resume_proxy().await?;
-                            Ok(missed(KillMissReason::ScenarioEndedBeforeAnchor))
+                            Ok(missed(schedule, KillMissReason::ScenarioEndedBeforeAnchor))
                         }
                     }
                 }
@@ -324,6 +318,15 @@ async fn teardown_replica(
     deployment.teardown().await
 }
 
+/// A [`KillReport`] for a fault that did not fire, for the given reason.
+fn missed(schedule: &Schedule, reason: KillMissReason) -> KillReport {
+    KillReport {
+        schedule_id: schedule.schedule_id,
+        service: schedule.service.clone(),
+        result: KillResult::Missed(reason),
+    }
+}
+
 /// Apply the kill against the already-frozen fleet and produce its report. Kill
 /// the target, then release the freeze and bring the target back so the scenario
 /// runs against the dead-then-recovering service.
@@ -342,12 +345,6 @@ where
     D: Deployment,
     D::Error: std::fmt::Display,
 {
-    let missed = |reason| KillReport {
-        schedule_id: schedule.schedule_id,
-        service: schedule.service.clone(),
-        result: KillResult::Missed(reason),
-    };
-
     let killed_at_ns = match deployment.kill_service(&schedule.service).await {
         Ok(killed_at_ns) => killed_at_ns,
         Err(e) => {
@@ -355,7 +352,7 @@ where
             // proxy is holding and report the miss. A resume failure here still
             // leaves the fleet wedged, so it is fatal.
             deployment.resume_proxy().await?;
-            return Ok(missed(KillMissReason::KillFailed(e.to_string())));
+            return Ok(missed(schedule, KillMissReason::KillFailed(e.to_string())));
         }
     };
     deployment.resume_proxy().await?;

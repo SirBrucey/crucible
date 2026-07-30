@@ -42,10 +42,11 @@ async fn run() -> Result<()> {
     .handshake()
     .await?;
 
-    match worker.await_work().await? {
-        IdleNext::Learn(worker) => worker.execute_learn().await?.teardown().await?,
-        IdleNext::Work(worker) => worker.execute_and_report().await?.teardown().await?,
-    }
+    let shutting_down = match worker.await_work().await? {
+        IdleNext::Learn(worker) => worker.execute_learn().await?,
+        IdleNext::Work(worker) => worker.execute_and_report().await?,
+    };
+    shutting_down.teardown().await?;
 
     Ok(())
 }
