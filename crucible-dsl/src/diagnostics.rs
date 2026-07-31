@@ -47,7 +47,10 @@ impl Diag {
 /// Returns an [`std::io::Error`] if a report cannot be written to stderr.
 pub fn emit_to_stderr(name: &str, src: &str, diags: &[Diag]) -> std::io::Result<()> {
     let mut cache = (name, Source::from(src));
-    for diag in diags {
+    for (index, diag) in diags.iter().enumerate() {
+        if index > 0 {
+            eprintln!();
+        }
         let mut report = Report::build(ReportKind::Error, (name, diag.span.range()))
             .with_message(&diag.message)
             .with_label(Label::new((name, diag.span.range())).with_color(Color::Red));
