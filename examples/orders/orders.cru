@@ -3,10 +3,10 @@
 // asserts all three persist.
 
 fleet "orders" {
-  service api       { kind: http; image: "crucible-example/orders-api:0.1"; port: 8080 };
-  service broker    { kind: amqp; image: "rabbitmq:3.13-management"; port: 5672 };
-  service db        { kind: sql;  image: "mariadb:11.4"; port: 3306 };
-  service inventory { kind: amqp; image: "crucible-example/orders-inventory:0.1"; port: 8081 };
+  service api       { kind: http, image: "crucible-example/orders-api:0.1", port: 8080 };
+  service broker    { kind: amqp, image: "rabbitmq:3.13-management", port: 5672 };
+  service db        { kind: sql,  image: "mariadb:11.4", port: 3306 };
+  service inventory { kind: amqp, image: "crucible-example/orders-inventory:0.1", port: 8081 };
 }
 
 scenario "orders_durability" {
