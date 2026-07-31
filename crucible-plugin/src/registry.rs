@@ -2,10 +2,11 @@
 
 use std::collections::HashMap;
 
+use crucible_core::schema::{AttrSchema, OpSig};
+
 use crate::{
     builtin::{Docker, Http, Mariadb},
     role::{Deployment, Driver, Observer},
-    schema::{AttrSchema, OpSig},
 };
 
 /// The available plugins, keyed by name and resolved to their schemas.

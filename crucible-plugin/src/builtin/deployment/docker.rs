@@ -1,9 +1,8 @@
 //! The Docker deployment plugin.
 
-use crate::{
-    role::Deployment,
-    schema::{AttrDecl, AttrSchema, ValueType},
-};
+use crucible_core::schema::{AttrDecl, AttrSchema, ValueType};
+
+use crate::role::Deployment;
 
 /// Brings services up as Docker containers.
 pub struct Docker;
@@ -24,7 +23,8 @@ impl Deployment for Docker {
 #[cfg(test)]
 mod tests {
     use super::Docker;
-    use crate::{role::Deployment, schema::ValueType};
+    use crate::role::Deployment;
+    use crucible_core::schema::ValueType;
 
     #[test]
     fn image_and_port_are_required_env_is_optional() {

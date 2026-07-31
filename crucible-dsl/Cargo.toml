@@ -8,6 +8,7 @@ license.workspace = true
 
 [dependencies]
 ariadne = { workspace = true }
+crucible-core = { path = "../crucible-core" }
 crucible-plugin = { path = "../crucible-plugin" }
 
 [lints]

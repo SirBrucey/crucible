@@ -1,7 +1,7 @@
 //! The per-role plugin traits. A plugin crate implements one or more, and each
 //! advertises the schema for its role.
 
-use crate::schema::{AttrSchema, OpSig};
+use crucible_core::schema::{AttrSchema, OpSig};
 
 /// A deployment plugin: it advertises the attributes a `service { ... }` body of
 /// its kind accepts.

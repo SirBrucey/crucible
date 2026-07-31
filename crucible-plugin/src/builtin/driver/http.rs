@@ -1,9 +1,8 @@
 //! The HTTP driver plugin.
 
-use crate::{
-    role::Driver,
-    schema::{ClauseDecl, ClauseShape, HeadPattern, OpSig, Param, ParamType},
-};
+use crucible_core::schema::{ClauseDecl, ClauseShape, HeadPattern, OpSig, Param, ParamType};
+
+use crate::role::Driver;
 
 /// Drives HTTP requests against a service.
 pub struct Http;
@@ -31,10 +30,8 @@ fn request_params() -> Vec<Param> {
 #[cfg(test)]
 mod tests {
     use super::Http;
-    use crate::{
-        role::Driver,
-        schema::{ClauseShape, HeadPattern},
-    };
+    use crate::role::Driver;
+    use crucible_core::schema::{ClauseShape, HeadPattern};
 
     #[test]
     fn exposes_post_get_and_delete() {
