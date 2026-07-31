@@ -168,18 +168,19 @@ fn run_check(file: &Path) -> ExitCode {
     };
 
     let registry = crucible_plugin::Registry::builtins();
-    let diags = crucible_dsl::validate::validate(&ast, &registry);
-    if !diags.is_empty() {
-        return render_and_fail(&name, &src, &diags);
-    }
+    let plan = match crucible_dsl::lower::lower(&ast, &registry) {
+        Ok(plan) => plan,
+        Err(diags) => return render_and_fail(&name, &src, &diags),
+    };
 
-    let fleet = &ast.fleet.node;
+    let fleet = &plan.fleet;
     println!(
-        "{name}: ok (fleet `{}` via `{}`, {} service(s), {} scenario(s))",
-        fleet.name.node,
-        fleet.deployment.node,
+        "{name}: ok (fleet `{}` via `{}`, {} service(s), {} scenario(s), spec {:016x})",
+        fleet.name,
+        fleet.deployment,
         fleet.services.len(),
-        ast.scenarios.len(),
+        plan.scenarios.len(),
+        plan.spec_hash().0,
     );
     ExitCode::SUCCESS
 }

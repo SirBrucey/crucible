@@ -1,5 +1,5 @@
-//! Semantic checks on a parsed file: plugin resolution, service attributes, and
-//! operation signatures.
+//! Lowering a parsed file to a [`plan::Plan`], resolving plugins and validating
+//! service attributes and operation signatures as it goes.
 
 use std::collections::HashMap;
 
@@ -10,21 +10,35 @@ use crucible_plugin::{
 use crate::{
     ast::{self, Clause, Fleet, OpCall, Predicate, Scenario, Value},
     diagnostics::Diag,
+    plan,
     span::{Span, Spanned},
 };
+
+/// Lower `file` to a [`plan::Plan`], or the diagnostics that prevent it.
+///
+/// # Errors
+/// Returns one diagnostic per semantic error when the file does not lower.
+pub fn lower(file: &ast::File, registry: &Registry) -> Result<plan::Plan, Vec<Diag>> {
+    let mut lowerer = Lowerer {
+        registry,
+        diags: Vec::new(),
+    };
+    let (fleet, services) = lowerer.fleet(&file.fleet.node);
+    let mut scenarios = Vec::new();
+    for scenario in &file.scenarios {
+        scenarios.push(lowerer.scenario(&scenario.node, &services));
+    }
+    if lowerer.diags.is_empty() {
+        Ok(plan::Plan { fleet, scenarios })
+    } else {
+        Err(lowerer.diags)
+    }
+}
 
 /// Check `file` against `registry`, returning one diagnostic per semantic error.
 #[must_use]
 pub fn validate(file: &ast::File, registry: &Registry) -> Vec<Diag> {
-    let mut validator = Validator {
-        registry,
-        diags: Vec::new(),
-    };
-    let services = validator.fleet(&file.fleet.node);
-    for scenario in &file.scenarios {
-        validator.scenario(&scenario.node, &services);
-    }
-    validator.diags
+    lower(file, registry).err().unwrap_or_default()
 }
 
 /// The plugins a service speaks.
@@ -32,12 +46,12 @@ struct ServiceModel {
     kinds: Vec<String>,
 }
 
-struct Validator<'a> {
+struct Lowerer<'a> {
     registry: &'a Registry,
     diags: Vec<Diag>,
 }
 
-impl<'a> Validator<'a> {
+impl<'a> Lowerer<'a> {
     fn error(&mut self, span: Span, message: impl Into<String>) {
         self.diags.push(Diag::new(span, message));
     }
@@ -77,9 +91,9 @@ impl<'a> Validator<'a> {
         self.diags.push(diag);
     }
 
-    /// Resolve the deployment plugin and validate each service's attributes,
-    /// returning the services by name.
-    fn fleet(&mut self, fleet: &Fleet) -> HashMap<String, ServiceModel> {
+    /// Resolve the deployment plugin, lower each service, and return the plan
+    /// fleet alongside the services by name.
+    fn fleet(&mut self, fleet: &Fleet) -> (plan::Fleet, HashMap<String, ServiceModel>) {
         let schema = self.registry.deployment(&fleet.deployment.node);
         if schema.is_none() {
             let known = sorted(
@@ -97,14 +111,26 @@ impl<'a> Validator<'a> {
         }
 
         let mut services = HashMap::new();
+        let mut plan_services = Vec::new();
         for service in &fleet.services {
             let kinds = self.service_kinds(&service.node);
             if let Some(schema) = schema {
                 self.service_attrs(&service.node, schema);
             }
+            plan_services.push(plan::Service {
+                name: service.node.name.node.clone(),
+                kinds: kinds.clone(),
+                attrs: lower_attrs(&service.node),
+            });
             services.insert(service.node.name.node.clone(), ServiceModel { kinds });
         }
-        services
+
+        let plan_fleet = plan::Fleet {
+            name: fleet.name.node.clone(),
+            deployment: fleet.deployment.node.clone(),
+            services: plan_services,
+        };
+        (plan_fleet, services)
     }
 
     /// The plugin names in a service's `kinds` list, reporting a malformed one.
@@ -167,21 +193,41 @@ impl<'a> Validator<'a> {
         }
     }
 
-    fn scenario(&mut self, scenario: &Scenario, services: &HashMap<String, ServiceModel>) {
+    fn scenario(
+        &mut self,
+        scenario: &Scenario,
+        services: &HashMap<String, ServiceModel>,
+    ) -> plan::Scenario {
+        let mut steps = Vec::new();
         for step in &scenario.steps {
-            self.do_step(step, services);
+            if let Some(step) = self.do_step(step, services) {
+                steps.push(step);
+            }
         }
+        let mut checks = Vec::new();
         for predicate in &scenario.expect {
-            self.predicate(predicate, services);
+            if let Some(check) = self.predicate(predicate, services) {
+                checks.push(check);
+            }
+        }
+        plan::Scenario {
+            name: scenario.name.node.clone(),
+            consistent_within: scenario.consistent_within.node,
+            steps,
+            checks,
         }
     }
 
-    /// Validate a `do` action against its driver's signature.
-    fn do_step(&mut self, step: &Spanned<OpCall>, services: &HashMap<String, ServiceModel>) {
+    /// Lower a `do` action against its driver's signature.
+    fn do_step(
+        &mut self,
+        step: &Spanned<OpCall>,
+        services: &HashMap<String, ServiceModel>,
+    ) -> Option<plan::Step> {
         let op = &step.node;
         let [driver, operation] = op.head.as_slice() else {
             self.error(step.span, "a `do` action names a driver and an operation");
-            return;
+            return None;
         };
         let Some(signatures) = self.registry.driver(&driver.node) else {
             let known = sorted(self.registry.driver_names().into_iter().map(String::from));
@@ -191,7 +237,7 @@ impl<'a> Validator<'a> {
                 "known drivers:",
                 known,
             );
-            return;
+            return None;
         };
         let Some(sig) = signatures
             .iter()
@@ -204,10 +250,16 @@ impl<'a> Validator<'a> {
                 "operations:",
                 ops,
             );
-            return;
+            return None;
         };
         self.check_args(step, sig, driver, services);
         self.check_clauses(op, sig);
+        Some(plan::Step {
+            driver: driver.node.clone(),
+            operation: operation.node.clone(),
+            args: op.args.iter().map(|arg| lower_value(&arg.node)).collect(),
+            body: body_of(op),
+        })
     }
 
     /// Validate a `do` action's positional arguments against the operation's
@@ -290,23 +342,23 @@ impl<'a> Validator<'a> {
         }
     }
 
-    /// Validate an `expect` predicate: resolve the observable, then check the
-    /// comparison against its result.
+    /// Lower an `expect` predicate: resolve the observable, check the comparison,
+    /// and bind the observer that answers it.
     fn predicate(
         &mut self,
         predicate: &Spanned<Predicate>,
         services: &HashMap<String, ServiceModel>,
-    ) {
+    ) -> Option<plan::Check> {
         let observable = &predicate.node.left.node;
         let Some((service_ref, path)) = observable.head.split_first() else {
             self.error(predicate.node.left.span, "an observable names a service");
-            return;
+            return None;
         };
         let Some(service) = services.get(&service_ref.node) else {
             self.unknown_service(service_ref.span, &service_ref.node, services);
-            return;
+            return None;
         };
-        let Some(sig) = self.match_observable(service, path) else {
+        let Some((observer, sig)) = self.match_observable(service, path) else {
             let name = path
                 .iter()
                 .map(|segment| segment.node.as_str())
@@ -321,35 +373,44 @@ impl<'a> Validator<'a> {
                 known,
                 format!("no available observables for `{}`", service_ref.node),
             );
-            return;
+            return None;
         };
         self.check_clauses(observable, sig);
         self.check_comparison(&predicate.node, sig);
+        Some(plan::Check {
+            service: service_ref.node.clone(),
+            observer,
+            observable: path.iter().map(|segment| segment.node.clone()).collect(),
+            filter: where_of(observable),
+            op: plugin_cmp(predicate.node.op.node),
+            value: lower_value(&predicate.node.right.node),
+        })
     }
 
-    /// The observer signature on one of the service's kinds whose head matches
+    /// The observer kind on the service and the signature whose head matches
     /// `path`.
     fn match_observable(
         &self,
         service: &ServiceModel,
         path: &[Spanned<String>],
-    ) -> Option<&'a OpSig> {
-        self.observables(service)
-            .find(|sig| head_matches(&sig.head, path))
+    ) -> Option<(String, &'a OpSig)> {
+        let registry = self.registry;
+        service.kinds.iter().find_map(|kind| {
+            let sig = registry
+                .observer(kind)?
+                .iter()
+                .find(|sig| head_matches(&sig.head, path))?;
+            Some((kind.clone(), sig))
+        })
     }
 
-    /// Every observable on the service's observer kinds.
-    fn observables(&self, service: &ServiceModel) -> impl Iterator<Item = &'a OpSig> {
+    fn observable_labels(&self, service: &ServiceModel) -> Vec<String> {
         let registry = self.registry;
         service
             .kinds
             .iter()
-            .filter_map(move |kind| registry.observer(kind))
+            .filter_map(|kind| registry.observer(kind))
             .flat_map(<[OpSig]>::iter)
-    }
-
-    fn observable_labels(&self, service: &ServiceModel) -> Vec<String> {
-        self.observables(service)
             .map(|sig| head_label(&sig.head))
             .collect()
     }
@@ -422,6 +483,58 @@ impl<'a> Validator<'a> {
     }
 }
 
+fn lower_value(value: &Value) -> plan::Value {
+    match value {
+        Value::Str(s) => plan::Value::Str(s.clone()),
+        Value::Int(n) => plan::Value::Int(*n),
+        Value::Bool(b) => plan::Value::Bool(*b),
+        Value::Duration(d) => plan::Value::Duration(*d),
+        Value::Ident(s) => plan::Value::Ident(s.clone()),
+        Value::List(items) => {
+            plan::Value::List(items.iter().map(|item| lower_value(&item.node)).collect())
+        }
+        Value::Map(entries) => plan::Value::Map(lower_pairs(entries)),
+    }
+}
+
+fn lower_pairs(entries: &[(Spanned<String>, Spanned<Value>)]) -> Vec<(String, plan::Value)> {
+    entries
+        .iter()
+        .map(|(key, value)| (key.node.clone(), lower_value(&value.node)))
+        .collect()
+}
+
+/// A service's bring-up attributes, without the reserved `kinds`.
+fn lower_attrs(service: &ast::Service) -> Vec<(String, plan::Value)> {
+    let Value::Map(entries) = &service.attrs.node else {
+        return Vec::new();
+    };
+    entries
+        .iter()
+        .filter(|(key, _)| key.node != "kinds")
+        .map(|(key, value)| (key.node.clone(), lower_value(&value.node)))
+        .collect()
+}
+
+fn body_of(op: &OpCall) -> Option<Vec<(String, plan::Value)>> {
+    op.clauses.iter().find_map(|clause| match &clause.node {
+        Clause::Body(value) => Some(match &value.node {
+            Value::Map(entries) => lower_pairs(entries),
+            _ => Vec::new(),
+        }),
+        Clause::Where(_) => None,
+    })
+}
+
+fn where_of(op: &OpCall) -> Option<(String, plan::Value)> {
+    op.clauses.iter().find_map(|clause| match &clause.node {
+        Clause::Where(filter) => {
+            Some((filter.column.node.clone(), lower_value(&filter.value.node)))
+        }
+        Clause::Body(_) => None,
+    })
+}
+
 fn sorted(names: impl IntoIterator<Item = String>) -> Vec<String> {
     let mut names: Vec<String> = names.into_iter().collect();
     names.sort_unstable();
@@ -476,15 +589,24 @@ fn type_name(ty: &ValueType) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::validate;
-    use crate::{diagnostics::Diag, lexer::lex, parser::parse};
+    use std::time::Duration;
+
+    use super::{lower, validate};
+    use crate::{ast, diagnostics::Diag, lexer::lex, parser::parse, plan};
     use crucible_plugin::Registry;
 
-    fn diagnose(src: &str) -> Vec<Diag> {
+    fn parse_file(src: &str) -> ast::File {
         let (tokens, lex_errors) = lex(src);
         assert!(lex_errors.is_empty(), "lex errors: {lex_errors:?}");
-        let file = parse(tokens).expect("parses");
-        validate(&file, &Registry::builtins())
+        parse(tokens).expect("parses")
+    }
+
+    fn diagnose(src: &str) -> Vec<Diag> {
+        validate(&parse_file(src), &Registry::builtins())
+    }
+
+    fn lower_ok(src: &str) -> plan::Plan {
+        lower(&parse_file(src), &Registry::builtins()).expect("lowers")
     }
 
     fn find<'a>(diags: &'a [Diag], needle: &str) -> &'a Diag {
@@ -503,13 +625,58 @@ mod tests {
         scenario "s" {
           consistent_within: 10s;
           do { http POST api "/orders" body { item: "book", quantity: 1 } };
-          expect { db.orders.count == 1; }
+          expect { db.orders.count where item = "book" == 1; }
         }
     "#;
 
     #[test]
     fn the_example_shape_validates_clean() {
         assert!(diagnose(VALID).is_empty(), "{:?}", diagnose(VALID));
+    }
+
+    #[test]
+    fn the_example_lowers_to_a_plan() {
+        let plan = lower_ok(VALID);
+        assert_eq!(plan.fleet.name, "orders");
+        assert_eq!(plan.fleet.deployment, "docker");
+        assert_eq!(plan.fleet.services.len(), 2);
+
+        let scenario = &plan.scenarios[0];
+        assert_eq!(scenario.consistent_within, Duration::from_secs(10));
+
+        let step = &scenario.steps[0];
+        assert_eq!(step.driver, "http");
+        assert_eq!(step.operation, "POST");
+        assert!(step.body.is_some());
+
+        // The check binds `db`'s kind to the mariadb observer, and keeps the filter.
+        let check = &scenario.checks[0];
+        assert_eq!(check.service, "db");
+        assert_eq!(check.observer, "mariadb");
+        assert_eq!(check.observable, ["orders", "count"]);
+        assert_eq!(
+            check.filter,
+            Some(("item".to_string(), plan::Value::Str("book".to_string()))),
+        );
+    }
+
+    #[test]
+    fn lowering_fails_on_a_semantic_error() {
+        let src = r#"fleet "f" { deployment: docker; service api { kinds: [http], image: "x", port: 80 } }
+                     scenario "s" { consistent_within: 1s; expect { db.orders.count == 1; } }"#;
+        let error = lower(&parse_file(src), &Registry::builtins()).unwrap_err();
+        assert!(
+            error
+                .iter()
+                .any(|diag| diag.message.contains("unknown service"))
+        );
+    }
+
+    #[test]
+    fn the_spec_hash_is_stable_and_content_sensitive() {
+        assert_eq!(lower_ok(VALID).spec_hash(), lower_ok(VALID).spec_hash());
+        let renamed = lower_ok(&VALID.replace(r#"scenario "s""#, r#"scenario "t""#));
+        assert_ne!(lower_ok(VALID).spec_hash(), renamed.spec_hash());
     }
 
     #[test]
