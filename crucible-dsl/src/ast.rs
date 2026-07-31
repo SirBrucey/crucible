@@ -11,10 +11,11 @@ pub struct File {
     pub scenarios: Vec<Spanned<Scenario>>,
 }
 
-/// A fleet: its name and the services it brings up.
+/// A fleet: its name, the plugin that brings its services up, and those services.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Fleet {
     pub name: Spanned<String>,
+    pub deployment: Spanned<String>,
     pub services: Vec<Spanned<Service>>,
 }
 
@@ -31,7 +32,7 @@ pub struct Service {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Scenario {
     pub name: Spanned<String>,
-    pub consistent_within: Option<Spanned<Duration>>,
+    pub consistent_within: Spanned<Duration>,
     pub steps: Vec<Spanned<OpCall>>,
     pub expect: Vec<Spanned<Predicate>>,
 }

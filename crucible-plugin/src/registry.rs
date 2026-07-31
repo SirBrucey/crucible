@@ -56,6 +56,18 @@ impl Registry {
     pub fn observer(&self, name: &str) -> Option<&[OpSig]> {
         self.observers.get(name).map(Vec::as_slice)
     }
+
+    /// The names of the registered deployment plugins.
+    #[must_use]
+    pub fn deployment_names(&self) -> Vec<&'static str> {
+        self.deployments.keys().copied().collect()
+    }
+
+    /// The names of the registered driver plugins.
+    #[must_use]
+    pub fn driver_names(&self) -> Vec<&'static str> {
+        self.drivers.keys().copied().collect()
+    }
 }
 
 #[cfg(test)]

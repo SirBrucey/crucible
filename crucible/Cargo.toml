@@ -10,6 +10,7 @@ license.workspace = true
 clap = { workspace = true }
 crucible-core = { path = "../crucible-core" }
 crucible-dsl = { path = "../crucible-dsl" }
+crucible-plugin = { path = "../crucible-plugin" }
 libc = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }

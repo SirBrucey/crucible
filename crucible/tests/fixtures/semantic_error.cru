@@ -1,0 +1,10 @@
+fleet "f" {
+  deployment: docker;
+  service api { kinds: [http], image: "example/api:1", port: 80 };
+}
+
+scenario "s" {
+  consistent_within: 5s;
+  do { http POST api "/orders" };
+  expect { db.orders.count == 1; }
+}

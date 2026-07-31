@@ -26,6 +26,19 @@ fn the_example_scenario_checks_cleanly() {
 }
 
 #[test]
+fn the_errors_example_reports_diagnostics() {
+    let out = check(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../examples/errors/errors.cru"
+    ));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(stderr.contains("known drivers"), "stderr: {stderr}");
+    assert!(stderr.contains("known attributes"), "stderr: {stderr}");
+    assert!(stderr.contains("errors"), "stderr: {stderr}");
+}
+
+#[test]
 fn a_lexing_error_exits_one_with_a_diagnostic() {
     let out = check(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -51,6 +64,18 @@ fn a_parse_error_exits_one_with_a_diagnostic() {
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr),
     );
+}
+
+#[test]
+fn a_semantic_error_exits_one_with_a_diagnostic() {
+    let out = check(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/semantic_error.cru"
+    ));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(stderr.contains("unknown service"), "stderr: {stderr}");
+    assert!(stderr.contains("defined services"), "stderr: {stderr}");
 }
 
 #[test]
