@@ -5,7 +5,7 @@ use std::{
     time::Duration,
 };
 
-use crucible_plugin::CmpOp;
+use crate::schema::CmpOp;
 
 /// A validated `.cru` file lowered to a fleet and its scenarios, with every
 /// service, action, and observable carrying the plugin that serves it.

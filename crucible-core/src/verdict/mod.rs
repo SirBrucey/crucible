@@ -18,10 +18,11 @@ pub enum Invariant {
 }
 
 /// Observations captured during schedule execution and fed to a [`Driver`].
-// FIXME(#83): shape belongs to a kind plugin, not this shared type.
+// FIXME(#83): db_state gives way to per-check observed values once observers
+// read what a check names.
 #[derive(Debug, Default)]
 pub struct Observations {
-    pub http_outcomes: Vec<HttpOutcome>,
+    pub outcomes: Vec<Outcome>,
     pub db_state: Option<DbState>,
     pub sessions: Vec<crucible_protocol::Session>,
     pub kill: Option<crucible_protocol::KillReport>,
@@ -32,16 +33,47 @@ impl Observations {
     pub fn empty() -> Self {
         Self::default()
     }
+
+    /// How many driven operations the system acknowledged.
+    #[must_use]
+    pub fn acked(&self) -> usize {
+        self.outcomes
+            .iter()
+            .filter(|outcome| outcome.ack == Ack::Acked)
+            .count()
+    }
+
+    /// How many driven operations left the caller in doubt.
+    #[must_use]
+    pub fn unknown(&self) -> usize {
+        self.outcomes
+            .iter()
+            .filter(|outcome| outcome.ack == Ack::Unknown)
+            .count()
+    }
 }
 
-/// The result of one HTTP call made by a scenario.
+/// Whether the system took responsibility for a driven operation. The driver
+/// that ran the operation decides, by the rules of the protocol it speaks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ack {
+    /// Acknowledged: the system accepted responsibility for the write.
+    Acked,
+    /// Refused: the system definitively did not accept it.
+    Rejected,
+    /// In doubt: the caller cannot tell whether it was accepted.
+    Unknown,
+}
+
+/// The result of one operation a driver ran. The payloads are opaque; only the
+/// driver that produced them knows how to read them.
 #[derive(Debug)]
-pub struct HttpOutcome {
-    pub method: String,
-    pub path: String,
-    pub request_body: Vec<u8>,
-    pub status: u16,
-    pub body: Vec<u8>,
+pub struct Outcome {
+    /// What was run, for reporting.
+    pub operation: String,
+    pub ack: Ack,
+    pub request: Vec<u8>,
+    pub response: Vec<u8>,
 }
 
 /// Snapshot of the fleet's persisted state after the scenario finished.

@@ -1,9 +1,8 @@
 //! The `MariaDB` observer plugin.
 
-use crate::{
-    role::Observer,
-    schema::{ClauseDecl, ClauseShape, CmpOp, HeadPattern, OpSig, ValueType},
-};
+use crucible_core::schema::{ClauseDecl, ClauseShape, CmpOp, HeadPattern, OpSig, ValueType};
+
+use crate::role::Observer;
 
 /// Reads persisted state from a `MariaDB` database.
 pub struct Mariadb;
@@ -26,10 +25,8 @@ impl Observer for Mariadb {
 #[cfg(test)]
 mod tests {
     use super::Mariadb;
-    use crate::{
-        role::Observer,
-        schema::{ClauseShape, CmpOp, HeadPattern, ValueType},
-    };
+    use crate::role::Observer;
+    use crucible_core::schema::{ClauseShape, CmpOp, HeadPattern, ValueType};
 
     #[test]
     fn count_is_an_int_observable_with_a_where_filter() {

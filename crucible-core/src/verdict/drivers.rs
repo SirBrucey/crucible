@@ -1,8 +1,6 @@
 //! Verdict drivers for the four invariants. Idempotent, Converges, and
 //! Recovers remain stubs until their invariants land.
 
-use serde::Deserialize;
-
 use super::{Driver, Observations};
 use crate::ipc::Verdict;
 
@@ -48,61 +46,26 @@ impl Driver for Durable {
             };
         };
 
-        // Parse every 2xx request/response into an AckedOrder.
-        let mut acked: Vec<AckedOrder> = Vec::new();
-        for outcome in &observations.http_outcomes {
-            if !(200..300).contains(&outcome.status) {
-                continue;
-            }
-            let Ok(req) = serde_json::from_slice::<OrderRequestBody>(&outcome.request_body) else {
-                return Verdict::Inconclusive {
-                    reason: "could not decode an acked order request".into(),
-                };
-            };
-            let Ok(resp) = serde_json::from_slice::<OrderResponseBody>(&outcome.body) else {
-                return Verdict::Inconclusive {
-                    reason: "could not decode an acked order response".into(),
-                };
-            };
-            acked.push(AckedOrder {
-                order_id: resp.order_id,
-                item: req.item,
-                quantity: req.quantity,
-            });
-        }
+        // The dual contract: everything acknowledged survived, and nothing
+        // survived that was never acknowledged. An operation left in doubt may
+        // legitimately land either way, so it only widens the upper bound.
+        let acked = observations.acked();
+        let unknown = observations.unknown();
+        let observed = db.orders.len();
 
-        // Every acked write must be present in the DB, and no un-acked write may
-        // be (a zombie). Consume one matching row per acked order so duplicates
-        // pair one-to-one with distinct rows; whatever remains is unaccounted for.
-        let mut remaining: Vec<_> = db.orders.iter().collect();
-        for ack in &acked {
-            let matched = remaining.iter().position(|row| {
-                row.id == ack.order_id && row.item == ack.item && row.quantity == ack.quantity
-            });
-            match matched {
-                Some(i) => {
-                    remaining.swap_remove(i);
-                }
-                None => {
-                    return Verdict::Fail {
-                        reason: format!(
-                            "acked order {} ({} x{}) is absent from persisted state after heal",
-                            ack.order_id, ack.item, ack.quantity
-                        ),
-                    };
-                }
-            }
+        if observed < acked {
+            return Verdict::Fail {
+                reason: format!("{acked} acked write(s), but only {observed} survived the heal"),
+            };
         }
-
-        if !remaining.is_empty() {
+        if observed > acked + unknown {
             return Verdict::Fail {
                 reason: format!(
-                    "{} persisted order(s) were never acked (zombie writes)",
-                    remaining.len()
+                    "{observed} write(s) persisted, but at most {} were acknowledged (zombie writes)",
+                    acked + unknown
                 ),
             };
         }
-
         Verdict::Pass
     }
 }
@@ -115,29 +78,12 @@ impl Driver for Recovers {
     }
 }
 
-#[derive(Deserialize)]
-struct OrderRequestBody {
-    item: String,
-    quantity: i32,
-}
-
-#[derive(Deserialize)]
-struct OrderResponseBody {
-    order_id: u64,
-}
-
-struct AckedOrder {
-    order_id: u64,
-    item: String,
-    quantity: i32,
-}
-
 #[cfg(test)]
 mod tests {
     use crucible_protocol::{KillReport, KillResult};
 
     use super::*;
-    use crate::verdict::{DbState, HttpOutcome, Invariant, OrderRow, driver_for};
+    use crate::verdict::{Ack, DbState, Invariant, OrderRow, Outcome, driver_for};
 
     fn fired_kill() -> KillReport {
         KillReport {
@@ -152,40 +98,36 @@ mod tests {
         }
     }
 
-    fn ack(item: &str, quantity: i32, order_id: u64) -> HttpOutcome {
-        HttpOutcome {
-            method: "POST".into(),
-            path: "/orders".into(),
-            request_body: serde_json::to_vec(&serde_json::json!({
-                "item": item,
-                "quantity": quantity,
-            }))
-            .unwrap(),
-            status: 200,
-            body: serde_json::to_vec(&serde_json::json!({ "order_id": order_id })).unwrap(),
+    fn outcome(ack: Ack) -> Outcome {
+        Outcome {
+            operation: "write".into(),
+            ack,
+            request: Vec::new(),
+            response: Vec::new(),
         }
     }
 
-    fn err(item: &str, quantity: i32) -> HttpOutcome {
-        HttpOutcome {
-            method: "POST".into(),
-            path: "/orders".into(),
-            request_body: serde_json::to_vec(&serde_json::json!({
-                "item": item,
-                "quantity": quantity,
-            }))
-            .unwrap(),
-            status: 0,
-            body: Vec::new(),
+    fn persisted(count: u64) -> DbState {
+        DbState {
+            orders: (0..count)
+                .map(|id| OrderRow {
+                    id,
+                    item: "item".into(),
+                    quantity: 1,
+                })
+                .collect(),
+            stock: Vec::new(),
         }
     }
 
-    fn row(id: u64, item: &str, quantity: i32) -> OrderRow {
-        OrderRow {
-            id,
-            item: item.into(),
-            quantity,
-        }
+    /// A run whose fault fired and whose state was snapshotted, so the dual
+    /// contract is the only thing left to decide the verdict.
+    fn judged(acks: &[Ack], survived: u64) -> Verdict {
+        let mut obs = Observations::empty();
+        obs.kill = Some(fired_kill());
+        obs.outcomes = acks.iter().copied().map(outcome).collect();
+        obs.db_state = Some(persisted(survived));
+        Durable.drive(&obs)
     }
 
     #[test]
@@ -222,73 +164,34 @@ mod tests {
     fn missing_db_state_is_inconclusive() {
         let mut obs = Observations::empty();
         obs.kill = Some(fired_kill());
-        obs.http_outcomes.push(ack("book", 4, 1));
+        obs.outcomes.push(outcome(Ack::Acked));
         assert!(matches!(Durable.drive(&obs), Verdict::Inconclusive { .. }));
     }
 
     #[test]
-    fn ack_matched_in_db_is_pass() {
-        let mut obs = Observations::empty();
-        obs.kill = Some(fired_kill());
-        obs.http_outcomes.push(ack("book", 4, 1));
-        obs.db_state = Some(DbState {
-            orders: vec![row(1, "book", 4)],
-            stock: vec![],
-        });
-        assert_eq!(Durable.drive(&obs), Verdict::Pass);
+    fn acked_writes_that_survive_are_pass() {
+        assert_eq!(judged(&[Ack::Acked, Ack::Acked], 2), Verdict::Pass);
     }
 
     #[test]
-    fn acked_but_not_persisted_is_fail() {
-        let mut obs = Observations::empty();
-        obs.kill = Some(fired_kill());
-        obs.http_outcomes.push(ack("book", 4, 1));
-        obs.db_state = Some(DbState {
-            orders: vec![],
-            stock: vec![],
-        });
-        assert!(matches!(Durable.drive(&obs), Verdict::Fail { .. }));
+    fn an_acked_write_that_did_not_survive_is_fail() {
+        assert!(matches!(
+            judged(&[Ack::Acked, Ack::Acked], 1),
+            Verdict::Fail { .. }
+        ));
     }
 
     #[test]
-    fn zombie_persisted_but_not_acked_is_fail() {
-        let mut obs = Observations::empty();
-        obs.kill = Some(fired_kill());
-        obs.http_outcomes.push(ack("book", 4, 1));
-        obs.http_outcomes.push(err("noodles", 10));
-        obs.db_state = Some(DbState {
-            orders: vec![row(1, "book", 4), row(2, "noodles", 10)],
-            stock: vec![],
-        });
-        assert!(matches!(Durable.drive(&obs), Verdict::Fail { .. }));
+    fn a_write_that_was_never_acked_is_a_zombie() {
+        assert!(matches!(
+            judged(&[Ack::Acked, Ack::Rejected], 2),
+            Verdict::Fail { .. }
+        ));
     }
 
     #[test]
-    fn a_duplicate_ack_cannot_mask_a_zombie() {
-        // Two acks resolve to the same (order_id, item, quantity), so a count of
-        // rows-versus-acks would treat the one matching row as covering both and
-        // miss the second, zombie row. Consuming one row per ack surfaces it.
-        let mut obs = Observations::empty();
-        obs.kill = Some(fired_kill());
-        obs.http_outcomes.push(ack("book", 4, 1));
-        obs.http_outcomes.push(ack("book", 4, 1));
-        obs.db_state = Some(DbState {
-            orders: vec![row(1, "book", 4), row(2, "noodles", 10)],
-            stock: vec![],
-        });
-        assert!(matches!(Durable.drive(&obs), Verdict::Fail { .. }));
-    }
-
-    #[test]
-    fn acked_row_with_wrong_fields_is_fail() {
-        // Ack for (book, 4) but DB persisted (book, 999).
-        let mut obs = Observations::empty();
-        obs.kill = Some(fired_kill());
-        obs.http_outcomes.push(ack("book", 4, 1));
-        obs.db_state = Some(DbState {
-            orders: vec![row(1, "book", 999)],
-            stock: vec![],
-        });
-        assert!(matches!(Durable.drive(&obs), Verdict::Fail { .. }));
+    fn a_write_left_in_doubt_may_land_either_way() {
+        assert_eq!(judged(&[Ack::Acked, Ack::Unknown], 1), Verdict::Pass);
+        assert_eq!(judged(&[Ack::Acked, Ack::Unknown], 2), Verdict::Pass);
     }
 }

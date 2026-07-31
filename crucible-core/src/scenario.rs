@@ -5,7 +5,20 @@ use std::{net::SocketAddr, time::Duration};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-use crate::verdict::{HttpOutcome, Observations};
+use crate::verdict::{Ack, Observations, Outcome};
+
+/// An HTTP status decides whether the service took responsibility: a success
+/// acknowledges the write, a client error refuses it, and a server error leaves
+/// the caller unable to tell.
+fn classify(status: reqwest::StatusCode) -> Ack {
+    if status.is_success() {
+        Ack::Acked
+    } else if status.is_client_error() {
+        Ack::Rejected
+    } else {
+        Ack::Unknown
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -50,25 +63,29 @@ impl Orders {
                 .await
             {
                 Ok(response) => {
-                    let status = response.status().as_u16();
+                    let ack = classify(response.status());
                     let bytes = response.bytes().await.unwrap_or_default();
-                    HttpOutcome {
-                        method: "POST".into(),
-                        path: "/orders".into(),
-                        request_body,
-                        status,
-                        body: bytes.to_vec(),
+                    Outcome {
+                        operation: "POST /orders".into(),
+                        ack,
+                        request: request_body,
+                        response: bytes.to_vec(),
                     }
                 }
-                Err(e) => HttpOutcome {
-                    method: "POST".into(),
-                    path: "/orders".into(),
-                    request_body,
-                    status: 0,
-                    body: e.to_string().into_bytes(),
+                // A refused connection never reached the service, so the write
+                // definitively did not happen; anything else leaves it in doubt.
+                Err(e) => Outcome {
+                    operation: "POST /orders".into(),
+                    ack: if e.is_connect() {
+                        Ack::Rejected
+                    } else {
+                        Ack::Unknown
+                    },
+                    request: request_body,
+                    response: e.to_string().into_bytes(),
                 },
             };
-            observations.http_outcomes.push(outcome);
+            observations.outcomes.push(outcome);
         }
         Ok(observations)
     }

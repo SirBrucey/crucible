@@ -527,6 +527,7 @@ name = "crucible-dsl"
 version = "0.1.0"
 dependencies = [
  "ariadne",
+ "crucible-core",
  "crucible-plugin",
 ]
 
@@ -545,6 +546,9 @@ dependencies = [
 [[package]]
 name = "crucible-plugin"
 version = "0.1.0"
+dependencies = [
+ "crucible-core",
+]
 
 [[package]]
 name = "crucible-protocol"

@@ -3,14 +3,15 @@
 
 use std::collections::HashMap;
 
-use crucible_plugin::{
-    AttrSchema, ClauseShape, CmpOp, HeadPattern, OpSig, Param, ParamType, Registry, ValueType,
+use crucible_core::{
+    plan,
+    schema::{AttrSchema, ClauseShape, CmpOp, HeadPattern, OpSig, Param, ParamType, ValueType},
 };
+use crucible_plugin::Registry;
 
 use crate::{
     ast::{self, Clause, Fleet, OpCall, Predicate, Scenario, Value},
     diagnostics::Diag,
-    plan,
     span::{Span, Spanned},
 };
 
@@ -592,7 +593,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{lower, validate};
-    use crate::{ast, diagnostics::Diag, lexer::lex, parser::parse, plan};
+    use crate::{ast, diagnostics::Diag, lexer::lex, parser::parse};
+    use crucible_core::plan;
     use crucible_plugin::Registry;
 
     fn parse_file(src: &str) -> ast::File {
