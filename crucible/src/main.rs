@@ -166,8 +166,9 @@ fn run_check(file: &Path) -> ExitCode {
         Ok(ast) => {
             let fleet = &ast.fleet.node;
             println!(
-                "{name}: ok (fleet `{}`, {} service(s), {} scenario(s))",
+                "{name}: ok (fleet `{}` via `{}`, {} service(s), {} scenario(s))",
                 fleet.name.node,
+                fleet.deployment.node,
                 fleet.services.len(),
                 ast.scenarios.len(),
             );

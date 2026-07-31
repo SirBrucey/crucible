@@ -159,21 +159,49 @@ impl Parser {
         }
         let name = self.expect_str("a fleet name")?;
         self.expect(&TokenKind::LBrace, "`{`");
+        let mut deployment = None;
         let mut services = Vec::new();
         while !self.at_eof() && !self.at(&TokenKind::RBrace) {
-            if let Some(service) = self.service() {
-                services.push(service);
+            if self.at_kw("deployment") {
+                if let Some(plugin) = self.deployment_stmt() {
+                    deployment = Some(plugin);
+                }
+            } else if self.at_kw("service") {
+                if let Some(service) = self.service() {
+                    services.push(service);
+                } else {
+                    self.recover_to(&TokenKind::Semi);
+                    self.consume(&TokenKind::Semi);
+                }
             } else {
+                self.error_here("expected `deployment` or `service`");
                 self.recover_to(&TokenKind::Semi);
                 self.consume(&TokenKind::Semi);
             }
         }
         let end = self.peek_span();
         self.expect(&TokenKind::RBrace, "`}`");
+        let Some(deployment) = deployment else {
+            self.error(name.span, "fleet is missing `deployment`");
+            return None;
+        };
         Some(Spanned::new(
-            Fleet { name, services },
+            Fleet {
+                name,
+                deployment,
+                services,
+            },
             Span::new(start.start, end.end),
         ))
+    }
+
+    /// Parse `deployment: <plugin>;`, the plugin that brings the fleet up.
+    fn deployment_stmt(&mut self) -> Option<Spanned<String>> {
+        self.consume_kw("deployment");
+        self.expect(&TokenKind::Colon, "`:`");
+        let plugin = self.expect_ident("a deployment plugin name")?;
+        self.consume(&TokenKind::Semi);
+        Some(plugin)
     }
 
     fn service(&mut self) -> Option<Spanned<Service>> {
@@ -483,19 +511,28 @@ mod tests {
     #[test]
     fn a_fleet_with_services_parses() {
         let file = parse_src(
-            r#"fleet "orders" { service api { kind: http, port: 8080 }; service db { kind: sql, port: 3306 }; }"#,
+            r#"fleet "orders" { deployment: docker; service api { kind: http, port: 8080 }; service db { kind: sql, port: 3306 }; }"#,
         )
         .expect("parses");
         assert_eq!(file.fleet.node.name.node, "orders");
+        assert_eq!(file.fleet.node.deployment.node, "docker");
         assert_eq!(file.fleet.node.services.len(), 2);
         assert_eq!(file.fleet.node.services[0].node.name.node, "api");
         assert_eq!(file.fleet.node.services[1].node.name.node, "db");
     }
 
     #[test]
+    fn a_fleet_without_a_deployment_is_an_error() {
+        let errors = parse_src(r#"fleet "f" { service api { port: 80 } }"#).unwrap_err();
+        assert!(errors.iter().any(|d| d.message.contains("deployment")));
+    }
+
+    #[test]
     fn service_attrs_parse_as_a_map() {
-        let file =
-            parse_src(r#"fleet "f" { service api { kind: http, port: 8080 } }"#).expect("parses");
+        let file = parse_src(
+            r#"fleet "f" { deployment: docker; service api { kind: http, port: 8080 } }"#,
+        )
+        .expect("parses");
         let Value::Map(entries) = &file.fleet.node.services[0].node.attrs.node else {
             panic!("expected a map");
         };
@@ -509,7 +546,8 @@ mod tests {
     #[test]
     fn a_list_attribute_parses() {
         let file =
-            parse_src(r#"fleet "f" { service api { env: ["A=1", "B=2"] } }"#).expect("parses");
+            parse_src(r#"fleet "f" { deployment: docker; service api { env: ["A=1", "B=2"] } }"#)
+                .expect("parses");
         let Value::Map(entries) = &file.fleet.node.services[0].node.attrs.node else {
             panic!("expected a map");
         };
@@ -529,7 +567,7 @@ mod tests {
     #[test]
     fn a_scenario_body_parses() {
         let file = parse_src(
-            r#"fleet "f" { }
+            r#"fleet "f" { deployment: docker; }
                scenario "s" {
                  consistent_within: 30s;
                  do { http POST api "/orders" body { item: "book", quantity: 4 } };
@@ -581,7 +619,8 @@ mod tests {
 
     #[test]
     fn a_scenario_without_consistent_within_is_an_error() {
-        let errors = parse_src(r#"fleet "f" { } scenario "s" { }"#).unwrap_err();
+        let errors =
+            parse_src(r#"fleet "f" { deployment: docker; } scenario "s" { }"#).unwrap_err();
         assert!(
             errors
                 .iter()
@@ -598,7 +637,9 @@ mod tests {
     #[test]
     fn recovery_reports_an_error_from_each_malformed_service() {
         // Two services each missing a value; both surface in one pass.
-        let errors = parse_src(r#"fleet "f" { service a { x: }; service b { y: }; }"#).unwrap_err();
+        let errors =
+            parse_src(r#"fleet "f" { deployment: docker; service a { x: }; service b { y: }; }"#)
+                .unwrap_err();
         assert_eq!(errors.len(), 2);
     }
 }
