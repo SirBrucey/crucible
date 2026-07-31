@@ -1,0 +1,35 @@
+// A deliberately broken fleet: one of every `crucible check` diagnostic in a
+// single file. Run `crucible check examples/errors/errors.cru` to see them all.
+//
+// The deployment stays `docker` on purpose: an unknown deployment has no schema,
+// so the service-attribute checks below would be skipped. Swap it for an unknown
+// name to see that diagnostic instead.
+
+fleet "broken" {
+  deployment: docker;
+
+  service api { kinds: [http],    image: "example/api:1", port: 80 };
+  service db  { kinds: [mariadb], image: "example/db:1",  port: 3306 };
+
+  service missing_port { kinds: [http], image: "example/x:1" };
+  service bad_port     { kinds: [http], image: "example/x:1", port: "eighty" };
+  service stray_attr   { kinds: [http], image: "example/x:1", port: 80, colour: "red" };
+  service bad_kinds    { kinds: "http", image: "example/x:1", port: 80 };
+}
+
+scenario "demo" {
+  consistent_within: 5s;
+
+  do { grpc SEND api "/x" };                // unknown driver
+  do { http PATCH api "/x" };               // unknown operation
+  do { http POST ghost "/orders" };         // unknown service
+  do { http POST db "/orders" };            // db does not speak http
+  do { http POST api };                     // missing the path argument
+  do { http GET api "/x" body { a: 1 } };   // GET takes no body
+
+  expect {
+    ghost.orders.count == 1;                // unknown service
+    db.orders.rows == 1;                     // unknown observable
+    db.orders.count == "lots";               // count is an integer, not a string
+  }
+}
