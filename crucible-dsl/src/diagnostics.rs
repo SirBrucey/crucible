@@ -70,5 +70,10 @@ pub fn emit_to_stderr(name: &str, src: &str, diags: &[Diag]) -> std::io::Result<
         }
         report.finish().eprint(&mut cache)?;
     }
+    if !diags.is_empty() {
+        let plural = if diags.len() == 1 { "error" } else { "errors" };
+        eprintln!();
+        eprintln!("{}", format!("{} {plural}", diags.len()).fg(Color::Red));
+    }
     Ok(())
 }

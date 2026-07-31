@@ -35,6 +35,7 @@ fn the_errors_example_reports_diagnostics() {
     assert_eq!(out.status.code(), Some(1));
     assert!(stderr.contains("known drivers"), "stderr: {stderr}");
     assert!(stderr.contains("known attributes"), "stderr: {stderr}");
+    assert!(stderr.contains("errors"), "stderr: {stderr}");
 }
 
 #[test]
