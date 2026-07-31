@@ -247,9 +247,10 @@ impl Parser {
         }
         let end = self.peek_span();
         self.expect(&TokenKind::RBrace, "`}`");
-        if consistent_within.is_none() {
+        let Some(consistent_within) = consistent_within else {
             self.error(name.span, "scenario is missing `consistent_within`");
-        }
+            return None;
+        };
         Some(Spanned::new(
             Scenario {
                 name,
@@ -582,8 +583,8 @@ mod tests {
         let scenario = &file.scenarios[0].node;
         assert_eq!(scenario.name.node, "s");
         assert_eq!(
-            scenario.consistent_within.as_ref().map(|d| d.node),
-            Some(std::time::Duration::from_secs(30)),
+            scenario.consistent_within.node,
+            std::time::Duration::from_secs(30),
         );
 
         let step = &scenario.steps[0].node;

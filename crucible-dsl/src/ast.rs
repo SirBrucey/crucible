@@ -32,7 +32,7 @@ pub struct Service {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Scenario {
     pub name: Spanned<String>,
-    pub consistent_within: Option<Spanned<Duration>>,
+    pub consistent_within: Spanned<Duration>,
     pub steps: Vec<Spanned<OpCall>>,
     pub expect: Vec<Spanned<Predicate>>,
 }
