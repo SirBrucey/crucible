@@ -6,7 +6,7 @@ pub use burst::BurstScheduler;
 
 use crucible_protocol::Direction;
 
-use crate::ipc::RunnerToWorker;
+use crucible_core::ipc::RunnerToWorker;
 
 /// A schedule the runner hands to a worker to execute. The fault fires once the
 /// target service's proxy has observed `fault_packet_index` packets on

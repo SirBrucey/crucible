@@ -10,9 +10,11 @@ use std::{
 use clap::{Parser, Subcommand};
 use crucible_core::{
     deployment::docker::{Docker, HEAL_BUDGET},
-    event_bus::EventBus,
     fleet,
     ipc::{ServiceProfile, Verdict},
+};
+use crucible_engine::{
+    event_bus::EventBus,
     journal,
     scheduler::{BurstScheduler, Schedule, Scheduler},
 };

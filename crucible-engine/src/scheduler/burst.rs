@@ -1,7 +1,7 @@
 //! Burst scheduler: enumerate the fault anchors the learn pass derived, one
 //! schedule per `(service, direction, Kth-packet)` anchor. The learn pass does
 //! the burst clustering (see
-//! [`crate::proxy_log::service_profiles_from_sessions`]); this just turns each
+//! [`crucible_core::proxy_log::service_profiles_from_sessions`]); this just turns each
 //! anchor into a schedule. Schedules are emitted round-robin
 //! across `(service, direction)` so a budget-truncated campaign samples every
 //! edge evenly rather than exhausting one service and never reaching another.

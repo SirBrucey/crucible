@@ -7,15 +7,16 @@ use std::{
 
 use crucible_protocol::{KillMissReason, KillReport, KillResult, ServiceProfile, now_ns};
 
-use crate::{
+use crucible_core::{
     deployment::{Deployment, Docker, docker, docker::HEAL_BUDGET},
     ipc::Verdict,
     observer::{self, DbObserver, SessionObserver},
     proxy_log::service_profiles_from_sessions,
     scenario::{self, Orders},
-    scheduler::Schedule,
     verdict::{Invariant, driver_for},
 };
+
+use crate::scheduler::Schedule;
 
 /// After a restart, wait this long before judging the fleet quiescent, so
 /// recovery traffic has a chance to start.
