@@ -52,13 +52,18 @@ pub fn emit_to_stderr(name: &str, src: &str, diags: &[Diag]) -> std::io::Result<
             .with_message(&diag.message)
             .with_label(Label::new((name, diag.span.range())).with_color(Color::Red));
         if let Some(help) = &diag.help {
-            let suggestions = help
-                .suggestions
-                .iter()
-                .map(|name| name.fg(Color::Green).to_string())
-                .collect::<Vec<_>>()
-                .join(", ");
-            report = report.with_help(format!("{} {suggestions}", help.lead));
+            let note = if help.suggestions.is_empty() {
+                help.lead.clone()
+            } else {
+                let suggestions = help
+                    .suggestions
+                    .iter()
+                    .map(|name| name.fg(Color::Green).to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("{} {suggestions}", help.lead)
+            };
+            report = report.with_help(note);
         }
         report.finish().eprint(&mut cache)?;
     }

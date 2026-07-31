@@ -42,17 +42,38 @@ impl<'a> Validator<'a> {
         self.diags.push(Diag::new(span, message));
     }
 
-    /// Report a reference to an undefined service, suggesting the defined ones.
-    fn unknown_service(
+    /// Report an error, and if there are alternatives, list them as a help note.
+    fn error_suggesting(
         &mut self,
         span: Span,
-        name: &str,
-        services: &HashMap<String, ServiceModel>,
+        message: impl Into<String>,
+        lead: impl Into<String>,
+        suggestions: Vec<String>,
     ) {
-        let mut diag = Diag::new(span, format!("unknown service `{name}`"));
-        if !services.is_empty() {
-            diag = diag.with_help("defined services:", service_names(services));
-        }
+        let diag = Diag::new(span, message);
+        let diag = if suggestions.is_empty() {
+            diag
+        } else {
+            diag.with_help(lead, suggestions)
+        };
+        self.diags.push(diag);
+    }
+
+    /// Report an error listing `options` in green, or, when there are none, the
+    /// `empty_note` as prose.
+    fn error_options(
+        &mut self,
+        span: Span,
+        message: impl Into<String>,
+        lead: impl Into<String>,
+        options: Vec<String>,
+        empty_note: impl Into<String>,
+    ) {
+        let diag = if options.is_empty() {
+            Diag::new(span, message).with_help(empty_note, Vec::new())
+        } else {
+            Diag::new(span, message).with_help(lead, options)
+        };
         self.diags.push(diag);
     }
 
@@ -61,9 +82,17 @@ impl<'a> Validator<'a> {
     fn fleet(&mut self, fleet: &Fleet) -> HashMap<String, ServiceModel> {
         let schema = self.registry.deployment(&fleet.deployment.node);
         if schema.is_none() {
-            self.error(
+            let known = sorted(
+                self.registry
+                    .deployment_names()
+                    .into_iter()
+                    .map(String::from),
+            );
+            self.error_suggesting(
                 fleet.deployment.span,
                 format!("unknown deployment plugin `{}`", fleet.deployment.node),
+                "known deployments:",
+                known,
             );
         }
 
@@ -113,9 +142,16 @@ impl<'a> Validator<'a> {
             if key.node == "kinds" {
                 continue;
             }
-            match schema.attr(&key.node) {
-                Some(decl) => self.check_type(value, &decl.ty),
-                None => self.error(key.span, format!("unknown attribute `{}`", key.node)),
+            if let Some(decl) = schema.attr(&key.node) {
+                self.check_type(value, &decl.ty);
+            } else {
+                let known = sorted(schema.attrs.iter().map(|decl| decl.name.clone()));
+                self.error_suggesting(
+                    key.span,
+                    format!("unknown attribute `{}`", key.node),
+                    "known attributes:",
+                    known,
+                );
             }
         }
         for decl in &schema.attrs {
@@ -148,16 +184,25 @@ impl<'a> Validator<'a> {
             return;
         };
         let Some(signatures) = self.registry.driver(&driver.node) else {
-            self.error(driver.span, format!("unknown driver `{}`", driver.node));
+            let known = sorted(self.registry.driver_names().into_iter().map(String::from));
+            self.error_suggesting(
+                driver.span,
+                format!("unknown driver `{}`", driver.node),
+                "known drivers:",
+                known,
+            );
             return;
         };
         let Some(sig) = signatures
             .iter()
             .find(|sig| matches!(&sig.head, HeadPattern::Exact(name) if *name == operation.node))
         else {
-            self.error(
+            let ops = sorted(signatures.iter().map(|sig| head_label(&sig.head)));
+            self.error_suggesting(
                 operation.span,
                 format!("`{}` has no operation `{}`", driver.node, operation.node),
+                "operations:",
+                ops,
             );
             return;
         };
@@ -211,9 +256,18 @@ impl<'a> Validator<'a> {
                     return;
                 };
                 if !service.kinds.contains(&driver.node) {
-                    self.error(
+                    let drivers: Vec<String> = service
+                        .kinds
+                        .iter()
+                        .filter(|kind| self.registry.driver(kind).is_some())
+                        .cloned()
+                        .collect();
+                    self.error_options(
                         arg.span,
                         format!("service `{name}` does not speak `{}`", driver.node),
+                        "drivers:",
+                        sorted(drivers),
+                        format!("no available drivers for `{name}`"),
                     );
                 }
             }
@@ -258,9 +312,14 @@ impl<'a> Validator<'a> {
                 .map(|segment| segment.node.as_str())
                 .collect::<Vec<_>>()
                 .join(".");
-            self.error(
-                predicate.node.left.span,
+            let span = path_span(path).unwrap_or(predicate.node.left.span);
+            let known = sorted(self.observable_labels(service));
+            self.error_options(
+                span,
                 format!("no observable `{name}` on service `{}`", service_ref.node),
+                "observables:",
+                known,
+                format!("no available observables for `{}`", service_ref.node),
             );
             return;
         };
@@ -275,13 +334,39 @@ impl<'a> Validator<'a> {
         service: &ServiceModel,
         path: &[Spanned<String>],
     ) -> Option<&'a OpSig> {
+        self.observables(service)
+            .find(|sig| head_matches(&sig.head, path))
+    }
+
+    /// Every observable on the service's observer kinds.
+    fn observables(&self, service: &ServiceModel) -> impl Iterator<Item = &'a OpSig> {
         let registry = self.registry;
         service
             .kinds
             .iter()
-            .filter_map(|kind| registry.observer(kind))
+            .filter_map(move |kind| registry.observer(kind))
             .flat_map(<[OpSig]>::iter)
-            .find(|sig| head_matches(&sig.head, path))
+    }
+
+    fn observable_labels(&self, service: &ServiceModel) -> Vec<String> {
+        self.observables(service)
+            .map(|sig| head_label(&sig.head))
+            .collect()
+    }
+
+    /// Report a reference to an undefined service, suggesting the defined ones.
+    fn unknown_service(
+        &mut self,
+        span: Span,
+        name: &str,
+        services: &HashMap<String, ServiceModel>,
+    ) {
+        self.error_suggesting(
+            span,
+            format!("unknown service `{name}`"),
+            "defined services:",
+            sorted(services.keys().cloned()),
+        );
     }
 
     fn check_comparison(&mut self, predicate: &Predicate, sig: &OpSig) {
@@ -337,10 +422,26 @@ impl<'a> Validator<'a> {
     }
 }
 
-fn service_names(services: &HashMap<String, ServiceModel>) -> Vec<String> {
-    let mut names: Vec<String> = services.keys().cloned().collect();
+fn sorted(names: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut names: Vec<String> = names.into_iter().collect();
     names.sort_unstable();
     names
+}
+
+/// A readable label for an operation head, e.g. `POST` or `<table>.count`.
+fn head_label(head: &HeadPattern) -> String {
+    match head {
+        HeadPattern::Exact(name) => name.clone(),
+        HeadPattern::Wildcard { segment, tail } => format!("<{segment}>.{tail}"),
+    }
+}
+
+/// The span covering a dotted path's segments, or `None` if it is empty.
+fn path_span(path: &[Spanned<String>]) -> Option<Span> {
+    match (path.first(), path.last()) {
+        (Some(first), Some(last)) => Some(Span::new(first.span.start, last.span.end)),
+        _ => None,
+    }
 }
 
 fn head_matches(pattern: &HeadPattern, path: &[Spanned<String>]) -> bool {
@@ -376,17 +477,21 @@ fn type_name(ty: &ValueType) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::validate;
-    use crate::{lexer::lex, parser::parse};
+    use crate::{diagnostics::Diag, lexer::lex, parser::parse};
     use crucible_plugin::Registry;
 
-    fn diags(src: &str) -> Vec<String> {
+    fn diagnose(src: &str) -> Vec<Diag> {
         let (tokens, lex_errors) = lex(src);
         assert!(lex_errors.is_empty(), "lex errors: {lex_errors:?}");
         let file = parse(tokens).expect("parses");
         validate(&file, &Registry::builtins())
-            .into_iter()
-            .map(|diag| diag.message)
-            .collect()
+    }
+
+    fn find<'a>(diags: &'a [Diag], needle: &str) -> &'a Diag {
+        diags
+            .iter()
+            .find(|diag| diag.message.contains(needle))
+            .unwrap_or_else(|| panic!("no diagnostic matching {needle:?} in {diags:?}"))
     }
 
     const VALID: &str = r#"
@@ -404,28 +509,30 @@ mod tests {
 
     #[test]
     fn the_example_shape_validates_clean() {
-        assert!(diags(VALID).is_empty(), "{:?}", diags(VALID));
+        assert!(diagnose(VALID).is_empty(), "{:?}", diagnose(VALID));
     }
 
     #[test]
-    fn an_unknown_deployment_is_reported() {
+    fn an_unknown_deployment_suggests_the_known_ones() {
         let src = r#"fleet "f" { deployment: podman; service api { image: "x", port: 80 } }
                      scenario "s" { consistent_within: 1s; }"#;
-        assert!(
-            diags(src)
-                .iter()
-                .any(|d| d.contains("deployment plugin `podman`"))
-        );
+        let diags = diagnose(src);
+        let diag = find(&diags, "deployment plugin `podman`");
+        assert_eq!(diag.help.as_ref().unwrap().suggestions, ["docker"]);
     }
 
     #[test]
-    fn an_unknown_attribute_is_reported() {
+    fn an_unknown_attribute_suggests_the_schema() {
         let src = r#"fleet "f" { deployment: docker; service api { image: "x", port: 80, colour: "red" } }
                      scenario "s" { consistent_within: 1s; }"#;
+        let diags = diagnose(src);
+        let diag = find(&diags, "unknown attribute `colour`");
         assert!(
-            diags(src)
-                .iter()
-                .any(|d| d.contains("unknown attribute `colour`"))
+            diag.help
+                .as_ref()
+                .unwrap()
+                .suggestions
+                .contains(&"image".to_string())
         );
     }
 
@@ -433,58 +540,39 @@ mod tests {
     fn a_missing_required_attribute_is_reported() {
         let src = r#"fleet "f" { deployment: docker; service api { image: "x" } }
                      scenario "s" { consistent_within: 1s; }"#;
-        assert!(
-            diags(src)
-                .iter()
-                .any(|d| d.contains("missing required attribute `port`"))
-        );
-    }
-
-    #[test]
-    fn a_do_on_an_unknown_service_is_reported() {
-        let src = r#"fleet "f" { deployment: docker; service api { kinds: [http], image: "x", port: 80 } }
-                     scenario "s" { consistent_within: 1s; do { http POST gateway "/x" }; }"#;
-        assert!(
-            diags(src)
-                .iter()
-                .any(|d| d.contains("unknown service `gateway`"))
-        );
+        assert!(!diagnose(src).is_empty());
+        find(&diagnose(src), "missing required attribute `port`");
     }
 
     #[test]
     fn an_unknown_service_lists_the_defined_ones() {
         let src = r#"fleet "f" { deployment: docker; service api { kinds: [http], image: "x", port: 80 } }
                      scenario "s" { consistent_within: 1s; do { http POST gateway "/x" }; }"#;
-        let (tokens, _) = lex(src);
-        let file = parse(tokens).expect("parses");
-        let diags = validate(&file, &Registry::builtins());
-        let unknown = diags
-            .iter()
-            .find(|diag| diag.message.contains("unknown service"))
-            .expect("unknown service diagnostic");
-        let help = unknown.help.as_ref().expect("help note");
-        assert_eq!(help.suggestions, ["api"]);
+        let diags = diagnose(src);
+        let diag = find(&diags, "unknown service `gateway`");
+        assert_eq!(diag.help.as_ref().unwrap().suggestions, ["api"]);
     }
 
     #[test]
-    fn a_service_that_does_not_speak_the_driver_is_reported() {
+    fn a_service_that_does_not_speak_the_driver_has_no_driver_to_suggest() {
+        // api's only kind, mariadb, is an observer, so there is no driver to suggest.
         let src = r#"fleet "f" { deployment: docker; service api { kinds: [mariadb], image: "x", port: 80 } }
                      scenario "s" { consistent_within: 1s; do { http POST api "/x" }; }"#;
-        assert!(
-            diags(src)
-                .iter()
-                .any(|d| d.contains("does not speak `http`"))
-        );
+        let diags = diagnose(src);
+        let diag = find(&diags, "does not speak `http`");
+        let help = diag.help.as_ref().unwrap();
+        assert!(help.suggestions.is_empty());
+        assert!(help.lead.contains("no available drivers"));
     }
 
     #[test]
-    fn an_unknown_observable_is_reported() {
+    fn an_unknown_observable_suggests_the_observables() {
         let src = r#"fleet "f" { deployment: docker; service db { kinds: [mariadb], image: "x", port: 80 } }
                      scenario "s" { consistent_within: 1s; expect { db.orders.rows == 1; } }"#;
-        assert!(
-            diags(src)
-                .iter()
-                .any(|d| d.contains("no observable `orders.rows`"))
-        );
+        let diags = diagnose(src);
+        let diag = find(&diags, "no observable `orders.rows`");
+        assert_eq!(diag.help.as_ref().unwrap().suggestions, ["<table>.count"]);
+        // The span covers the observable path, not the valid `db` service.
+        assert_eq!(&src[diag.span.start..diag.span.end], "orders.rows");
     }
 }
