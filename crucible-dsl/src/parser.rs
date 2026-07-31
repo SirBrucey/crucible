@@ -2,7 +2,7 @@
 //! at statement and block boundaries so one error does not abort the parse.
 
 use crate::{
-    ast::{File, Fleet, Scenario, Service, Value},
+    ast::{Clause, CmpOp, File, Filter, Fleet, OpCall, Predicate, Scenario, Service, Value},
     diagnostics::Diag,
     lexer::{Token, TokenKind},
     span::{Span, Spanned},
@@ -193,34 +193,212 @@ impl Parser {
         let start = self.peek_span();
         self.consume_kw("scenario");
         let name = self.expect_str("a scenario name")?;
-        // The scenario body grammar lands in a later slice; recognise the block
-        // and skip it so the rest of the file still parses.
-        let end = self.skip_braced_block();
+        self.expect(&TokenKind::LBrace, "`{`");
+        let mut consistent_within = None;
+        let mut steps = Vec::new();
+        let mut expect = Vec::new();
+        while !self.at_eof() && !self.at(&TokenKind::RBrace) {
+            if self.at_kw("consistent_within") {
+                if let Some(deadline) = self.consistent_within_stmt() {
+                    consistent_within = Some(deadline);
+                }
+            } else if self.at_kw("do") {
+                if let Some(step) = self.do_step() {
+                    steps.push(step);
+                } else {
+                    self.recover_to(&TokenKind::Semi);
+                    self.consume(&TokenKind::Semi);
+                }
+            } else if self.at_kw("expect") {
+                expect.append(&mut self.expect_block());
+            } else {
+                self.error_here("expected `consistent_within`, `do`, or `expect`");
+                self.recover_to(&TokenKind::Semi);
+                self.consume(&TokenKind::Semi);
+            }
+        }
+        let end = self.peek_span();
+        self.expect(&TokenKind::RBrace, "`}`");
+        if consistent_within.is_none() {
+            self.error(name.span, "scenario is missing `consistent_within`");
+        }
         Some(Spanned::new(
-            Scenario { name },
+            Scenario {
+                name,
+                consistent_within,
+                steps,
+                expect,
+            },
             Span::new(start.start, end.end),
         ))
     }
 
-    /// Consume a `{ ... }` block, matching nested braces, and return the closing
-    /// brace's span (or the opening one if the block is unterminated).
-    fn skip_braced_block(&mut self) -> Span {
-        let open = self.peek_span();
-        if !self.expect(&TokenKind::LBrace, "`{`") {
-            return open;
+    /// Parse `consistent_within: <duration>;`, the scenario's heal-phase deadline.
+    fn consistent_within_stmt(&mut self) -> Option<Spanned<std::time::Duration>> {
+        self.consume_kw("consistent_within");
+        self.expect(&TokenKind::Colon, "`:`");
+        let value = self.value()?;
+        self.consume(&TokenKind::Semi);
+        if let Value::Duration(d) = value.node {
+            Some(Spanned::new(d, value.span))
+        } else {
+            self.error(
+                value.span,
+                "`consistent_within` expects a duration like `30s`",
+            );
+            None
         }
-        let mut depth = 1u32;
-        let mut last = open;
-        while depth > 0 && !self.at_eof() {
-            last = self.peek_span();
-            match self.peek() {
-                TokenKind::LBrace => depth += 1,
-                TokenKind::RBrace => depth -= 1,
-                _ => {}
+    }
+
+    /// Parse `do { <operation> };`, one driver step.
+    fn do_step(&mut self) -> Option<Spanned<OpCall>> {
+        let start = self.peek_span();
+        self.consume_kw("do");
+        self.expect(&TokenKind::LBrace, "`{`");
+        let op = self.op_call()?;
+        let end = self.peek_span();
+        self.expect(&TokenKind::RBrace, "`}`");
+        self.consume(&TokenKind::Semi);
+        Some(Spanned::new(op.node, Span::new(start.start, end.end)))
+    }
+
+    /// Parse an action operation: a `driver op` head, positional arguments, and
+    /// clauses (`body { ... }`).
+    fn op_call(&mut self) -> Option<Spanned<OpCall>> {
+        let driver = self.expect_ident("a driver name")?;
+        let op = self.expect_ident("an operation")?;
+        let start = driver.span.start;
+        let mut end = op.span.end;
+        let head = vec![driver, op];
+        let mut args = Vec::new();
+        let mut clauses = Vec::new();
+        loop {
+            if self.at_kw("body") {
+                let clause = self.body_clause();
+                end = clause.span.end;
+                clauses.push(clause);
+            } else if self.is_value_start() {
+                let Some(value) = self.value() else { break };
+                end = value.span.end;
+                args.push(value);
+            } else {
+                break;
             }
-            self.advance();
         }
-        last
+        Some(Spanned::new(
+            OpCall {
+                head,
+                args,
+                clauses,
+            },
+            Span::new(start, end),
+        ))
+    }
+
+    fn body_clause(&mut self) -> Spanned<Clause> {
+        let start = self.peek_span();
+        self.consume_kw("body");
+        let map = self.map();
+        let span = Span::new(start.start, map.span.end);
+        Spanned::new(Clause::Body(map), span)
+    }
+
+    /// Whether the next token can begin a value (and so a positional argument).
+    fn is_value_start(&self) -> bool {
+        matches!(
+            self.peek(),
+            TokenKind::Str(_)
+                | TokenKind::Int(_)
+                | TokenKind::Duration(_)
+                | TokenKind::Ident(_)
+                | TokenKind::LBracket
+                | TokenKind::LBrace
+        )
+    }
+
+    /// Parse `expect { <predicate>; ... }`, the settled-state expectation.
+    fn expect_block(&mut self) -> Vec<Spanned<Predicate>> {
+        self.consume_kw("expect");
+        self.expect(&TokenKind::LBrace, "`{`");
+        let mut predicates = Vec::new();
+        while !self.at_eof() && !self.at(&TokenKind::RBrace) {
+            if let Some(predicate) = self.predicate() {
+                predicates.push(predicate);
+                self.consume(&TokenKind::Semi);
+            } else {
+                self.recover_to(&TokenKind::Semi);
+                self.consume(&TokenKind::Semi);
+            }
+        }
+        self.expect(&TokenKind::RBrace, "`}`");
+        self.consume(&TokenKind::Semi);
+        predicates
+    }
+
+    /// Parse `<observable> <cmp> <value>`, e.g. `db.orders.count == 3`.
+    fn predicate(&mut self) -> Option<Spanned<Predicate>> {
+        let left = self.observable()?;
+        let op = self.cmp_op()?;
+        let right = self.value()?;
+        let span = Span::new(left.span.start, right.span.end);
+        Some(Spanned::new(Predicate { left, op, right }, span))
+    }
+
+    /// Parse a dotted observable path with an optional `where` filter, e.g.
+    /// `db.orders.count where name = "www"`.
+    fn observable(&mut self) -> Option<Spanned<OpCall>> {
+        let first = self.expect_ident("an observable")?;
+        let start = first.span.start;
+        let mut end = first.span.end;
+        let mut head = vec![first];
+        while self.consume(&TokenKind::Dot) {
+            let segment = self.expect_ident("an observable path segment")?;
+            end = segment.span.end;
+            head.push(segment);
+        }
+        let mut clauses = Vec::new();
+        if self.at_kw("where")
+            && let Some(clause) = self.where_clause()
+        {
+            end = clause.span.end;
+            clauses.push(clause);
+        }
+        Some(Spanned::new(
+            OpCall {
+                head,
+                args: Vec::new(),
+                clauses,
+            },
+            Span::new(start, end),
+        ))
+    }
+
+    fn where_clause(&mut self) -> Option<Spanned<Clause>> {
+        let start = self.peek_span();
+        self.consume_kw("where");
+        let column = self.expect_ident("a column name")?;
+        self.expect(&TokenKind::Eq, "`=`");
+        let value = self.value()?;
+        let span = Span::new(start.start, value.span.end);
+        Some(Spanned::new(Clause::Where(Filter { column, value }), span))
+    }
+
+    fn cmp_op(&mut self) -> Option<Spanned<CmpOp>> {
+        let span = self.peek_span();
+        let op = match self.peek() {
+            TokenKind::EqEq => CmpOp::Eq,
+            TokenKind::Ne => CmpOp::Ne,
+            TokenKind::Lt => CmpOp::Lt,
+            TokenKind::Le => CmpOp::Le,
+            TokenKind::Gt => CmpOp::Gt,
+            TokenKind::Ge => CmpOp::Ge,
+            _ => {
+                self.error_here("expected a comparison (`==`, `!=`, `<`, `<=`, `>`, `>=`)");
+                return None;
+            }
+        };
+        self.advance();
+        Some(Spanned::new(op, span))
     }
 
     fn map(&mut self) -> Spanned<Value> {
@@ -229,18 +407,18 @@ impl Parser {
         let mut entries = Vec::new();
         while !self.at_eof() && !self.at(&TokenKind::RBrace) {
             let Some(key) = self.expect_ident("an attribute name") else {
-                self.recover_to(&TokenKind::Semi);
-                self.consume(&TokenKind::Semi);
+                self.recover_to(&TokenKind::Comma);
+                self.consume(&TokenKind::Comma);
                 continue;
             };
             self.expect(&TokenKind::Colon, "`:`");
             let Some(value) = self.value() else {
-                self.recover_to(&TokenKind::Semi);
-                self.consume(&TokenKind::Semi);
+                self.recover_to(&TokenKind::Comma);
+                self.consume(&TokenKind::Comma);
                 continue;
             };
             entries.push((key, value));
-            if !self.consume(&TokenKind::Semi) {
+            if !self.consume(&TokenKind::Comma) {
                 break;
             }
         }
@@ -291,7 +469,10 @@ impl Parser {
 #[cfg(test)]
 mod tests {
     use super::parse;
-    use crate::{ast::Value, lexer::lex};
+    use crate::{
+        ast::{Clause, CmpOp, Value},
+        lexer::lex,
+    };
 
     fn parse_src(src: &str) -> Result<super::File, Vec<super::Diag>> {
         let (tokens, lex_errors) = lex(src);
@@ -302,7 +483,7 @@ mod tests {
     #[test]
     fn a_fleet_with_services_parses() {
         let file = parse_src(
-            r#"fleet "orders" { service api { kind: http; port: 8080 }; service db { kind: sql; port: 3306 }; }"#,
+            r#"fleet "orders" { service api { kind: http, port: 8080 }; service db { kind: sql, port: 3306 }; }"#,
         )
         .expect("parses");
         assert_eq!(file.fleet.node.name.node, "orders");
@@ -314,7 +495,7 @@ mod tests {
     #[test]
     fn service_attrs_parse_as_a_map() {
         let file =
-            parse_src(r#"fleet "f" { service api { kind: http; port: 8080 } }"#).expect("parses");
+            parse_src(r#"fleet "f" { service api { kind: http, port: 8080 } }"#).expect("parses");
         let Value::Map(entries) = &file.fleet.node.services[0].node.attrs.node else {
             panic!("expected a map");
         };
@@ -346,12 +527,66 @@ mod tests {
     }
 
     #[test]
-    fn a_scenario_header_is_recognised_and_its_body_skipped() {
-        let file =
-            parse_src(r#"fleet "f" { } scenario "s" { do { anything } ; nested { braces } }"#)
-                .expect("parses");
-        assert_eq!(file.scenarios.len(), 1);
-        assert_eq!(file.scenarios[0].node.name.node, "s");
+    fn a_scenario_body_parses() {
+        let file = parse_src(
+            r#"fleet "f" { }
+               scenario "s" {
+                 consistent_within: 30s;
+                 do { http POST api "/orders" body { item: "book", quantity: 4 } };
+                 expect {
+                   db.orders.count == 2;
+                   db.orders.count where item = "book" == 1;
+                 }
+               }"#,
+        )
+        .expect("parses");
+
+        let scenario = &file.scenarios[0].node;
+        assert_eq!(scenario.name.node, "s");
+        assert_eq!(
+            scenario.consistent_within.as_ref().map(|d| d.node),
+            Some(std::time::Duration::from_secs(30)),
+        );
+
+        let step = &scenario.steps[0].node;
+        let head: Vec<&str> = step.head.iter().map(|h| h.node.as_str()).collect();
+        assert_eq!(head, ["http", "POST"]);
+        let args: Vec<&Value> = step.args.iter().map(|a| &a.node).collect();
+        assert_eq!(
+            args,
+            [
+                &Value::Ident("api".to_string()),
+                &Value::Str("/orders".to_string())
+            ],
+        );
+        assert!(matches!(step.clauses[0].node, Clause::Body(_)));
+
+        assert_eq!(scenario.expect.len(), 2);
+        let first = &scenario.expect[0].node;
+        let observable: Vec<&str> = first
+            .left
+            .node
+            .head
+            .iter()
+            .map(|h| h.node.as_str())
+            .collect();
+        assert_eq!(observable, ["db", "orders", "count"]);
+        assert_eq!(first.op.node, CmpOp::Eq);
+        assert_eq!(first.right.node, Value::Int(2));
+        assert!(matches!(
+            scenario.expect[1].node.left.node.clauses[0].node,
+            Clause::Where(_),
+        ));
+    }
+
+    #[test]
+    fn a_scenario_without_consistent_within_is_an_error() {
+        let errors = parse_src(r#"fleet "f" { } scenario "s" { }"#).unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|d| d.message.contains("consistent_within"))
+        );
     }
 
     #[test]
