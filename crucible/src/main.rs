@@ -162,20 +162,26 @@ fn run_check(file: &Path) -> ExitCode {
         return render_and_fail(&name, &src, &diags);
     }
 
-    match crucible_dsl::parser::parse(tokens) {
-        Ok(ast) => {
-            let fleet = &ast.fleet.node;
-            println!(
-                "{name}: ok (fleet `{}` via `{}`, {} service(s), {} scenario(s))",
-                fleet.name.node,
-                fleet.deployment.node,
-                fleet.services.len(),
-                ast.scenarios.len(),
-            );
-            ExitCode::SUCCESS
-        }
-        Err(diags) => render_and_fail(&name, &src, &diags),
+    let ast = match crucible_dsl::parser::parse(tokens) {
+        Ok(ast) => ast,
+        Err(diags) => return render_and_fail(&name, &src, &diags),
+    };
+
+    let registry = crucible_plugin::Registry::builtins();
+    let diags = crucible_dsl::validate::validate(&ast, &registry);
+    if !diags.is_empty() {
+        return render_and_fail(&name, &src, &diags);
     }
+
+    let fleet = &ast.fleet.node;
+    println!(
+        "{name}: ok (fleet `{}` via `{}`, {} service(s), {} scenario(s))",
+        fleet.name.node,
+        fleet.deployment.node,
+        fleet.services.len(),
+        ast.scenarios.len(),
+    );
+    ExitCode::SUCCESS
 }
 
 /// Render diagnostics to stderr and return the check-failed exit code.

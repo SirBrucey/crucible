@@ -491,6 +491,7 @@ dependencies = [
  "clap",
  "crucible-core",
  "crucible-dsl",
+ "crucible-plugin",
  "libc",
  "thiserror",
  "tokio",
@@ -525,6 +526,7 @@ name = "crucible-dsl"
 version = "0.1.0"
 dependencies = [
  "ariadne",
+ "crucible-plugin",
 ]
 
 [[package]]

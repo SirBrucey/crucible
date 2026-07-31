@@ -54,6 +54,18 @@ fn a_parse_error_exits_one_with_a_diagnostic() {
 }
 
 #[test]
+fn a_semantic_error_exits_one_with_a_diagnostic() {
+    let out = check(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/semantic_error.cru"
+    ));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(stderr.contains("unknown service"), "stderr: {stderr}");
+    assert!(stderr.contains("defined services"), "stderr: {stderr}");
+}
+
+#[test]
 fn a_non_cru_extension_is_rejected() {
     let out = check(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"));
     assert_eq!(out.status.code(), Some(2));
