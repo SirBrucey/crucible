@@ -4,12 +4,12 @@
 //! changes. Transitions consume `self` and return the next `Session<_>`; illegal
 //! sequences are compile errors.
 
-use crucible_core::{
+use crucible_core::ipc::{
+    HEARTBEAT_TIMEOUT, RunnerToWorker, ServiceProfile, Verdict, WorkerToRunner,
+    codec::{read_frame, write_frame},
+};
+use crucible_engine::{
     event_bus::{EventBus, RunnerEvent},
-    ipc::{
-        HEARTBEAT_TIMEOUT, RunnerToWorker, ServiceProfile, Verdict, WorkerToRunner,
-        codec::{read_frame, write_frame},
-    },
     scheduler::Schedule,
 };
 use tokio::{net::UnixStream, time::timeout};

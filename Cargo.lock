@@ -491,6 +491,7 @@ dependencies = [
  "clap",
  "crucible-core",
  "crucible-dsl",
+ "crucible-engine",
  "crucible-plugin",
  "libc",
  "thiserror",
@@ -530,6 +531,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "crucible-engine"
+version = "0.1.0"
+dependencies = [
+ "crucible-core",
+ "crucible-protocol",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "crucible-plugin"
 version = "0.1.0"
 
@@ -559,6 +572,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "crucible-core",
+ "crucible-engine",
  "thiserror",
  "tokio",
  "tracing",

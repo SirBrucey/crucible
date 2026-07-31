@@ -17,8 +17,10 @@ use crucible_core::{
         codec::{read_frame, write_frame},
     },
     observer::DbObserver,
-    orchestrator::{Done, Orchestrator, Ready},
     scenario::Orders,
+};
+use crucible_engine::{
+    orchestrator::{Done, Orchestrator, Ready},
     scheduler::Schedule,
 };
 use tokio::{

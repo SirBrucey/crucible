@@ -63,7 +63,7 @@ pub fn default_path(pid: u32) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ipc::WorkerToRunner;
+    use crucible_core::ipc::WorkerToRunner;
 
     fn temp_journal_path(name: &str) -> PathBuf {
         let mut path = std::env::temp_dir();

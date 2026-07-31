@@ -1,6 +1,7 @@
 use std::io;
 
-use crucible_core::{deployment::docker, ipc::codec, observer, orchestrator, scenario};
+use crucible_core::{deployment::docker, ipc::codec, observer, scenario};
+use crucible_engine::orchestrator;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
