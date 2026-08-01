@@ -2,8 +2,10 @@
 //! of the first-party plugins.
 
 pub mod builtin;
+pub mod error;
 pub mod registry;
 pub mod role;
 
+pub use error::Error;
 pub use registry::Registry;
-pub use role::{Deployment, Driver, Observer};
+pub use role::{Deployment, DeploymentRuntime, Driver, FaultPrimitives, Observer};

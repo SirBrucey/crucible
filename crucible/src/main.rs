@@ -9,9 +9,9 @@ use std::{
 
 use clap::{Parser, Subcommand};
 use crucible_core::{
-    deployment::docker::{Docker, HEAL_BUDGET},
-    fleet,
+    HEAL_BUDGET,
     ipc::{ServiceProfile, Verdict},
+    plan,
 };
 use crucible_engine::{
     event_bus::EventBus,
@@ -234,9 +234,18 @@ async fn run() -> Result<CampaignOutcome> {
 /// reclaims the replica so its containers and network do not leak and starve the
 /// host of the concurrent workers still running.
 async fn reclaim_fleet(worker_id: u32) {
-    if let Err(e) = Docker::reclaim(worker_id, &fleet::EXAMPLE).await {
+    if let Err(e) = reclaim(worker_id).await {
         tracing::warn!(worker_id, error = %e, "failed to reclaim worker fleet");
     }
+}
+
+/// Remove a replica by worker id alone. Needs no live worker state, since the
+/// container and network names follow from the id, and is a no-op once the
+/// replica is already gone.
+async fn reclaim(worker_id: u32) -> std::result::Result<(), crucible_plugin::Error> {
+    let mut deployment =
+        crucible_plugin::Registry::builtins().deployment_for(&plan::example(), worker_id, None)?;
+    deployment.teardown().await
 }
 
 /// Remove this invocation's per-worker socket files, which unix listeners do not

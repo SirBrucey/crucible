@@ -2,11 +2,16 @@
 
 use std::collections::HashMap;
 
-use crucible_core::schema::{AttrSchema, OpSig};
+use crucible_core::{
+    fault::Anchor,
+    plan,
+    schema::{AttrSchema, OpSig},
+};
 
 use crate::{
     builtin::{Docker, Http, Mariadb},
-    role::{Deployment, Driver, Observer},
+    error::Error,
+    role::{Deployment, DeploymentRuntime, Driver, Observer},
 };
 
 /// The available plugins, keyed by name and resolved to their schemas.
@@ -69,6 +74,46 @@ impl Registry {
     pub fn driver_names(&self) -> Vec<&'static str> {
         self.drivers.keys().copied().collect()
     }
+
+    /// Build the replica the planned fleet describes, ready to be brought up by
+    /// the deployment plugin it names. The plugin must be registered, so a plan
+    /// that passed `check` against this registry resolves here too.
+    ///
+    /// # Errors
+    /// Errors if the plan names a deployment plugin this registry does not hold,
+    /// if a service does not bind, or if the plugin cannot be reached.
+    pub fn deployment_for(
+        &self,
+        planned: &plan::Fleet,
+        worker_id: u32,
+        anchor: Option<Anchor>,
+    ) -> Result<Box<dyn DeploymentRuntime>, Error> {
+        let name = planned.deployment.as_str();
+        if !self.deployments.contains_key(name) {
+            return Err(unknown_deployment(name));
+        }
+        match name {
+            Docker::NAME => {
+                let services = bind_services::<Docker>(planned)?;
+                let docker = Docker::new(worker_id, services, anchor).map_err(Error::from)?;
+                Ok(Box::new(docker))
+            }
+            other => Err(unknown_deployment(other)),
+        }
+    }
+}
+
+/// Bind every service of a planned fleet through one deployment plugin.
+fn bind_services<D: Deployment>(planned: &plan::Fleet) -> Result<Vec<D::Config>, Error> {
+    planned
+        .services
+        .iter()
+        .map(|service| D::bind(service).map_err(|e| Error::new(D::NAME, e)))
+        .collect()
+}
+
+fn unknown_deployment(name: &str) -> Error {
+    Error::new("registry", format!("no deployment plugin named `{name}`"))
 }
 
 #[cfg(test)]
@@ -89,5 +134,18 @@ mod tests {
         assert!(registry.deployment("podman").is_none());
         assert!(registry.driver("grpc").is_none());
         assert!(registry.observer("postgres").is_none());
+    }
+
+    #[test]
+    fn a_registry_will_not_build_a_deployment_it_does_not_hold() {
+        // A plan is checked against the registry before it runs, so a registry
+        // that reports a plugin absent must not then hand one out.
+        let registry = Registry::default();
+        assert!(registry.deployment("docker").is_none());
+        assert!(
+            registry
+                .deployment_for(&crucible_core::plan::example(), 0, None)
+                .is_err()
+        );
     }
 }

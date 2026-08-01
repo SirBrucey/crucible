@@ -45,6 +45,22 @@ pub struct Service {
     pub attrs: Vec<(String, Value)>,
 }
 
+impl Service {
+    /// The named bring-up attribute, if the service declares it.
+    #[must_use]
+    pub fn attr(&self, name: &str) -> Option<&Value> {
+        lookup(&self.attrs, name)
+    }
+}
+
+/// The named entry of an attribute or body list.
+fn lookup<'a>(entries: &'a [(String, Value)], name: &str) -> Option<&'a Value> {
+    entries
+        .iter()
+        .find(|(key, _)| key == name)
+        .map(|(_, value)| value)
+}
+
 /// A scenario: its heal-phase deadline, driver steps, and settled-state checks.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Scenario {
@@ -75,6 +91,10 @@ pub struct Check {
 }
 
 /// A literal value carried by a plan.
+///
+/// The `as_*` accessors mirror [`crate::schema::ValueType`], one per shape a
+/// plugin can declare. The check pass has already validated a value against the
+/// schema, so a `None` means the plugin asked for a shape it never declared.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Value {
     Str(String),
@@ -84,4 +104,162 @@ pub enum Value {
     Ident(String),
     List(Vec<Value>),
     Map(Vec<(String, Value)>),
+}
+
+impl Value {
+    #[must_use]
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            Value::Str(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// The service this value names, for a value declared as a service
+    /// reference.
+    #[must_use]
+    pub fn as_service_ref(&self) -> Option<&str> {
+        match self {
+            Value::Ident(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn as_int(&self) -> Option<i64> {
+        match self {
+            Value::Int(n) => Some(*n),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn as_bool(&self) -> Option<bool> {
+        match self {
+            Value::Bool(b) => Some(*b),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn as_duration(&self) -> Option<Duration> {
+        match self {
+            Value::Duration(d) => Some(*d),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn as_list(&self) -> Option<&[Value]> {
+        match self {
+            Value::List(items) => Some(items),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn as_map(&self) -> Option<&[(String, Value)]> {
+        match self {
+            Value::Map(entries) => Some(entries),
+            _ => None,
+        }
+    }
+
+    /// The strings in a list value, or `None` if any entry is not a string.
+    #[must_use]
+    pub fn as_strs(&self) -> Option<Vec<&str>> {
+        self.as_list()?.iter().map(Value::as_str).collect()
+    }
+}
+
+/// The `orders` example fleet: an HTTP API that accepts orders, a rabbitmq
+/// broker, a mariadb database, and an inventory consumer that decrements
+/// stock in response to `order.created` events.
+#[must_use]
+pub fn example() -> Fleet {
+    Fleet {
+        name: "orders".into(),
+        deployment: "docker".into(),
+        services: vec![
+            service(
+                "api",
+                &["http"],
+                "crucible-example/orders-api:0.1",
+                8080,
+                &[
+                    "DATABASE_URL=mysql://root@db:3306/orders",
+                    "BROKER_URL=amqp://broker:5672",
+                    "RUST_LOG=info",
+                ],
+                &["CMD", "curl", "-fsS", "http://127.0.0.1:8080/healthz"],
+            ),
+            service(
+                "broker",
+                &["amqp"],
+                "rabbitmq:3.13-management",
+                5672,
+                &[],
+                // Probe the AMQP port rather than run `rabbitmq-diagnostics`. That
+                // command starts an Erlang node, and Docker runs healthchecks as the
+                // image's default user (root here), so under a slow concurrent boot a
+                // probe can create a root-owned /var/lib/rabbitmq/.erlang.cookie before
+                // the broker (running as rabbitmq) writes its own; the broker then
+                // cannot read the cookie and dies with `.erlang.cookie: eacces`. A bare
+                // TCP connect touches no cookie and still gates on the listener.
+                &["CMD", "bash", "-c", ": < /dev/tcp/127.0.0.1/5672"],
+            ),
+            service(
+                "db",
+                &["mariadb"],
+                "mariadb:11.4",
+                3306,
+                &[
+                    "MARIADB_ALLOW_EMPTY_ROOT_PASSWORD=yes",
+                    "MARIADB_DATABASE=orders",
+                ],
+                &["CMD", "mariadb-admin", "ping", "-h", "127.0.0.1"],
+            ),
+            service(
+                "inventory",
+                &["amqp"],
+                "crucible-example/orders-inventory:0.1",
+                8081,
+                &[
+                    "DATABASE_URL=mysql://root@db:3306/orders",
+                    "BROKER_URL=amqp://broker:5672",
+                    "RUST_LOG=info",
+                ],
+                &["CMD", "curl", "-fsS", "http://127.0.0.1:8081/healthz"],
+            ),
+        ],
+    }
+}
+
+fn service(
+    name: &str,
+    kinds: &[&str],
+    image: &str,
+    port: i64,
+    env: &[&str],
+    healthcheck: &[&str],
+) -> Service {
+    Service {
+        name: name.to_owned(),
+        kinds: kinds.iter().map(|kind| (*kind).to_owned()).collect(),
+        attrs: vec![
+            ("image".to_owned(), Value::Str(image.to_owned())),
+            ("port".to_owned(), Value::Int(port)),
+            ("env".to_owned(), strs(env)),
+            ("healthcheck".to_owned(), strs(healthcheck)),
+        ],
+    }
+}
+
+fn strs(values: &[&str]) -> Value {
+    Value::List(
+        values
+            .iter()
+            .map(|value| Value::Str((*value).to_owned()))
+            .collect(),
+    )
 }

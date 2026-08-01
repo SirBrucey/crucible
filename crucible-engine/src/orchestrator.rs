@@ -8,13 +8,14 @@ use std::{
 use crucible_protocol::{KillMissReason, KillReport, KillResult, ServiceProfile, now_ns};
 
 use crucible_core::{
-    deployment::{Deployment, Docker, docker, docker::HEAL_BUDGET},
+    HEAL_BUDGET,
     ipc::Verdict,
     observer::{self, DbObserver, SessionObserver},
     proxy_log::service_profiles_from_sessions,
     scenario::{self, Orders},
     verdict::{Invariant, driver_for},
 };
+use crucible_plugin::{DeploymentRuntime, FaultPrimitives};
 
 use crate::scheduler::Schedule;
 
@@ -44,7 +45,7 @@ pub enum Error {
     #[error(transparent)]
     Observer(#[from] observer::Error),
     #[error(transparent)]
-    Docker(#[from] docker::Error),
+    Deployment(#[from] crucible_plugin::Error),
 }
 
 /// Per-worker orchestrator that owns the replica lifecycle around one scenario,
@@ -58,7 +59,7 @@ pub enum Error {
 /// [`learn`]: Orchestrator::<Ready>::learn
 /// [`execute`]: Orchestrator::<Ready>::execute
 pub struct Orchestrator<S> {
-    deployment: Docker,
+    deployment: Box<dyn DeploymentRuntime>,
     scenario: Orders,
     state: S,
 }
@@ -81,7 +82,7 @@ pub struct Done {
 
 impl Orchestrator<New> {
     #[must_use]
-    pub fn new(deployment: Docker, scenario: Orders) -> Self {
+    pub fn new(deployment: Box<dyn DeploymentRuntime>, scenario: Orders) -> Self {
         Self {
             deployment,
             scenario,
@@ -96,7 +97,7 @@ impl Orchestrator<New> {
     /// # Errors
     /// Errors if the fleet fails to come up or become ready, or if the api
     /// endpoint is absent once it has (which the fleet always publishes).
-    pub async fn setup(mut self) -> Result<Orchestrator<Ready>, docker::Error> {
+    pub async fn setup(mut self) -> Result<Orchestrator<Ready>, crucible_plugin::Error> {
         if let Err(e) = self.deployment.setup().await {
             let _ = self.deployment.teardown().await;
             return Err(e);
@@ -110,7 +111,10 @@ impl Orchestrator<New> {
         let Some(api) = self.deployment.endpoint("api") else {
             session_observer.shutdown().await;
             let _ = self.deployment.teardown().await;
-            return Err(docker::Error::EndpointMissing("api".to_string()));
+            return Err(crucible_plugin::Error::new(
+                "orchestrator",
+                "the fleet published no `api` endpoint",
+            ));
         };
         Ok(Orchestrator {
             deployment: self.deployment,
@@ -125,8 +129,8 @@ impl Orchestrator<New> {
 
 impl Orchestrator<Ready> {
     #[must_use]
-    pub fn deployment(&self) -> &Docker {
-        &self.deployment
+    pub fn deployment(&self) -> &dyn DeploymentRuntime {
+        self.deployment.as_ref()
     }
 
     /// Run the scenario fault-free and return per-service profiles so the
@@ -222,7 +226,7 @@ impl Orchestrator<Ready> {
                             // The proxy never reported freezing (the target did not
                             // reach its Kth packet); release the freeze in case it is
                             // mid-flight and record a miss.
-                            deployment.resume_proxy().await?;
+                            deployment.resume().await?;
                             return Ok::<_, Error>(missed(schedule, KillMissReason::ScenarioEndedBeforeAnchor));
                         }
                         // The proxy froze the fleet to place the kill precisely on the
@@ -233,7 +237,7 @@ impl Orchestrator<Ready> {
                         // fail; ops once it is back succeed) rather than the world
                         // stopping while we heal.
                         let actual = scenario_start.elapsed().as_nanos();
-                        Ok(fire_kill(&deployment, schedule, actual).await?)
+                        Ok(fire_kill(deployment.as_ref(), schedule, actual).await?)
                     }
                     _ = &mut scenario_end_rx => {
                         // The scenario finished before a freeze was seen. The freeze
@@ -243,11 +247,11 @@ impl Orchestrator<Ready> {
                         // concluding the anchor was missed.
                         if session_observer.wait_for_freeze(FREEZE_GRACE).await {
                             let actual = scenario_start.elapsed().as_nanos();
-                            Ok(fire_kill(&deployment, schedule, actual).await?)
+                            Ok(fire_kill(deployment.as_ref(), schedule, actual).await?)
                         } else {
                             // Genuinely no freeze; release it in case one is
                             // mid-flight and record the miss.
-                            deployment.resume_proxy().await?;
+                            deployment.resume().await?;
                             Ok(missed(schedule, KillMissReason::ScenarioEndedBeforeAnchor))
                         }
                     }
@@ -295,7 +299,7 @@ impl Orchestrator<Ready> {
     ///
     /// # Errors
     /// Errors if the fleet's containers or network cannot be removed.
-    pub async fn teardown(self) -> Result<(), docker::Error> {
+    pub async fn teardown(self) -> Result<(), crucible_plugin::Error> {
         teardown_replica(self.deployment, self.state.session_observer).await
     }
 }
@@ -305,16 +309,16 @@ impl Orchestrator<Done> {
     ///
     /// # Errors
     /// Errors if the fleet's containers or network cannot be removed.
-    pub async fn teardown(self) -> Result<(), docker::Error> {
+    pub async fn teardown(self) -> Result<(), crucible_plugin::Error> {
         teardown_replica(self.deployment, self.state.session_observer).await
     }
 }
 
 /// Shut down the session observer, then remove the fleet replica.
 async fn teardown_replica(
-    mut deployment: Docker,
+    mut deployment: Box<dyn DeploymentRuntime>,
     session_observer: SessionObserver,
-) -> Result<(), docker::Error> {
+) -> Result<(), crucible_plugin::Error> {
     session_observer.shutdown().await;
     deployment.teardown().await
 }
@@ -337,27 +341,23 @@ fn missed(schedule: &Schedule, reason: KillMissReason) -> KillReport {
 /// verdict read afterwards would be meaningless. Those failures propagate as an
 /// error rather than being reported as a successful kill. A failed kill, by
 /// contrast, is a miss (nothing fired), not an error.
-async fn fire_kill<D>(
-    deployment: &D,
+async fn fire_kill(
+    deployment: &dyn FaultPrimitives,
     schedule: &Schedule,
     actual_offset_ns: u128,
-) -> Result<KillReport, D::Error>
-where
-    D: Deployment,
-    D::Error: std::fmt::Display,
-{
-    let killed_at_ns = match deployment.kill_service(&schedule.service).await {
+) -> Result<KillReport, crucible_plugin::Error> {
+    let killed_at_ns = match deployment.kill(&schedule.service).await {
         Ok(killed_at_ns) => killed_at_ns,
         Err(e) => {
             // The kill never landed, so nothing is dead; release the freeze the
             // proxy is holding and report the miss. A resume failure here still
             // leaves the fleet wedged, so it is fatal.
-            deployment.resume_proxy().await?;
+            deployment.resume().await?;
             return Ok(missed(schedule, KillMissReason::KillFailed(e.to_string())));
         }
     };
-    deployment.resume_proxy().await?;
-    deployment.restart_service(&schedule.service).await?;
+    deployment.resume().await?;
+    deployment.restart(&schedule.service).await?;
     Ok(KillReport {
         schedule_id: schedule.schedule_id,
         service: schedule.service.clone(),
@@ -372,20 +372,10 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::net::SocketAddr;
-
+    use crucible_plugin::role::BoxFuture;
     use crucible_protocol::Direction;
 
     use super::*;
-
-    #[derive(Debug)]
-    struct FakeError(&'static str);
-
-    impl std::fmt::Display for FakeError {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.write_str(self.0)
-        }
-    }
 
     /// A deployment whose fault primitives can be told to fail, so `fire_kill`'s
     /// error handling can be exercised without a real fleet.
@@ -396,45 +386,44 @@ mod tests {
         restart_fails: bool,
     }
 
-    impl Deployment for FakeDeployment {
-        type Error = FakeError;
+    impl FaultPrimitives for FakeDeployment {
+        fn arm_anchor(&self) -> BoxFuture<'_, Result<(), crucible_plugin::Error>> {
+            Box::pin(async { Ok(()) })
+        }
 
-        async fn setup(&mut self) -> Result<(), FakeError> {
-            Ok(())
+        fn resume(&self) -> BoxFuture<'_, Result<(), crucible_plugin::Error>> {
+            Box::pin(async move {
+                if self.resume_fails {
+                    Err(fake("resume failed"))
+                } else {
+                    Ok(())
+                }
+            })
         }
-        async fn wait_ready(&self) -> Result<(), FakeError> {
-            Ok(())
+
+        fn kill(&self, _service: &str) -> BoxFuture<'_, Result<u128, crucible_plugin::Error>> {
+            Box::pin(async move {
+                if self.kill_fails {
+                    Err(fake("kill failed"))
+                } else {
+                    Ok(42)
+                }
+            })
         }
-        async fn teardown(&mut self) -> Result<(), FakeError> {
-            Ok(())
+
+        fn restart(&self, _service: &str) -> BoxFuture<'_, Result<u128, crucible_plugin::Error>> {
+            Box::pin(async move {
+                if self.restart_fails {
+                    Err(fake("restart failed"))
+                } else {
+                    Ok(99)
+                }
+            })
         }
-        fn endpoint(&self, _name: &str) -> Option<SocketAddr> {
-            None
-        }
-        async fn arm_anchor(&self) -> Result<(), FakeError> {
-            Ok(())
-        }
-        async fn resume_proxy(&self) -> Result<(), FakeError> {
-            if self.resume_fails {
-                Err(FakeError("resume failed"))
-            } else {
-                Ok(())
-            }
-        }
-        async fn kill_service(&self, _name: &str) -> Result<u128, FakeError> {
-            if self.kill_fails {
-                Err(FakeError("kill failed"))
-            } else {
-                Ok(42)
-            }
-        }
-        async fn restart_service(&self, _name: &str) -> Result<u128, FakeError> {
-            if self.restart_fails {
-                Err(FakeError("restart failed"))
-            } else {
-                Ok(99)
-            }
-        }
+    }
+
+    fn fake(message: &'static str) -> crucible_plugin::Error {
+        crucible_plugin::Error::new("fake", message)
     }
 
     fn schedule() -> Schedule {
