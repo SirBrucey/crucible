@@ -554,7 +554,6 @@ dependencies = [
  "futures-util",
  "thiserror",
  "tokio",
- "tracing",
 ]
 
 [[package]]

@@ -2,7 +2,7 @@
 //! binds a service to that, and runs the replica.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     time::Duration,
 };
@@ -117,7 +117,15 @@ impl std::fmt::Display for TeardownFailures {
     }
 }
 
-pub type Result<T> = std::result::Result<T, Error>;
+#[derive(Debug, thiserror::Error)]
+pub enum BindError {
+    #[error("service `{service}` has no usable `{attr}`")]
+    Attr { service: String, attr: &'static str },
+    #[error("service `{service}`: {port} is not a port number")]
+    Port { service: String, port: i64 },
+}
+
+pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct Docker {
     client: DockerClient,
@@ -207,7 +215,7 @@ impl Docker {
         );
 
         let healthcheck = (!service.healthcheck.is_empty()).then(|| HealthConfig {
-            test: Some(service.healthcheck.iter().map(Clone::clone).collect()),
+            test: Some(service.healthcheck.clone()),
             interval: Some(nanos(HEALTHCHECK_INTERVAL)),
             start_period: Some(nanos(HEALTHCHECK_START_PERIOD)),
             ..Default::default()
@@ -252,7 +260,7 @@ impl Docker {
         // The proxy binds one listener per service port. Distinct ports map
         // through unchanged; a shared port cannot be disambiguated on the single
         // container IP, so reject it rather than misroute.
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = HashSet::new();
         for service in &self.fleet.services {
             if !seen.insert(service.port) {
                 return Err(Error::PortCollision(service.port));
@@ -336,11 +344,9 @@ impl Docker {
         }
         Ok(endpoints)
     }
-}
 
-impl Docker {
     /// SIGKILL the service's backing container. Returns the wall-clock
-    /// nanoseconds since the Unix epoch of the moment bollard's kill returned.
+    /// nanoseconds since the Unix epoch of the moment the kill returned.
     async fn kill_backing(&self, name: &str) -> Result<u128> {
         let service = self.service_by_name(name)?;
         let container = self.backing_container_name(service);
@@ -532,14 +538,6 @@ async fn published_port(
     })
 }
 
-#[derive(Debug, thiserror::Error)]
-pub enum BindError {
-    #[error("service `{service}` has no usable `{attr}`")]
-    Attr { service: String, attr: &'static str },
-    #[error("service `{service}`: {port} is not a port number")]
-    Port { service: String, port: i64 },
-}
-
 impl Deployment for Docker {
     const NAME: &'static str = "docker";
     type Config = fleet::Service;
@@ -554,7 +552,7 @@ impl Deployment for Docker {
         ])
     }
 
-    fn bind(service: &plan::Service) -> std::result::Result<Self::Config, Self::Error> {
+    fn bind(service: &plan::Service) -> Result<Self::Config, Self::Error> {
         let missing = |attr| BindError::Attr {
             service: service.name.clone(),
             attr,
@@ -583,10 +581,7 @@ impl Deployment for Docker {
 }
 
 /// An optional list-of-strings attribute, empty when the service omits it.
-fn owned_strs(
-    service: &plan::Service,
-    attr: &'static str,
-) -> std::result::Result<Vec<String>, BindError> {
+fn owned_strs(service: &plan::Service, attr: &'static str) -> Result<Vec<String>, BindError> {
     let Some(value) = service.attr(attr) else {
         return Ok(Vec::new());
     };
@@ -602,7 +597,7 @@ impl FaultPrimitives for Docker {
     /// the anchor lands relative to scenario traffic rather than the fleet's
     /// bring-up. When it reaches the scheduled packet the proxy freezes the
     /// fleet itself.
-    fn arm_anchor(&self) -> BoxFuture<'_, std::result::Result<(), PluginError>> {
+    fn arm_anchor(&self) -> BoxFuture<'_, Result<(), PluginError>> {
         Box::pin(async move {
             self.signal_proxy("SIGUSR1")
                 .await
@@ -611,7 +606,7 @@ impl FaultPrimitives for Docker {
     }
 
     /// SIGUSR2 the proxy to release the freeze, letting the held bytes flow again.
-    fn resume(&self) -> BoxFuture<'_, std::result::Result<(), PluginError>> {
+    fn resume(&self) -> BoxFuture<'_, Result<(), PluginError>> {
         Box::pin(async move {
             self.signal_proxy("SIGUSR2")
                 .await
@@ -619,12 +614,12 @@ impl FaultPrimitives for Docker {
         })
     }
 
-    fn kill(&self, service: &str) -> BoxFuture<'_, std::result::Result<u128, PluginError>> {
+    fn kill(&self, service: &str) -> BoxFuture<'_, Result<u128, PluginError>> {
         let service = service.to_owned();
         Box::pin(async move { self.kill_backing(&service).await.map_err(PluginError::from) })
     }
 
-    fn restart(&self, service: &str) -> BoxFuture<'_, std::result::Result<u128, PluginError>> {
+    fn restart(&self, service: &str) -> BoxFuture<'_, Result<u128, PluginError>> {
         let service = service.to_owned();
         Box::pin(async move {
             self.restart_backing(&service)
@@ -635,15 +630,15 @@ impl FaultPrimitives for Docker {
 }
 
 impl DeploymentRuntime for Docker {
-    fn setup(&mut self) -> BoxFuture<'_, std::result::Result<(), PluginError>> {
+    fn setup(&mut self) -> BoxFuture<'_, Result<(), PluginError>> {
         Box::pin(async move { self.create_replica().await.map_err(PluginError::from) })
     }
 
-    fn wait_ready(&self) -> BoxFuture<'_, std::result::Result<(), PluginError>> {
+    fn wait_ready(&self) -> BoxFuture<'_, Result<(), PluginError>> {
         Box::pin(async move { self.await_healthy().await.map_err(PluginError::from) })
     }
 
-    fn teardown(&mut self) -> BoxFuture<'_, std::result::Result<(), PluginError>> {
+    fn teardown(&mut self) -> BoxFuture<'_, Result<(), PluginError>> {
         Box::pin(async move { self.destroy_replica().await.map_err(PluginError::from) })
     }
 
@@ -802,10 +797,6 @@ mod tests {
             "orphan container should have been removed"
         );
     }
-
-    use super::{BindError, Docker};
-    use crate::role::Deployment;
-    use crucible_core::{fleet, plan, schema::ValueType};
 
     fn service(attrs: Vec<(&str, plan::Value)>) -> plan::Service {
         plan::Service {
