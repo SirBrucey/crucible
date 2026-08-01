@@ -8,6 +8,7 @@ license.workspace = true
 
 [dependencies]
 crucible-core = { path = "../crucible-core" }
+thiserror = { workspace = true }
 
 [lints]
 workspace = true

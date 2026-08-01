@@ -45,6 +45,23 @@ pub struct Service {
     pub attrs: Vec<(String, Value)>,
 }
 
+impl Service {
+    /// The named bring-up attribute, if the service declares it.
+    #[must_use]
+    pub fn attr(&self, name: &str) -> Option<&Value> {
+        lookup(&self.attrs, name)
+    }
+}
+
+/// The named entry of an attribute or body list.
+#[must_use]
+pub fn lookup<'a>(entries: &'a [(String, Value)], name: &str) -> Option<&'a Value> {
+    entries
+        .iter()
+        .find(|(key, _)| key == name)
+        .map(|(_, value)| value)
+}
+
 /// A scenario: its heal-phase deadline, driver steps, and settled-state checks.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Scenario {
@@ -84,4 +101,63 @@ pub enum Value {
     Ident(String),
     List(Vec<Value>),
     Map(Vec<(String, Value)>),
+}
+
+/// Read a value a plugin expects to be of a particular shape. The check pass has
+/// already validated it against the plugin's schema, so a `None` here means the
+/// plugin asked for something it never declared.
+impl Value {
+    #[must_use]
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            Value::Str(s) | Value::Ident(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn as_int(&self) -> Option<i64> {
+        match self {
+            Value::Int(n) => Some(*n),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn as_bool(&self) -> Option<bool> {
+        match self {
+            Value::Bool(b) => Some(*b),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn as_duration(&self) -> Option<Duration> {
+        match self {
+            Value::Duration(d) => Some(*d),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn as_list(&self) -> Option<&[Value]> {
+        match self {
+            Value::List(items) => Some(items),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn as_map(&self) -> Option<&[(String, Value)]> {
+        match self {
+            Value::Map(entries) => Some(entries),
+            _ => None,
+        }
+    }
+
+    /// The strings in a list value, or `None` if any entry is not a string.
+    #[must_use]
+    pub fn as_strs(&self) -> Option<Vec<&str>> {
+        self.as_list()?.iter().map(Value::as_str).collect()
+    }
 }
