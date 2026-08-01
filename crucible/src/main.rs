@@ -238,7 +238,9 @@ async fn reclaim_fleet(worker_id: u32) {
     }
 }
 
-/// Bring up a handle to the worker's replica purely to remove it.
+/// Remove a replica by worker id alone. Needs no live worker state, since the
+/// container and network names follow from the id, and is a no-op once the
+/// replica is already gone.
 async fn reclaim(worker_id: u32) -> std::result::Result<(), crucible_plugin::Error> {
     let mut deployment =
         crucible_plugin::Registry::builtins().deployment_for(&fleet::example(), worker_id, None)?;

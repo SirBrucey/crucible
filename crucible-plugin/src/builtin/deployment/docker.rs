@@ -63,8 +63,6 @@ pub enum Error {
     TeardownIncomplete(TeardownFailures),
     #[error("unknown service `{0}`")]
     UnknownService(String),
-    #[error("service `{0}` has no published endpoint after setup")]
-    EndpointMissing(String),
     #[error(
         "two services share port {0}; the single-container proxy would need to remap it and \
          rewrite the consumer's endpoint, which is not wired yet"
@@ -144,20 +142,6 @@ impl Docker {
             endpoints: HashMap::new(),
             anchor,
         })
-    }
-
-    /// Reclaim, by worker id alone, any fleet a worker left behind. The runner
-    /// calls this after force-killing a worker so a replica the worker never got
-    /// to tear down does not leak. It needs no live worker state (container and
-    /// network names are derived from the id), and is a no-op once the fleet is
-    /// already gone.
-    ///
-    /// # Errors
-    /// Errors if connecting to the Docker daemon fails, or if teardown cannot
-    /// remove the worker's containers or network.
-    pub async fn reclaim(worker_id: u32, fleet: Fleet) -> Result<()> {
-        let mut docker = Self::new(worker_id, fleet, None)?;
-        docker.destroy_replica().await
     }
 
     fn service_by_name(&self, name: &str) -> Result<&Service> {
