@@ -10,6 +10,7 @@
 use std::sync::Arc;
 
 use crucible_core::{
+    fault::Anchor,
     fleet,
     ipc::{
         HEARTBEAT_INTERVAL, RunnerToWorker, WorkerEvent, WorkerToRunner,
@@ -22,7 +23,7 @@ use crucible_engine::{
     orchestrator::{Done, Orchestrator, Ready},
     scheduler::Schedule,
 };
-use crucible_plugin::{Registry, builtin::deployment::docker::ProxyAnchor};
+use crucible_plugin::Registry;
 use tokio::{
     net::{
         UnixStream,
@@ -145,7 +146,7 @@ pub enum IdleNext {
 /// Build the fleet and the orchestrator, arming the proxy with `anchor` if set.
 /// Tears the replica down on any bring-up failure so a worker that dies here (a
 /// flaky readiness timeout, a crash) does not leak its containers.
-async fn bring_up(worker_id: u32, anchor: Option<ProxyAnchor>) -> Result<Orchestrator<Ready>> {
+async fn bring_up(worker_id: u32, anchor: Option<Anchor>) -> Result<Orchestrator<Ready>> {
     let deployment = Registry::builtins().deployment_for(&fleet::example(), worker_id, anchor)?;
     let orchestrator = Orchestrator::new(deployment, Orders::new()?)
         .setup()
@@ -258,7 +259,7 @@ impl Worker<Executing> {
     pub async fn execute_and_report(self) -> Result<Worker<ShuttingDown>> {
         let schedule = &self.state.schedule;
         let schedule_id = schedule.schedule_id;
-        let anchor = ProxyAnchor {
+        let anchor = Anchor {
             service: schedule.service.clone(),
             direction: schedule.direction,
             k: schedule.fault_packet_index,

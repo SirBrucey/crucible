@@ -23,6 +23,7 @@ use futures_util::TryStreamExt;
 use tokio::time::sleep;
 
 use crucible_core::{
+    fault::Anchor,
     fleet::{self, Fleet, Service},
     observer::SessionObserver,
     plan,
@@ -33,15 +34,6 @@ use crate::{
     error::Error as PluginError,
     role::{BoxFuture, Deployment, DeploymentRuntime, FaultPrimitives},
 };
-
-/// A fault anchor to arm the proxy with at fleet startup: freeze the fleet once
-/// `service` has forwarded `k` packets on `direction`. Passed on the proxy
-/// command line so it counts in-process, with no runtime control channel.
-pub struct ProxyAnchor {
-    pub service: String,
-    pub direction: Direction,
-    pub k: u32,
-}
 
 const READINESS_TIMEOUT: Duration = Duration::from_mins(1);
 const READINESS_POLL: Duration = Duration::from_millis(500);
@@ -132,7 +124,7 @@ pub struct Docker {
     network: String,
     fleet: Fleet,
     endpoints: HashMap<String, SocketAddr>,
-    anchor: Option<ProxyAnchor>,
+    anchor: Option<Anchor>,
 }
 
 impl Docker {
@@ -141,7 +133,7 @@ impl Docker {
     ///
     /// # Errors
     /// Errors if connecting to the Docker daemon socket fails.
-    pub fn new(worker_id: u32, fleet: Fleet, anchor: Option<ProxyAnchor>) -> Result<Self> {
+    pub fn new(worker_id: u32, fleet: Fleet, anchor: Option<Anchor>) -> Result<Self> {
         let client = DockerClient::connect_with_socket_defaults()?;
         Ok(Self {
             client,

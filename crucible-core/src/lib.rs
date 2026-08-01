@@ -2,6 +2,7 @@
 //! plan a scenario lowers to, the fleet spec, what a run observes, the verdicts
 //! drawn from it, and the runner/worker message protocol.
 
+pub mod fault;
 pub mod fleet;
 pub mod ipc;
 pub mod observer;

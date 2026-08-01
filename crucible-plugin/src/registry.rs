@@ -3,12 +3,13 @@
 use std::collections::HashMap;
 
 use crucible_core::{
+    fault::Anchor,
     fleet, plan,
     schema::{AttrSchema, OpSig},
 };
 
 use crate::{
-    builtin::{Docker, Http, Mariadb, deployment::docker::ProxyAnchor},
+    builtin::{Docker, Http, Mariadb},
     error::Error,
     role::{Deployment, DeploymentRuntime, Driver, Observer},
 };
@@ -85,7 +86,7 @@ impl Registry {
         &self,
         planned: &plan::Fleet,
         worker_id: u32,
-        anchor: Option<ProxyAnchor>,
+        anchor: Option<Anchor>,
     ) -> Result<Box<dyn DeploymentRuntime>, Error> {
         let name = planned.deployment.as_str();
         if !self.deployments.contains_key(name) {
