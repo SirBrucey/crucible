@@ -54,8 +54,7 @@ impl Service {
 }
 
 /// The named entry of an attribute or body list.
-#[must_use]
-pub fn lookup<'a>(entries: &'a [(String, Value)], name: &str) -> Option<&'a Value> {
+fn lookup<'a>(entries: &'a [(String, Value)], name: &str) -> Option<&'a Value> {
     entries
         .iter()
         .find(|(key, _)| key == name)
@@ -92,6 +91,10 @@ pub struct Check {
 }
 
 /// A literal value carried by a plan.
+///
+/// The `as_*` accessors mirror [`crate::schema::ValueType`], one per shape a
+/// plugin can declare. The check pass has already validated a value against the
+/// schema, so a `None` means the plugin asked for a shape it never declared.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Value {
     Str(String),
@@ -103,14 +106,21 @@ pub enum Value {
     Map(Vec<(String, Value)>),
 }
 
-/// Read a value a plugin expects to be of a particular shape. The check pass has
-/// already validated it against the plugin's schema, so a `None` here means the
-/// plugin asked for something it never declared.
 impl Value {
     #[must_use]
     pub fn as_str(&self) -> Option<&str> {
         match self {
-            Value::Str(s) | Value::Ident(s) => Some(s),
+            Value::Str(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// The service this value names, for a value declared as a service
+    /// reference.
+    #[must_use]
+    pub fn as_service_ref(&self) -> Option<&str> {
+        match self {
+            Value::Ident(s) => Some(s),
             _ => None,
         }
     }

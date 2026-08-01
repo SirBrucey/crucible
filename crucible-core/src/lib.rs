@@ -14,5 +14,4 @@ pub mod verdict;
 use std::time::Duration;
 
 /// How long a fleet is given to settle after a fault before its state is read.
-/// A scenario's `consistent_within` supersedes this once plans drive the run.
 pub const HEAL_BUDGET: Duration = Duration::from_secs(15);
