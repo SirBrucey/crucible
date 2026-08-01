@@ -24,6 +24,7 @@ use tokio::time::sleep;
 
 use crucible_core::{
     fleet::{self, Fleet, Service},
+    observer::SessionObserver,
     plan,
     schema::{AttrDecl, AttrSchema, ValueType},
 };
@@ -173,11 +174,6 @@ impl Docker {
             .kill_container(&self.proxy_container_name(), Some(options))
             .await?;
         Ok(())
-    }
-
-    #[must_use]
-    fn open_session_observer(&self) -> crucible_core::observer::SessionObserver {
-        crucible_core::observer::SessionObserver::start(&self.client, self.proxy_container_name())
     }
 
     /// Network-scoped name of a service's backing container: its in-network
@@ -359,20 +355,6 @@ impl Docker {
 }
 
 impl Docker {
-    /// SIGUSR1 the proxy: it resets its packet counter and begins counting, so
-    /// the anchor lands relative to scenario traffic rather than the fleet's
-    /// bring-up. When it reaches the scheduled packet the proxy freezes the
-    /// fleet itself.
-    async fn arm(&self) -> Result<()> {
-        self.signal_proxy("SIGUSR1").await
-    }
-
-    /// SIGUSR2 the proxy to release the freeze, letting the held bytes flow
-    /// again.
-    async fn release(&self) -> Result<()> {
-        self.signal_proxy("SIGUSR2").await
-    }
-
     /// SIGKILL the service's backing container. Returns the wall-clock
     /// nanoseconds since the Unix epoch of the moment bollard's kill returned.
     async fn kill_backing(&self, name: &str) -> Result<u128> {
@@ -468,10 +450,6 @@ impl Docker {
         } else {
             Err(Error::TeardownIncomplete(failures))
         }
-    }
-
-    fn endpoint_of(&self, name: &str) -> Option<SocketAddr> {
-        self.endpoints.get(name).copied()
     }
 }
 
@@ -636,12 +614,17 @@ fn owned_strs(
 }
 
 impl FaultPrimitives for Docker {
+    /// SIGUSR1 the proxy: it resets its packet counter and begins counting, so
+    /// the anchor lands relative to scenario traffic rather than the fleet's
+    /// bring-up. When it reaches the scheduled packet the proxy freezes the
+    /// fleet itself.
     fn arm_anchor(&self) -> BoxFuture<'_, std::result::Result<(), PluginError>> {
-        Box::pin(async move { self.arm().await.map_err(wrap) })
+        Box::pin(async move { self.signal_proxy("SIGUSR1").await.map_err(wrap) })
     }
 
+    /// SIGUSR2 the proxy to release the freeze, letting the held bytes flow again.
     fn resume(&self) -> BoxFuture<'_, std::result::Result<(), PluginError>> {
-        Box::pin(async move { self.release().await.map_err(wrap) })
+        Box::pin(async move { self.signal_proxy("SIGUSR2").await.map_err(wrap) })
     }
 
     fn kill(&self, service: &str) -> BoxFuture<'_, std::result::Result<u128, PluginError>> {
@@ -669,11 +652,11 @@ impl DeploymentRuntime for Docker {
     }
 
     fn endpoint(&self, service: &str) -> Option<SocketAddr> {
-        self.endpoint_of(service)
+        self.endpoints.get(service).copied()
     }
 
-    fn start_session_observer(&self) -> crucible_core::observer::SessionObserver {
-        self.open_session_observer()
+    fn start_session_observer(&self) -> SessionObserver {
+        SessionObserver::start(&self.client, self.proxy_container_name())
     }
 }
 
@@ -741,20 +724,23 @@ mod tests {
     async fn deployment_lifecycle_brings_up_and_tears_down_every_service() {
         let worker_id = std::process::id();
         let fleet = lifecycle_test_fleet();
-        let mut docker = Docker::new(worker_id, fleet.clone(), None).expect("connect to docker");
+        // Driven through the trait, which is how the framework reaches a
+        // deployment, so a delegation wired to the wrong method fails here.
+        let mut deployment: Box<dyn DeploymentRuntime> =
+            Box::new(Docker::new(worker_id, fleet.clone(), None).expect("connect to docker"));
 
-        let setup_outcome = docker.create_replica().await;
+        let setup_outcome = deployment.setup().await;
         for service in &fleet.services {
             assert!(
-                docker.endpoint_of(&service.name).is_some(),
+                deployment.endpoint(&service.name).is_some(),
                 "expected endpoint for `{}`",
                 service.name
             );
         }
 
-        let wait_outcome = docker.await_healthy().await;
+        let wait_outcome = deployment.wait_ready().await;
 
-        let teardown_outcome = docker.destroy_replica().await;
+        let teardown_outcome = deployment.teardown().await;
 
         setup_outcome.expect("setup should succeed");
         wait_outcome.expect("every service should become ready");
@@ -762,7 +748,7 @@ mod tests {
 
         for service in &fleet.services {
             assert!(
-                docker.endpoint_of(&service.name).is_none(),
+                deployment.endpoint(&service.name).is_none(),
                 "endpoint for `{}` should be cleared after teardown",
                 service.name
             );

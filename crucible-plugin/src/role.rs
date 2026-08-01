@@ -62,7 +62,9 @@ pub trait DeploymentRuntime: FaultPrimitives {
     fn endpoint(&self, service: &str) -> Option<SocketAddr>;
 
     /// Start streaming what the replica's substrate sees on the wire. The
-    /// deployment runs that substrate, so only it can open the stream.
+    /// deployment runs that substrate, so only it can open the stream. The
+    /// observer runs until shut down, so dropping one strands its tasks.
+    #[must_use]
     fn start_session_observer(&self) -> SessionObserver;
 }
 
