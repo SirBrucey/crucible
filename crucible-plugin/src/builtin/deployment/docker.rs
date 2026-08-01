@@ -851,6 +851,16 @@ mod tests {
     }
 
     #[test]
+    fn every_service_of_the_example_fleet_binds() {
+        // The example is built at runtime rather than declared as a constant, so
+        // a mistyped attribute would otherwise surface only at bring-up.
+        for service in &crucible_core::plan::example().services {
+            Docker::bind(service)
+                .unwrap_or_else(|e| panic!("service `{}` should bind: {e}", service.name));
+        }
+    }
+
+    #[test]
     fn a_port_outside_the_port_range_is_rejected() {
         let bound = Docker::bind(&service(vec![
             ("image", plan::Value::Str("example/api:1".into())),
