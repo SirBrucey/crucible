@@ -619,36 +619,48 @@ impl FaultPrimitives for Docker {
     /// bring-up. When it reaches the scheduled packet the proxy freezes the
     /// fleet itself.
     fn arm_anchor(&self) -> BoxFuture<'_, std::result::Result<(), PluginError>> {
-        Box::pin(async move { self.signal_proxy("SIGUSR1").await.map_err(wrap) })
+        Box::pin(async move {
+            self.signal_proxy("SIGUSR1")
+                .await
+                .map_err(PluginError::from)
+        })
     }
 
     /// SIGUSR2 the proxy to release the freeze, letting the held bytes flow again.
     fn resume(&self) -> BoxFuture<'_, std::result::Result<(), PluginError>> {
-        Box::pin(async move { self.signal_proxy("SIGUSR2").await.map_err(wrap) })
+        Box::pin(async move {
+            self.signal_proxy("SIGUSR2")
+                .await
+                .map_err(PluginError::from)
+        })
     }
 
     fn kill(&self, service: &str) -> BoxFuture<'_, std::result::Result<u128, PluginError>> {
         let service = service.to_owned();
-        Box::pin(async move { self.kill_backing(&service).await.map_err(wrap) })
+        Box::pin(async move { self.kill_backing(&service).await.map_err(PluginError::from) })
     }
 
     fn restart(&self, service: &str) -> BoxFuture<'_, std::result::Result<u128, PluginError>> {
         let service = service.to_owned();
-        Box::pin(async move { self.restart_backing(&service).await.map_err(wrap) })
+        Box::pin(async move {
+            self.restart_backing(&service)
+                .await
+                .map_err(PluginError::from)
+        })
     }
 }
 
 impl DeploymentRuntime for Docker {
     fn setup(&mut self) -> BoxFuture<'_, std::result::Result<(), PluginError>> {
-        Box::pin(async move { self.create_replica().await.map_err(wrap) })
+        Box::pin(async move { self.create_replica().await.map_err(PluginError::from) })
     }
 
     fn wait_ready(&self) -> BoxFuture<'_, std::result::Result<(), PluginError>> {
-        Box::pin(async move { self.await_healthy().await.map_err(wrap) })
+        Box::pin(async move { self.await_healthy().await.map_err(PluginError::from) })
     }
 
     fn teardown(&mut self) -> BoxFuture<'_, std::result::Result<(), PluginError>> {
-        Box::pin(async move { self.destroy_replica().await.map_err(wrap) })
+        Box::pin(async move { self.destroy_replica().await.map_err(PluginError::from) })
     }
 
     fn endpoint(&self, service: &str) -> Option<SocketAddr> {
@@ -660,8 +672,16 @@ impl DeploymentRuntime for Docker {
     }
 }
 
-fn wrap(e: Error) -> PluginError {
-    PluginError::new(Docker::NAME, e)
+impl From<Error> for PluginError {
+    fn from(e: Error) -> Self {
+        Self::new(Docker::NAME, e)
+    }
+}
+
+impl From<BindError> for PluginError {
+    fn from(e: BindError) -> Self {
+        Self::new(Docker::NAME, e)
+    }
 }
 
 #[cfg(test)]

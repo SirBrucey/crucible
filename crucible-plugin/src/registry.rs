@@ -74,46 +74,41 @@ impl Registry {
         self.drivers.keys().copied().collect()
     }
 
-    /// Bind every service of a planned fleet through the deployment plugin it
-    /// names, giving the spec that plugin needs to bring the fleet up.
-    ///
-    /// # Errors
-    /// Errors if the plan names a deployment plugin that is not registered, or
-    /// if a service does not bind.
-    pub fn bind_fleet(&self, planned: &plan::Fleet) -> Result<fleet::Fleet, Error> {
-        match planned.deployment.as_str() {
-            Docker::NAME => planned
-                .services
-                .iter()
-                .map(|service| Docker::bind(service).map_err(|e| Error::new(Docker::NAME, e)))
-                .collect::<Result<Vec<_>, _>>()
-                .map(fleet::Fleet::new),
-            other => Err(unknown_deployment(other)),
-        }
-    }
-
     /// Build the replica the planned fleet describes, ready to be brought up by
-    /// the deployment plugin it names.
+    /// the deployment plugin it names. The plugin must be registered, so a plan
+    /// that passed `check` against this registry resolves here too.
     ///
     /// # Errors
-    /// Errors if the plan names a deployment plugin that is not registered, if a
-    /// service does not bind, or if the plugin cannot be reached.
+    /// Errors if the plan names a deployment plugin this registry does not hold,
+    /// if a service does not bind, or if the plugin cannot be reached.
     pub fn deployment_for(
         &self,
         planned: &plan::Fleet,
         worker_id: u32,
         anchor: Option<ProxyAnchor>,
     ) -> Result<Box<dyn DeploymentRuntime>, Error> {
-        let fleet = self.bind_fleet(planned)?;
-        match planned.deployment.as_str() {
+        let name = planned.deployment.as_str();
+        if !self.deployments.contains_key(name) {
+            return Err(unknown_deployment(name));
+        }
+        match name {
             Docker::NAME => {
-                let docker = Docker::new(worker_id, fleet, anchor)
-                    .map_err(|e| Error::new(Docker::NAME, e))?;
+                let fleet = fleet::Fleet::new(bind_services::<Docker>(planned)?);
+                let docker = Docker::new(worker_id, fleet, anchor).map_err(Error::from)?;
                 Ok(Box::new(docker))
             }
             other => Err(unknown_deployment(other)),
         }
     }
+}
+
+/// Bind every service of a planned fleet through one deployment plugin.
+fn bind_services<D: Deployment>(planned: &plan::Fleet) -> Result<Vec<D::Config>, Error> {
+    planned
+        .services
+        .iter()
+        .map(|service| D::bind(service).map_err(|e| Error::new(D::NAME, e)))
+        .collect()
 }
 
 fn unknown_deployment(name: &str) -> Error {
@@ -138,5 +133,18 @@ mod tests {
         assert!(registry.deployment("podman").is_none());
         assert!(registry.driver("grpc").is_none());
         assert!(registry.observer("postgres").is_none());
+    }
+
+    #[test]
+    fn a_registry_will_not_build_a_deployment_it_does_not_hold() {
+        // A plan is checked against the registry before it runs, so a registry
+        // that reports a plugin absent must not then hand one out.
+        let registry = Registry::default();
+        assert!(registry.deployment("docker").is_none());
+        assert!(
+            registry
+                .deployment_for(&crucible_core::fleet::example(), 0, None)
+                .is_err()
+        );
     }
 }
