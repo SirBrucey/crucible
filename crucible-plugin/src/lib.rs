@@ -8,4 +8,4 @@ pub mod role;
 
 pub use error::Error;
 pub use registry::Registry;
-pub use role::{Deployment, DeploymentRuntime, Driver, Observer};
+pub use role::{Deployment, DeploymentRuntime, Driver, FaultPrimitives, Observer};

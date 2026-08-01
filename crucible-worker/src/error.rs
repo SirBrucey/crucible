@@ -1,6 +1,6 @@
 use std::io;
 
-use crucible_core::{deployment::docker, ipc::codec, observer, scenario};
+use crucible_core::{ipc::codec, observer, scenario};
 use crucible_engine::orchestrator;
 
 #[derive(Debug, thiserror::Error)]
@@ -10,13 +10,13 @@ pub enum Error {
     #[error(transparent)]
     Codec(#[from] codec::Error),
     #[error(transparent)]
-    Deployment(#[from] docker::Error),
-    #[error(transparent)]
     Scenario(#[from] scenario::Error),
     #[error(transparent)]
     Observer(#[from] observer::Error),
     #[error(transparent)]
     Execute(#[from] orchestrator::Error),
+    #[error(transparent)]
+    Plugin(#[from] crucible_plugin::Error),
     #[error("worker in state `{state}` expected `{expected}`, got `{got}`")]
     UnexpectedMessage {
         state: &'static str,

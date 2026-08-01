@@ -10,7 +10,6 @@
 use std::sync::Arc;
 
 use crucible_core::{
-    deployment::{Deployment, Docker, ProxyAnchor},
     fleet,
     ipc::{
         HEARTBEAT_INTERVAL, RunnerToWorker, WorkerEvent, WorkerToRunner,
@@ -23,6 +22,7 @@ use crucible_engine::{
     orchestrator::{Done, Orchestrator, Ready},
     scheduler::Schedule,
 };
+use crucible_plugin::{Registry, builtin::deployment::docker::ProxyAnchor};
 use tokio::{
     net::{
         UnixStream,
@@ -146,12 +146,10 @@ pub enum IdleNext {
 /// Tears the replica down on any bring-up failure so a worker that dies here (a
 /// flaky readiness timeout, a crash) does not leak its containers.
 async fn bring_up(worker_id: u32, anchor: Option<ProxyAnchor>) -> Result<Orchestrator<Ready>> {
-    let orchestrator = Orchestrator::new(
-        Docker::new(worker_id, &fleet::EXAMPLE, anchor)?,
-        Orders::new()?,
-    )
-    .setup()
-    .await?;
+    let deployment = Registry::builtins().deployment_for(&fleet::example(), worker_id, anchor)?;
+    let orchestrator = Orchestrator::new(deployment, Orders::new()?)
+        .setup()
+        .await?;
     Ok(orchestrator)
 }
 

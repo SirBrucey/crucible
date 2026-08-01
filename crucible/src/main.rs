@@ -9,8 +9,7 @@ use std::{
 
 use clap::{Parser, Subcommand};
 use crucible_core::{
-    deployment::docker::{Docker, HEAL_BUDGET},
-    fleet,
+    HEAL_BUDGET, fleet,
     ipc::{ServiceProfile, Verdict},
 };
 use crucible_engine::{
@@ -234,9 +233,16 @@ async fn run() -> Result<CampaignOutcome> {
 /// reclaims the replica so its containers and network do not leak and starve the
 /// host of the concurrent workers still running.
 async fn reclaim_fleet(worker_id: u32) {
-    if let Err(e) = Docker::reclaim(worker_id, &fleet::EXAMPLE).await {
+    if let Err(e) = reclaim(worker_id).await {
         tracing::warn!(worker_id, error = %e, "failed to reclaim worker fleet");
     }
+}
+
+/// Bring up a handle to the worker's replica purely to remove it.
+async fn reclaim(worker_id: u32) -> std::result::Result<(), crucible_plugin::Error> {
+    let mut deployment =
+        crucible_plugin::Registry::builtins().deployment_for(&fleet::example(), worker_id, None)?;
+    deployment.teardown().await
 }
 
 /// Remove this invocation's per-worker socket files, which unix listeners do not

@@ -2,11 +2,15 @@
 
 use std::collections::HashMap;
 
-use crucible_core::schema::{AttrSchema, OpSig};
+use crucible_core::{
+    fleet, plan,
+    schema::{AttrSchema, OpSig},
+};
 
 use crate::{
-    builtin::{Docker, Http, Mariadb},
-    role::{Deployment, Driver, Observer},
+    builtin::{Docker, Http, Mariadb, deployment::docker::ProxyAnchor},
+    error::Error,
+    role::{Deployment, DeploymentRuntime, Driver, Observer},
 };
 
 /// The available plugins, keyed by name and resolved to their schemas.
@@ -69,6 +73,51 @@ impl Registry {
     pub fn driver_names(&self) -> Vec<&'static str> {
         self.drivers.keys().copied().collect()
     }
+
+    /// Bind every service of a planned fleet through the deployment plugin it
+    /// names, giving the spec that plugin needs to bring the fleet up.
+    ///
+    /// # Errors
+    /// Errors if the plan names a deployment plugin that is not registered, or
+    /// if a service does not bind.
+    pub fn bind_fleet(&self, planned: &plan::Fleet) -> Result<fleet::Fleet, Error> {
+        match planned.deployment.as_str() {
+            Docker::NAME => planned
+                .services
+                .iter()
+                .map(|service| Docker::bind(service).map_err(|e| Error::new(Docker::NAME, e)))
+                .collect::<Result<Vec<_>, _>>()
+                .map(fleet::Fleet::new),
+            other => Err(unknown_deployment(other)),
+        }
+    }
+
+    /// Build the replica the planned fleet describes, ready to be brought up by
+    /// the deployment plugin it names.
+    ///
+    /// # Errors
+    /// Errors if the plan names a deployment plugin that is not registered, if a
+    /// service does not bind, or if the plugin cannot be reached.
+    pub fn deployment_for(
+        &self,
+        planned: &plan::Fleet,
+        worker_id: u32,
+        anchor: Option<ProxyAnchor>,
+    ) -> Result<Box<dyn DeploymentRuntime>, Error> {
+        let fleet = self.bind_fleet(planned)?;
+        match planned.deployment.as_str() {
+            Docker::NAME => {
+                let docker = Docker::new(worker_id, fleet, anchor)
+                    .map_err(|e| Error::new(Docker::NAME, e))?;
+                Ok(Box::new(docker))
+            }
+            other => Err(unknown_deployment(other)),
+        }
+    }
+}
+
+fn unknown_deployment(name: &str) -> Error {
+    Error::new("registry", format!("no deployment plugin named `{name}`"))
 }
 
 #[cfg(test)]

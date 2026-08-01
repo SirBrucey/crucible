@@ -7,8 +7,13 @@ publish.workspace = true
 license.workspace = true
 
 [dependencies]
+bollard = { workspace = true }
 crucible-core = { path = "../crucible-core" }
+crucible-protocol = { path = "../crucible-protocol" }
+futures-util = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
 
 [lints]
 workspace = true

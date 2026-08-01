@@ -9,6 +9,7 @@
 use std::{future::Future, net::SocketAddr, pin::Pin};
 
 use crucible_core::{
+    observer::SessionObserver,
     plan,
     schema::{AttrSchema, OpSig},
 };
@@ -37,15 +38,9 @@ pub trait Deployment {
     fn bind(service: &plan::Service) -> Result<Self::Config, Self::Error>;
 }
 
-/// A live fleet replica: bring it up, probe it, fault it, and remove it.
-pub trait DeploymentRuntime: Send + Sync {
-    fn setup(&mut self) -> BoxFuture<'_, Result<(), Error>>;
-    fn wait_ready(&self) -> BoxFuture<'_, Result<(), Error>>;
-    fn teardown(&mut self) -> BoxFuture<'_, Result<(), Error>>;
-
-    /// Where the named service can be reached, once the replica is up.
-    fn endpoint(&self, service: &str) -> Option<SocketAddr>;
-
+/// The faults a schedule drives against a live replica. Separate from the
+/// replica's lifecycle, because a schedule only ever needs these.
+pub trait FaultPrimitives: Send + Sync {
     /// Arm the fault anchor at scenario start, so the replica freezes once the
     /// target reaches the anchored point.
     fn arm_anchor(&self) -> BoxFuture<'_, Result<(), Error>>;
@@ -55,6 +50,20 @@ pub trait DeploymentRuntime: Send + Sync {
     fn kill(&self, service: &str) -> BoxFuture<'_, Result<u128, Error>>;
     /// Bring the named service back, reporting when it became ready.
     fn restart(&self, service: &str) -> BoxFuture<'_, Result<u128, Error>>;
+}
+
+/// A live fleet replica: bring it up, probe it, fault it, and remove it.
+pub trait DeploymentRuntime: FaultPrimitives {
+    fn setup(&mut self) -> BoxFuture<'_, Result<(), Error>>;
+    fn wait_ready(&self) -> BoxFuture<'_, Result<(), Error>>;
+    fn teardown(&mut self) -> BoxFuture<'_, Result<(), Error>>;
+
+    /// Where the named service can be reached, once the replica is up.
+    fn endpoint(&self, service: &str) -> Option<SocketAddr>;
+
+    /// Start streaming what the replica's substrate sees on the wire. The
+    /// deployment runs that substrate, so only it can open the stream.
+    fn start_session_observer(&self) -> SessionObserver;
 }
 
 /// A driver plugin: it advertises the action operations a `do { ... }` step can
