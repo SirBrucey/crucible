@@ -172,11 +172,48 @@ impl Value {
     }
 }
 
-/// The `orders` example fleet: an HTTP API that accepts orders, a rabbitmq
-/// broker, a mariadb database, and an inventory consumer that decrements
-/// stock in response to `order.created` events.
+/// The `orders` example: a fleet of an HTTP API that accepts orders, a rabbitmq
+/// broker, a mariadb database, and an inventory consumer that decrements stock
+/// in response to `order.created` events, and a scenario that places three
+/// orders and expects all three to survive.
 #[must_use]
-pub fn example() -> Fleet {
+pub fn example() -> Plan {
+    Plan {
+        fleet: example_fleet(),
+        scenarios: vec![example_scenario()],
+    }
+}
+
+fn example_scenario() -> Scenario {
+    let order = |item: &str, quantity: i64| Step {
+        driver: "http".into(),
+        operation: "POST".into(),
+        args: vec![Value::Ident("api".into()), Value::Str("/orders".into())],
+        body: Some(vec![
+            ("item".into(), Value::Str(item.into())),
+            ("quantity".into(), Value::Int(quantity)),
+        ]),
+    };
+    Scenario {
+        name: "orders_durability".into(),
+        consistent_within: Duration::from_secs(15),
+        steps: vec![
+            order("book", 4),
+            order("noodles", 10),
+            order("usb-c cable", 1),
+        ],
+        checks: vec![Check {
+            service: "db".into(),
+            observer: "mariadb".into(),
+            observable: vec!["orders".into(), "count".into()],
+            filter: None,
+            op: CmpOp::Eq,
+            value: Value::Int(3),
+        }],
+    }
+}
+
+fn example_fleet() -> Fleet {
     Fleet {
         name: "orders".into(),
         deployment: "docker".into(),

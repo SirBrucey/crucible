@@ -243,8 +243,11 @@ async fn reclaim_fleet(worker_id: u32) {
 /// container and network names follow from the id, and is a no-op once the
 /// replica is already gone.
 async fn reclaim(worker_id: u32) -> std::result::Result<(), crucible_plugin::Error> {
-    let mut deployment =
-        crucible_plugin::Registry::builtins().deployment_for(&plan::example(), worker_id, None)?;
+    let mut deployment = crucible_plugin::Registry::builtins().deployment_for(
+        &plan::example().fleet,
+        worker_id,
+        None,
+    )?;
     deployment.teardown().await
 }
 
