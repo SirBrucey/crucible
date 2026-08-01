@@ -1,6 +1,6 @@
 use std::io;
 
-use crucible_core::{ipc::codec, observer, scenario};
+use crucible_core::{ipc::codec, observer};
 use crucible_engine::orchestrator;
 
 #[derive(Debug, thiserror::Error)]
@@ -9,8 +9,6 @@ pub enum Error {
     Io(#[from] io::Error),
     #[error(transparent)]
     Codec(#[from] codec::Error),
-    #[error(transparent)]
-    Scenario(#[from] scenario::Error),
     #[error(transparent)]
     Observer(#[from] observer::Error),
     #[error(transparent)]
