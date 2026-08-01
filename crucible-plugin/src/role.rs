@@ -12,6 +12,7 @@ use crucible_core::{
     observer::SessionObserver,
     plan,
     schema::{AttrSchema, OpSig},
+    verdict::Outcome,
 };
 
 use crate::error::Error;
@@ -22,7 +23,7 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// A deployment plugin: it advertises the attributes a `service { ... }` body of
 /// its kind accepts, and binds them to its own configuration.
 pub trait Deployment {
-    /// Stable identifier used to select this plugin, e.g. `docker`.
+    /// Stable identifier used to select this plugin.
     const NAME: &'static str;
     /// This plugin's configuration for one service.
     type Config;
@@ -69,18 +70,48 @@ pub trait DeploymentRuntime: FaultPrimitives {
 }
 
 /// A driver plugin: it advertises the action operations a `do { ... }` step can
-/// invoke, e.g. `http` with `POST` / `GET` / `DELETE`.
+/// invoke, and binds a step to its own action type.
 pub trait Driver {
-    /// Stable identifier used to select this plugin, e.g. `http`.
+    /// Stable identifier used to select this plugin.
     const NAME: &'static str;
+    /// One step of a plan, in this plugin's own terms.
+    type Action;
+    type Error: std::error::Error + Send + Sync + 'static;
 
     fn signatures() -> Vec<OpSig>;
+
+    /// Bind a step to an action this driver can run.
+    ///
+    /// # Errors
+    /// Errors if the step names an operation this driver does not run, or
+    /// carries arguments it cannot use.
+    fn bind(step: &plan::Step) -> Result<Self::Action, Self::Error>;
+}
+
+/// A driver, ready to run steps.
+pub trait DriverRuntime: Send + Sync {
+    /// Bind a step to a runnable action. This happens before the fleet is
+    /// brought up, so a step the driver cannot run fails before anything starts.
+    ///
+    /// # Errors
+    /// Errors if the step does not bind to an operation this driver runs.
+    fn prepare(&self, step: &plan::Step) -> Result<Box<dyn Action>, Error>;
+}
+
+/// One bound step, runnable against the service it names.
+pub trait Action: Send + Sync {
+    /// The service this action runs against, so the caller can resolve where it
+    /// is reachable.
+    fn target(&self) -> &str;
+
+    /// Run the action, reporting whether the system took responsibility for it.
+    fn run(&self, endpoint: SocketAddr) -> BoxFuture<'_, Result<Outcome, Error>>;
 }
 
 /// An observer plugin: it advertises the observables an `expect { ... }`
-/// predicate can read, e.g. `mariadb` with `<table>.count`.
+/// predicate can read.
 pub trait Observer {
-    /// Stable identifier used to select this plugin, e.g. `mariadb`.
+    /// Stable identifier used to select this plugin.
     const NAME: &'static str;
 
     fn signatures() -> Vec<OpSig>;

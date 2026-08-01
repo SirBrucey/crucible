@@ -552,6 +552,8 @@ dependencies = [
  "crucible-core",
  "crucible-protocol",
  "futures-util",
+ "reqwest",
+ "serde_json",
  "thiserror",
  "tokio",
 ]
