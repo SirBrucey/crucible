@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use crucible_core::{
     fault::Anchor,
-    fleet, plan,
+    plan,
     schema::{AttrSchema, OpSig},
 };
 
@@ -94,8 +94,8 @@ impl Registry {
         }
         match name {
             Docker::NAME => {
-                let fleet = fleet::Fleet::new(bind_services::<Docker>(planned)?);
-                let docker = Docker::new(worker_id, fleet, anchor).map_err(Error::from)?;
+                let services = bind_services::<Docker>(planned)?;
+                let docker = Docker::new(worker_id, services, anchor).map_err(Error::from)?;
                 Ok(Box::new(docker))
             }
             other => Err(unknown_deployment(other)),
@@ -144,7 +144,7 @@ mod tests {
         assert!(registry.deployment("docker").is_none());
         assert!(
             registry
-                .deployment_for(&crucible_core::fleet::example(), 0, None)
+                .deployment_for(&crucible_core::plan::example(), 0, None)
                 .is_err()
         );
     }

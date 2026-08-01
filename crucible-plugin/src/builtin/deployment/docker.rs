@@ -24,7 +24,6 @@ use tokio::time::sleep;
 
 use crucible_core::{
     fault::Anchor,
-    fleet::{self, Fleet, Service},
     observer::SessionObserver,
     plan,
     schema::{AttrDecl, AttrSchema, ValueType},
@@ -119,10 +118,24 @@ pub enum BindError {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// What Docker needs to run one service.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServiceConfig {
+    pub name: String,
+    pub image: String,
+    pub port: u16,
+    /// Environment variables, one per entry in `KEY=value` form.
+    pub env: Vec<String>,
+    /// Command to run inside the container as a healthcheck; empty means the
+    /// image's own healthcheck.
+    pub healthcheck: Vec<String>,
+}
+
+/// Brings services up as Docker containers.
 pub struct Docker {
     client: DockerClient,
     network: String,
-    fleet: Fleet,
+    services: Vec<ServiceConfig>,
     endpoints: HashMap<String, SocketAddr>,
     anchor: Option<Anchor>,
 }
@@ -133,20 +146,25 @@ impl Docker {
     ///
     /// # Errors
     /// Errors if connecting to the Docker daemon socket fails.
-    pub fn new(worker_id: u32, fleet: Fleet, anchor: Option<Anchor>) -> Result<Self> {
+    pub fn new(
+        worker_id: u32,
+        services: Vec<ServiceConfig>,
+        anchor: Option<Anchor>,
+    ) -> Result<Self> {
         let client = DockerClient::connect_with_socket_defaults()?;
         Ok(Self {
             client,
             network: format!("crucible-{worker_id}"),
-            fleet,
+            services,
             endpoints: HashMap::new(),
             anchor,
         })
     }
 
-    fn service_by_name(&self, name: &str) -> Result<&Service> {
-        self.fleet
-            .service(name)
+    fn service_by_name(&self, name: &str) -> Result<&ServiceConfig> {
+        self.services
+            .iter()
+            .find(|service| service.name == name)
             .ok_or_else(|| Error::UnknownService(name.to_string()))
     }
 
@@ -162,7 +180,7 @@ impl Docker {
 
     /// Network-scoped name of a service's backing container: its in-network
     /// alias prefixed with the per-worker network.
-    fn backing_container_name(&self, service: &Service) -> String {
+    fn backing_container_name(&self, service: &ServiceConfig) -> String {
         format!("{}-{}", self.network, Self::backing_alias(service))
     }
 
@@ -175,7 +193,6 @@ impl Docker {
     /// fronting proxy.
     fn container_names(&self) -> Vec<String> {
         let mut names: Vec<String> = self
-            .fleet
             .services
             .iter()
             .map(|s| self.backing_container_name(s))
@@ -185,13 +202,13 @@ impl Docker {
     }
 
     /// In-network alias a backing container is reached by (via the proxy).
-    fn backing_alias(service: &Service) -> String {
+    fn backing_alias(service: &ServiceConfig) -> String {
         format!("{}-{}", service.name, BACKING_SUFFIX)
     }
 
     /// Start a service's backing container. It is reached only through the proxy
     /// (via its `service-actual` network alias), so it publishes no host port.
-    async fn start_service(&self, service: &Service) -> Result<()> {
+    async fn start_service(&self, service: &ServiceConfig) -> Result<()> {
         ensure_image(&self.client, &service.image).await?;
 
         let container_name = self.backing_container_name(service);
@@ -253,7 +270,7 @@ impl Docker {
         // through unchanged; a shared port cannot be disambiguated on the single
         // container IP, so reject it rather than misroute.
         let mut seen = HashSet::new();
-        for service in &self.fleet.services {
+        for service in &self.services {
             if !seen.insert(service.port) {
                 return Err(Error::PortCollision(service.port));
             }
@@ -261,8 +278,8 @@ impl Docker {
 
         let container_name = self.proxy_container_name();
 
-        let mut cmd = Vec::with_capacity(self.fleet.services.len() * 2 + 2);
-        for service in &self.fleet.services {
+        let mut cmd = Vec::with_capacity(self.services.len() * 2 + 2);
+        for service in &self.services {
             cmd.push("--pair".to_string());
             cmd.push(format!(
                 "{name}=0.0.0.0:{port}={upstream}:{port}",
@@ -281,13 +298,12 @@ impl Docker {
         }
 
         let exposed_ports: Vec<String> = self
-            .fleet
             .services
             .iter()
             .map(|s| format!("{}/tcp", s.port))
             .collect();
 
-        let aliases: Vec<String> = self.fleet.services.iter().map(|s| s.name.clone()).collect();
+        let aliases: Vec<String> = self.services.iter().map(|s| s.name.clone()).collect();
         let mut endpoints_config = HashMap::new();
         endpoints_config.insert(
             self.network.clone(),
@@ -326,8 +342,8 @@ impl Docker {
             .start_container(&container_name, None::<StartContainerOptions>)
             .await?;
 
-        let mut endpoints = Vec::with_capacity(self.fleet.services.len());
-        for service in &self.fleet.services {
+        let mut endpoints = Vec::with_capacity(self.services.len());
+        for service in &self.services {
             let host_port = published_port(&self.client, &container_name, service.port).await?;
             endpoints.push((
                 service.name.clone(),
@@ -379,14 +395,8 @@ impl Docker {
         // fronts the whole fleet. The proxy resolves its upstreams lazily, so the
         // backings need not be ready first.
         let docker = &*self;
-        futures_util::future::try_join_all(
-            docker
-                .fleet
-                .services
-                .iter()
-                .map(|s| docker.start_service(s)),
-        )
-        .await?;
+        futures_util::future::try_join_all(docker.services.iter().map(|s| docker.start_service(s)))
+            .await?;
         let endpoints = docker.start_proxy().await?;
         self.endpoints.extend(endpoints);
         Ok(())
@@ -532,7 +542,7 @@ async fn published_port(
 
 impl Deployment for Docker {
     const NAME: &'static str = "docker";
-    type Config = fleet::Service;
+    type Config = ServiceConfig;
     type Error = BindError;
 
     fn attr_schema() -> AttrSchema {
@@ -559,7 +569,7 @@ impl Deployment for Docker {
             .and_then(plan::Value::as_int)
             .ok_or_else(|| missing("port"))?;
 
-        Ok(fleet::Service {
+        Ok(ServiceConfig {
             name: service.name.clone(),
             image: image.to_owned(),
             port: u16::try_from(port).map_err(|_| BindError::Port {
@@ -693,15 +703,15 @@ mod tests {
 
     // Distinct ports: the single proxy container binds one listener per service
     // port, so two services must not share one (see `Error::PortCollision`).
-    fn lifecycle_test_fleet() -> Fleet {
-        Fleet::new(vec![
+    fn lifecycle_test_fleet() -> Vec<ServiceConfig> {
+        vec![
             test_service("web-a", "nginx:alpine", 80),
             test_service("cache-b", "redis:alpine", 6379),
-        ])
+        ]
     }
 
-    fn test_service(name: &str, image: &str, port: u16) -> Service {
-        Service {
+    fn test_service(name: &str, image: &str, port: u16) -> ServiceConfig {
+        ServiceConfig {
             name: name.to_owned(),
             image: image.to_owned(),
             port,
@@ -721,7 +731,7 @@ mod tests {
             Box::new(Docker::new(worker_id, fleet.clone(), None).expect("connect to docker"));
 
         let setup_outcome = deployment.setup().await;
-        for service in &fleet.services {
+        for service in &fleet {
             assert!(
                 deployment.endpoint(&service.name).is_some(),
                 "expected endpoint for `{}`",
@@ -737,7 +747,7 @@ mod tests {
         wait_outcome.expect("every service should become ready");
         teardown_outcome.expect("teardown should succeed");
 
-        for service in &fleet.services {
+        for service in &fleet {
             assert!(
                 deployment.endpoint(&service.name).is_none(),
                 "endpoint for `{}` should be cleared after teardown",
@@ -746,8 +756,8 @@ mod tests {
         }
     }
 
-    fn orphan_test_fleet() -> Fleet {
-        Fleet::new(vec![test_service("orphan", "nginx:alpine", 80)])
+    fn orphan_test_fleet() -> Vec<ServiceConfig> {
+        vec![test_service("orphan", "nginx:alpine", 80)]
     }
 
     #[tokio::test]
@@ -830,7 +840,7 @@ mod tests {
 
         assert_eq!(
             bound,
-            fleet::Service {
+            ServiceConfig {
                 name: "api".into(),
                 image: "example/api:1".into(),
                 port: 8080,

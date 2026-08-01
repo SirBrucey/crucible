@@ -9,8 +9,9 @@ use std::{
 
 use clap::{Parser, Subcommand};
 use crucible_core::{
-    HEAL_BUDGET, fleet,
+    HEAL_BUDGET,
     ipc::{ServiceProfile, Verdict},
+    plan,
 };
 use crucible_engine::{
     event_bus::EventBus,
@@ -243,7 +244,7 @@ async fn reclaim_fleet(worker_id: u32) {
 /// replica is already gone.
 async fn reclaim(worker_id: u32) -> std::result::Result<(), crucible_plugin::Error> {
     let mut deployment =
-        crucible_plugin::Registry::builtins().deployment_for(&fleet::example(), worker_id, None)?;
+        crucible_plugin::Registry::builtins().deployment_for(&plan::example(), worker_id, None)?;
     deployment.teardown().await
 }
 

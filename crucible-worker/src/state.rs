@@ -11,12 +11,12 @@ use std::sync::Arc;
 
 use crucible_core::{
     fault::Anchor,
-    fleet,
     ipc::{
         HEARTBEAT_INTERVAL, RunnerToWorker, WorkerEvent, WorkerToRunner,
         codec::{read_frame, write_frame},
     },
     observer::DbObserver,
+    plan,
     scenario::Orders,
 };
 use crucible_engine::{
@@ -147,7 +147,7 @@ pub enum IdleNext {
 /// Tears the replica down on any bring-up failure so a worker that dies here (a
 /// flaky readiness timeout, a crash) does not leak its containers.
 async fn bring_up(worker_id: u32, anchor: Option<Anchor>) -> Result<Orchestrator<Ready>> {
-    let deployment = Registry::builtins().deployment_for(&fleet::example(), worker_id, anchor)?;
+    let deployment = Registry::builtins().deployment_for(&plan::example(), worker_id, anchor)?;
     let orchestrator = Orchestrator::new(deployment, Orders::new()?)
         .setup()
         .await?;
