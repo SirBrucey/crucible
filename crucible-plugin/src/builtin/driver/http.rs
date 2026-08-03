@@ -1,23 +1,169 @@
 //! The HTTP driver plugin.
 
-use crucible_core::schema::{ClauseDecl, ClauseShape, HeadPattern, OpSig, Param, ParamType};
+use std::{net::SocketAddr, time::Duration};
 
-use crate::role::Driver;
+use crucible_core::{
+    plan,
+    schema::{ClauseDecl, ClauseShape, HeadPattern, OpSig, Param, ParamType},
+    verdict::{Ack, Outcome},
+};
+use reqwest::{Client, Method, StatusCode};
+
+use crate::{
+    error::Error as PluginError,
+    role::{Action, BoxFuture, Driver, DriverRuntime},
+};
+
+/// How long a request waits before the caller is left in doubt.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// The clause carrying a request payload.
+const BODY: &str = "body";
 
 /// Drives HTTP requests against a service.
-pub struct Http;
+pub struct Http {
+    client: Client,
+}
+
+/// One request, in the terms this plugin runs it.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Request {
+    pub method: Method,
+    pub service: String,
+    pub path: String,
+    pub body: Option<Vec<u8>>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error("`{0}` is not an HTTP method")]
+    Method(String),
+    #[error("a request names a service and a path")]
+    Arguments,
+    #[error("`{0}` is not a path: a path starts with `/`")]
+    Path(String),
+    #[error("`{0}` takes no body")]
+    Body(Method),
+    #[error("a body carries {0:?}, whose millisecond count does not fit a `u64`")]
+    Duration(Duration),
+    #[error(transparent)]
+    Client(#[from] reqwest::Error),
+    #[error(transparent)]
+    Encode(#[from] serde_json::Error),
+}
+
+impl From<Error> for PluginError {
+    fn from(e: Error) -> Self {
+        Self::new(Http::NAME, e)
+    }
+}
+
+impl Http {
+    /// A driver sharing one client, and so one connection pool, across the
+    /// steps it runs.
+    ///
+    /// # Errors
+    /// Errors if the HTTP client cannot be built.
+    pub fn new() -> Result<Self, Error> {
+        Ok(Self {
+            client: Client::builder().timeout(REQUEST_TIMEOUT).build()?,
+        })
+    }
+}
+
+/// A body is authored as plan values and sent as a JSON object.
+fn encode(fields: &[(String, plan::Value)]) -> Result<Vec<u8>, Error> {
+    let map: serde_json::Map<String, serde_json::Value> = fields
+        .iter()
+        .map(|(key, value)| Ok((key.clone(), json(value)?)))
+        .collect::<Result<_, Error>>()?;
+    Ok(serde_json::to_vec(&map)?)
+}
+
+fn json(value: &plan::Value) -> Result<serde_json::Value, Error> {
+    let json = match value {
+        plan::Value::Str(s) | plan::Value::Ident(s) => serde_json::Value::from(s.clone()),
+        plan::Value::Int(n) => serde_json::Value::from(*n),
+        plan::Value::Bool(b) => serde_json::Value::from(*b),
+        plan::Value::Duration(d) => u64::try_from(d.as_millis())
+            .map(serde_json::Value::from)
+            .map_err(|_| Error::Duration(*d))?,
+        plan::Value::List(items) => items
+            .iter()
+            .map(json)
+            .collect::<Result<Vec<_>, Error>>()?
+            .into(),
+        plan::Value::Map(entries) => serde_json::Value::Object(
+            entries
+                .iter()
+                .map(|(key, value)| Ok((key.clone(), json(value)?)))
+                .collect::<Result<_, Error>>()?,
+        ),
+    };
+    Ok(json)
+}
 
 impl Driver for Http {
     const NAME: &'static str = "http";
+    type Action = Request;
+    type Error = Error;
 
     fn signatures() -> Vec<OpSig> {
         vec![
             OpSig::action(HeadPattern::exact("POST"), request_params())
-                .with_clause(ClauseDecl::new("body", ClauseShape::Block)),
+                .with_clause(ClauseDecl::new(BODY, ClauseShape::Block)),
             OpSig::action(HeadPattern::exact("GET"), request_params()),
             OpSig::action(HeadPattern::exact("DELETE"), request_params()),
         ]
     }
+
+    fn bind(step: &plan::Step) -> Result<Self::Action, Self::Error> {
+        // Exactly the operations `signatures` advertises, so this driver never
+        // runs something it did not offer.
+        let method = match step.operation.as_str() {
+            "POST" => Method::POST,
+            "GET" => Method::GET,
+            "DELETE" => Method::DELETE,
+            other => return Err(Error::Method(other.to_owned())),
+        };
+        let [service, path] = step.args.as_slice() else {
+            return Err(Error::Arguments);
+        };
+        let (Some(service), Some(path)) = (service.as_service_ref(), path.as_str()) else {
+            return Err(Error::Arguments);
+        };
+        // A relative path would concatenate onto the address and address some
+        // other port entirely, so it is rejected here rather than sent.
+        if !path.starts_with('/') {
+            return Err(Error::Path(path.to_owned()));
+        }
+        if step.body.is_some() && !takes_body(&step.operation) {
+            return Err(Error::Body(method));
+        }
+        Ok(Request {
+            method,
+            service: service.to_owned(),
+            path: path.to_owned(),
+            body: step.body.as_deref().map(encode).transpose()?,
+        })
+    }
+}
+
+impl DriverRuntime for Http {
+    fn prepare(&self, step: &plan::Step) -> Result<Box<dyn Action>, PluginError> {
+        Ok(Box::new(Call {
+            request: Http::bind(step)?,
+            client: self.client.clone(),
+        }))
+    }
+}
+
+/// Whether the named operation declares a `body` clause, so what this driver
+/// accepts follows what it advertises.
+fn takes_body(operation: &str) -> bool {
+    Http::signatures()
+        .iter()
+        .filter(|sig| matches!(&sig.head, HeadPattern::Exact(name) if name == operation))
+        .any(|sig| sig.clauses.iter().any(|clause| clause.keyword == BODY))
 }
 
 fn request_params() -> Vec<Param> {
@@ -27,11 +173,112 @@ fn request_params() -> Vec<Param> {
     ]
 }
 
+/// A bound request and the client that sends it.
+struct Call {
+    request: Request,
+    client: Client,
+}
+
+impl Action for Call {
+    fn target(&self) -> &str {
+        &self.request.service
+    }
+
+    fn run(&self, endpoint: SocketAddr) -> BoxFuture<'_, Result<Outcome, PluginError>> {
+        Box::pin(async move { self.send(endpoint).await.map_err(PluginError::from) })
+    }
+}
+
+impl Call {
+    /// A transport failure is an outcome rather than an error: a scenario that
+    /// could not reach the fleet is what a fault is meant to cause. A request
+    /// that never became a request is not, so it errors instead of being
+    /// reported as something the fleet did.
+    async fn send(&self, endpoint: SocketAddr) -> Result<Outcome, Error> {
+        let request = &self.request;
+        let operation = format!("{} {}", request.method, request.path);
+        let sent = request.body.clone().unwrap_or_default();
+        let url = format!("http://{endpoint}{}", request.path);
+
+        let mut builder = self.client.request(request.method.clone(), url);
+        if let Some(body) = request.body.clone() {
+            builder = builder
+                .header("content-type", "application/json")
+                .body(body);
+        }
+
+        let outcome = match builder.send().await {
+            Ok(response) => {
+                let ack = classify(response.status());
+                let body = response.bytes().await.unwrap_or_default();
+                Outcome {
+                    operation,
+                    ack,
+                    request: sent,
+                    response: body.to_vec(),
+                }
+            }
+            // Nothing was ever sent, so there is no outcome to report: saying
+            // the fleet left this in doubt would count it towards a verdict.
+            Err(e) if e.is_builder() => return Err(Error::Client(e)),
+            // A refused connection never reached the service, so the request
+            // definitively did not happen; anything else leaves it in doubt.
+            Err(e) => Outcome {
+                operation,
+                ack: if e.is_connect() {
+                    Ack::Rejected
+                } else {
+                    Ack::Unknown
+                },
+                request: sent,
+                response: e.to_string().into_bytes(),
+            },
+        };
+        Ok(outcome)
+    }
+}
+
+/// The status decides whether the service took responsibility: a success
+/// acknowledges the request, a client error refuses it, and a server error
+/// leaves the caller unable to tell.
+fn classify(status: StatusCode) -> Ack {
+    if status.is_success() {
+        Ack::Acked
+    } else if status.is_client_error() {
+        Ack::Rejected
+    } else {
+        Ack::Unknown
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::Http;
+    use super::{Error, Http, Request};
     use crate::role::Driver;
-    use crucible_core::schema::{ClauseShape, HeadPattern};
+    use crucible_core::{
+        plan,
+        schema::{ClauseShape, HeadPattern},
+    };
+    use reqwest::Method;
+
+    fn step(operation: &str, args: Vec<plan::Value>) -> plan::Step {
+        plan::Step {
+            driver: "http".into(),
+            operation: operation.into(),
+            args,
+            body: None,
+        }
+    }
+
+    fn post_to(service: &str, path: &str) -> plan::Step {
+        step(
+            "POST",
+            vec![
+                plan::Value::Ident(service.into()),
+                plan::Value::Str(path.into()),
+            ],
+        )
+    }
 
     #[test]
     fn exposes_post_get_and_delete() {
@@ -56,5 +303,66 @@ mod tests {
                 .iter()
                 .any(|clause| clause.keyword == "body" && clause.shape == ClauseShape::Block),
         );
+    }
+
+    #[test]
+    fn a_step_binds_to_a_request() {
+        let bound = Http::bind(&post_to("api", "/orders")).expect("binds");
+        assert_eq!(
+            bound,
+            Request {
+                method: Method::POST,
+                service: "api".into(),
+                path: "/orders".into(),
+                body: None,
+            },
+        );
+    }
+
+    #[test]
+    fn a_body_binds_to_json() {
+        let mut step = post_to("api", "/orders");
+        step.body = Some(vec![
+            ("item".into(), plan::Value::Str("book".into())),
+            ("quantity".into(), plan::Value::Int(4)),
+        ]);
+        let bound = Http::bind(&step).expect("binds");
+        let body = bound.body.expect("a body was authored");
+        let sent: serde_json::Value = serde_json::from_slice(&body).expect("valid json");
+        assert_eq!(sent["item"], "book");
+        assert_eq!(sent["quantity"], 4);
+    }
+
+    #[test]
+    fn an_operation_that_is_not_a_method_is_rejected() {
+        let bound = Http::bind(&step("SEND", vec![plan::Value::Ident("api".into())]));
+        assert!(matches!(bound, Err(Error::Method(_))));
+    }
+
+    #[test]
+    fn an_operation_that_declares_no_body_will_not_take_one() {
+        let mut step = step(
+            "GET",
+            vec![
+                plan::Value::Ident("api".into()),
+                plan::Value::Str("/orders".into()),
+            ],
+        );
+        step.body = Some(vec![("item".into(), plan::Value::Str("book".into()))]);
+        assert!(matches!(Http::bind(&step), Err(Error::Body(_))));
+    }
+
+    #[test]
+    fn a_relative_path_is_rejected() {
+        // It would concatenate onto the address, addressing some other port,
+        // and the failure would look like the fleet leaving a write in doubt.
+        let bound = Http::bind(&post_to("api", "orders"));
+        assert!(matches!(bound, Err(Error::Path(_))));
+    }
+
+    #[test]
+    fn a_request_without_a_path_is_rejected() {
+        let bound = Http::bind(&step("GET", vec![plan::Value::Ident("api".into())]));
+        assert!(matches!(bound, Err(Error::Arguments)));
     }
 }

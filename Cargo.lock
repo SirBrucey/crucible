@@ -512,7 +512,6 @@ dependencies = [
  "postcard",
  "proptest",
  "rand 0.10.2",
- "reqwest",
  "serde",
  "serde_json",
  "sqlx",
@@ -552,6 +551,8 @@ dependencies = [
  "crucible-core",
  "crucible-protocol",
  "futures-util",
+ "reqwest",
+ "serde_json",
  "thiserror",
  "tokio",
 ]

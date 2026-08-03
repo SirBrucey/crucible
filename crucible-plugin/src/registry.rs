@@ -1,6 +1,6 @@
 //! The in-process registry of the compiled-in plugins, resolved to their schemas.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, hash_map::Entry};
 
 use crucible_core::{
     fault::Anchor,
@@ -11,7 +11,7 @@ use crucible_core::{
 use crate::{
     builtin::{Docker, Http, Mariadb},
     error::Error,
-    role::{Deployment, DeploymentRuntime, Driver, Observer},
+    role::{Action, Deployment, DeploymentRuntime, Driver, DriverRuntime, Observer},
 };
 
 /// The available plugins, keyed by name and resolved to their schemas.
@@ -88,17 +88,46 @@ impl Registry {
         worker_id: u32,
         anchor: Option<Anchor>,
     ) -> Result<Box<dyn DeploymentRuntime>, Error> {
-        let name = planned.deployment.as_str();
-        if !self.deployments.contains_key(name) {
-            return Err(unknown_deployment(name));
-        }
-        match name {
-            Docker::NAME => {
+        match planned.deployment.as_str() {
+            Docker::NAME if self.deployments.contains_key(Docker::NAME) => {
                 let services = bind_services::<Docker>(planned)?;
-                let docker = Docker::new(worker_id, services, anchor).map_err(Error::from)?;
-                Ok(Box::new(docker))
+                Ok(Box::new(Docker::new(worker_id, services, anchor)?))
             }
-            other => Err(unknown_deployment(other)),
+            other => Err(Error::new(
+                "registry",
+                format!("no deployment plugin named `{other}`"),
+            )),
+        }
+    }
+
+    /// Prepare every step of a scenario, each bound to the driver it names, in
+    /// the order the scenario runs them.
+    ///
+    /// # Errors
+    /// Errors if a step names a driver this registry does not hold, or does not
+    /// bind to an operation that driver runs.
+    pub fn actions_for(&self, scenario: &plan::Scenario) -> Result<Vec<Box<dyn Action>>, Error> {
+        let mut drivers: HashMap<&str, Box<dyn DriverRuntime>> = HashMap::new();
+        let mut actions = Vec::with_capacity(scenario.steps.len());
+        for step in &scenario.steps {
+            let driver = match drivers.entry(step.driver.as_str()) {
+                Entry::Occupied(driver) => driver.into_mut(),
+                Entry::Vacant(slot) => slot.insert(self.driver_runtime(&step.driver)?),
+            };
+            actions.push(driver.prepare(step)?);
+        }
+        Ok(actions)
+    }
+
+    /// The guard keeps this in step with what the registry reports: a plugin it
+    /// says is absent falls through to the catch-all rather than being built.
+    fn driver_runtime(&self, name: &str) -> Result<Box<dyn DriverRuntime>, Error> {
+        match name {
+            Http::NAME if self.drivers.contains_key(name) => Ok(Box::new(Http::new()?)),
+            other => Err(Error::new(
+                "registry",
+                format!("no driver plugin named `{other}`"),
+            )),
         }
     }
 }
@@ -110,10 +139,6 @@ fn bind_services<D: Deployment>(planned: &plan::Fleet) -> Result<Vec<D::Config>,
         .iter()
         .map(|service| D::bind(service).map_err(|e| Error::new(D::NAME, e)))
         .collect()
-}
-
-fn unknown_deployment(name: &str) -> Error {
-    Error::new("registry", format!("no deployment plugin named `{name}`"))
 }
 
 #[cfg(test)]
@@ -137,6 +162,23 @@ mod tests {
     }
 
     #[test]
+    fn every_step_of_the_example_scenario_prepares() {
+        let plan = crucible_core::plan::example();
+        let actions = Registry::builtins()
+            .actions_for(&plan.scenarios[0])
+            .expect("every step binds to its driver");
+        let targets: Vec<&str> = actions.iter().map(|action| action.target()).collect();
+        assert_eq!(targets, ["api", "api", "api"]);
+    }
+
+    #[test]
+    fn a_step_naming_an_unregistered_driver_is_rejected() {
+        let mut scenario = crucible_core::plan::example().scenarios.remove(0);
+        scenario.steps[0].driver = "grpc".into();
+        assert!(Registry::builtins().actions_for(&scenario).is_err());
+    }
+
+    #[test]
     fn a_registry_will_not_build_a_deployment_it_does_not_hold() {
         // A plan is checked against the registry before it runs, so a registry
         // that reports a plugin absent must not then hand one out.
@@ -144,7 +186,7 @@ mod tests {
         assert!(registry.deployment("docker").is_none());
         assert!(
             registry
-                .deployment_for(&crucible_core::plan::example(), 0, None)
+                .deployment_for(&crucible_core::plan::example().fleet, 0, None)
                 .is_err()
         );
     }

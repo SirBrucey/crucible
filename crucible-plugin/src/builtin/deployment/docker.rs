@@ -854,7 +854,7 @@ mod tests {
     fn every_service_of_the_example_fleet_binds() {
         // The example is built at runtime rather than declared as a constant, so
         // a mistyped attribute would otherwise surface only at bring-up.
-        for service in &crucible_core::plan::example().services {
+        for service in &crucible_core::plan::example().fleet.services {
             Docker::bind(service)
                 .unwrap_or_else(|e| panic!("service `{}` should bind: {e}", service.name));
         }

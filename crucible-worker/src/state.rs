@@ -17,7 +17,6 @@ use crucible_core::{
     },
     observer::DbObserver,
     plan,
-    scenario::Orders,
 };
 use crucible_engine::{
     orchestrator::{Done, Orchestrator, Ready},
@@ -147,10 +146,15 @@ pub enum IdleNext {
 /// Tears the replica down on any bring-up failure so a worker that dies here (a
 /// flaky readiness timeout, a crash) does not leak its containers.
 async fn bring_up(worker_id: u32, anchor: Option<Anchor>) -> Result<Orchestrator<Ready>> {
-    let deployment = Registry::builtins().deployment_for(&plan::example(), worker_id, anchor)?;
-    let orchestrator = Orchestrator::new(deployment, Orders::new()?)
-        .setup()
-        .await?;
+    let plan = plan::example();
+    let registry = Registry::builtins();
+    let deployment = registry.deployment_for(&plan.fleet, worker_id, anchor)?;
+    let scenario = plan
+        .scenarios
+        .first()
+        .ok_or_else(|| crucible_plugin::Error::new("worker", "the plan describes no scenario"))?;
+    let actions = registry.actions_for(scenario)?;
+    let orchestrator = Orchestrator::new(deployment, actions).setup().await?;
     Ok(orchestrator)
 }
 
