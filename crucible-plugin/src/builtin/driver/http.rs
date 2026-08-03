@@ -37,6 +37,8 @@ pub enum Error {
     Method(String),
     #[error("a request names a service and a path")]
     Arguments,
+    #[error("`{0}` is not a path: a path starts with `/`")]
+    Path(String),
     #[error("a body carries {0:?}, which is longer than a JSON number holds")]
     Duration(Duration),
     #[error(transparent)]
@@ -122,6 +124,11 @@ impl Driver for Http {
         let (Some(service), Some(path)) = (service.as_service_ref(), path.as_str()) else {
             return Err(Error::Arguments);
         };
+        // A relative path would concatenate onto the address and address some
+        // other port entirely, so it is rejected here rather than sent.
+        if !path.starts_with('/') {
+            return Err(Error::Path(path.to_owned()));
+        }
         Ok(Request {
             method,
             service: service.to_owned(),
@@ -159,14 +166,16 @@ impl Action for Call {
     }
 
     fn run(&self, endpoint: SocketAddr) -> BoxFuture<'_, Result<Outcome, PluginError>> {
-        Box::pin(async move { Ok(self.send(endpoint).await) })
+        Box::pin(async move { self.send(endpoint).await.map_err(PluginError::from) })
     }
 }
 
 impl Call {
     /// A transport failure is an outcome rather than an error: a scenario that
-    /// could not reach the fleet is what a fault is meant to cause.
-    async fn send(&self, endpoint: SocketAddr) -> Outcome {
+    /// could not reach the fleet is what a fault is meant to cause. A request
+    /// that never became a request is not, so it errors instead of being
+    /// reported as something the fleet did.
+    async fn send(&self, endpoint: SocketAddr) -> Result<Outcome, Error> {
         let request = &self.request;
         let operation = format!("{} {}", request.method, request.path);
         let sent = request.body.clone().unwrap_or_default();
@@ -179,7 +188,7 @@ impl Call {
                 .body(body);
         }
 
-        match builder.send().await {
+        let outcome = match builder.send().await {
             Ok(response) => {
                 let ack = classify(response.status());
                 let body = response.bytes().await.unwrap_or_default();
@@ -190,6 +199,9 @@ impl Call {
                     response: body.to_vec(),
                 }
             }
+            // Nothing was ever sent, so there is no outcome to report: saying
+            // the fleet left this in doubt would count it towards a verdict.
+            Err(e) if e.is_builder() => return Err(Error::Client(e)),
             // A refused connection never reached the service, so the request
             // definitively did not happen; anything else leaves it in doubt.
             Err(e) => Outcome {
@@ -202,7 +214,8 @@ impl Call {
                 request: sent,
                 response: e.to_string().into_bytes(),
             },
-        }
+        };
+        Ok(outcome)
     }
 }
 
@@ -305,6 +318,14 @@ mod tests {
     fn an_operation_that_is_not_a_method_is_rejected() {
         let bound = Http::bind(&step("SEND", vec![plan::Value::Ident("api".into())]));
         assert!(matches!(bound, Err(Error::Method(_))));
+    }
+
+    #[test]
+    fn a_relative_path_is_rejected() {
+        // It would concatenate onto the address, addressing some other port,
+        // and the failure would look like the fleet leaving a write in doubt.
+        let bound = Http::bind(&post_to("api", "orders"));
+        assert!(matches!(bound, Err(Error::Path(_))));
     }
 
     #[test]
