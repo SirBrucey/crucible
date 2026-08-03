@@ -538,7 +538,6 @@ dependencies = [
  "crucible-protocol",
  "serde",
  "serde_json",
- "thiserror",
  "tokio",
 ]
 
