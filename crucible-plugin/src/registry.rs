@@ -1,6 +1,6 @@
 //! The in-process registry of the compiled-in plugins, resolved to their schemas.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, hash_map::Entry};
 
 use crucible_core::{
     fault::Anchor,
@@ -88,17 +88,15 @@ impl Registry {
         worker_id: u32,
         anchor: Option<Anchor>,
     ) -> Result<Box<dyn DeploymentRuntime>, Error> {
-        let name = planned.deployment.as_str();
-        if !self.deployments.contains_key(name) {
-            return Err(unknown_deployment(name));
-        }
-        match name {
-            Docker::NAME => {
+        match planned.deployment.as_str() {
+            Docker::NAME if self.deployments.contains_key(Docker::NAME) => {
                 let services = bind_services::<Docker>(planned)?;
-                let docker = Docker::new(worker_id, services, anchor).map_err(Error::from)?;
-                Ok(Box::new(docker))
+                Ok(Box::new(Docker::new(worker_id, services, anchor)?))
             }
-            other => Err(unknown_deployment(other)),
+            other => Err(Error::new(
+                "registry",
+                format!("no deployment plugin named `{other}`"),
+            )),
         }
     }
 
@@ -112,24 +110,20 @@ impl Registry {
         let mut drivers: HashMap<&str, Box<dyn DriverRuntime>> = HashMap::new();
         let mut actions = Vec::with_capacity(scenario.steps.len());
         for step in &scenario.steps {
-            if !drivers.contains_key(step.driver.as_str()) {
-                drivers.insert(step.driver.as_str(), self.driver_runtime(&step.driver)?);
-            }
-            let driver = &drivers[step.driver.as_str()];
+            let driver = match drivers.entry(step.driver.as_str()) {
+                Entry::Occupied(driver) => driver.into_mut(),
+                Entry::Vacant(slot) => slot.insert(self.driver_runtime(&step.driver)?),
+            };
             actions.push(driver.prepare(step)?);
         }
         Ok(actions)
     }
 
+    /// The guard keeps this in step with what the registry reports: a plugin it
+    /// says is absent falls through to the catch-all rather than being built.
     fn driver_runtime(&self, name: &str) -> Result<Box<dyn DriverRuntime>, Error> {
-        if !self.drivers.contains_key(name) {
-            return Err(Error::new(
-                "registry",
-                format!("no driver plugin named `{name}`"),
-            ));
-        }
         match name {
-            Http::NAME => Ok(Box::new(Http::new().map_err(Error::from)?)),
+            Http::NAME if self.drivers.contains_key(name) => Ok(Box::new(Http::new()?)),
             other => Err(Error::new(
                 "registry",
                 format!("no driver plugin named `{other}`"),
@@ -145,10 +139,6 @@ fn bind_services<D: Deployment>(planned: &plan::Fleet) -> Result<Vec<D::Config>,
         .iter()
         .map(|service| D::bind(service).map_err(|e| Error::new(D::NAME, e)))
         .collect()
-}
-
-fn unknown_deployment(name: &str) -> Error {
-    Error::new("registry", format!("no deployment plugin named `{name}`"))
 }
 
 #[cfg(test)]

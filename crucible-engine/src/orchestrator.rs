@@ -1,7 +1,6 @@
 //! L4 orchestrator: brings up the fleet replica, executes one schedule, tears it down.
 
 use std::{
-    collections::HashMap,
     net::SocketAddr,
     time::{Duration, Instant},
 };
@@ -48,7 +47,7 @@ pub enum Error {
 
 /// Per-worker orchestrator that owns the replica lifecycle around one scenario,
 /// modelled as a typestate so a phase can only reach for what earlier phases
-/// produced. `New` holds just the deployment and scenario; [`setup`] brings up
+/// produced. `New` holds the deployment and the actions to run; [`setup`] brings up
 /// the fleet and its session observer to reach [`Ready`], from which the replica
 /// runs exactly one scenario, fault-free via [`learn`] or with a fault via
 /// [`execute`], leaving the orchestrator [`Done`] with only teardown remaining.
@@ -58,19 +57,23 @@ pub enum Error {
 /// [`execute`]: Orchestrator::<Ready>::execute
 pub struct Orchestrator<S> {
     deployment: Box<dyn DeploymentRuntime>,
-    actions: Vec<Box<dyn Action>>,
     state: S,
 }
 
-/// Before the fleet is up.
-pub struct New;
+/// Before the fleet is up, holding the scenario's actions until there is
+/// somewhere to run them.
+pub struct New {
+    actions: Vec<Box<dyn Action>>,
+}
 
-/// Fleet up and the session observer streaming: ready to run one scenario. Every
-/// action's target was resolved during setup, so running one uses a
-/// proven-present address rather than looking it up again.
+/// An action and the address its target answers on.
+type TargetedAction = (Box<dyn Action>, SocketAddr);
+
+/// Fleet up and the session observer streaming: ready to run one scenario. Each
+/// action carries the address its target answers on, resolved during setup.
 pub struct Ready {
     session_observer: SessionObserver,
-    endpoints: HashMap<String, SocketAddr>,
+    actions: Vec<TargetedAction>,
 }
 
 /// The scenario has run; only teardown remains.
@@ -83,8 +86,7 @@ impl Orchestrator<New> {
     pub fn new(deployment: Box<dyn DeploymentRuntime>, actions: Vec<Box<dyn Action>>) -> Self {
         Self {
             deployment,
-            actions,
-            state: New,
+            state: New { actions },
         }
     }
 
@@ -106,8 +108,8 @@ impl Orchestrator<New> {
             let _ = self.deployment.teardown().await;
             return Err(e);
         }
-        let endpoints = match self.resolve_targets() {
-            Ok(endpoints) => endpoints,
+        let actions = match resolve_targets(self.deployment.as_ref(), self.state.actions) {
+            Ok(actions) => actions,
             Err(e) => {
                 session_observer.shutdown().await;
                 let _ = self.deployment.teardown().await;
@@ -116,32 +118,32 @@ impl Orchestrator<New> {
         };
         Ok(Orchestrator {
             deployment: self.deployment,
-            actions: self.actions,
             state: Ready {
                 session_observer,
-                endpoints,
+                actions,
             },
         })
     }
+}
 
-    /// Where each service an action targets is reachable.
-    fn resolve_targets(&self) -> Result<HashMap<String, SocketAddr>, crucible_plugin::Error> {
-        self.actions
-            .iter()
-            .map(|action| {
-                let target = action.target();
-                self.deployment
-                    .endpoint(target)
-                    .map(|endpoint| (target.to_owned(), endpoint))
-                    .ok_or_else(|| {
-                        crucible_plugin::Error::new(
-                            "orchestrator",
-                            format!("the fleet published no endpoint for `{target}`"),
-                        )
-                    })
-            })
-            .collect()
-    }
+/// Pair each action with the address its target answers on.
+fn resolve_targets(
+    deployment: &dyn DeploymentRuntime,
+    actions: Vec<Box<dyn Action>>,
+) -> Result<Vec<TargetedAction>, crucible_plugin::Error> {
+    actions
+        .into_iter()
+        .map(|action| {
+            let target = action.target();
+            let endpoint = deployment.endpoint(target).ok_or_else(|| {
+                crucible_plugin::Error::new(
+                    "orchestrator",
+                    format!("the fleet published no endpoint for `{target}`"),
+                )
+            })?;
+            Ok((action, endpoint))
+        })
+        .collect()
 }
 
 impl Orchestrator<Ready> {
@@ -158,15 +160,13 @@ impl Orchestrator<Ready> {
     pub async fn learn(self) -> Result<(Vec<ServiceProfile>, Orchestrator<Done>), Error> {
         let Orchestrator {
             deployment,
-            actions,
-            state:
-                Ready {
-                    session_observer,
-                    endpoints,
-                },
+            state: Ready {
+                session_observer,
+                actions,
+            },
         } = self;
         let scenario_start_ns = now_ns();
-        let mut observations = match run_actions(&actions, &endpoints).await {
+        let mut observations = match run_actions(&actions).await {
             Ok(observations) => observations,
             Err(e) => {
                 // A failed scenario leaves the replica up; tear it down rather
@@ -187,7 +187,6 @@ impl Orchestrator<Ready> {
         let profiles = service_profiles_from_sessions(&observations.sessions, scenario_start_ns);
         let done = Orchestrator {
             deployment,
-            actions,
             state: Done { session_observer },
         };
         Ok((profiles, done))
@@ -209,12 +208,10 @@ impl Orchestrator<Ready> {
     ) -> Result<((Verdict, KillReport), Orchestrator<Done>), Error> {
         let Orchestrator {
             deployment,
-            actions,
-            state:
-                Ready {
-                    session_observer,
-                    endpoints,
-                },
+            state: Ready {
+                session_observer,
+                actions,
+            },
         } = self;
 
         // Run the fault sequence borrowing the replica handles, so whatever the
@@ -232,7 +229,7 @@ impl Orchestrator<Ready> {
             let (scenario_end_tx, mut scenario_end_rx) = tokio::sync::oneshot::channel::<()>();
             let scenario_start = Instant::now();
             let scenario_fut = async {
-                let result = run_actions(&actions, &endpoints).await;
+                let result = run_actions(&actions).await;
                 let _ = scenario_end_tx.send(());
                 result
             };
@@ -302,7 +299,6 @@ impl Orchestrator<Ready> {
             Ok((verdict, kill_report)) => {
                 let done = Orchestrator {
                     deployment,
-                    actions,
                     state: Done { session_observer },
                 };
                 Ok(((verdict, kill_report), done))
@@ -352,16 +348,11 @@ fn missed(schedule: &Schedule, reason: KillMissReason) -> KillReport {
 }
 
 /// Run a scenario's actions in order against the fleet, collecting what each
-/// one observed. Every action's target was resolved during setup, so the
-/// endpoint is present.
-async fn run_actions(
-    actions: &[Box<dyn Action>],
-    endpoints: &HashMap<String, SocketAddr>,
-) -> Result<Observations, crucible_plugin::Error> {
+/// one observed.
+async fn run_actions(actions: &[TargetedAction]) -> Result<Observations, crucible_plugin::Error> {
     let mut observations = Observations::empty();
-    for action in actions {
-        let endpoint = endpoints[action.target()];
-        observations.outcomes.push(action.run(endpoint).await?);
+    for (action, endpoint) in actions {
+        observations.outcomes.push(action.run(*endpoint).await?);
     }
     Ok(observations)
 }

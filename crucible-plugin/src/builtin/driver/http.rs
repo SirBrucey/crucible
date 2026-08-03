@@ -23,7 +23,7 @@ pub struct Http {
 }
 
 /// One request, in the terms this plugin runs it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct Request {
     pub method: Method,
     pub service: String,
@@ -39,7 +39,7 @@ pub enum Error {
     Arguments,
     #[error("`{0}` is not a path: a path starts with `/`")]
     Path(String),
-    #[error("a body carries {0:?}, which is longer than a JSON number holds")]
+    #[error("a body carries {0:?}, whose millisecond count does not fit a `u64`")]
     Duration(Duration),
     #[error(transparent)]
     Client(#[from] reqwest::Error),
@@ -54,6 +54,9 @@ impl From<Error> for PluginError {
 }
 
 impl Http {
+    /// A driver sharing one client, and so one connection pool, across the
+    /// steps it runs.
+    ///
     /// # Errors
     /// Errors if the HTTP client cannot be built.
     pub fn new() -> Result<Self, Error> {
@@ -61,38 +64,38 @@ impl Http {
             client: Client::builder().timeout(REQUEST_TIMEOUT).build()?,
         })
     }
+}
 
-    /// A body is authored as plan values and sent as JSON.
-    fn encode(fields: &[(String, plan::Value)]) -> Result<Vec<u8>, Error> {
-        let map: serde_json::Map<String, serde_json::Value> = fields
+/// A body is authored as plan values and sent as a JSON object.
+fn encode(fields: &[(String, plan::Value)]) -> Result<Vec<u8>, Error> {
+    let map: serde_json::Map<String, serde_json::Value> = fields
+        .iter()
+        .map(|(key, value)| Ok((key.clone(), json(value)?)))
+        .collect::<Result<_, Error>>()?;
+    Ok(serde_json::to_vec(&map)?)
+}
+
+fn json(value: &plan::Value) -> Result<serde_json::Value, Error> {
+    let json = match value {
+        plan::Value::Str(s) | plan::Value::Ident(s) => serde_json::Value::from(s.clone()),
+        plan::Value::Int(n) => serde_json::Value::from(*n),
+        plan::Value::Bool(b) => serde_json::Value::from(*b),
+        plan::Value::Duration(d) => u64::try_from(d.as_millis())
+            .map(serde_json::Value::from)
+            .map_err(|_| Error::Duration(*d))?,
+        plan::Value::List(items) => items
             .iter()
-            .map(|(key, value)| Ok((key.clone(), Self::json(value)?)))
-            .collect::<Result<_, Error>>()?;
-        Ok(serde_json::to_vec(&map)?)
-    }
-
-    fn json(value: &plan::Value) -> Result<serde_json::Value, Error> {
-        let json = match value {
-            plan::Value::Str(s) | plan::Value::Ident(s) => serde_json::Value::from(s.clone()),
-            plan::Value::Int(n) => serde_json::Value::from(*n),
-            plan::Value::Bool(b) => serde_json::Value::from(*b),
-            plan::Value::Duration(d) => u64::try_from(d.as_millis())
-                .map(serde_json::Value::from)
-                .map_err(|_| Error::Duration(*d))?,
-            plan::Value::List(items) => items
+            .map(json)
+            .collect::<Result<Vec<_>, Error>>()?
+            .into(),
+        plan::Value::Map(entries) => serde_json::Value::Object(
+            entries
                 .iter()
-                .map(Self::json)
-                .collect::<Result<Vec<_>, Error>>()?
-                .into(),
-            plan::Value::Map(entries) => serde_json::Value::Object(
-                entries
-                    .iter()
-                    .map(|(key, value)| Ok((key.clone(), Self::json(value)?)))
-                    .collect::<Result<_, Error>>()?,
-            ),
-        };
-        Ok(json)
-    }
+                .map(|(key, value)| Ok((key.clone(), json(value)?)))
+                .collect::<Result<_, Error>>()?,
+        ),
+    };
+    Ok(json)
 }
 
 impl Driver for Http {
@@ -133,7 +136,7 @@ impl Driver for Http {
             method,
             service: service.to_owned(),
             path: path.to_owned(),
-            body: step.body.as_deref().map(Self::encode).transpose()?,
+            body: step.body.as_deref().map(encode).transpose()?,
         })
     }
 }

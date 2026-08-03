@@ -149,7 +149,11 @@ async fn bring_up(worker_id: u32, anchor: Option<Anchor>) -> Result<Orchestrator
     let plan = plan::example();
     let registry = Registry::builtins();
     let deployment = registry.deployment_for(&plan.fleet, worker_id, anchor)?;
-    let actions = registry.actions_for(&plan.scenarios[0])?;
+    let scenario = plan
+        .scenarios
+        .first()
+        .ok_or_else(|| crucible_plugin::Error::new("worker", "the plan describes no scenario"))?;
+    let actions = registry.actions_for(scenario)?;
     let orchestrator = Orchestrator::new(deployment, actions).setup().await?;
     Ok(orchestrator)
 }

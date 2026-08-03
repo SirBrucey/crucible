@@ -90,8 +90,7 @@ pub trait Driver {
 
 /// A driver, ready to run steps.
 pub trait DriverRuntime: Send + Sync {
-    /// Bind a step to a runnable action. This happens before the fleet is
-    /// brought up, so a step the driver cannot run fails before anything starts.
+    /// Bind a step to a runnable action, without a live fleet.
     ///
     /// # Errors
     /// Errors if the step does not bind to an operation this driver runs.
@@ -100,8 +99,7 @@ pub trait DriverRuntime: Send + Sync {
 
 /// One bound step, runnable against the service it names.
 pub trait Action: Send + Sync {
-    /// The service this action runs against, so the caller can resolve where it
-    /// is reachable.
+    /// The service this action runs against.
     fn target(&self) -> &str;
 
     /// Run the action, reporting whether the system took responsibility for it.
