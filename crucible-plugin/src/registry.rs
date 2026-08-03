@@ -11,7 +11,10 @@ use crucible_core::{
 use crate::{
     builtin::{Docker, Http, Mariadb},
     error::Error,
-    role::{Action, Deployment, DeploymentRuntime, Driver, DriverRuntime, Observer},
+    role::{
+        Action, Deployment, DeploymentRuntime, Driver, DriverRuntime, Observer, ObserverRuntime,
+        Query,
+    },
 };
 
 /// The available plugins, keyed by name and resolved to their schemas.
@@ -174,6 +177,54 @@ impl Registry {
             )),
         }
     }
+
+    /// Prepare every check of a scenario, each bound to the observer that
+    /// answers it, reading as the service it names is configured.
+    ///
+    /// # Errors
+    /// Errors if a check names an observer this registry does not hold or a
+    /// service the fleet does not describe, or does not bind to an observable
+    /// that observer reads.
+    pub fn queries_for(
+        &self,
+        fleet: &plan::Fleet,
+        scenario: &plan::Scenario,
+    ) -> Result<Vec<Box<dyn Query>>, Error> {
+        scenario
+            .checks
+            .iter()
+            .map(|check| {
+                let service = fleet
+                    .services
+                    .iter()
+                    .find(|service| service.name == check.service)
+                    .ok_or_else(|| {
+                        Error::new(
+                            "registry",
+                            format!("the fleet has no service named `{}`", check.service),
+                        )
+                    })?;
+                self.observer_runtime(&check.observer, service)?
+                    .prepare(check)
+            })
+            .collect()
+    }
+
+    fn observer_runtime(
+        &self,
+        name: &str,
+        service: &plan::Service,
+    ) -> Result<Box<dyn ObserverRuntime>, Error> {
+        match name {
+            Mariadb::NAME if self.observers.contains_key(name) => {
+                Ok(Box::new(Mariadb::new(service)))
+            }
+            other => Err(Error::new(
+                "registry",
+                format!("no observer plugin named `{other}`"),
+            )),
+        }
+    }
 }
 
 /// What one service may declare: the attributes its deployment reads, plus
@@ -266,6 +317,27 @@ mod tests {
             .expect("every step binds to its driver");
         let targets: Vec<&str> = actions.iter().map(|action| action.target()).collect();
         assert_eq!(targets, ["api", "api", "api"]);
+    }
+
+    #[test]
+    fn every_check_of_the_example_scenario_prepares() {
+        let plan = crucible_core::plan::example();
+        let queries = Registry::builtins()
+            .queries_for(&plan.fleet, &plan.scenarios[0])
+            .expect("every check binds to its observer");
+        let targets: Vec<&str> = queries.iter().map(|query| query.target()).collect();
+        assert_eq!(targets, ["db"]);
+    }
+
+    #[test]
+    fn a_check_naming_a_service_the_fleet_lacks_is_rejected() {
+        let mut plan = crucible_core::plan::example();
+        plan.scenarios[0].checks[0].service = "ledger".into();
+        assert!(
+            Registry::builtins()
+                .queries_for(&plan.fleet, &plan.scenarios[0])
+                .is_err()
+        );
     }
 
     #[test]

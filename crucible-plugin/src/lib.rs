@@ -10,4 +10,5 @@ pub use error::Error;
 pub use registry::Registry;
 pub use role::{
     Action, Deployment, DeploymentRuntime, Driver, DriverRuntime, FaultPrimitives, Observer,
+    ObserverRuntime, Query,
 };
