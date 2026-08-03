@@ -5,9 +5,9 @@ use std::collections::HashMap;
 
 use crucible_core::{
     plan,
-    schema::{AttrSchema, CmpOp, HeadPattern, OpSig, Param, ParamType, ValueType},
+    schema::{CmpOp, HeadPattern, OpSig, Param, ParamType, ValueType},
 };
-use crucible_plugin::Registry;
+use crucible_plugin::{Registry, registry::ServiceSchema};
 
 use crate::{
     ast::{self, Clause, Fleet, OpCall, Predicate, Scenario, Value},
@@ -115,8 +115,14 @@ impl<'a> Lowerer<'a> {
         let mut plan_services = Vec::new();
         for service in &fleet.services {
             let kinds = self.service_kinds(&service.node);
-            if let Some(schema) = schema {
-                self.service_attrs(&service.node, schema);
+            // Each plugin the service speaks reads attributes of its own, so a
+            // service is checked against all of them together.
+            match self.registry.service_schema(&fleet.deployment.node, &kinds) {
+                Ok(schema) => self.service_attrs(&service.node, &schema),
+                // The unknown deployment is already reported above; anything
+                // else is the plugins disagreeing with each other.
+                Err(e) if schema.is_some() => self.error(service.node.name.span, e.to_string()),
+                Err(_) => {}
             }
             plan_services.push(plan::Service {
                 name: service.node.name.node.clone(),
@@ -159,9 +165,9 @@ impl<'a> Lowerer<'a> {
             .collect()
     }
 
-    /// Validate a service's attributes against the deployment schema, skipping the
-    /// reserved `kinds`.
-    fn service_attrs(&mut self, service: &ast::Service, schema: &AttrSchema) {
+    /// Validate a service's attributes against everything its plugins read,
+    /// skipping the reserved `kinds`.
+    fn service_attrs(&mut self, service: &ast::Service, schema: &ServiceSchema) {
         let Value::Map(entries) = &service.attrs.node else {
             return;
         };
@@ -172,7 +178,7 @@ impl<'a> Lowerer<'a> {
             if let Some(decl) = schema.attr(&key.node) {
                 self.check_type(value, &decl.ty);
             } else {
-                let known = sorted(schema.attrs.iter().map(|decl| decl.name.clone()));
+                let known = sorted(schema.attrs().map(|decl| decl.name.clone()));
                 self.error_suggesting(
                     key.span,
                     format!("unknown attribute `{}`", key.node),
@@ -181,12 +187,13 @@ impl<'a> Lowerer<'a> {
                 );
             }
         }
-        for decl in &schema.attrs {
+        for decl in schema.attrs() {
             if decl.required && !entries.iter().any(|(key, _)| key.node == decl.name) {
+                let reader = schema.reader(&decl.name).unwrap_or("a plugin");
                 self.error(
                     service.name.span,
                     format!(
-                        "service `{}` is missing required attribute `{}`",
+                        "service `{}` is missing `{}`, which `{reader}` reads",
                         service.name.node, decl.name
                     ),
                 );
@@ -711,8 +718,11 @@ mod tests {
     fn a_missing_required_attribute_is_reported() {
         let src = r#"fleet "f" { deployment: docker; service api { image: "x" } }
                      scenario "s" { consistent_within: 1s; }"#;
-        assert!(!diagnose(src).is_empty());
-        find(&diagnose(src), "missing required attribute `port`");
+        // Naming the plugin that reads it says where the requirement came from,
+        // which matters once several plugins read a service's attributes.
+        let diags = diagnose(src);
+        let diag = find(&diags, "is missing `port`");
+        assert!(diag.message.contains("docker"), "{}", diag.message);
     }
 
     #[test]

@@ -5,7 +5,7 @@ use std::collections::{HashMap, hash_map::Entry};
 use crucible_core::{
     fault::Anchor,
     plan,
-    schema::{AttrSchema, OpSig},
+    schema::{AttrDecl, AttrSchema, OpSig},
 };
 
 use crate::{
@@ -100,6 +100,50 @@ impl Registry {
         }
     }
 
+    /// What a service brought up by `deployment` and speaking `kinds` may
+    /// declare.
+    ///
+    /// # Errors
+    /// Errors if the deployment or one of the kinds is not registered, or if two
+    /// of them read one attribute as different things.
+    pub fn service_schema(
+        &self,
+        deployment: &str,
+        kinds: &[String],
+    ) -> Result<ServiceSchema, Error> {
+        let (name, attrs) = self.deployments.get_key_value(deployment).ok_or_else(|| {
+            Error::new(
+                "registry",
+                format!("no deployment plugin named `{deployment}`"),
+            )
+        })?;
+        let mut schema = ServiceSchema { attrs: Vec::new() };
+        schema.extend(name, attrs.clone())?;
+        for kind in kinds {
+            if let Some((name, attrs)) = self.kind_attrs(kind) {
+                schema.extend(name, attrs)?;
+            }
+        }
+        Ok(schema)
+    }
+
+    /// The attributes the named kind reads of a service that speaks it, and the
+    /// name it is registered under. A kind that is not registered reads nothing:
+    /// naming it is reported where the kind itself is resolved.
+    fn kind_attrs(&self, kind: &str) -> Option<(&'static str, AttrSchema)> {
+        match kind {
+            Http::NAME => self
+                .drivers
+                .get_key_value(kind)
+                .map(|(name, _)| (*name, Http::attr_schema())),
+            Mariadb::NAME => self
+                .observers
+                .get_key_value(kind)
+                .map(|(name, _)| (*name, Mariadb::attr_schema())),
+            _ => None,
+        }
+    }
+
     /// Prepare every step of a scenario, each bound to the driver it names, in
     /// the order the scenario runs them.
     ///
@@ -129,6 +173,59 @@ impl Registry {
                 format!("no driver plugin named `{other}`"),
             )),
         }
+    }
+}
+
+/// What one service may declare: the attributes its deployment reads, plus
+/// those read by each plugin it speaks, and which plugin reads each.
+pub struct ServiceSchema {
+    attrs: Vec<(AttrDecl, &'static str)>,
+}
+
+impl ServiceSchema {
+    /// The declaration for `name`, if any plugin reads it.
+    #[must_use]
+    pub fn attr(&self, name: &str) -> Option<&AttrDecl> {
+        self.attrs
+            .iter()
+            .find(|(decl, _)| decl.name == name)
+            .map(|(decl, _)| decl)
+    }
+
+    /// The plugin that reads `name`.
+    #[must_use]
+    pub fn reader(&self, name: &str) -> Option<&'static str> {
+        self.attrs
+            .iter()
+            .find(|(decl, _)| decl.name == name)
+            .map(|(_, plugin)| *plugin)
+    }
+
+    /// Every attribute a service may declare.
+    pub fn attrs(&self) -> impl Iterator<Item = &AttrDecl> {
+        self.attrs.iter().map(|(decl, _)| decl)
+    }
+
+    /// Take on `schema`, whose attributes `plugin` reads. Two plugins may read
+    /// the same attribute, which is how a service states a fact once for both,
+    /// but only if they agree on what it holds.
+    fn extend(&mut self, plugin: &'static str, schema: AttrSchema) -> Result<(), Error> {
+        for decl in schema.attrs {
+            match self.attrs.iter().find(|(held, _)| held.name == decl.name) {
+                Some((held, other)) if held.ty != decl.ty => {
+                    return Err(Error::new(
+                        "registry",
+                        format!(
+                            "`{}` and `{other}` disagree on what `{}` holds",
+                            plugin, decl.name
+                        ),
+                    ));
+                }
+                Some(_) => {}
+                None => self.attrs.push((decl, plugin)),
+            }
+        }
+        Ok(())
     }
 }
 

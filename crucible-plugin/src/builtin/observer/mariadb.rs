@@ -1,6 +1,8 @@
 //! The `MariaDB` observer plugin.
 
-use crucible_core::schema::{ClauseDecl, ClauseShape, CmpOp, HeadPattern, OpSig, ValueType};
+use crucible_core::schema::{
+    AttrDecl, AttrSchema, ClauseDecl, ClauseShape, CmpOp, HeadPattern, OpSig, ValueType,
+};
 
 use crate::role::Observer;
 
@@ -19,6 +21,16 @@ impl Observer for Mariadb {
             )
             .with_clause(ClauseDecl::new("where", ClauseShape::Filter)),
         ]
+    }
+
+    /// Which database holds the state is discovered rather than declared, since
+    /// the deployment is what creates it. Only the credentials to read it with
+    /// are the author's to give, and they default to the unprivileged case.
+    fn attr_schema() -> AttrSchema {
+        AttrSchema::new(vec![
+            AttrDecl::optional("user", ValueType::Str),
+            AttrDecl::optional("password", ValueType::Str),
+        ])
     }
 }
 

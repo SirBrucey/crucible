@@ -80,6 +80,13 @@ pub trait Driver {
 
     fn signatures() -> Vec<OpSig>;
 
+    /// What a service speaking this plugin declares beyond its bring-up: a
+    /// plugin that needs nothing of the author declares nothing.
+    #[must_use]
+    fn attr_schema() -> AttrSchema {
+        AttrSchema::new(Vec::new())
+    }
+
     /// Bind a step to an action this driver can run.
     ///
     /// # Errors
@@ -113,4 +120,11 @@ pub trait Observer {
     const NAME: &'static str;
 
     fn signatures() -> Vec<OpSig>;
+
+    /// What a service speaking this plugin declares beyond its bring-up: a
+    /// plugin that needs nothing of the author declares nothing.
+    #[must_use]
+    fn attr_schema() -> AttrSchema {
+        AttrSchema::new(Vec::new())
+    }
 }
