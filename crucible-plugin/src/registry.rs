@@ -5,13 +5,16 @@ use std::collections::{HashMap, hash_map::Entry};
 use crucible_core::{
     fault::Anchor,
     plan,
-    schema::{AttrSchema, OpSig},
+    schema::{AttrDecl, AttrSchema, OpSig},
 };
 
 use crate::{
     builtin::{Docker, Http, Mariadb},
     error::Error,
-    role::{Action, Deployment, DeploymentRuntime, Driver, DriverRuntime, Observer},
+    role::{
+        Action, Deployment, DeploymentRuntime, Driver, DriverRuntime, Observer, ObserverRuntime,
+        Query,
+    },
 };
 
 /// The available plugins, keyed by name and resolved to their schemas.
@@ -100,6 +103,50 @@ impl Registry {
         }
     }
 
+    /// What a service brought up by `deployment` and speaking `kinds` may
+    /// declare.
+    ///
+    /// # Errors
+    /// Errors if the deployment or one of the kinds is not registered, or if two
+    /// of them read one attribute as different things.
+    pub fn service_schema(
+        &self,
+        deployment: &str,
+        kinds: &[String],
+    ) -> Result<ServiceSchema, Error> {
+        let (name, attrs) = self.deployments.get_key_value(deployment).ok_or_else(|| {
+            Error::new(
+                "registry",
+                format!("no deployment plugin named `{deployment}`"),
+            )
+        })?;
+        let mut schema = ServiceSchema { attrs: Vec::new() };
+        schema.extend(name, attrs.clone())?;
+        for kind in kinds {
+            if let Some((name, attrs)) = self.kind_attrs(kind) {
+                schema.extend(name, attrs)?;
+            }
+        }
+        Ok(schema)
+    }
+
+    /// The attributes the named kind reads of a service that speaks it, and the
+    /// name it is registered under. A kind that is not registered reads nothing:
+    /// naming it is reported where the kind itself is resolved.
+    fn kind_attrs(&self, kind: &str) -> Option<(&'static str, AttrSchema)> {
+        match kind {
+            Http::NAME => self
+                .drivers
+                .get_key_value(kind)
+                .map(|(name, _)| (*name, Http::attr_schema())),
+            Mariadb::NAME => self
+                .observers
+                .get_key_value(kind)
+                .map(|(name, _)| (*name, Mariadb::attr_schema())),
+            _ => None,
+        }
+    }
+
     /// Prepare every step of a scenario, each bound to the driver it names, in
     /// the order the scenario runs them.
     ///
@@ -129,6 +176,112 @@ impl Registry {
                 format!("no driver plugin named `{other}`"),
             )),
         }
+    }
+
+    /// Prepare every check of a scenario, each bound to the observer that
+    /// answers it, reading as the service it names is configured.
+    ///
+    /// # Errors
+    /// Errors if a check names an observer this registry does not hold or a
+    /// service the fleet does not describe, or does not bind to an observable
+    /// that observer reads.
+    pub fn queries_for(
+        &self,
+        fleet: &plan::Fleet,
+        scenario: &plan::Scenario,
+    ) -> Result<Vec<PreparedCheck>, Error> {
+        scenario
+            .checks
+            .iter()
+            .map(|check| {
+                let service = fleet
+                    .services
+                    .iter()
+                    .find(|service| service.name == check.service)
+                    .ok_or_else(|| {
+                        Error::new(
+                            "registry",
+                            format!("the fleet has no service named `{}`", check.service),
+                        )
+                    })?;
+                let query = self
+                    .observer_runtime(&check.observer, service)?
+                    .prepare(check)?;
+                Ok((check.clone(), query))
+            })
+            .collect()
+    }
+
+    fn observer_runtime(
+        &self,
+        name: &str,
+        service: &plan::Service,
+    ) -> Result<Box<dyn ObserverRuntime>, Error> {
+        match name {
+            Mariadb::NAME if self.observers.contains_key(name) => {
+                Ok(Box::new(Mariadb::new(service)))
+            }
+            other => Err(Error::new(
+                "registry",
+                format!("no observer plugin named `{other}`"),
+            )),
+        }
+    }
+}
+
+/// A check and the query bound to answer it.
+pub type PreparedCheck = (plan::Check, Box<dyn Query>);
+
+/// What one service may declare: the attributes its deployment reads, plus
+/// those read by each plugin it speaks, and which plugin reads each.
+pub struct ServiceSchema {
+    attrs: Vec<(AttrDecl, &'static str)>,
+}
+
+impl ServiceSchema {
+    /// The declaration for `name`, if any plugin reads it.
+    #[must_use]
+    pub fn attr(&self, name: &str) -> Option<&AttrDecl> {
+        self.attrs
+            .iter()
+            .find(|(decl, _)| decl.name == name)
+            .map(|(decl, _)| decl)
+    }
+
+    /// The plugin that reads `name`.
+    #[must_use]
+    pub fn reader(&self, name: &str) -> Option<&'static str> {
+        self.attrs
+            .iter()
+            .find(|(decl, _)| decl.name == name)
+            .map(|(_, plugin)| *plugin)
+    }
+
+    /// Every attribute a service may declare.
+    pub fn attrs(&self) -> impl Iterator<Item = &AttrDecl> {
+        self.attrs.iter().map(|(decl, _)| decl)
+    }
+
+    /// Take on `schema`, whose attributes `plugin` reads. Two plugins may read
+    /// the same attribute, which is how a service states a fact once for both,
+    /// but only if they agree on what it holds.
+    fn extend(&mut self, plugin: &'static str, schema: AttrSchema) -> Result<(), Error> {
+        for decl in schema.attrs {
+            match self.attrs.iter().find(|(held, _)| held.name == decl.name) {
+                Some((held, other)) if held.ty != decl.ty => {
+                    return Err(Error::new(
+                        "registry",
+                        format!(
+                            "`{}` and `{other}` disagree on what `{}` holds",
+                            plugin, decl.name
+                        ),
+                    ));
+                }
+                Some(_) => {}
+                None => self.attrs.push((decl, plugin)),
+            }
+        }
+        Ok(())
     }
 }
 
@@ -169,6 +322,27 @@ mod tests {
             .expect("every step binds to its driver");
         let targets: Vec<&str> = actions.iter().map(|action| action.target()).collect();
         assert_eq!(targets, ["api", "api", "api"]);
+    }
+
+    #[test]
+    fn every_check_of_the_example_scenario_prepares() {
+        let plan = crucible_core::plan::example();
+        let queries = Registry::builtins()
+            .queries_for(&plan.fleet, &plan.scenarios[0])
+            .expect("every check binds to its observer");
+        let targets: Vec<&str> = queries.iter().map(|(_, query)| query.target()).collect();
+        assert_eq!(targets, ["db"]);
+    }
+
+    #[test]
+    fn a_check_naming_a_service_the_fleet_lacks_is_rejected() {
+        let mut plan = crucible_core::plan::example();
+        plan.scenarios[0].checks[0].service = "ledger".into();
+        assert!(
+            Registry::builtins()
+                .queries_for(&plan.fleet, &plan.scenarios[0])
+                .is_err()
+        );
     }
 
     #[test]

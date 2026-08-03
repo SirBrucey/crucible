@@ -18,14 +18,21 @@ pub enum Invariant {
 }
 
 /// Observations captured during schedule execution and fed to a [`Driver`].
-// FIXME(#83): db_state gives way to per-check observed values once observers
-// read what a check names.
 #[derive(Debug, Default)]
 pub struct Observations {
     pub outcomes: Vec<Outcome>,
-    pub db_state: Option<DbState>,
+    /// What the scenario's checks read once the fleet settled, in the order the
+    /// scenario states them.
+    pub checks: Vec<Observed>,
     pub sessions: Vec<crucible_protocol::Session>,
     pub kill: Option<crucible_protocol::KillReport>,
+}
+
+/// A check and what the fleet was actually holding when it was read.
+#[derive(Debug)]
+pub struct Observed {
+    pub check: crate::plan::Check,
+    pub value: crate::plan::Value,
 }
 
 impl Observations {
@@ -74,26 +81,6 @@ pub struct Outcome {
     pub ack: Ack,
     pub request: Vec<u8>,
     pub response: Vec<u8>,
-}
-
-/// Snapshot of the fleet's persisted state after the scenario finished.
-#[derive(Debug, Default)]
-pub struct DbState {
-    pub orders: Vec<OrderRow>,
-    pub stock: Vec<StockRow>,
-}
-
-#[derive(Debug)]
-pub struct OrderRow {
-    pub id: u64,
-    pub item: String,
-    pub quantity: i32,
-}
-
-#[derive(Debug)]
-pub struct StockRow {
-    pub item: String,
-    pub level: i32,
 }
 
 /// Produces a [`Verdict`] from a set of observations for one invariant.

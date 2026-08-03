@@ -15,7 +15,6 @@ use crucible_core::{
         HEARTBEAT_INTERVAL, RunnerToWorker, WorkerEvent, WorkerToRunner,
         codec::{read_frame, write_frame},
     },
-    observer::DbObserver,
     plan,
 };
 use crucible_engine::{
@@ -271,18 +270,14 @@ impl Worker<Executing> {
         let heartbeat = self.conn.start_heartbeat();
         let orchestrator = bring_up(self.id, Some(anchor)).await?;
 
-        // Read the database through the proxy's stable host port: it survives the
-        // db being killed and restarted (the alias re-resolves to the new
+        // A check reads through the proxy's stable host port: it survives the
+        // target being killed and restarted (the alias re-resolves to the new
         // container), where a direct ephemeral port would not. The anchor is
-        // dormant during setup and released before this observer queries, so the
-        // proxy path is never actually frozen under it.
-        let db_addr = orchestrator
-            .deployment()
-            .endpoint("db")
-            .expect("db endpoint present after setup");
-        let db_url = format!("mysql://root@{db_addr}/orders");
-        let db_observer = match DbObserver::connect(&db_url).await {
-            Ok(observer) => observer,
+        // dormant during setup and released before a check reads, so the proxy
+        // path is never actually frozen under it.
+        let plan = plan::example();
+        let queries = match Registry::builtins().queries_for(&plan.fleet, &plan.scenarios[0]) {
+            Ok(queries) => queries,
             Err(e) => {
                 let _ = orchestrator.teardown().await;
                 return Err(e.into());
@@ -290,7 +285,7 @@ impl Worker<Executing> {
         };
 
         let ((verdict, kill_report), orchestrator) = orchestrator
-            .execute(&self.state.schedule, db_observer)
+            .execute(&self.state.schedule, queries)
             .await
             .inspect_err(
                 |e| tracing::error!(worker_id = self.id, schedule_id, error = %e, "execute failed"),

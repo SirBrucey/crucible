@@ -1,7 +1,6 @@
 use std::io;
 
-use crucible_core::{ipc::codec, observer};
-use crucible_engine::orchestrator;
+use crucible_core::ipc::codec;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -9,10 +8,6 @@ pub enum Error {
     Io(#[from] io::Error),
     #[error(transparent)]
     Codec(#[from] codec::Error),
-    #[error(transparent)]
-    Observer(#[from] observer::Error),
-    #[error(transparent)]
-    Execute(#[from] orchestrator::Error),
     #[error(transparent)]
     Plugin(#[from] crucible_plugin::Error),
     #[error("worker in state `{state}` expected `{expected}`, got `{got}`")]

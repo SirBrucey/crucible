@@ -10,11 +10,13 @@ use crucible_protocol::{KillMissReason, KillReport, KillResult, ServiceProfile, 
 use crucible_core::{
     HEAL_BUDGET,
     ipc::Verdict,
-    observer::{self, DbObserver, SessionObserver},
+    observer::SessionObserver,
     proxy_log::service_profiles_from_sessions,
-    verdict::{Invariant, Observations, driver_for},
+    verdict::{Invariant, Observations, Observed, driver_for},
 };
-use crucible_plugin::{Action, DeploymentRuntime, FaultPrimitives};
+use crucible_plugin::{
+    Action, DeploymentRuntime, FaultPrimitives, Targeted, registry::PreparedCheck,
+};
 
 use crate::scheduler::Schedule;
 
@@ -36,14 +38,6 @@ const ANCHOR_TIMEOUT: Duration = Duration::from_mins(1);
 /// freeze triggered by a post-ack edge to become visible before concluding the
 /// anchor was missed. Comfortably larger than docker-log delivery latency.
 const FREEZE_GRACE: Duration = Duration::from_secs(1);
-
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-    #[error(transparent)]
-    Observer(#[from] observer::Error),
-    #[error(transparent)]
-    Plugin(#[from] crucible_plugin::Error),
-}
 
 /// Per-worker orchestrator that owns the replica lifecycle around one scenario,
 /// modelled as a typestate so a phase can only reach for what earlier phases
@@ -126,24 +120,31 @@ impl Orchestrator<New> {
     }
 }
 
-/// Pair each action with the address its target answers on.
-fn resolve_targets(
+/// Pair each of `bound` with the address its target answers on.
+fn resolve_targets<T: Targeted + ?Sized>(
     deployment: &dyn DeploymentRuntime,
-    actions: Vec<Box<dyn Action>>,
-) -> Result<Vec<TargetedAction>, crucible_plugin::Error> {
-    actions
+    bound: Vec<Box<T>>,
+) -> Result<Vec<(Box<T>, SocketAddr)>, crucible_plugin::Error> {
+    bound
         .into_iter()
-        .map(|action| {
-            let target = action.target();
-            let endpoint = deployment.endpoint(target).ok_or_else(|| {
-                crucible_plugin::Error::new(
-                    "orchestrator",
-                    format!("the fleet published no endpoint for `{target}`"),
-                )
-            })?;
-            Ok((action, endpoint))
+        .map(|bound| {
+            let endpoint = endpoint_for(deployment, bound.target())?;
+            Ok((bound, endpoint))
         })
         .collect()
+}
+
+/// Where the named service answers, once the replica is up.
+fn endpoint_for(
+    deployment: &dyn DeploymentRuntime,
+    target: &str,
+) -> Result<SocketAddr, crucible_plugin::Error> {
+    deployment.endpoint(target).ok_or_else(|| {
+        crucible_plugin::Error::new(
+            "orchestrator",
+            format!("the fleet published no endpoint for `{target}`"),
+        )
+    })
 }
 
 impl Orchestrator<Ready> {
@@ -157,7 +158,9 @@ impl Orchestrator<Ready> {
     ///
     /// # Errors
     /// Errors if the scenario fails to run against the fleet.
-    pub async fn learn(self) -> Result<(Vec<ServiceProfile>, Orchestrator<Done>), Error> {
+    pub async fn learn(
+        self,
+    ) -> Result<(Vec<ServiceProfile>, Orchestrator<Done>), crucible_plugin::Error> {
         let Orchestrator {
             deployment,
             state: Ready {
@@ -172,7 +175,7 @@ impl Orchestrator<Ready> {
                 // A failed scenario leaves the replica up; tear it down rather
                 // than dropping the only handle to it and its observer tasks.
                 let _ = teardown_replica(deployment, session_observer).await;
-                return Err(e.into());
+                return Err(e);
             }
         };
         // Let the fleet fall quiescent before snapshotting, so writes that land
@@ -194,18 +197,18 @@ impl Orchestrator<Ready> {
 
     /// Run the scenario; the proxy self-freezes the fleet once the target has
     /// forwarded the schedule's `fault_packet_index` packets on its direction,
-    /// then the kill lands against that held flow. `db_observer` reads the
-    /// durability state after the fleet settles. Produce a verdict and report,
-    /// leaving the orchestrator [`Done`].
+    /// then the kill lands against that held flow. The scenario's checks read
+    /// what the fleet settled on. Produce a verdict and report, leaving the
+    /// orchestrator [`Done`].
     ///
     /// # Errors
     /// Errors if arming, resuming, killing, or restarting the fleet fails, if the
-    /// scenario fails to run, or if the durability state cannot be read.
+    /// scenario fails to run, or if a check cannot be read.
     pub async fn execute(
         self,
         schedule: &Schedule,
-        db_observer: DbObserver,
-    ) -> Result<((Verdict, KillReport), Orchestrator<Done>), Error> {
+        queries: Vec<PreparedCheck>,
+    ) -> Result<((Verdict, KillReport), Orchestrator<Done>), crucible_plugin::Error> {
         let Orchestrator {
             deployment,
             state: Ready {
@@ -218,7 +221,7 @@ impl Orchestrator<Ready> {
         // outcome we still own them afterwards: on success they move into `Done`
         // for the caller to tear down, on error we tear down here rather than
         // dropping the only handle to the replica and its observer tasks.
-        let outcome: Result<(Verdict, KillReport), Error> = async {
+        let outcome: Result<(Verdict, KillReport), crucible_plugin::Error> = async {
             // Arm the anchor as the scenario starts: the proxy resets and counts
             // scenario packets from here, and wait_for_freeze captures its observer
             // baseline at the same moment, so both share the scenario-start origin.
@@ -243,7 +246,10 @@ impl Orchestrator<Ready> {
                             // reach its Kth packet); release the freeze in case it is
                             // mid-flight and record a miss.
                             deployment.resume().await?;
-                            return Ok::<_, Error>(missed(schedule, KillMissReason::ScenarioEndedBeforeAnchor));
+                            return Ok::<_, crucible_plugin::Error>(missed(
+                                schedule,
+                                KillMissReason::ScenarioEndedBeforeAnchor,
+                            ));
                         }
                         // The proxy froze the fleet to place the kill precisely on the
                         // anchored packet. Kill the target, then release the flow and
@@ -288,7 +294,7 @@ impl Orchestrator<Ready> {
                     .await;
             }
 
-            db_observer.observe(&mut observations).await?;
+            observations.checks = read_checks(deployment.as_ref(), queries).await?;
             session_observer.observe(&mut observations);
             let verdict = driver_for(Invariant::Durable).drive(&observations);
             Ok((verdict, kill_report))
@@ -345,6 +351,22 @@ fn missed(schedule: &Schedule, reason: KillMissReason) -> KillReport {
         service: schedule.service.clone(),
         result: KillResult::Missed(reason),
     }
+}
+
+/// Read what the fleet settled on, one reading per check the scenario states.
+async fn read_checks(
+    deployment: &dyn DeploymentRuntime,
+    queries: Vec<PreparedCheck>,
+) -> Result<Vec<Observed>, crucible_plugin::Error> {
+    let mut readings = Vec::with_capacity(queries.len());
+    for (check, query) in queries {
+        let endpoint = endpoint_for(deployment, query.target())?;
+        readings.push(Observed {
+            value: query.read(endpoint).await?,
+            check,
+        });
+    }
+    Ok(readings)
 }
 
 /// Run a scenario's actions in order against the fleet, collecting what each

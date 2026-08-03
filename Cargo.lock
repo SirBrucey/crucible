@@ -514,7 +514,6 @@ dependencies = [
  "rand 0.10.2",
  "serde",
  "serde_json",
- "sqlx",
  "strum",
  "thiserror",
  "tokio",
@@ -539,7 +538,6 @@ dependencies = [
  "crucible-protocol",
  "serde",
  "serde_json",
- "thiserror",
  "tokio",
 ]
 
@@ -553,6 +551,7 @@ dependencies = [
  "futures-util",
  "reqwest",
  "serde_json",
+ "sqlx",
  "thiserror",
  "tokio",
 ]

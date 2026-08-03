@@ -80,6 +80,13 @@ pub trait Driver {
 
     fn signatures() -> Vec<OpSig>;
 
+    /// What a service speaking this plugin declares beyond its bring-up: a
+    /// plugin that needs nothing of the author declares nothing.
+    #[must_use]
+    fn attr_schema() -> AttrSchema {
+        AttrSchema::new(Vec::new())
+    }
+
     /// Bind a step to an action this driver can run.
     ///
     /// # Errors
@@ -97,11 +104,14 @@ pub trait DriverRuntime: Send + Sync {
     fn prepare(&self, step: &plan::Step) -> Result<Box<dyn Action>, Error>;
 }
 
-/// One bound step, runnable against the service it names.
-pub trait Action: Send + Sync {
-    /// The service this action runs against.
+/// Something bound to one service of the fleet.
+pub trait Targeted {
+    /// The service this is bound to.
     fn target(&self) -> &str;
+}
 
+/// One bound step, runnable against the service it names.
+pub trait Action: Targeted + Send + Sync {
     /// Run the action, reporting whether the system took responsibility for it.
     fn run(&self, endpoint: SocketAddr) -> BoxFuture<'_, Result<Outcome, Error>>;
 }
@@ -111,6 +121,38 @@ pub trait Action: Send + Sync {
 pub trait Observer {
     /// Stable identifier used to select this plugin.
     const NAME: &'static str;
+    /// One check of a plan, in this plugin's own terms.
+    type Query;
+    type Error: std::error::Error + Send + Sync + 'static;
 
     fn signatures() -> Vec<OpSig>;
+
+    /// Bind a check to a query this observer can answer.
+    ///
+    /// # Errors
+    /// Errors if the check names an observable this observer does not read, or
+    /// filters it in a way it cannot express.
+    fn bind(check: &plan::Check) -> Result<Self::Query, Self::Error>;
+
+    /// What a service speaking this plugin declares beyond its bring-up: a
+    /// plugin that needs nothing of the author declares nothing.
+    #[must_use]
+    fn attr_schema() -> AttrSchema {
+        AttrSchema::new(Vec::new())
+    }
+}
+
+/// An observer, ready to read settled state.
+pub trait ObserverRuntime: Send + Sync {
+    /// Bind a check to a runnable query, without a live fleet.
+    ///
+    /// # Errors
+    /// Errors if the check does not bind to an observable this observer reads.
+    fn prepare(&self, check: &plan::Check) -> Result<Box<dyn Query>, Error>;
+}
+
+/// One bound check, readable against the service it names. It yields what was
+/// observed; the framework compares that against what the check expects.
+pub trait Query: Targeted + Send + Sync {
+    fn read(&self, endpoint: SocketAddr) -> BoxFuture<'_, Result<plan::Value, Error>>;
 }
