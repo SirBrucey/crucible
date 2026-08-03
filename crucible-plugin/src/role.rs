@@ -104,11 +104,14 @@ pub trait DriverRuntime: Send + Sync {
     fn prepare(&self, step: &plan::Step) -> Result<Box<dyn Action>, Error>;
 }
 
-/// One bound step, runnable against the service it names.
-pub trait Action: Send + Sync {
-    /// The service this action runs against.
+/// Something bound to one service of the fleet.
+pub trait Targeted {
+    /// The service this is bound to.
     fn target(&self) -> &str;
+}
 
+/// One bound step, runnable against the service it names.
+pub trait Action: Targeted + Send + Sync {
     /// Run the action, reporting whether the system took responsibility for it.
     fn run(&self, endpoint: SocketAddr) -> BoxFuture<'_, Result<Outcome, Error>>;
 }
@@ -150,9 +153,6 @@ pub trait ObserverRuntime: Send + Sync {
 
 /// One bound check, readable against the service it names. It yields what was
 /// observed; the framework compares that against what the check expects.
-pub trait Query: Send + Sync {
-    /// The service this query reads.
-    fn target(&self) -> &str;
-
+pub trait Query: Targeted + Send + Sync {
     fn read(&self, endpoint: SocketAddr) -> BoxFuture<'_, Result<plan::Value, Error>>;
 }

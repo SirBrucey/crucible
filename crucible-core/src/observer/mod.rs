@@ -1,9 +1,7 @@
 //! Observers snapshot per-run state into the shared `Observations` bag.
 
-pub mod db;
 pub mod session;
 
-pub use db::DbObserver;
 pub use session::{EventIndex, SessionObserver};
 
 #[derive(Debug, thiserror::Error)]

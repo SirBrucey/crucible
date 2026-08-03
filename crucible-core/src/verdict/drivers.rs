@@ -39,32 +39,47 @@ impl Driver for Durable {
             };
         }
 
-        // Without a persisted-state snapshot we can't say either way.
-        let Some(db) = &observations.db_state else {
+        // With nothing read after the heal we can't say either way.
+        if observations.checks.is_empty() {
             return Verdict::Inconclusive {
-                reason: "no persisted-state snapshot after heal".into(),
+                reason: "the scenario states nothing to check after heal".into(),
             };
-        };
+        }
 
         // The dual contract: everything acknowledged survived, and nothing
         // survived that was never acknowledged. An operation left in doubt may
-        // legitimately land either way, so it only widens the upper bound.
+        // legitimately land either way, so it only widens the upper bound. The
+        // scenario's own expectation is the fault-free one, which a kill
+        // legitimately changes, so the tally replaces it here.
         let acked = observations.acked();
         let unknown = observations.unknown();
-        let observed = db.orders.len();
-
-        if observed < acked {
-            return Verdict::Fail {
-                reason: format!("{acked} acked write(s), but only {observed} survived the heal"),
+        for observed in &observations.checks {
+            let name = observed.check.observable.join(".");
+            let Some(survived) = observed.value.as_int() else {
+                return Verdict::Inconclusive {
+                    reason: format!("`{name}` did not read as a number of writes"),
+                };
             };
-        }
-        if observed > acked + unknown {
-            return Verdict::Fail {
-                reason: format!(
-                    "{observed} write(s) persisted, but at most {} were acknowledged (zombie writes)",
-                    acked + unknown
-                ),
+            let Ok(survived) = usize::try_from(survived) else {
+                return Verdict::Inconclusive {
+                    reason: format!("`{name}` read as {survived}, which is not a count"),
+                };
             };
+            if survived < acked {
+                return Verdict::Fail {
+                    reason: format!(
+                        "{acked} acked write(s), but `{name}` holds only {survived} after heal"
+                    ),
+                };
+            }
+            if survived > acked + unknown {
+                return Verdict::Fail {
+                    reason: format!(
+                        "`{name}` holds {survived}, but at most {} were acknowledged (zombie writes)",
+                        acked + unknown
+                    ),
+                };
+            }
         }
         Verdict::Pass
     }
@@ -83,7 +98,10 @@ mod tests {
     use crucible_protocol::{KillReport, KillResult};
 
     use super::*;
-    use crate::verdict::{Ack, DbState, Invariant, OrderRow, Outcome, driver_for};
+    use crate::{
+        plan,
+        verdict::{Ack, Invariant, Observed, Outcome, driver_for},
+    };
 
     fn fired_kill() -> KillReport {
         KillReport {
@@ -107,26 +125,27 @@ mod tests {
         }
     }
 
-    fn persisted(count: u64) -> DbState {
-        DbState {
-            orders: (0..count)
-                .map(|id| OrderRow {
-                    id,
-                    item: "item".into(),
-                    quantity: 1,
-                })
-                .collect(),
-            stock: Vec::new(),
+    fn read(survived: i64) -> Observed {
+        Observed {
+            check: plan::Check {
+                service: "db".into(),
+                observer: "mariadb".into(),
+                observable: vec!["writes".into(), "count".into()],
+                filter: None,
+                op: crate::schema::CmpOp::Eq,
+                value: plan::Value::Int(survived),
+            },
+            value: plan::Value::Int(survived),
         }
     }
 
-    /// A run whose fault fired and whose state was snapshotted, so the dual
-    /// contract is the only thing left to decide the verdict.
-    fn judged(acks: &[Ack], survived: u64) -> Verdict {
+    /// A run whose fault fired and whose state was read, so the dual contract is
+    /// the only thing left to decide the verdict.
+    fn judged(acks: &[Ack], survived: i64) -> Verdict {
         let mut obs = Observations::empty();
         obs.kill = Some(fired_kill());
         obs.outcomes = acks.iter().copied().map(outcome).collect();
-        obs.db_state = Some(persisted(survived));
+        obs.checks = vec![read(survived)];
         Durable.drive(&obs)
     }
 
@@ -156,12 +175,12 @@ mod tests {
                 crucible_protocol::KillMissReason::ScenarioEndedBeforeAnchor,
             ),
         });
-        obs.db_state = Some(DbState::default());
+        obs.checks = vec![read(0)];
         assert!(matches!(Durable.drive(&obs), Verdict::Inconclusive { .. }));
     }
 
     #[test]
-    fn missing_db_state_is_inconclusive() {
+    fn a_scenario_with_nothing_to_check_is_inconclusive() {
         let mut obs = Observations::empty();
         obs.kill = Some(fired_kill());
         obs.outcomes.push(outcome(Ack::Acked));

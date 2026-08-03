@@ -189,7 +189,7 @@ impl Registry {
         &self,
         fleet: &plan::Fleet,
         scenario: &plan::Scenario,
-    ) -> Result<Vec<Box<dyn Query>>, Error> {
+    ) -> Result<Vec<PreparedCheck>, Error> {
         scenario
             .checks
             .iter()
@@ -204,8 +204,10 @@ impl Registry {
                             format!("the fleet has no service named `{}`", check.service),
                         )
                     })?;
-                self.observer_runtime(&check.observer, service)?
-                    .prepare(check)
+                let query = self
+                    .observer_runtime(&check.observer, service)?
+                    .prepare(check)?;
+                Ok((check.clone(), query))
             })
             .collect()
     }
@@ -226,6 +228,9 @@ impl Registry {
         }
     }
 }
+
+/// A check and the query bound to answer it.
+pub type PreparedCheck = (plan::Check, Box<dyn Query>);
 
 /// What one service may declare: the attributes its deployment reads, plus
 /// those read by each plugin it speaks, and which plugin reads each.
@@ -325,7 +330,7 @@ mod tests {
         let queries = Registry::builtins()
             .queries_for(&plan.fleet, &plan.scenarios[0])
             .expect("every check binds to its observer");
-        let targets: Vec<&str> = queries.iter().map(|query| query.target()).collect();
+        let targets: Vec<&str> = queries.iter().map(|(_, query)| query.target()).collect();
         assert_eq!(targets, ["db"]);
     }
 

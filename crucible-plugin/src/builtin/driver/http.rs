@@ -11,7 +11,7 @@ use reqwest::{Client, Method, StatusCode};
 
 use crate::{
     error::Error as PluginError,
-    role::{Action, BoxFuture, Driver, DriverRuntime},
+    role::{Action, BoxFuture, Driver, DriverRuntime, Targeted},
 };
 
 /// How long a request waits before the caller is left in doubt.
@@ -179,11 +179,13 @@ struct Call {
     client: Client,
 }
 
-impl Action for Call {
+impl Targeted for Call {
     fn target(&self) -> &str {
         &self.request.service
     }
+}
 
+impl Action for Call {
     fn run(&self, endpoint: SocketAddr) -> BoxFuture<'_, Result<Outcome, PluginError>> {
         Box::pin(async move { self.send(endpoint).await.map_err(PluginError::from) })
     }

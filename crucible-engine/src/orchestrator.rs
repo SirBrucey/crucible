@@ -10,11 +10,13 @@ use crucible_protocol::{KillMissReason, KillReport, KillResult, ServiceProfile, 
 use crucible_core::{
     HEAL_BUDGET,
     ipc::Verdict,
-    observer::{self, DbObserver, SessionObserver},
+    observer::{self, SessionObserver},
     proxy_log::service_profiles_from_sessions,
-    verdict::{Invariant, Observations, driver_for},
+    verdict::{Invariant, Observations, Observed, driver_for},
 };
-use crucible_plugin::{Action, DeploymentRuntime, FaultPrimitives};
+use crucible_plugin::{
+    Action, DeploymentRuntime, FaultPrimitives, Targeted, registry::PreparedCheck,
+};
 
 use crate::scheduler::Schedule;
 
@@ -126,24 +128,31 @@ impl Orchestrator<New> {
     }
 }
 
-/// Pair each action with the address its target answers on.
-fn resolve_targets(
+/// Pair each of `bound` with the address its target answers on.
+fn resolve_targets<T: Targeted + ?Sized>(
     deployment: &dyn DeploymentRuntime,
-    actions: Vec<Box<dyn Action>>,
-) -> Result<Vec<TargetedAction>, crucible_plugin::Error> {
-    actions
+    bound: Vec<Box<T>>,
+) -> Result<Vec<(Box<T>, SocketAddr)>, crucible_plugin::Error> {
+    bound
         .into_iter()
-        .map(|action| {
-            let target = action.target();
-            let endpoint = deployment.endpoint(target).ok_or_else(|| {
-                crucible_plugin::Error::new(
-                    "orchestrator",
-                    format!("the fleet published no endpoint for `{target}`"),
-                )
-            })?;
-            Ok((action, endpoint))
+        .map(|bound| {
+            let endpoint = endpoint_for(deployment, bound.target())?;
+            Ok((bound, endpoint))
         })
         .collect()
+}
+
+/// Where the named service answers, once the replica is up.
+fn endpoint_for(
+    deployment: &dyn DeploymentRuntime,
+    target: &str,
+) -> Result<SocketAddr, crucible_plugin::Error> {
+    deployment.endpoint(target).ok_or_else(|| {
+        crucible_plugin::Error::new(
+            "orchestrator",
+            format!("the fleet published no endpoint for `{target}`"),
+        )
+    })
 }
 
 impl Orchestrator<Ready> {
@@ -194,17 +203,17 @@ impl Orchestrator<Ready> {
 
     /// Run the scenario; the proxy self-freezes the fleet once the target has
     /// forwarded the schedule's `fault_packet_index` packets on its direction,
-    /// then the kill lands against that held flow. `db_observer` reads the
-    /// durability state after the fleet settles. Produce a verdict and report,
-    /// leaving the orchestrator [`Done`].
+    /// then the kill lands against that held flow. The scenario's checks read
+    /// what the fleet settled on. Produce a verdict and report, leaving the
+    /// orchestrator [`Done`].
     ///
     /// # Errors
     /// Errors if arming, resuming, killing, or restarting the fleet fails, if the
-    /// scenario fails to run, or if the durability state cannot be read.
+    /// scenario fails to run, or if a check cannot be read.
     pub async fn execute(
         self,
         schedule: &Schedule,
-        db_observer: DbObserver,
+        queries: Vec<PreparedCheck>,
     ) -> Result<((Verdict, KillReport), Orchestrator<Done>), Error> {
         let Orchestrator {
             deployment,
@@ -288,7 +297,7 @@ impl Orchestrator<Ready> {
                     .await;
             }
 
-            db_observer.observe(&mut observations).await?;
+            observations.checks = read_checks(deployment.as_ref(), queries).await?;
             session_observer.observe(&mut observations);
             let verdict = driver_for(Invariant::Durable).drive(&observations);
             Ok((verdict, kill_report))
@@ -345,6 +354,22 @@ fn missed(schedule: &Schedule, reason: KillMissReason) -> KillReport {
         service: schedule.service.clone(),
         result: KillResult::Missed(reason),
     }
+}
+
+/// Read what the fleet settled on, one reading per check the scenario states.
+async fn read_checks(
+    deployment: &dyn DeploymentRuntime,
+    queries: Vec<PreparedCheck>,
+) -> Result<Vec<Observed>, crucible_plugin::Error> {
+    let mut readings = Vec::with_capacity(queries.len());
+    for (check, query) in queries {
+        let endpoint = endpoint_for(deployment, query.target())?;
+        readings.push(Observed {
+            value: query.read(endpoint).await?,
+            check,
+        });
+    }
+    Ok(readings)
 }
 
 /// Run a scenario's actions in order against the fleet, collecting what each

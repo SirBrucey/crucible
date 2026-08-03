@@ -10,7 +10,7 @@ use sqlx::{AssertSqlSafe, MySql, Pool, Row};
 
 use crate::{
     error::Error as PluginError,
-    role::{BoxFuture, Observer, ObserverRuntime, Query},
+    role::{BoxFuture, Observer, ObserverRuntime, Query, Targeted},
 };
 
 /// The clause narrowing which rows are counted.
@@ -147,11 +147,13 @@ struct Read {
     password: String,
 }
 
-impl Query for Read {
+impl Targeted for Read {
     fn target(&self) -> &str {
         &self.count.service
     }
+}
 
+impl Query for Read {
     fn read(&self, endpoint: SocketAddr) -> BoxFuture<'_, Result<plan::Value, PluginError>> {
         Box::pin(async move { self.count(endpoint).await.map_err(PluginError::from) })
     }
