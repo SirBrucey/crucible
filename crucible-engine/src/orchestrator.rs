@@ -10,7 +10,7 @@ use crucible_protocol::{KillMissReason, KillReport, KillResult, ServiceProfile, 
 use crucible_core::{
     HEAL_BUDGET,
     ipc::Verdict,
-    observer::{self, SessionObserver},
+    observer::SessionObserver,
     proxy_log::service_profiles_from_sessions,
     verdict::{Invariant, Observations, Observed, driver_for},
 };
@@ -38,14 +38,6 @@ const ANCHOR_TIMEOUT: Duration = Duration::from_mins(1);
 /// freeze triggered by a post-ack edge to become visible before concluding the
 /// anchor was missed. Comfortably larger than docker-log delivery latency.
 const FREEZE_GRACE: Duration = Duration::from_secs(1);
-
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-    #[error(transparent)]
-    Observer(#[from] observer::Error),
-    #[error(transparent)]
-    Plugin(#[from] crucible_plugin::Error),
-}
 
 /// Per-worker orchestrator that owns the replica lifecycle around one scenario,
 /// modelled as a typestate so a phase can only reach for what earlier phases
@@ -166,7 +158,9 @@ impl Orchestrator<Ready> {
     ///
     /// # Errors
     /// Errors if the scenario fails to run against the fleet.
-    pub async fn learn(self) -> Result<(Vec<ServiceProfile>, Orchestrator<Done>), Error> {
+    pub async fn learn(
+        self,
+    ) -> Result<(Vec<ServiceProfile>, Orchestrator<Done>), crucible_plugin::Error> {
         let Orchestrator {
             deployment,
             state: Ready {
@@ -181,7 +175,7 @@ impl Orchestrator<Ready> {
                 // A failed scenario leaves the replica up; tear it down rather
                 // than dropping the only handle to it and its observer tasks.
                 let _ = teardown_replica(deployment, session_observer).await;
-                return Err(e.into());
+                return Err(e);
             }
         };
         // Let the fleet fall quiescent before snapshotting, so writes that land
@@ -214,7 +208,7 @@ impl Orchestrator<Ready> {
         self,
         schedule: &Schedule,
         queries: Vec<PreparedCheck>,
-    ) -> Result<((Verdict, KillReport), Orchestrator<Done>), Error> {
+    ) -> Result<((Verdict, KillReport), Orchestrator<Done>), crucible_plugin::Error> {
         let Orchestrator {
             deployment,
             state: Ready {
@@ -227,7 +221,7 @@ impl Orchestrator<Ready> {
         // outcome we still own them afterwards: on success they move into `Done`
         // for the caller to tear down, on error we tear down here rather than
         // dropping the only handle to the replica and its observer tasks.
-        let outcome: Result<(Verdict, KillReport), Error> = async {
+        let outcome: Result<(Verdict, KillReport), crucible_plugin::Error> = async {
             // Arm the anchor as the scenario starts: the proxy resets and counts
             // scenario packets from here, and wait_for_freeze captures its observer
             // baseline at the same moment, so both share the scenario-start origin.
@@ -252,7 +246,10 @@ impl Orchestrator<Ready> {
                             // reach its Kth packet); release the freeze in case it is
                             // mid-flight and record a miss.
                             deployment.resume().await?;
-                            return Ok::<_, Error>(missed(schedule, KillMissReason::ScenarioEndedBeforeAnchor));
+                            return Ok::<_, crucible_plugin::Error>(missed(
+                                schedule,
+                                KillMissReason::ScenarioEndedBeforeAnchor,
+                            ));
                         }
                         // The proxy froze the fleet to place the kill precisely on the
                         // anchored packet. Kill the target, then release the flow and
