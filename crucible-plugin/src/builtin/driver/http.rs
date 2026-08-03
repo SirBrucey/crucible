@@ -16,6 +16,8 @@ use crate::{
 
 /// How long a request waits before the caller is left in doubt.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// The clause carrying a request payload.
+const BODY: &str = "body";
 
 /// Drives HTTP requests against a service.
 pub struct Http {
@@ -39,6 +41,8 @@ pub enum Error {
     Arguments,
     #[error("`{0}` is not a path: a path starts with `/`")]
     Path(String),
+    #[error("`{0}` takes no body")]
+    Body(Method),
     #[error("a body carries {0:?}, whose millisecond count does not fit a `u64`")]
     Duration(Duration),
     #[error(transparent)]
@@ -106,7 +110,7 @@ impl Driver for Http {
     fn signatures() -> Vec<OpSig> {
         vec![
             OpSig::action(HeadPattern::exact("POST"), request_params())
-                .with_clause(ClauseDecl::new("body", ClauseShape::Block)),
+                .with_clause(ClauseDecl::new(BODY, ClauseShape::Block)),
             OpSig::action(HeadPattern::exact("GET"), request_params()),
             OpSig::action(HeadPattern::exact("DELETE"), request_params()),
         ]
@@ -132,6 +136,9 @@ impl Driver for Http {
         if !path.starts_with('/') {
             return Err(Error::Path(path.to_owned()));
         }
+        if step.body.is_some() && !takes_body(&step.operation) {
+            return Err(Error::Body(method));
+        }
         Ok(Request {
             method,
             service: service.to_owned(),
@@ -148,6 +155,15 @@ impl DriverRuntime for Http {
             client: self.client.clone(),
         }))
     }
+}
+
+/// Whether the named operation declares a `body` clause, so what this driver
+/// accepts follows what it advertises.
+fn takes_body(operation: &str) -> bool {
+    Http::signatures()
+        .iter()
+        .filter(|sig| matches!(&sig.head, HeadPattern::Exact(name) if name == operation))
+        .any(|sig| sig.clauses.iter().any(|clause| clause.keyword == BODY))
 }
 
 fn request_params() -> Vec<Param> {
@@ -321,6 +337,19 @@ mod tests {
     fn an_operation_that_is_not_a_method_is_rejected() {
         let bound = Http::bind(&step("SEND", vec![plan::Value::Ident("api".into())]));
         assert!(matches!(bound, Err(Error::Method(_))));
+    }
+
+    #[test]
+    fn an_operation_that_declares_no_body_will_not_take_one() {
+        let mut step = step(
+            "GET",
+            vec![
+                plan::Value::Ident("api".into()),
+                plan::Value::Str("/orders".into()),
+            ],
+        );
+        step.body = Some(vec![("item".into(), plan::Value::Str("book".into()))]);
+        assert!(matches!(Http::bind(&step), Err(Error::Body(_))));
     }
 
     #[test]

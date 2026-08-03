@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use crucible_core::{
     plan,
-    schema::{AttrSchema, ClauseShape, CmpOp, HeadPattern, OpSig, Param, ParamType, ValueType},
+    schema::{AttrSchema, CmpOp, HeadPattern, OpSig, Param, ParamType, ValueType},
 };
 use crucible_plugin::Registry;
 
@@ -445,15 +445,17 @@ impl<'a> Lowerer<'a> {
         self.check_type(&predicate.right, result);
     }
 
-    /// Validate the clauses on an operation against the ones its signature allows.
+    /// Validate the clauses on an operation against the ones its signature
+    /// allows, by the keyword the author wrote rather than its shape: two
+    /// clauses can share a shape and mean different things.
     fn check_clauses(&mut self, op: &OpCall, sig: &OpSig) {
         for clause in &op.clauses {
-            let (shape, what) = match &clause.node {
-                Clause::Body(_) => (ClauseShape::Block, "body"),
-                Clause::Where(_) => (ClauseShape::Filter, "where"),
+            let keyword = match &clause.node {
+                Clause::Body(_) => "body",
+                Clause::Where(_) => "where",
             };
-            if !sig.clauses.iter().any(|decl| decl.shape == shape) {
-                self.error(clause.span, format!("this operation takes no `{what}`"));
+            if !sig.clauses.iter().any(|decl| decl.keyword == keyword) {
+                self.error(clause.span, format!("this operation takes no `{keyword}`"));
             }
         }
     }
