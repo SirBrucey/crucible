@@ -118,8 +118,18 @@ pub trait Action: Send + Sync {
 pub trait Observer {
     /// Stable identifier used to select this plugin.
     const NAME: &'static str;
+    /// One check of a plan, in this plugin's own terms.
+    type Query;
+    type Error: std::error::Error + Send + Sync + 'static;
 
     fn signatures() -> Vec<OpSig>;
+
+    /// Bind a check to a query this observer can answer.
+    ///
+    /// # Errors
+    /// Errors if the check names an observable this observer does not read, or
+    /// filters it in a way it cannot express.
+    fn bind(check: &plan::Check) -> Result<Self::Query, Self::Error>;
 
     /// What a service speaking this plugin declares beyond its bring-up: a
     /// plugin that needs nothing of the author declares nothing.
@@ -127,4 +137,22 @@ pub trait Observer {
     fn attr_schema() -> AttrSchema {
         AttrSchema::new(Vec::new())
     }
+}
+
+/// An observer, ready to read settled state.
+pub trait ObserverRuntime: Send + Sync {
+    /// Bind a check to a runnable query, without a live fleet.
+    ///
+    /// # Errors
+    /// Errors if the check does not bind to an observable this observer reads.
+    fn prepare(&self, check: &plan::Check) -> Result<Box<dyn Query>, Error>;
+}
+
+/// One bound check, readable against the service it names. It yields what was
+/// observed; the framework compares that against what the check expects.
+pub trait Query: Send + Sync {
+    /// The service this query reads.
+    fn target(&self) -> &str;
+
+    fn read(&self, endpoint: SocketAddr) -> BoxFuture<'_, Result<plan::Value, Error>>;
 }

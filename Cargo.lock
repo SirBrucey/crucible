@@ -553,6 +553,7 @@ dependencies = [
  "futures-util",
  "reqwest",
  "serde_json",
+ "sqlx",
  "thiserror",
  "tokio",
 ]
