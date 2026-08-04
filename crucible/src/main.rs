@@ -275,21 +275,21 @@ async fn run(plan: &plan::Plan) -> Result<CampaignOutcome> {
 /// killed before it could (a setup that outran its budget, a crash), this
 /// reclaims the replica so its containers and network do not leak and starve the
 /// host of the concurrent workers still running.
-async fn reclaim_fleet(worker_id: u32) {
-    if let Err(e) = reclaim(worker_id).await {
+async fn reclaim_fleet(worker_id: u32, fleet: &plan::Fleet) {
+    if let Err(e) = reclaim(worker_id, fleet).await {
         tracing::warn!(worker_id, error = %e, "failed to reclaim worker fleet");
     }
 }
 
-/// Remove a replica by worker id alone. Needs no live worker state, since the
-/// container and network names follow from the id, and is a no-op once the
-/// replica is already gone.
-async fn reclaim(worker_id: u32) -> std::result::Result<(), crucible_plugin::Error> {
-    let mut deployment = crucible_plugin::Registry::builtins().deployment_for(
-        &plan::example().fleet,
-        worker_id,
-        None,
-    )?;
+/// Remove a worker's replica without any live worker state: the containers are
+/// named from the worker id and the fleet's services, and removing one already
+/// gone is a no-op.
+async fn reclaim(
+    worker_id: u32,
+    fleet: &plan::Fleet,
+) -> std::result::Result<(), crucible_plugin::Error> {
+    let mut deployment =
+        crucible_plugin::Registry::builtins().deployment_for(fleet, worker_id, None)?;
     deployment.teardown().await
 }
 
@@ -456,6 +456,9 @@ impl Recovery {
 /// carry on.
 struct Pool<'a> {
     bus: &'a EventBus,
+    /// The fleet every replica of this campaign runs, so one can be reclaimed
+    /// without the worker that owned it.
+    fleet: &'a plan::Fleet,
     inflight: JoinSet<(Schedule, u32, Result<Verdict>)>,
     outcomes: Outcomes,
     recovery: Recovery,
@@ -470,6 +473,7 @@ struct Pool<'a> {
 impl<'a> Pool<'a> {
     fn new(
         bus: &'a EventBus,
+        fleet: &'a plan::Fleet,
         worker_id: u32,
         schedule_budget: Duration,
         campaign_start: Instant,
@@ -477,6 +481,7 @@ impl<'a> Pool<'a> {
     ) -> Self {
         Self {
             bus,
+            fleet,
             inflight: JoinSet::new(),
             outcomes: Outcomes::default(),
             recovery: Recovery::default(),
@@ -580,7 +585,7 @@ impl<'a> Pool<'a> {
     async fn reclaim_all(&mut self) {
         self.inflight.shutdown().await;
         for id in 0..self.worker_id {
-            reclaim_fleet(id).await;
+            reclaim_fleet(id, self.fleet).await;
         }
     }
 }
@@ -607,6 +612,7 @@ async fn drive(bus: &EventBus, plan: &plan::Plan) -> Result<CampaignOutcome> {
     let total = scheduler.total();
     let mut pool = Pool::new(
         bus,
+        &plan.fleet,
         worker_id,
         run_cost + HEAL_BUDGET + SCHEDULE_MARGIN,
         campaign_start,
@@ -668,7 +674,7 @@ async fn run_learn(
             faults: Vec::new(),
         };
         let outcome = execute_learn(bus, id, schedule).await;
-        reclaim_fleet(id).await;
+        reclaim_fleet(id, fleet).await;
         match outcome {
             Ok(result) => return Ok(result),
             Err(e) if attempt < LEARN_MAX_ATTEMPTS => {
@@ -734,7 +740,7 @@ async fn run_one_schedule(
     schedule_budget: Duration,
 ) -> (Schedule, u32, Result<Verdict>) {
     let verdict = run_worker(&bus, worker_id, schedule.clone(), schedule_budget).await;
-    reclaim_fleet(worker_id).await;
+    reclaim_fleet(worker_id, &schedule.fleet).await;
     (schedule, attempt, verdict)
 }
 
