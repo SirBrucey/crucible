@@ -95,13 +95,16 @@ fn worker_bin_path() -> Result<PathBuf> {
 #[command(version)]
 struct Cli {
     #[command(subcommand)]
-    command: Option<Cmd>,
+    command: Cmd,
 }
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Run a fault-injection campaign against the example fleet.
-    Run,
+    /// Run a fault-injection campaign against a `.cru` scenario file.
+    Run {
+        /// Path to the scenario file.
+        file: PathBuf,
+    },
     /// Parse and check a `.cru` scenario file, reporting diagnostics.
     Check {
         /// Path to the scenario file.
@@ -111,14 +114,14 @@ enum Cmd {
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    match Cli::parse().command.unwrap_or(Cmd::Run) {
+    match Cli::parse().command {
         Cmd::Check { file } => run_check(&file),
-        Cmd::Run => run_campaign().await,
+        Cmd::Run { file } => run_campaign(&file).await,
     }
 }
 
 /// Initialise logging and run a fault-injection campaign to completion.
-async fn run_campaign() -> ExitCode {
+async fn run_campaign(file: &Path) -> ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -127,13 +130,51 @@ async fn run_campaign() -> ExitCode {
         .with_writer(std::io::stderr)
         .init();
 
-    match run().await {
+    let plan = match load(file) {
+        Ok(plan) => plan,
+        Err(e) => {
+            tracing::error!(error = %e, "cannot run this scenario");
+            return ExitCode::from(2);
+        }
+    };
+
+    match run(&plan).await {
         Ok(outcome) => outcome.exit_code(),
         Err(e) => {
             tracing::error!(error = %e, "runner exiting with error");
             ExitCode::from(2)
         }
     }
+}
+
+/// Lower a `.cru` file to the plan a campaign runs, rendering diagnostics for
+/// anything that stops it.
+fn load(file: &Path) -> Result<plan::Plan> {
+    let name = file.display().to_string();
+    let src = std::fs::read_to_string(file)?;
+    let (tokens, lex_errors) = crucible_dsl::lexer::lex(&src);
+    let diags = if lex_errors.is_empty() {
+        match crucible_dsl::parser::parse(tokens) {
+            Ok(ast) => {
+                match crucible_dsl::lower::lower(&ast, &crucible_plugin::Registry::builtins()) {
+                    Ok(plan) => return Ok(plan),
+                    Err(diags) => diags,
+                }
+            }
+            Err(diags) => diags,
+        }
+    } else {
+        lex_errors
+            .iter()
+            .map(|e| crucible_dsl::diagnostics::Diag::new(e.span, e.message.clone()))
+            .collect()
+    };
+    if let Err(e) = crucible_dsl::diagnostics::emit_to_stderr(&name, &src, &diags) {
+        eprintln!("crucible run: failed to render diagnostics: {e}");
+    }
+    Err(Error::Plan(format!(
+        "{name} does not describe a runnable plan"
+    )))
 }
 
 /// Lex and parse a `.cru` file, rendering diagnostics on failure. Exits 0 on
@@ -196,7 +237,7 @@ fn render_and_fail(name: &str, src: &str, diags: &[crucible_dsl::diagnostics::Di
     ExitCode::from(1)
 }
 
-async fn run() -> Result<CampaignOutcome> {
+async fn run(plan: &plan::Plan) -> Result<CampaignOutcome> {
     let (bus, journal_rx) = EventBus::new();
 
     let journal_path = journal::default_path(std::process::id());
@@ -219,7 +260,7 @@ async fn run() -> Result<CampaignOutcome> {
         }
     });
 
-    let workload = drive(&bus).await;
+    let workload = drive(&bus, plan).await;
 
     drop(bus);
     journal_task.await.expect("journal task should not panic")?;
@@ -544,12 +585,11 @@ impl<'a> Pool<'a> {
     }
 }
 
-async fn drive(bus: &EventBus) -> Result<CampaignOutcome> {
+async fn drive(bus: &EventBus, plan: &plan::Plan) -> Result<CampaignOutcome> {
     let campaign_start = Instant::now();
     let mut worker_id: u32 = 0;
 
     // One scenario for now; a plan describing several would run each in turn.
-    let plan = plan::example();
     let scenario = plan
         .scenarios
         .first()

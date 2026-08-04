@@ -280,15 +280,22 @@ fn service(
     env: &[&str],
     healthcheck: &[&str],
 ) -> Service {
+    // An attribute an author would leave out is left out here too, so this and
+    // the `.cru` describing the same fleet stay comparable.
+    let mut attrs = vec![
+        ("image".to_owned(), Value::Str(image.to_owned())),
+        ("port".to_owned(), Value::Int(port)),
+    ];
+    if !env.is_empty() {
+        attrs.push(("env".to_owned(), strs(env)));
+    }
+    if !healthcheck.is_empty() {
+        attrs.push(("healthcheck".to_owned(), strs(healthcheck)));
+    }
     Service {
         name: name.to_owned(),
         kinds: kinds.iter().map(|kind| (*kind).to_owned()).collect(),
-        attrs: vec![
-            ("image".to_owned(), Value::Str(image.to_owned())),
-            ("port".to_owned(), Value::Int(port)),
-            ("env".to_owned(), strs(env)),
-            ("healthcheck".to_owned(), strs(healthcheck)),
-        ],
+        attrs,
     }
 }
 
