@@ -7,6 +7,7 @@ pub mod ipc;
 pub mod observer;
 pub mod plan;
 pub mod proxy_log;
+pub mod schedule;
 pub mod schema;
 pub mod verdict;
 

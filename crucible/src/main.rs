@@ -12,11 +12,12 @@ use crucible_core::{
     HEAL_BUDGET,
     ipc::{ServiceProfile, Verdict},
     plan,
+    schedule::Schedule,
 };
 use crucible_engine::{
     event_bus::EventBus,
     journal,
-    scheduler::{BurstScheduler, Schedule, Scheduler},
+    scheduler::{BurstScheduler, Scheduler},
 };
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
@@ -486,7 +487,7 @@ impl<'a> Pool<'a> {
         match joined {
             Ok((schedule, _attempt, Ok(verdict))) => {
                 self.recovery.reset();
-                self.outcomes.record_verdict(schedule.schedule_id, verdict);
+                self.outcomes.record_verdict(schedule.id, verdict);
             }
             // A worker that outran its budget did not crash; we simply have no
             // verdict in the time allowed. Record it inconclusive rather than
@@ -494,7 +495,7 @@ impl<'a> Pool<'a> {
             Ok((schedule, _attempt, Err(Error::WorkerTimeout(budget)))) => {
                 self.recovery.reset();
                 self.outcomes.record_verdict(
-                    schedule.schedule_id,
+                    schedule.id,
                     Verdict::Inconclusive {
                         reason: format!("worker exceeded its {budget:?} budget"),
                     },
@@ -504,7 +505,7 @@ impl<'a> Pool<'a> {
                 if !self.gave_up && self.within_budget() && Recovery::may_respawn(attempt) =>
             {
                 tracing::warn!(
-                    schedule_id = schedule.schedule_id,
+                    schedule_id = schedule.id,
                     attempt,
                     error = %e,
                     "worker failed; respawning on a fresh replica"
@@ -512,7 +513,7 @@ impl<'a> Pool<'a> {
                 self.spawn(schedule, attempt + 1);
             }
             Ok((schedule, attempt, Err(e))) => {
-                let schedule_id = schedule.schedule_id;
+                let schedule_id = schedule.id;
                 tracing::warn!(schedule_id, attempts = attempt, error = %e, "worker failed and will not be retried");
                 self.outcomes.record_error(Some(schedule_id), e);
                 self.recovery.record_failure();
@@ -547,15 +548,22 @@ async fn drive(bus: &EventBus) -> Result<CampaignOutcome> {
     let campaign_start = Instant::now();
     let mut worker_id: u32 = 0;
 
+    // One scenario for now; a plan describing several would run each in turn.
+    let plan = plan::example();
+    let scenario = plan
+        .scenarios
+        .first()
+        .ok_or_else(|| Error::Plan("the plan describes no scenario".into()))?;
+
     // Learn is a barrier: schedules derive from its observed traffic profiles.
-    let (services, run_cost) = run_learn(bus, &mut worker_id).await?;
+    let (services, run_cost) = run_learn(bus, &mut worker_id, &plan.fleet, scenario).await?;
     tracing::info!(
         services = services.len(),
         run_cost_ms = run_cost.as_millis(),
         "session catalogue received"
     );
 
-    let mut scheduler = BurstScheduler::new(&services);
+    let mut scheduler = BurstScheduler::new(&plan.fleet, scenario, &services);
     let total = scheduler.total();
     let mut pool = Pool::new(
         bus,
@@ -601,12 +609,25 @@ async fn drive(bus: &EventBus) -> Result<CampaignOutcome> {
 /// campaign. Each attempt runs on its own worker and is reclaimed afterwards,
 /// whatever the outcome, so a killed learn worker leaves nothing behind.
 /// Advances `worker_id` past every attempt so each gets its own socket and fleet.
-async fn run_learn(bus: &EventBus, worker_id: &mut u32) -> Result<(Vec<ServiceProfile>, Duration)> {
+async fn run_learn(
+    bus: &EventBus,
+    worker_id: &mut u32,
+    fleet: &plan::Fleet,
+    scenario: &plan::Scenario,
+) -> Result<(Vec<ServiceProfile>, Duration)> {
     let mut attempt = 1;
     loop {
         let id = *worker_id;
         *worker_id += 1;
-        let outcome = execute_learn(bus, id).await;
+        // The fault-free run: the scenario's own work, with nothing to break.
+        let schedule = Schedule {
+            id: 0,
+            fleet: fleet.clone(),
+            steps: scenario.steps.clone(),
+            checks: scenario.checks.clone(),
+            faults: Vec::new(),
+        };
+        let outcome = execute_learn(bus, id, schedule).await;
         reclaim_fleet(id).await;
         match outcome {
             Ok(result) => return Ok(result),
@@ -623,13 +644,17 @@ async fn run_learn(bus: &EventBus, worker_id: &mut u32) -> Result<(Vec<ServicePr
 /// hung worker (for instance one that connects but never sends `Ready`) cannot
 /// wedge the campaign, and reaping the child on every path so a failure leaves
 /// no zombie.
-async fn execute_learn(bus: &EventBus, worker_id: u32) -> Result<(Vec<ServiceProfile>, Duration)> {
+async fn execute_learn(
+    bus: &EventBus,
+    worker_id: u32,
+    schedule: Schedule,
+) -> Result<(Vec<ServiceProfile>, Duration)> {
     let (socket_path, listener) = bind_worker_listener(worker_id).await?;
     let (mut child, stderr_relay) = spawn_worker(&socket_path, worker_id)?;
     let learn_start = Instant::now();
     let pipeline = async {
         let session = accept_and_handshake(&listener, bus).await?;
-        let services = session.learn(bus).await?;
+        let services = session.learn(bus, schedule).await?;
         Ok::<_, Error>((services, learn_start.elapsed()))
     };
     match tokio::time::timeout(LEARN_BUDGET, pipeline).await {

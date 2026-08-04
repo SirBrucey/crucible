@@ -9,7 +9,7 @@ use crate::schema::CmpOp;
 
 /// A validated `.cru` file lowered to a fleet and its scenarios, with every
 /// service, action, and observable carrying the plugin that serves it.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Deserialize, serde::Serialize)]
 pub struct Plan {
     pub fleet: Fleet,
     pub scenarios: Vec<Scenario>,
@@ -26,11 +26,11 @@ impl Plan {
 }
 
 /// A content hash of a [`Plan`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Deserialize, serde::Serialize)]
 pub struct SpecHash(pub u64);
 
 /// A fleet: the deployment plugin that brings it up and the services it runs.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Deserialize, serde::Serialize)]
 pub struct Fleet {
     pub name: String,
     pub deployment: String,
@@ -38,7 +38,7 @@ pub struct Fleet {
 }
 
 /// A service: the plugins it speaks and its bring-up attributes.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Deserialize, serde::Serialize)]
 pub struct Service {
     pub name: String,
     pub kinds: Vec<String>,
@@ -62,7 +62,7 @@ fn lookup<'a>(entries: &'a [(String, Value)], name: &str) -> Option<&'a Value> {
 }
 
 /// A scenario: its heal-phase deadline, driver steps, and settled-state checks.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Deserialize, serde::Serialize)]
 pub struct Scenario {
     pub name: String,
     pub consistent_within: Duration,
@@ -71,7 +71,7 @@ pub struct Scenario {
 }
 
 /// A driver action, carrying the driver that runs it.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Deserialize, serde::Serialize)]
 pub struct Step {
     pub driver: String,
     pub operation: String,
@@ -80,7 +80,7 @@ pub struct Step {
 }
 
 /// A settled-state check, carrying the service and observer that answer it.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Deserialize, serde::Serialize)]
 pub struct Check {
     pub service: String,
     pub observer: String,
@@ -95,7 +95,7 @@ pub struct Check {
 /// The `as_*` accessors mirror [`crate::schema::ValueType`], one per shape a
 /// plugin can declare. The check pass has already validated a value against the
 /// schema, so a `None` means the plugin asked for a shape it never declared.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Deserialize, serde::Serialize)]
 pub enum Value {
     Str(String),
     Int(i64),

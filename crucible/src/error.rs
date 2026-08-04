@@ -10,6 +10,8 @@ pub enum Error {
     Codec(#[from] codec::Error),
     #[error("runner exe has no parent directory")]
     RunnerExeParentless,
+    #[error("{0}")]
+    Plan(String),
     #[error("spawned child has no pid")]
     ChildPidMissing,
     #[error("handshake timed out")]

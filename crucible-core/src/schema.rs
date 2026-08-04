@@ -153,7 +153,7 @@ impl ClauseDecl {
 }
 
 /// A comparison operator an observable's result can be tested with.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Deserialize, serde::Serialize)]
 pub enum CmpOp {
     Eq,
     Ne,

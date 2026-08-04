@@ -4,14 +4,14 @@
 //! changes. Transitions consume `self` and return the next `Session<_>`; illegal
 //! sequences are compile errors.
 
-use crucible_core::ipc::{
-    HEARTBEAT_TIMEOUT, RunnerToWorker, ServiceProfile, Verdict, WorkerToRunner,
-    codec::{read_frame, write_frame},
+use crucible_core::{
+    ipc::{
+        HEARTBEAT_TIMEOUT, RunnerToWorker, ServiceProfile, Verdict, WorkerToRunner,
+        codec::{read_frame, write_frame},
+    },
+    schedule::Schedule,
 };
-use crucible_engine::{
-    event_bus::{EventBus, RunnerEvent},
-    scheduler::Schedule,
-};
+use crucible_engine::event_bus::{EventBus, RunnerEvent};
 use tokio::{net::UnixStream, time::timeout};
 
 use crate::error::{Error, Result};
@@ -105,10 +105,17 @@ impl Session<Dispatching> {
         Ok(())
     }
 
-    pub async fn learn(mut self, bus: &EventBus) -> Result<Vec<ServiceProfile>> {
+    /// Drive the fault-free run: the same schedule shape as any other, with
+    /// nothing to break, so what it observes describes the workload the faulted
+    /// runs perform.
+    pub async fn learn(
+        mut self,
+        bus: &EventBus,
+        schedule: Schedule,
+    ) -> Result<Vec<ServiceProfile>> {
         self.read_ready(bus, "Learning").await?;
 
-        let outbound = RunnerToWorker::Learn;
+        let outbound = RunnerToWorker::Run(schedule);
         write_frame(&mut self.stream, &outbound).await?;
         journal_out(bus, self.state.worker_id, outbound).await;
 
