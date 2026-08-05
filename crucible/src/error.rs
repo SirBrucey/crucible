@@ -10,8 +10,15 @@ pub enum Error {
     Codec(#[from] codec::Error),
     #[error("runner exe has no parent directory")]
     RunnerExeParentless,
-    #[error("{0}")]
-    Plan(String),
+    #[error("expected a `.cru` file, got `{0}`")]
+    NotAScenarioFile(String),
+    #[error("cannot read {path}: {source}")]
+    ScenarioUnreadable {
+        path: String,
+        source: std::io::Error,
+    },
+    #[error("{0} does not describe a runnable plan")]
+    ScenarioRejected(String),
     #[error("spawned child has no pid")]
     ChildPidMissing,
     #[error("handshake timed out")]

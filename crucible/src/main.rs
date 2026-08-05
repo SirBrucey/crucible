@@ -132,6 +132,8 @@ async fn run_campaign(file: &Path) -> ExitCode {
 
     let plan = match load(file) {
         Ok(plan) => plan,
+        // Already rendered to stderr with source context.
+        Err(Error::ScenarioRejected(_)) => return ExitCode::from(2),
         Err(e) => {
             tracing::error!(error = %e, "cannot run this scenario");
             return ExitCode::from(2);
@@ -148,78 +150,42 @@ async fn run_campaign(file: &Path) -> ExitCode {
 }
 
 /// Lower a `.cru` file to the plan a campaign runs, rendering diagnostics for
-/// anything that stops it.
+/// anything that stops it. Both commands come through here, so both accept
+/// exactly the same files and reject them for the same reasons.
 fn load(file: &Path) -> Result<plan::Plan> {
     let name = file.display().to_string();
-    let src = std::fs::read_to_string(file)?;
-    let (tokens, lex_errors) = crucible_dsl::lexer::lex(&src);
-    let diags = if lex_errors.is_empty() {
-        match crucible_dsl::parser::parse(tokens) {
-            Ok(ast) => {
-                match crucible_dsl::lower::lower(&ast, &crucible_plugin::Registry::builtins()) {
-                    Ok(plan) => return Ok(plan),
-                    Err(diags) => diags,
-                }
-            }
-            Err(diags) => diags,
-        }
-    } else {
-        lex_errors
-            .iter()
-            .map(|e| crucible_dsl::diagnostics::Diag::new(e.span, e.message.clone()))
-            .collect()
-    };
-    if let Err(e) = crucible_dsl::diagnostics::emit_to_stderr(&name, &src, &diags) {
-        eprintln!("crucible run: failed to render diagnostics: {e}");
+    if file.extension().and_then(std::ffi::OsStr::to_str) != Some("cru") {
+        return Err(Error::NotAScenarioFile(name));
     }
-    Err(Error::Plan(format!(
-        "{name} does not describe a runnable plan"
-    )))
+    let src = std::fs::read_to_string(file).map_err(|source| Error::ScenarioUnreadable {
+        path: name.clone(),
+        source,
+    })?;
+    crucible_dsl::compile(&src, &crucible_plugin::Registry::builtins()).map_err(|diags| {
+        if let Err(e) = crucible_dsl::diagnostics::emit_to_stderr(&name, &src, &diags) {
+            eprintln!("crucible: failed to render diagnostics: {e}");
+        }
+        Error::ScenarioRejected(name)
+    })
 }
 
-/// Lex and parse a `.cru` file, rendering diagnostics on failure. Exits 0 on
-/// success, 1 on lexing or parsing diagnostics, and 2 if the file is not a
-/// readable `.cru` file.
+/// Check a `.cru` file and describe what it says. Exits 0 on success, 1 if the
+/// file was read but says something we cannot run, and 2 if it could not be
+/// read at all.
 fn run_check(file: &Path) -> ExitCode {
-    if file.extension().and_then(std::ffi::OsStr::to_str) != Some("cru") {
-        eprintln!(
-            "crucible check: expected a `.cru` file, got `{}`",
-            file.display()
-        );
-        return ExitCode::from(2);
-    }
-    let name = file.display().to_string();
-    let src = match std::fs::read_to_string(file) {
-        Ok(src) => src,
+    let plan = match load(file) {
+        Ok(plan) => plan,
+        Err(Error::ScenarioRejected(_)) => return ExitCode::from(1),
         Err(e) => {
-            eprintln!("crucible check: cannot read {name}: {e}");
+            eprintln!("crucible check: {e}");
             return ExitCode::from(2);
         }
     };
 
-    let (tokens, lex_errors) = crucible_dsl::lexer::lex(&src);
-    if !lex_errors.is_empty() {
-        let diags: Vec<_> = lex_errors
-            .iter()
-            .map(|e| crucible_dsl::diagnostics::Diag::new(e.span, e.message.clone()))
-            .collect();
-        return render_and_fail(&name, &src, &diags);
-    }
-
-    let ast = match crucible_dsl::parser::parse(tokens) {
-        Ok(ast) => ast,
-        Err(diags) => return render_and_fail(&name, &src, &diags),
-    };
-
-    let registry = crucible_plugin::Registry::builtins();
-    let plan = match crucible_dsl::lower::lower(&ast, &registry) {
-        Ok(plan) => plan,
-        Err(diags) => return render_and_fail(&name, &src, &diags),
-    };
-
     let fleet = &plan.fleet;
     println!(
-        "{name}: ok (fleet `{}` via `{}`, {} service(s), {} scenario(s), spec {:016x})",
+        "{}: ok (fleet `{}` via `{}`, {} service(s), {} scenario(s), spec {:016x})",
+        file.display(),
         fleet.name,
         fleet.deployment,
         fleet.services.len(),
@@ -227,14 +193,6 @@ fn run_check(file: &Path) -> ExitCode {
         plan.spec_hash().0,
     );
     ExitCode::SUCCESS
-}
-
-/// Render diagnostics to stderr and return the check-failed exit code.
-fn render_and_fail(name: &str, src: &str, diags: &[crucible_dsl::diagnostics::Diag]) -> ExitCode {
-    if let Err(e) = crucible_dsl::diagnostics::emit_to_stderr(name, src, diags) {
-        eprintln!("crucible check: failed to render diagnostics: {e}");
-    }
-    ExitCode::from(1)
 }
 
 async fn run(plan: &plan::Plan) -> Result<CampaignOutcome> {
@@ -598,7 +556,7 @@ async fn drive(bus: &EventBus, plan: &plan::Plan) -> Result<CampaignOutcome> {
     let scenario = plan
         .scenarios
         .first()
-        .ok_or_else(|| Error::Plan("the plan describes no scenario".into()))?;
+        .expect("the grammar requires a scenario, so a lowered plan states one");
 
     // Learn is a barrier: schedules derive from its observed traffic profiles.
     let (services, run_cost) = run_learn(bus, &mut worker_id, &plan.fleet, scenario).await?;

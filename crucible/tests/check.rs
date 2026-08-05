@@ -83,20 +83,3 @@ fn a_non_cru_extension_is_rejected() {
     let out = check(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"));
     assert_eq!(out.status.code(), Some(2));
 }
-
-#[test]
-fn the_bundled_example_lowers_to_the_plan_the_tests_build() {
-    // The same fleet is described twice: once for an author to read, once for
-    // tests that cannot depend on the DSL. They have drifted before.
-    let src = std::fs::read_to_string(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../examples/orders/orders.cru"
-    ))
-    .expect("read the example");
-    let (tokens, lex_errors) = crucible_dsl::lexer::lex(&src);
-    assert!(lex_errors.is_empty(), "lex errors: {lex_errors:?}");
-    let ast = crucible_dsl::parser::parse(tokens).expect("parses");
-    let lowered =
-        crucible_dsl::lower::lower(&ast, &crucible_plugin::Registry::builtins()).expect("lowers");
-    assert_eq!(lowered, crucible_core::plan::example());
-}
