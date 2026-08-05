@@ -127,8 +127,11 @@ pub struct Learning {
     schedule: Schedule,
 }
 
+/// The fault is lifted out of the schedule on the way in, so reaching this
+/// state is what proves there is one to inject.
 pub struct Executing {
     schedule: Schedule,
+    fault: Anchor,
 }
 
 pub struct ShuttingDown {
@@ -141,16 +144,12 @@ pub enum IdleNext {
 }
 
 /// Build the fleet the schedule names and the orchestrator that runs its steps,
-/// arming the proxy with `anchor` if set. Tears the replica down on any bring-up
-/// failure so a worker that dies here (a flaky readiness timeout, a crash) does
-/// not leak its containers.
-async fn bring_up(
-    worker_id: u32,
-    schedule: &Schedule,
-    anchor: Option<Anchor>,
-) -> Result<Orchestrator<Ready>> {
+/// arming the proxy with the schedule's fault if it has one. Tears the replica
+/// down on any bring-up failure so a worker that dies here (a flaky readiness
+/// timeout, a crash) does not leak its containers.
+async fn bring_up(worker_id: u32, schedule: &Schedule) -> Result<Orchestrator<Ready>> {
     let registry = Registry::builtins();
-    let deployment = registry.deployment_for(&schedule.fleet, worker_id, anchor)?;
+    let deployment = registry.deployment_for(&schedule.fleet, worker_id, schedule.fault.clone())?;
     let actions = registry.actions_for(&schedule.steps)?;
     let orchestrator = Orchestrator::new(deployment, actions).setup().await?;
     Ok(orchestrator)
@@ -201,25 +200,29 @@ impl Worker<Idle> {
         tracing::debug!(worker_id = self.id, "sent READY");
 
         match self.conn.recv().await? {
-            // A schedule with no fault is the fault-free run every other
-            // schedule is judged against.
-            RunnerToWorker::Run(schedule) if schedule.is_fault_free() => {
-                tracing::info!(
-                    worker_id = self.id,
-                    schedule_id = schedule.id,
-                    "received learn"
-                );
-                Ok(IdleNext::Learn(self.transition(Learning { schedule })))
-            }
-            RunnerToWorker::Run(schedule) => {
-                tracing::info!(
-                    worker_id = self.id,
-                    schedule_id = schedule.id,
-                    faults = schedule.faults.len(),
-                    "received schedule"
-                );
-                Ok(IdleNext::Work(self.transition(Executing { schedule })))
-            }
+            RunnerToWorker::Run(schedule) => match schedule.fault.clone() {
+                // A schedule with no fault is the fault-free run every other
+                // schedule is judged against.
+                None => {
+                    tracing::info!(
+                        worker_id = self.id,
+                        schedule_id = schedule.id,
+                        "received learn"
+                    );
+                    Ok(IdleNext::Learn(self.transition(Learning { schedule })))
+                }
+                Some(fault) => {
+                    tracing::info!(
+                        worker_id = self.id,
+                        schedule_id = schedule.id,
+                        service = fault.service,
+                        "received schedule"
+                    );
+                    Ok(IdleNext::Work(
+                        self.transition(Executing { schedule, fault }),
+                    ))
+                }
+            },
             other @ RunnerToWorker::HelloAck { .. } => Err(Error::UnexpectedMessage {
                 state: "Idle",
                 expected: "Run",
@@ -232,7 +235,7 @@ impl Worker<Idle> {
 impl Worker<Learning> {
     pub async fn execute_learn(self) -> Result<Worker<ShuttingDown>> {
         let heartbeat = self.conn.start_heartbeat();
-        let orchestrator = bring_up(self.id, &self.state.schedule, None).await?;
+        let orchestrator = bring_up(self.id, &self.state.schedule).await?;
         let (services, orchestrator) = orchestrator
             .learn()
             .await
@@ -251,16 +254,8 @@ impl Worker<Executing> {
     pub async fn execute_and_report(self) -> Result<Worker<ShuttingDown>> {
         let schedule = &self.state.schedule;
         let schedule_id = schedule.id;
-        let fault = schedule.faults.first().ok_or_else(|| {
-            crucible_plugin::Error::new("worker", "a schedule to execute states a fault")
-        })?;
-        let anchor = Anchor {
-            service: fault.service.clone(),
-            direction: fault.direction,
-            k: fault.packet_index,
-        };
         let heartbeat = self.conn.start_heartbeat();
-        let orchestrator = bring_up(self.id, schedule, Some(anchor)).await?;
+        let orchestrator = bring_up(self.id, schedule).await?;
 
         // A check reads through the proxy's stable host port: it survives the
         // target being killed and restarted (the alias re-resolves to the new
@@ -276,7 +271,7 @@ impl Worker<Executing> {
         };
 
         let ((verdict, kill_report), orchestrator) = orchestrator
-            .execute(&self.state.schedule, queries)
+            .execute(schedule_id, &self.state.fault, queries)
             .await
             .inspect_err(
                 |e| tracing::error!(worker_id = self.id, schedule_id, error = %e, "execute failed"),

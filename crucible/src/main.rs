@@ -665,14 +665,11 @@ async fn run_learn(
     loop {
         let id = *worker_id;
         *worker_id += 1;
-        // The fault-free run: the scenario's own work, with nothing to break.
-        let schedule = Schedule {
-            id: 0,
-            fleet: fleet.clone(),
-            steps: scenario.steps.clone(),
-            checks: scenario.checks.clone(),
-            faults: Vec::new(),
-        };
+        let schedule = Schedule::learn(
+            fleet.clone(),
+            scenario.steps.clone(),
+            scenario.checks.clone(),
+        );
         let outcome = execute_learn(bus, id, schedule).await;
         reclaim_fleet(id, fleet).await;
         match outcome {

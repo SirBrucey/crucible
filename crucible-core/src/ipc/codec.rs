@@ -138,17 +138,17 @@ mod tests {
     #[tokio::test]
     async fn roundtrips_a_schedule_carrying_its_work() {
         let plan = crate::plan::example();
-        roundtrip(RunnerToWorker::Run(crate::schedule::Schedule {
-            id: 7,
-            fleet: plan.fleet,
-            steps: plan.scenarios[0].steps.clone(),
-            checks: plan.scenarios[0].checks.clone(),
-            faults: vec![crate::schedule::Fault {
+        roundtrip(RunnerToWorker::Run(crate::schedule::Schedule::faulted(
+            7,
+            plan.fleet,
+            plan.scenarios[0].steps.clone(),
+            plan.scenarios[0].checks.clone(),
+            crate::fault::Anchor {
                 service: "db".into(),
                 direction: Direction::ClientToUpstream,
-                packet_index: 3,
-            }],
-        }))
+                k: 3,
+            },
+        )))
         .await;
     }
 

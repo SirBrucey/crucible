@@ -8,10 +8,7 @@
 
 use crucible_protocol::{Direction, ServiceProfile};
 
-use crucible_core::{
-    plan,
-    schedule::{Fault, Schedule},
-};
+use crucible_core::{fault::Anchor, plan, schedule::Schedule};
 
 use super::Scheduler;
 
@@ -52,21 +49,21 @@ impl BurstScheduler {
 
         let max_len = anchored.iter().map(|(_, _, a)| a.len()).max().unwrap_or(0);
         let mut schedules: Vec<Schedule> = Vec::new();
-        let mut next_id: u32 = 0;
+        let mut next_id: u32 = Schedule::LEARN_ID + 1;
         for i in 0..max_len {
             for (service, direction, anchors) in &anchored {
                 if let Some(&k) = anchors.get(i) {
-                    schedules.push(Schedule {
-                        id: next_id,
-                        fleet: fleet.clone(),
-                        steps: scenario.steps.clone(),
-                        checks: scenario.checks.clone(),
-                        faults: vec![Fault {
+                    schedules.push(Schedule::faulted(
+                        next_id,
+                        fleet.clone(),
+                        scenario.steps.clone(),
+                        scenario.checks.clone(),
+                        Anchor {
                             service: (*service).to_string(),
                             direction: *direction,
-                            packet_index: k,
-                        }],
-                    });
+                            k,
+                        },
+                    ));
                     next_id += 1;
                 }
             }
@@ -108,12 +105,12 @@ mod tests {
         BurstScheduler::new(&plan.fleet, &plan.scenarios[0], profiles)
     }
 
-    /// The one fault a burst schedule carries.
-    fn fault(schedule: &Schedule) -> &Fault {
+    /// The fault a burst schedule carries.
+    fn fault(schedule: &Schedule) -> &Anchor {
         schedule
-            .faults
-            .first()
-            .expect("a burst schedule faults once")
+            .fault
+            .as_ref()
+            .expect("a burst schedule always faults")
     }
 
     #[test]
