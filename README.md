@@ -44,5 +44,6 @@ Milestones: **MVP** 27 Jul 2026, **Hard gate** 31 Aug, **Soft gate** 14 Sep, **S
 
 ```
 cargo build --workspace
-cargo run -p crucible
+cargo run -p crucible -- check examples/orders/orders.cru
+cargo run -p crucible -- run examples/orders/orders.cru
 ```

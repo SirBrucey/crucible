@@ -148,6 +148,13 @@ impl Parser {
                 break;
             }
         }
+        // A file with nothing to run is not something a campaign can be asked
+        // to run, so say so here rather than at the point of running it. Only
+        // when nothing else went wrong: a scenario that failed to parse has
+        // already said why it is missing.
+        if scenarios.is_empty() && self.errors.is_empty() {
+            self.error_here("expected at least one `scenario`");
+        }
         Some(File { fleet, scenarios })
     }
 
@@ -509,9 +516,17 @@ mod tests {
         parse(tokens)
     }
 
+    /// Parse a fleet block, completing the file with the least a scenario can
+    /// say, so a test about the fleet need not restate one.
+    fn parse_fleet(src: &str) -> Result<super::File, Vec<super::Diag>> {
+        parse_src(&format!(
+            r#"{src} scenario "s" {{ consistent_within: 1s; do {{ http GET api "/" }}; expect {{ db.t.count == 0; }} }}"#
+        ))
+    }
+
     #[test]
     fn a_fleet_with_services_parses() {
-        let file = parse_src(
+        let file = parse_fleet(
             r#"fleet "orders" { deployment: docker; service api { kind: http, port: 8080 }; service db { kind: sql, port: 3306 }; }"#,
         )
         .expect("parses");
@@ -523,6 +538,12 @@ mod tests {
     }
 
     #[test]
+    fn a_file_without_a_scenario_is_an_error() {
+        let errors = parse_src(r#"fleet "f" { deployment: docker; }"#).unwrap_err();
+        assert!(errors.iter().any(|d| d.message.contains("scenario")));
+    }
+
+    #[test]
     fn a_fleet_without_a_deployment_is_an_error() {
         let errors = parse_src(r#"fleet "f" { service api { port: 80 } }"#).unwrap_err();
         assert!(errors.iter().any(|d| d.message.contains("deployment")));
@@ -530,7 +551,7 @@ mod tests {
 
     #[test]
     fn service_attrs_parse_as_a_map() {
-        let file = parse_src(
+        let file = parse_fleet(
             r#"fleet "f" { deployment: docker; service api { kind: http, port: 8080 } }"#,
         )
         .expect("parses");
@@ -547,7 +568,7 @@ mod tests {
     #[test]
     fn a_list_attribute_parses() {
         let file =
-            parse_src(r#"fleet "f" { deployment: docker; service api { env: ["A=1", "B=2"] } }"#)
+            parse_fleet(r#"fleet "f" { deployment: docker; service api { env: ["A=1", "B=2"] } }"#)
                 .expect("parses");
         let Value::Map(entries) = &file.fleet.node.services[0].node.attrs.node else {
             panic!("expected a map");

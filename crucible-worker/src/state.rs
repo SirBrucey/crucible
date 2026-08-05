@@ -15,12 +15,9 @@ use crucible_core::{
         HEARTBEAT_INTERVAL, RunnerToWorker, WorkerEvent, WorkerToRunner,
         codec::{read_frame, write_frame},
     },
-    plan,
+    schedule::Schedule,
 };
-use crucible_engine::{
-    orchestrator::{Done, Orchestrator, Ready},
-    scheduler::Schedule,
-};
+use crucible_engine::orchestrator::{Done, Orchestrator, Ready};
 use crucible_plugin::Registry;
 use tokio::{
     net::{
@@ -126,10 +123,15 @@ pub struct Handshaking {
 
 pub struct Idle;
 
-pub struct Learning;
+pub struct Learning {
+    schedule: Schedule,
+}
 
+/// The fault is lifted out of the schedule on the way in, so reaching this
+/// state is what proves there is one to inject.
 pub struct Executing {
     schedule: Schedule,
+    fault: Anchor,
 }
 
 pub struct ShuttingDown {
@@ -141,18 +143,14 @@ pub enum IdleNext {
     Work(Worker<Executing>),
 }
 
-/// Build the fleet and the orchestrator, arming the proxy with `anchor` if set.
-/// Tears the replica down on any bring-up failure so a worker that dies here (a
-/// flaky readiness timeout, a crash) does not leak its containers.
-async fn bring_up(worker_id: u32, anchor: Option<Anchor>) -> Result<Orchestrator<Ready>> {
-    let plan = plan::example();
+/// Build the fleet the schedule names and the orchestrator that runs its steps,
+/// arming the proxy with the schedule's fault if it has one. Tears the replica
+/// down on any bring-up failure so a worker that dies here (a flaky readiness
+/// timeout, a crash) does not leak its containers.
+async fn bring_up(worker_id: u32, schedule: &Schedule) -> Result<Orchestrator<Ready>> {
     let registry = Registry::builtins();
-    let deployment = registry.deployment_for(&plan.fleet, worker_id, anchor)?;
-    let scenario = plan
-        .scenarios
-        .first()
-        .ok_or_else(|| crucible_plugin::Error::new("worker", "the plan describes no scenario"))?;
-    let actions = registry.actions_for(scenario)?;
+    let deployment = registry.deployment_for(&schedule.fleet, worker_id, schedule.fault.clone())?;
+    let actions = registry.actions_for(&schedule.steps)?;
     let orchestrator = Orchestrator::new(deployment, actions).setup().await?;
     Ok(orchestrator)
 }
@@ -187,7 +185,7 @@ impl Worker<Handshaking> {
                 tracing::info!(worker_id = self.id, %runner_version, "handshake ok");
                 Ok(self.transition(Idle))
             }
-            other => Err(Error::UnexpectedMessage {
+            other @ RunnerToWorker::Run(_) => Err(Error::UnexpectedMessage {
                 state: "Handshaking",
                 expected: "HelloAck",
                 got: format!("{other:?}"),
@@ -202,38 +200,32 @@ impl Worker<Idle> {
         tracing::debug!(worker_id = self.id, "sent READY");
 
         match self.conn.recv().await? {
-            RunnerToWorker::Learn => {
-                tracing::info!(worker_id = self.id, "received learn");
-                Ok(IdleNext::Learn(self.transition(Learning)))
-            }
-            RunnerToWorker::Schedule {
-                schedule_id,
-                service,
-                direction,
-                fault_packet_index,
-                payload,
-            } => {
-                tracing::info!(
-                    worker_id = self.id,
-                    schedule_id,
-                    %service,
-                    ?direction,
-                    fault_packet_index,
-                    "received schedule"
-                );
-                Ok(IdleNext::Work(self.transition(Executing {
-                    schedule: Schedule {
-                        schedule_id,
-                        service,
-                        direction,
-                        fault_packet_index,
-                        payload,
-                    },
-                })))
-            }
+            RunnerToWorker::Run(schedule) => match schedule.fault.clone() {
+                // A schedule with no fault is the fault-free run every other
+                // schedule is judged against.
+                None => {
+                    tracing::info!(
+                        worker_id = self.id,
+                        schedule_id = schedule.id,
+                        "received learn"
+                    );
+                    Ok(IdleNext::Learn(self.transition(Learning { schedule })))
+                }
+                Some(fault) => {
+                    tracing::info!(
+                        worker_id = self.id,
+                        schedule_id = schedule.id,
+                        service = fault.service,
+                        "received schedule"
+                    );
+                    Ok(IdleNext::Work(
+                        self.transition(Executing { schedule, fault }),
+                    ))
+                }
+            },
             other @ RunnerToWorker::HelloAck { .. } => Err(Error::UnexpectedMessage {
                 state: "Idle",
-                expected: "Learn or Schedule",
+                expected: "Run",
                 got: format!("{other:?}"),
             }),
         }
@@ -243,7 +235,7 @@ impl Worker<Idle> {
 impl Worker<Learning> {
     pub async fn execute_learn(self) -> Result<Worker<ShuttingDown>> {
         let heartbeat = self.conn.start_heartbeat();
-        let orchestrator = bring_up(self.id, None).await?;
+        let orchestrator = bring_up(self.id, &self.state.schedule).await?;
         let (services, orchestrator) = orchestrator
             .learn()
             .await
@@ -261,22 +253,16 @@ impl Worker<Learning> {
 impl Worker<Executing> {
     pub async fn execute_and_report(self) -> Result<Worker<ShuttingDown>> {
         let schedule = &self.state.schedule;
-        let schedule_id = schedule.schedule_id;
-        let anchor = Anchor {
-            service: schedule.service.clone(),
-            direction: schedule.direction,
-            k: schedule.fault_packet_index,
-        };
+        let schedule_id = schedule.id;
         let heartbeat = self.conn.start_heartbeat();
-        let orchestrator = bring_up(self.id, Some(anchor)).await?;
+        let orchestrator = bring_up(self.id, schedule).await?;
 
         // A check reads through the proxy's stable host port: it survives the
         // target being killed and restarted (the alias re-resolves to the new
         // container), where a direct ephemeral port would not. The anchor is
         // dormant during setup and released before a check reads, so the proxy
         // path is never actually frozen under it.
-        let plan = plan::example();
-        let queries = match Registry::builtins().queries_for(&plan.fleet, &plan.scenarios[0]) {
+        let queries = match Registry::builtins().queries_for(&schedule.fleet, &schedule.checks) {
             Ok(queries) => queries,
             Err(e) => {
                 let _ = orchestrator.teardown().await;
@@ -285,7 +271,7 @@ impl Worker<Executing> {
         };
 
         let ((verdict, kill_report), orchestrator) = orchestrator
-            .execute(&self.state.schedule, queries)
+            .execute(schedule_id, &self.state.fault, queries)
             .await
             .inspect_err(
                 |e| tracing::error!(worker_id = self.id, schedule_id, error = %e, "execute failed"),

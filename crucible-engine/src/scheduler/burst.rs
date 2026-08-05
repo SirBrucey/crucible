@@ -8,7 +8,9 @@
 
 use crucible_protocol::{Direction, ServiceProfile};
 
-use super::{Schedule, Scheduler};
+use crucible_core::{fault::Anchor, plan, schedule::Schedule};
+
+use super::Scheduler;
 
 pub struct BurstScheduler {
     total: usize,
@@ -17,9 +19,15 @@ pub struct BurstScheduler {
 
 impl BurstScheduler {
     /// Build one schedule per anchor the learn pass produced, round-robin across
-    /// `(service, direction)` so a truncated campaign covers every edge.
+    /// `(service, direction)` so a truncated campaign covers every edge. Each
+    /// carries the work to run as well as the fault, so a worker needs nothing
+    /// else to run it.
     #[must_use]
-    pub fn new(profiles: &[ServiceProfile]) -> Self {
+    pub fn new(
+        fleet: &plan::Fleet,
+        scenario: &plan::Scenario,
+        profiles: &[ServiceProfile],
+    ) -> Self {
         let anchored: Vec<(&str, Direction, &[u32])> = profiles
             .iter()
             .flat_map(|p| {
@@ -41,17 +49,21 @@ impl BurstScheduler {
 
         let max_len = anchored.iter().map(|(_, _, a)| a.len()).max().unwrap_or(0);
         let mut schedules: Vec<Schedule> = Vec::new();
-        let mut next_id: u32 = 0;
+        let mut next_id: u32 = Schedule::LEARN_ID + 1;
         for i in 0..max_len {
             for (service, direction, anchors) in &anchored {
                 if let Some(&k) = anchors.get(i) {
-                    schedules.push(Schedule {
-                        schedule_id: next_id,
-                        service: (*service).to_string(),
-                        direction: *direction,
-                        fault_packet_index: k,
-                        payload: Vec::new(),
-                    });
+                    schedules.push(Schedule::faulted(
+                        next_id,
+                        fleet.clone(),
+                        scenario.steps.clone(),
+                        scenario.checks.clone(),
+                        Anchor {
+                            service: (*service).to_string(),
+                            direction: *direction,
+                            k,
+                        },
+                    ));
                     next_id += 1;
                 }
             }
@@ -88,22 +100,35 @@ mod tests {
         }
     }
 
+    fn scheduler(profiles: &[ServiceProfile]) -> BurstScheduler {
+        let plan = plan::example();
+        BurstScheduler::new(&plan.fleet, &plan.scenarios[0], profiles)
+    }
+
+    /// The fault a burst schedule carries.
+    fn fault(schedule: &Schedule) -> &Anchor {
+        schedule
+            .fault
+            .as_ref()
+            .expect("a burst schedule always faults")
+    }
+
     #[test]
     fn empty_profiles_yield_nothing() {
-        let mut s = BurstScheduler::new(&[]);
+        let mut s = scheduler(&[]);
         assert_eq!(s.total(), 0);
         assert!(s.next().is_none());
     }
 
     #[test]
     fn one_schedule_per_anchor() {
-        let s = BurstScheduler::new(&[profile("db", vec![2, 3], vec![1])]);
+        let s = scheduler(&[profile("db", vec![2, 3], vec![1])]);
         assert_eq!(s.total(), 3);
     }
 
     #[test]
     fn both_directions_are_scheduled() {
-        let scheduler = BurstScheduler::new(&[profile("db", vec![1], vec![2])]);
+        let scheduler = scheduler(&[profile("db", vec![1], vec![2])]);
         let all: Vec<_> = std::iter::from_fn({
             let mut s = scheduler;
             move || s.next()
@@ -111,17 +136,17 @@ mod tests {
         .collect();
         assert!(
             all.iter()
-                .any(|s| s.direction == Direction::ClientToUpstream)
+                .any(|s| fault(s).direction == Direction::ClientToUpstream)
         );
         assert!(
             all.iter()
-                .any(|s| s.direction == Direction::UpstreamToClient)
+                .any(|s| fault(s).direction == Direction::UpstreamToClient)
         );
     }
 
     #[test]
     fn emission_is_round_robin_across_services() {
-        let scheduler = BurstScheduler::new(&[
+        let scheduler = scheduler(&[
             profile("api", vec![1], vec![]),
             profile("db", vec![1], vec![]),
         ]);
@@ -130,7 +155,7 @@ mod tests {
             move || s.next()
         })
         .take(2)
-        .map(|s| s.service)
+        .map(|s| fault(&s).service.clone())
         .collect();
         assert!(first_two.contains(&"api".to_string()));
         assert!(first_two.contains(&"db".to_string()));

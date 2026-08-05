@@ -9,6 +9,7 @@ use crucible_protocol::{KillMissReason, KillReport, KillResult, ServiceProfile, 
 
 use crucible_core::{
     HEAL_BUDGET,
+    fault::Anchor,
     ipc::Verdict,
     observer::SessionObserver,
     proxy_log::service_profiles_from_sessions,
@@ -17,8 +18,6 @@ use crucible_core::{
 use crucible_plugin::{
     Action, DeploymentRuntime, FaultPrimitives, Targeted, registry::PreparedCheck,
 };
-
-use crate::scheduler::Schedule;
 
 /// After a restart, wait this long before judging the fleet quiescent, so
 /// recovery traffic has a chance to start.
@@ -195,18 +194,18 @@ impl Orchestrator<Ready> {
         Ok((profiles, done))
     }
 
-    /// Run the scenario; the proxy self-freezes the fleet once the target has
-    /// forwarded the schedule's `fault_packet_index` packets on its direction,
-    /// then the kill lands against that held flow. The scenario's checks read
-    /// what the fleet settled on. Produce a verdict and report, leaving the
-    /// orchestrator [`Done`].
+    /// Run the scenario; the proxy self-freezes the fleet once `fault`'s target
+    /// has forwarded its Kth packet on its direction, then the kill lands
+    /// against that held flow. The scenario's checks read what the fleet settled
+    /// on. Produce a verdict and report, leaving the orchestrator [`Done`].
     ///
     /// # Errors
     /// Errors if arming, resuming, killing, or restarting the fleet fails, if the
     /// scenario fails to run, or if a check cannot be read.
     pub async fn execute(
         self,
-        schedule: &Schedule,
+        schedule_id: u32,
+        fault: &Anchor,
         queries: Vec<PreparedCheck>,
     ) -> Result<((Verdict, KillReport), Orchestrator<Done>), crucible_plugin::Error> {
         let Orchestrator {
@@ -247,7 +246,8 @@ impl Orchestrator<Ready> {
                             // mid-flight and record a miss.
                             deployment.resume().await?;
                             return Ok::<_, crucible_plugin::Error>(missed(
-                                schedule,
+                                schedule_id,
+                                fault,
                                 KillMissReason::ScenarioEndedBeforeAnchor,
                             ));
                         }
@@ -259,7 +259,7 @@ impl Orchestrator<Ready> {
                         // fail; ops once it is back succeed) rather than the world
                         // stopping while we heal.
                         let actual = scenario_start.elapsed().as_nanos();
-                        Ok(fire_kill(deployment.as_ref(), schedule, actual).await?)
+                        Ok(fire_kill(deployment.as_ref(), schedule_id, fault, actual).await?)
                     }
                     _ = &mut scenario_end_rx => {
                         // The scenario finished before a freeze was seen. The freeze
@@ -269,12 +269,12 @@ impl Orchestrator<Ready> {
                         // concluding the anchor was missed.
                         if session_observer.wait_for_freeze(FREEZE_GRACE).await {
                             let actual = scenario_start.elapsed().as_nanos();
-                            Ok(fire_kill(deployment.as_ref(), schedule, actual).await?)
+                            Ok(fire_kill(deployment.as_ref(), schedule_id, fault, actual).await?)
                         } else {
                             // Genuinely no freeze; release it in case one is
                             // mid-flight and record the miss.
                             deployment.resume().await?;
-                            Ok(missed(schedule, KillMissReason::ScenarioEndedBeforeAnchor))
+                            Ok(missed(schedule_id, fault, KillMissReason::ScenarioEndedBeforeAnchor))
                         }
                     }
                 }
@@ -345,10 +345,10 @@ async fn teardown_replica(
 }
 
 /// A [`KillReport`] for a fault that did not fire, for the given reason.
-fn missed(schedule: &Schedule, reason: KillMissReason) -> KillReport {
+fn missed(id: u32, fault: &Anchor, reason: KillMissReason) -> KillReport {
     KillReport {
-        schedule_id: schedule.schedule_id,
-        service: schedule.service.clone(),
+        schedule_id: id,
+        service: fault.service.clone(),
         result: KillResult::Missed(reason),
     }
 }
@@ -390,27 +390,28 @@ async fn run_actions(actions: &[TargetedAction]) -> Result<Observations, crucibl
 /// contrast, is a miss (nothing fired), not an error.
 async fn fire_kill(
     deployment: &dyn FaultPrimitives,
-    schedule: &Schedule,
+    id: u32,
+    fault: &Anchor,
     actual_offset_ns: u128,
 ) -> Result<KillReport, crucible_plugin::Error> {
-    let killed_at_ns = match deployment.kill(&schedule.service).await {
+    let killed_at_ns = match deployment.kill(&fault.service).await {
         Ok(killed_at_ns) => killed_at_ns,
         Err(e) => {
             // The kill never landed, so nothing is dead; release the freeze the
             // proxy is holding and report the miss. A resume failure here still
             // leaves the fleet wedged, so it is fatal.
             deployment.resume().await?;
-            return Ok(missed(schedule, KillMissReason::KillFailed(e.to_string())));
+            return Ok(missed(id, fault, KillMissReason::KillFailed(e.to_string())));
         }
     };
     deployment.resume().await?;
-    deployment.restart(&schedule.service).await?;
+    deployment.restart(&fault.service).await?;
     Ok(KillReport {
-        schedule_id: schedule.schedule_id,
-        service: schedule.service.clone(),
+        schedule_id: id,
+        service: fault.service.clone(),
         result: KillResult::Fired {
-            requested_direction: schedule.direction,
-            requested_packet_index: schedule.fault_packet_index,
+            requested_direction: fault.direction,
+            requested_packet_index: fault.k,
             actual_offset_ns,
             killed_at_ns,
         },
@@ -473,20 +474,18 @@ mod tests {
         crucible_plugin::Error::new("fake", message)
     }
 
-    fn schedule() -> Schedule {
-        Schedule {
-            schedule_id: 1,
+    fn fault() -> Anchor {
+        Anchor {
             service: "db".into(),
             direction: Direction::ClientToUpstream,
-            fault_packet_index: 3,
-            payload: Vec::new(),
+            k: 3,
         }
     }
 
     #[tokio::test]
     async fn fire_kill_reports_fired_when_recovery_succeeds() {
         let deployment = FakeDeployment::default();
-        let report = fire_kill(&deployment, &schedule(), 0)
+        let report = fire_kill(&deployment, 1, &fault(), 0)
             .await
             .expect("recovery succeeded, so fire_kill returns a report");
         assert!(matches!(report.result, KillResult::Fired { .. }));
@@ -500,7 +499,7 @@ mod tests {
             restart_fails: true,
             ..Default::default()
         };
-        let result = fire_kill(&deployment, &schedule(), 0).await;
+        let result = fire_kill(&deployment, 1, &fault(), 0).await;
         assert!(result.is_err());
     }
 
@@ -512,7 +511,7 @@ mod tests {
             resume_fails: true,
             ..Default::default()
         };
-        let result = fire_kill(&deployment, &schedule(), 0).await;
+        let result = fire_kill(&deployment, 1, &fault(), 0).await;
         assert!(result.is_err());
     }
 
@@ -523,7 +522,7 @@ mod tests {
             kill_fails: true,
             ..Default::default()
         };
-        let report = fire_kill(&deployment, &schedule(), 0)
+        let report = fire_kill(&deployment, 1, &fault(), 0)
             .await
             .expect("kill-failure is a miss, not an error");
         assert!(matches!(

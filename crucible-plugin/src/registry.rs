@@ -147,16 +147,15 @@ impl Registry {
         }
     }
 
-    /// Prepare every step of a scenario, each bound to the driver it names, in
-    /// the order the scenario runs them.
+    /// Prepare each step, bound to the driver it names, in the order given.
     ///
     /// # Errors
     /// Errors if a step names a driver this registry does not hold, or does not
     /// bind to an operation that driver runs.
-    pub fn actions_for(&self, scenario: &plan::Scenario) -> Result<Vec<Box<dyn Action>>, Error> {
+    pub fn actions_for(&self, steps: &[plan::Step]) -> Result<Vec<Box<dyn Action>>, Error> {
         let mut drivers: HashMap<&str, Box<dyn DriverRuntime>> = HashMap::new();
-        let mut actions = Vec::with_capacity(scenario.steps.len());
-        for step in &scenario.steps {
+        let mut actions = Vec::with_capacity(steps.len());
+        for step in steps {
             let driver = match drivers.entry(step.driver.as_str()) {
                 Entry::Occupied(driver) => driver.into_mut(),
                 Entry::Vacant(slot) => slot.insert(self.driver_runtime(&step.driver)?),
@@ -178,8 +177,8 @@ impl Registry {
         }
     }
 
-    /// Prepare every check of a scenario, each bound to the observer that
-    /// answers it, reading as the service it names is configured.
+    /// Prepare each check, bound to the observer that answers it, reading as the
+    /// service it names is configured.
     ///
     /// # Errors
     /// Errors if a check names an observer this registry does not hold or a
@@ -188,10 +187,9 @@ impl Registry {
     pub fn queries_for(
         &self,
         fleet: &plan::Fleet,
-        scenario: &plan::Scenario,
+        checks: &[plan::Check],
     ) -> Result<Vec<PreparedCheck>, Error> {
-        scenario
-            .checks
+        checks
             .iter()
             .map(|check| {
                 let service = fleet
@@ -318,7 +316,7 @@ mod tests {
     fn every_step_of_the_example_scenario_prepares() {
         let plan = crucible_core::plan::example();
         let actions = Registry::builtins()
-            .actions_for(&plan.scenarios[0])
+            .actions_for(&plan.scenarios[0].steps)
             .expect("every step binds to its driver");
         let targets: Vec<&str> = actions.iter().map(|action| action.target()).collect();
         assert_eq!(targets, ["api", "api", "api"]);
@@ -328,7 +326,7 @@ mod tests {
     fn every_check_of_the_example_scenario_prepares() {
         let plan = crucible_core::plan::example();
         let queries = Registry::builtins()
-            .queries_for(&plan.fleet, &plan.scenarios[0])
+            .queries_for(&plan.fleet, &plan.scenarios[0].checks)
             .expect("every check binds to its observer");
         let targets: Vec<&str> = queries.iter().map(|(_, query)| query.target()).collect();
         assert_eq!(targets, ["db"]);
@@ -340,7 +338,7 @@ mod tests {
         plan.scenarios[0].checks[0].service = "ledger".into();
         assert!(
             Registry::builtins()
-                .queries_for(&plan.fleet, &plan.scenarios[0])
+                .queries_for(&plan.fleet, &plan.scenarios[0].checks)
                 .is_err()
         );
     }
@@ -349,7 +347,7 @@ mod tests {
     fn a_step_naming_an_unregistered_driver_is_rejected() {
         let mut scenario = crucible_core::plan::example().scenarios.remove(0);
         scenario.steps[0].driver = "grpc".into();
-        assert!(Registry::builtins().actions_for(&scenario).is_err());
+        assert!(Registry::builtins().actions_for(&scenario.steps).is_err());
     }
 
     #[test]

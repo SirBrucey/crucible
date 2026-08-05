@@ -12,11 +12,12 @@ use crucible_core::{
     HEAL_BUDGET,
     ipc::{ServiceProfile, Verdict},
     plan,
+    schedule::Schedule,
 };
 use crucible_engine::{
     event_bus::EventBus,
     journal,
-    scheduler::{BurstScheduler, Schedule, Scheduler},
+    scheduler::{BurstScheduler, Scheduler},
 };
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
@@ -94,13 +95,16 @@ fn worker_bin_path() -> Result<PathBuf> {
 #[command(version)]
 struct Cli {
     #[command(subcommand)]
-    command: Option<Cmd>,
+    command: Cmd,
 }
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Run a fault-injection campaign against the example fleet.
-    Run,
+    /// Run a fault-injection campaign against a `.cru` scenario file.
+    Run {
+        /// Path to the scenario file.
+        file: PathBuf,
+    },
     /// Parse and check a `.cru` scenario file, reporting diagnostics.
     Check {
         /// Path to the scenario file.
@@ -110,14 +114,14 @@ enum Cmd {
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    match Cli::parse().command.unwrap_or(Cmd::Run) {
+    match Cli::parse().command {
         Cmd::Check { file } => run_check(&file),
-        Cmd::Run => run_campaign().await,
+        Cmd::Run { file } => run_campaign(&file).await,
     }
 }
 
 /// Initialise logging and run a fault-injection campaign to completion.
-async fn run_campaign() -> ExitCode {
+async fn run_campaign(file: &Path) -> ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -126,7 +130,17 @@ async fn run_campaign() -> ExitCode {
         .with_writer(std::io::stderr)
         .init();
 
-    match run().await {
+    let plan = match load(file) {
+        Ok(plan) => plan,
+        // Already rendered to stderr with source context.
+        Err(Error::ScenarioRejected(_)) => return ExitCode::from(2),
+        Err(e) => {
+            tracing::error!(error = %e, "cannot run this scenario");
+            return ExitCode::from(2);
+        }
+    };
+
+    match run(&plan).await {
         Ok(outcome) => outcome.exit_code(),
         Err(e) => {
             tracing::error!(error = %e, "runner exiting with error");
@@ -135,49 +149,43 @@ async fn run_campaign() -> ExitCode {
     }
 }
 
-/// Lex and parse a `.cru` file, rendering diagnostics on failure. Exits 0 on
-/// success, 1 on lexing or parsing diagnostics, and 2 if the file is not a
-/// readable `.cru` file.
-fn run_check(file: &Path) -> ExitCode {
-    if file.extension().and_then(std::ffi::OsStr::to_str) != Some("cru") {
-        eprintln!(
-            "crucible check: expected a `.cru` file, got `{}`",
-            file.display()
-        );
-        return ExitCode::from(2);
-    }
+/// Lower a `.cru` file to the plan a campaign runs, rendering diagnostics for
+/// anything that stops it. Both commands come through here, so both accept
+/// exactly the same files and reject them for the same reasons.
+fn load(file: &Path) -> Result<plan::Plan> {
     let name = file.display().to_string();
-    let src = match std::fs::read_to_string(file) {
-        Ok(src) => src,
+    if file.extension().and_then(std::ffi::OsStr::to_str) != Some("cru") {
+        return Err(Error::NotAScenarioFile(name));
+    }
+    let src = std::fs::read_to_string(file).map_err(|source| Error::ScenarioUnreadable {
+        path: name.clone(),
+        source,
+    })?;
+    crucible_dsl::compile(&src, &crucible_plugin::Registry::builtins()).map_err(|diags| {
+        if let Err(e) = crucible_dsl::diagnostics::emit_to_stderr(&name, &src, &diags) {
+            eprintln!("crucible: failed to render diagnostics: {e}");
+        }
+        Error::ScenarioRejected(name)
+    })
+}
+
+/// Check a `.cru` file and describe what it says. Exits 0 on success, 1 if the
+/// file was read but says something we cannot run, and 2 if it could not be
+/// read at all.
+fn run_check(file: &Path) -> ExitCode {
+    let plan = match load(file) {
+        Ok(plan) => plan,
+        Err(Error::ScenarioRejected(_)) => return ExitCode::from(1),
         Err(e) => {
-            eprintln!("crucible check: cannot read {name}: {e}");
+            eprintln!("crucible check: {e}");
             return ExitCode::from(2);
         }
     };
 
-    let (tokens, lex_errors) = crucible_dsl::lexer::lex(&src);
-    if !lex_errors.is_empty() {
-        let diags: Vec<_> = lex_errors
-            .iter()
-            .map(|e| crucible_dsl::diagnostics::Diag::new(e.span, e.message.clone()))
-            .collect();
-        return render_and_fail(&name, &src, &diags);
-    }
-
-    let ast = match crucible_dsl::parser::parse(tokens) {
-        Ok(ast) => ast,
-        Err(diags) => return render_and_fail(&name, &src, &diags),
-    };
-
-    let registry = crucible_plugin::Registry::builtins();
-    let plan = match crucible_dsl::lower::lower(&ast, &registry) {
-        Ok(plan) => plan,
-        Err(diags) => return render_and_fail(&name, &src, &diags),
-    };
-
     let fleet = &plan.fleet;
     println!(
-        "{name}: ok (fleet `{}` via `{}`, {} service(s), {} scenario(s), spec {:016x})",
+        "{}: ok (fleet `{}` via `{}`, {} service(s), {} scenario(s), spec {:016x})",
+        file.display(),
         fleet.name,
         fleet.deployment,
         fleet.services.len(),
@@ -187,15 +195,7 @@ fn run_check(file: &Path) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Render diagnostics to stderr and return the check-failed exit code.
-fn render_and_fail(name: &str, src: &str, diags: &[crucible_dsl::diagnostics::Diag]) -> ExitCode {
-    if let Err(e) = crucible_dsl::diagnostics::emit_to_stderr(name, src, diags) {
-        eprintln!("crucible check: failed to render diagnostics: {e}");
-    }
-    ExitCode::from(1)
-}
-
-async fn run() -> Result<CampaignOutcome> {
+async fn run(plan: &plan::Plan) -> Result<CampaignOutcome> {
     let (bus, journal_rx) = EventBus::new();
 
     let journal_path = journal::default_path(std::process::id());
@@ -218,7 +218,7 @@ async fn run() -> Result<CampaignOutcome> {
         }
     });
 
-    let workload = drive(&bus).await;
+    let workload = drive(&bus, plan).await;
 
     drop(bus);
     journal_task.await.expect("journal task should not panic")?;
@@ -233,21 +233,21 @@ async fn run() -> Result<CampaignOutcome> {
 /// killed before it could (a setup that outran its budget, a crash), this
 /// reclaims the replica so its containers and network do not leak and starve the
 /// host of the concurrent workers still running.
-async fn reclaim_fleet(worker_id: u32) {
-    if let Err(e) = reclaim(worker_id).await {
+async fn reclaim_fleet(worker_id: u32, fleet: &plan::Fleet) {
+    if let Err(e) = reclaim(worker_id, fleet).await {
         tracing::warn!(worker_id, error = %e, "failed to reclaim worker fleet");
     }
 }
 
-/// Remove a replica by worker id alone. Needs no live worker state, since the
-/// container and network names follow from the id, and is a no-op once the
-/// replica is already gone.
-async fn reclaim(worker_id: u32) -> std::result::Result<(), crucible_plugin::Error> {
-    let mut deployment = crucible_plugin::Registry::builtins().deployment_for(
-        &plan::example().fleet,
-        worker_id,
-        None,
-    )?;
+/// Remove a worker's replica without any live worker state: the containers are
+/// named from the worker id and the fleet's services, and removing one already
+/// gone is a no-op.
+async fn reclaim(
+    worker_id: u32,
+    fleet: &plan::Fleet,
+) -> std::result::Result<(), crucible_plugin::Error> {
+    let mut deployment =
+        crucible_plugin::Registry::builtins().deployment_for(fleet, worker_id, None)?;
     deployment.teardown().await
 }
 
@@ -414,6 +414,9 @@ impl Recovery {
 /// carry on.
 struct Pool<'a> {
     bus: &'a EventBus,
+    /// The fleet every replica of this campaign runs, so one can be reclaimed
+    /// without the worker that owned it.
+    fleet: &'a plan::Fleet,
     inflight: JoinSet<(Schedule, u32, Result<Verdict>)>,
     outcomes: Outcomes,
     recovery: Recovery,
@@ -428,6 +431,7 @@ struct Pool<'a> {
 impl<'a> Pool<'a> {
     fn new(
         bus: &'a EventBus,
+        fleet: &'a plan::Fleet,
         worker_id: u32,
         schedule_budget: Duration,
         campaign_start: Instant,
@@ -435,6 +439,7 @@ impl<'a> Pool<'a> {
     ) -> Self {
         Self {
             bus,
+            fleet,
             inflight: JoinSet::new(),
             outcomes: Outcomes::default(),
             recovery: Recovery::default(),
@@ -486,7 +491,7 @@ impl<'a> Pool<'a> {
         match joined {
             Ok((schedule, _attempt, Ok(verdict))) => {
                 self.recovery.reset();
-                self.outcomes.record_verdict(schedule.schedule_id, verdict);
+                self.outcomes.record_verdict(schedule.id, verdict);
             }
             // A worker that outran its budget did not crash; we simply have no
             // verdict in the time allowed. Record it inconclusive rather than
@@ -494,7 +499,7 @@ impl<'a> Pool<'a> {
             Ok((schedule, _attempt, Err(Error::WorkerTimeout(budget)))) => {
                 self.recovery.reset();
                 self.outcomes.record_verdict(
-                    schedule.schedule_id,
+                    schedule.id,
                     Verdict::Inconclusive {
                         reason: format!("worker exceeded its {budget:?} budget"),
                     },
@@ -504,7 +509,7 @@ impl<'a> Pool<'a> {
                 if !self.gave_up && self.within_budget() && Recovery::may_respawn(attempt) =>
             {
                 tracing::warn!(
-                    schedule_id = schedule.schedule_id,
+                    schedule_id = schedule.id,
                     attempt,
                     error = %e,
                     "worker failed; respawning on a fresh replica"
@@ -512,7 +517,7 @@ impl<'a> Pool<'a> {
                 self.spawn(schedule, attempt + 1);
             }
             Ok((schedule, attempt, Err(e))) => {
-                let schedule_id = schedule.schedule_id;
+                let schedule_id = schedule.id;
                 tracing::warn!(schedule_id, attempts = attempt, error = %e, "worker failed and will not be retried");
                 self.outcomes.record_error(Some(schedule_id), e);
                 self.recovery.record_failure();
@@ -538,27 +543,34 @@ impl<'a> Pool<'a> {
     async fn reclaim_all(&mut self) {
         self.inflight.shutdown().await;
         for id in 0..self.worker_id {
-            reclaim_fleet(id).await;
+            reclaim_fleet(id, self.fleet).await;
         }
     }
 }
 
-async fn drive(bus: &EventBus) -> Result<CampaignOutcome> {
+async fn drive(bus: &EventBus, plan: &plan::Plan) -> Result<CampaignOutcome> {
     let campaign_start = Instant::now();
     let mut worker_id: u32 = 0;
 
+    // One scenario for now; a plan describing several would run each in turn.
+    let scenario = plan
+        .scenarios
+        .first()
+        .expect("the grammar requires a scenario, so a lowered plan states one");
+
     // Learn is a barrier: schedules derive from its observed traffic profiles.
-    let (services, run_cost) = run_learn(bus, &mut worker_id).await?;
+    let (services, run_cost) = run_learn(bus, &mut worker_id, &plan.fleet, scenario).await?;
     tracing::info!(
         services = services.len(),
         run_cost_ms = run_cost.as_millis(),
         "session catalogue received"
     );
 
-    let mut scheduler = BurstScheduler::new(&services);
+    let mut scheduler = BurstScheduler::new(&plan.fleet, scenario, &services);
     let total = scheduler.total();
     let mut pool = Pool::new(
         bus,
+        &plan.fleet,
         worker_id,
         run_cost + HEAL_BUDGET + SCHEDULE_MARGIN,
         campaign_start,
@@ -601,13 +613,23 @@ async fn drive(bus: &EventBus) -> Result<CampaignOutcome> {
 /// campaign. Each attempt runs on its own worker and is reclaimed afterwards,
 /// whatever the outcome, so a killed learn worker leaves nothing behind.
 /// Advances `worker_id` past every attempt so each gets its own socket and fleet.
-async fn run_learn(bus: &EventBus, worker_id: &mut u32) -> Result<(Vec<ServiceProfile>, Duration)> {
+async fn run_learn(
+    bus: &EventBus,
+    worker_id: &mut u32,
+    fleet: &plan::Fleet,
+    scenario: &plan::Scenario,
+) -> Result<(Vec<ServiceProfile>, Duration)> {
     let mut attempt = 1;
     loop {
         let id = *worker_id;
         *worker_id += 1;
-        let outcome = execute_learn(bus, id).await;
-        reclaim_fleet(id).await;
+        let schedule = Schedule::learn(
+            fleet.clone(),
+            scenario.steps.clone(),
+            scenario.checks.clone(),
+        );
+        let outcome = execute_learn(bus, id, schedule).await;
+        reclaim_fleet(id, fleet).await;
         match outcome {
             Ok(result) => return Ok(result),
             Err(e) if attempt < LEARN_MAX_ATTEMPTS => {
@@ -623,13 +645,17 @@ async fn run_learn(bus: &EventBus, worker_id: &mut u32) -> Result<(Vec<ServicePr
 /// hung worker (for instance one that connects but never sends `Ready`) cannot
 /// wedge the campaign, and reaping the child on every path so a failure leaves
 /// no zombie.
-async fn execute_learn(bus: &EventBus, worker_id: u32) -> Result<(Vec<ServiceProfile>, Duration)> {
+async fn execute_learn(
+    bus: &EventBus,
+    worker_id: u32,
+    schedule: Schedule,
+) -> Result<(Vec<ServiceProfile>, Duration)> {
     let (socket_path, listener) = bind_worker_listener(worker_id).await?;
     let (mut child, stderr_relay) = spawn_worker(&socket_path, worker_id)?;
     let learn_start = Instant::now();
     let pipeline = async {
         let session = accept_and_handshake(&listener, bus).await?;
-        let services = session.learn(bus).await?;
+        let services = session.learn(bus, schedule).await?;
         Ok::<_, Error>((services, learn_start.elapsed()))
     };
     match tokio::time::timeout(LEARN_BUDGET, pipeline).await {
@@ -669,7 +695,7 @@ async fn run_one_schedule(
     schedule_budget: Duration,
 ) -> (Schedule, u32, Result<Verdict>) {
     let verdict = run_worker(&bus, worker_id, schedule.clone(), schedule_budget).await;
-    reclaim_fleet(worker_id).await;
+    reclaim_fleet(worker_id, &schedule.fleet).await;
     (schedule, attempt, verdict)
 }
 

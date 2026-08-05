@@ -1,4 +1,6 @@
-pub use crucible_protocol::{Direction, KillReport, ServiceProfile, Session};
+pub use crucible_protocol::{KillReport, ServiceProfile, Session};
+
+use crate::schedule::Schedule;
 
 /// Messages passed from one of the worker processes to the main runner.
 #[derive(Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -14,13 +16,13 @@ pub enum WorkerToRunner {
     Ready,
     /// Worker reports the outcome of executing a schedule.
     RunResult {
-        /// Correlation id, matching the `Schedule` this result is for.
+        /// Correlation id, matching the [`Schedule`] this result is for.
         schedule_id: u32,
         /// Outcome of the run, carrying the driver's explanation.
         verdict: Verdict,
     },
-    /// Worker returns the per-service fault anchors the Learn run derived from
-    /// its observed traffic, already scenario-relative.
+    /// Worker returns the per-service fault anchors the fault-free run derived
+    /// from its observed traffic, already scenario-relative.
     SessionCatalogue { services: Vec<ServiceProfile> },
     /// Worker emits an observational event for the runner to record.
     Event(WorkerEvent),
@@ -59,35 +61,8 @@ pub enum RunnerToWorker {
         /// Version of the runner
         runner_version: String,
     },
-    /// Runner asks the worker to run the scenario once with faults disabled and
-    /// return the sessions the sidecars observed as a `SessionCatalogue`.
-    Learn,
-    /// Runner sends a schedule for the worker to execute.
-    Schedule {
-        /// Correlation id, referenced by the matching `RunResult`.
-        schedule_id: u32,
-        /// Target service for the kill fault.
-        service: String,
-        /// Direction whose packets the anchor counts.
-        direction: Direction,
-        /// Freeze and kill once this many packets have crossed on `direction`.
-        fault_packet_index: u32,
-        /// Serialized schedule spec.
-        #[serde(with = "base64_bytes")]
-        payload: Vec<u8>,
-    },
-}
-
-mod base64_bytes {
-    use base64::{Engine as _, prelude::BASE64_STANDARD};
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
-
-    pub fn serialize<S: Serializer>(bytes: &Vec<u8>, s: S) -> Result<S::Ok, S::Error> {
-        BASE64_STANDARD.encode(bytes).serialize(s)
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
-        let s = String::deserialize(d)?;
-        BASE64_STANDARD.decode(s).map_err(serde::de::Error::custom)
-    }
+    /// Runner sends a schedule for the worker to run. A schedule with no faults
+    /// is the fault-free run, which answers with a `SessionCatalogue`; any other
+    /// answers with a `RunResult`.
+    Run(Schedule),
 }
