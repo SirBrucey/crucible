@@ -107,7 +107,9 @@ impl Session<Dispatching> {
 
     /// Drive the fault-free run: the same schedule shape as any other, with
     /// nothing to break, so what it observes describes the workload the faulted
-    /// runs perform.
+    /// runs perform. Reads frames until the catalogue arrives, journalling every
+    /// intervening `Event(_)` as [`Session::<AwaitingResult>::await_result`]
+    /// does.
     pub async fn learn(
         mut self,
         bus: &EventBus,
@@ -119,20 +121,24 @@ impl Session<Dispatching> {
         write_frame(&mut self.stream, &outbound).await?;
         journal_out(bus, self.state.worker_id, outbound).await;
 
-        let msg = read_live(&mut self.stream).await?;
-        let services = match &msg {
-            WorkerToRunner::SessionCatalogue { services } => services.clone(),
-            other => {
-                return Err(Error::UnexpectedMessage {
-                    state: "Learning",
-                    expected: "SessionCatalogue",
-                    got: format!("{other:?}"),
-                });
+        loop {
+            let msg = read_live(&mut self.stream).await?;
+            let services = match &msg {
+                WorkerToRunner::SessionCatalogue { services } => Some(services.clone()),
+                WorkerToRunner::Event(_) => None,
+                other => {
+                    return Err(Error::UnexpectedMessage {
+                        state: "Learning",
+                        expected: "SessionCatalogue or Event",
+                        got: format!("{other:?}"),
+                    });
+                }
+            };
+            journal_in(bus, self.state.worker_id, msg).await;
+            if let Some(services) = services {
+                return Ok(services);
             }
-        };
-        journal_in(bus, self.state.worker_id, msg).await;
-
-        Ok(services)
+        }
     }
 
     pub async fn dispatch(
