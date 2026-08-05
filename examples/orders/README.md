@@ -19,8 +19,8 @@ Produces two local images:
 
 ## Run
 
-The example fleet is what `crucible-core::fleet::EXAMPLE` points to. Running the framework binary brings the whole fleet up per worker, executes schedules, and tears it down:
+`orders.cru` describes the fleet and the scenario to drive against it. Running it brings the whole fleet up per worker, executes schedules, and tears it down:
 
 ```
-cargo run --bin crucible
+cargo run -p crucible -- run examples/orders/orders.cru
 ```
