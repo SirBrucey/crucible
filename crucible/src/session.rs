@@ -142,7 +142,7 @@ impl Session<Dispatching> {
     ) -> Result<Session<AwaitingResult>> {
         self.read_ready(bus, "Dispatching").await?;
 
-        let outbound = RunnerToWorker::from(schedule);
+        let outbound = RunnerToWorker::Run(schedule);
         write_frame(&mut self.stream, &outbound).await?;
         journal_out(bus, self.state.worker_id, outbound).await;
 

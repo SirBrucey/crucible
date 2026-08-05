@@ -16,13 +16,13 @@ pub enum WorkerToRunner {
     Ready,
     /// Worker reports the outcome of executing a schedule.
     RunResult {
-        /// Correlation id, matching the `Schedule` this result is for.
+        /// Correlation id, matching the [`Schedule`] this result is for.
         schedule_id: u32,
         /// Outcome of the run, carrying the driver's explanation.
         verdict: Verdict,
     },
-    /// Worker returns the per-service fault anchors the Learn run derived from
-    /// its observed traffic, already scenario-relative.
+    /// Worker returns the per-service fault anchors the fault-free run derived
+    /// from its observed traffic, already scenario-relative.
     SessionCatalogue { services: Vec<ServiceProfile> },
     /// Worker emits an observational event for the runner to record.
     Event(WorkerEvent),
@@ -65,10 +65,4 @@ pub enum RunnerToWorker {
     /// is the fault-free run, which answers with a `SessionCatalogue`; any other
     /// answers with a `RunResult`.
     Run(Schedule),
-}
-
-impl From<Schedule> for RunnerToWorker {
-    fn from(schedule: Schedule) -> Self {
-        RunnerToWorker::Run(schedule)
-    }
 }
