@@ -770,7 +770,10 @@ mod tests {
                      scenario "s" { consistent_within: 1s; expect { db.orders.rows == 1; } }"#;
         let diags = diagnose(src);
         let diag = find(&diags, "no observable `orders.rows`");
-        assert_eq!(diag.help.as_ref().unwrap().suggestions, ["<table>.count"]);
+        assert_eq!(
+            diag.help.as_ref().unwrap().suggestions,
+            ["<table>.count", "<table>.select"],
+        );
         // The span covers the observable path, not the valid `db` service.
         assert_eq!(&src[diag.span.start..diag.span.end], "orders.rows");
     }

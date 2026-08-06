@@ -218,4 +218,10 @@ impl OpSig {
         self.clauses.push(clause);
         self
     }
+
+    #[must_use]
+    pub fn with_param(mut self, param: Param) -> Self {
+        self.params.push(param);
+        self
+    }
 }
