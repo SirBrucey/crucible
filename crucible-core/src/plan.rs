@@ -196,23 +196,33 @@ fn example_scenario() -> Scenario {
             ("quantity".into(), Value::Int(quantity)),
         ]),
     };
+    let level = |item: &str, level: i64| Check {
+        service: "db".into(),
+        observer: "mariadb".into(),
+        observable: vec!["stock".into(), "select".into()],
+        args: vec![Value::Ident("level".into())],
+        filter: Some(("item".into(), Value::Str(item.into()))),
+        op: CmpOp::Eq,
+        value: Value::Int(level),
+    };
     Scenario {
         name: "orders_durability".into(),
         consistent_within: Duration::from_secs(15),
-        steps: vec![
-            order("book", 4),
-            order("noodles", 10),
-            order("usb-c cable", 1),
+        steps: vec![order("book", 4), order("pen", 10), order("mug", 1)],
+        checks: vec![
+            Check {
+                service: "db".into(),
+                observer: "mariadb".into(),
+                observable: vec!["orders".into(), "count".into()],
+                args: Vec::new(),
+                filter: None,
+                op: CmpOp::Eq,
+                value: Value::Int(3),
+            },
+            level("book", 96),
+            level("pen", 490),
+            level("mug", 249),
         ],
-        checks: vec![Check {
-            service: "db".into(),
-            observer: "mariadb".into(),
-            observable: vec!["orders".into(), "count".into()],
-            args: Vec::new(),
-            filter: None,
-            op: CmpOp::Eq,
-            value: Value::Int(3),
-        }],
     }
 }
 

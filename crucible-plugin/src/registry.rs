@@ -329,7 +329,12 @@ mod tests {
             .queries_for(&plan.fleet, &plan.scenarios[0].checks)
             .expect("every check binds to its observer");
         let targets: Vec<&str> = queries.iter().map(|(_, query)| query.target()).collect();
-        assert_eq!(targets, ["db"]);
+        let named: Vec<&str> = plan.scenarios[0]
+            .checks
+            .iter()
+            .map(|check| check.service.as_str())
+            .collect();
+        assert_eq!(targets, named);
     }
 
     #[test]

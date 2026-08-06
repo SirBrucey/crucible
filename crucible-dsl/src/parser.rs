@@ -380,8 +380,8 @@ impl Parser {
         Some(Spanned::new(Predicate { left, op, right }, span))
     }
 
-    /// Parse a dotted observable path with an optional `where` filter, e.g.
-    /// `db.orders.count where name = "www"`.
+    /// Parse a dotted observable path, its arguments, and an optional `where`
+    /// filter, e.g. `db.orders.count where name = "www"`.
     fn observable(&mut self) -> Option<Spanned<OpCall>> {
         let first = self.expect_ident("an observable")?;
         let start = first.span.start;
@@ -391,6 +391,14 @@ impl Parser {
             let segment = self.expect_ident("an observable path segment")?;
             end = segment.span.end;
             head.push(segment);
+        }
+        let mut args = Vec::new();
+        // `where` is an identifier like any other, so it is excluded by name or
+        // it reads as an argument.
+        while !self.at_kw("where") && self.is_value_start() {
+            let Some(value) = self.value() else { break };
+            end = value.span.end;
+            args.push(value);
         }
         let mut clauses = Vec::new();
         if self.at_kw("where")
@@ -402,7 +410,7 @@ impl Parser {
         Some(Spanned::new(
             OpCall {
                 head,
-                args: Vec::new(),
+                args,
                 clauses,
             },
             Span::new(start, end),
