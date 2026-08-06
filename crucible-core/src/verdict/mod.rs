@@ -2,11 +2,13 @@
 
 pub mod drivers;
 
+use std::cmp::Ordering;
+
 pub use drivers::{Converges, Durable, Idempotent, Recovers};
 use serde::{Deserialize, Serialize};
 use strum::EnumIter;
 
-use crate::ipc::Verdict;
+use crate::{ipc::Verdict, schema::CmpOp};
 
 /// The four canonical event-driven invariants Crucible checks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize, EnumIter)]
@@ -35,27 +37,65 @@ pub struct Observed {
     pub value: crate::plan::Value,
 }
 
+impl Observed {
+    /// Whether the reading satisfies the check it answers, or `None` when the
+    /// two cannot be compared: a reading of a different shape from the one the
+    /// check states, or an ordering asked of values that have none.
+    #[must_use]
+    pub fn holds(&self) -> Option<bool> {
+        let (reading, stated) = (&self.value, &self.check.value);
+        // The check pass held the author's value to the shape the observable
+        // declares, so a reading of another shape is the plugin answering with
+        // something it never said it would.
+        if std::mem::discriminant(reading) != std::mem::discriminant(stated) {
+            return None;
+        }
+        match self.check.op {
+            CmpOp::Eq => Some(reading == stated),
+            CmpOp::Ne => Some(reading != stated),
+            CmpOp::Lt => order(reading, stated).map(Ordering::is_lt),
+            CmpOp::Le => order(reading, stated).map(Ordering::is_le),
+            CmpOp::Gt => order(reading, stated).map(Ordering::is_gt),
+            CmpOp::Ge => order(reading, stated).map(Ordering::is_ge),
+        }
+    }
+
+    /// The check as the scenario spells it, for a verdict to point at.
+    #[must_use]
+    pub fn observable(&self) -> String {
+        let mut spelling = vec![self.check.observable.join(".")];
+        spelling.extend(self.check.args.iter().map(ToString::to_string));
+        if let Some((column, value)) = &self.check.filter {
+            spelling.push(format!("where {column} = {value}"));
+        }
+        spelling.join(" ")
+    }
+}
+
+/// How two readings of the same shape order, for the shapes that have an order.
+fn order(a: &crate::plan::Value, b: &crate::plan::Value) -> Option<Ordering> {
+    use crate::plan::Value::{Duration, Int, Str};
+    match (a, b) {
+        (Int(a), Int(b)) => Some(a.cmp(b)),
+        (Str(a), Str(b)) => Some(a.cmp(b)),
+        (Duration(a), Duration(b)) => Some(a.cmp(b)),
+        _ => None,
+    }
+}
+
 impl Observations {
     #[must_use]
     pub fn empty() -> Self {
         Self::default()
     }
 
-    /// How many driven operations the system acknowledged.
+    /// How many driven operations the system did not take responsibility for,
+    /// whether by refusing them or by leaving the caller in doubt.
     #[must_use]
-    pub fn acked(&self) -> usize {
+    pub fn undelivered(&self) -> usize {
         self.outcomes
             .iter()
-            .filter(|outcome| outcome.ack == Ack::Acked)
-            .count()
-    }
-
-    /// How many driven operations left the caller in doubt.
-    #[must_use]
-    pub fn unknown(&self) -> usize {
-        self.outcomes
-            .iter()
-            .filter(|outcome| outcome.ack == Ack::Unknown)
+            .filter(|outcome| outcome.ack != Ack::Acked)
             .count()
     }
 }

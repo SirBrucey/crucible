@@ -108,6 +108,31 @@ pub enum Value {
     Map(Vec<(String, Value)>),
 }
 
+/// As an author would have written it, so a verdict can quote a reading back
+/// in the terms of the scenario it came from.
+impl std::fmt::Display for Value {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Value::Str(s) => write!(f, "{s:?}"),
+            Value::Int(n) => write!(f, "{n}"),
+            Value::Bool(b) => write!(f, "{b}"),
+            Value::Duration(d) => write!(f, "{d:?}"),
+            Value::Ident(name) => write!(f, "{name}"),
+            Value::List(items) => {
+                let items: Vec<String> = items.iter().map(ToString::to_string).collect();
+                write!(f, "[{}]", items.join(", "))
+            }
+            Value::Map(entries) => {
+                let entries: Vec<String> = entries
+                    .iter()
+                    .map(|(key, value)| format!("{key}: {value}"))
+                    .collect();
+                write!(f, "{{ {} }}", entries.join(", "))
+            }
+        }
+    }
+}
+
 impl Value {
     #[must_use]
     pub fn as_str(&self) -> Option<&str> {
