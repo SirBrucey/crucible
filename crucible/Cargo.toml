@@ -6,6 +6,16 @@ authors.workspace = true
 publish.workspace = true
 license.workspace = true
 
+# Two binaries from one crate, so a change to the protocol they speak rebuilds
+# both or neither.
+[[bin]]
+name = "crucible"
+path = "src/runner/main.rs"
+
+[[bin]]
+name = "crucible-worker"
+path = "src/worker/main.rs"
+
 [dependencies]
 clap = { workspace = true }
 crucible-core = { path = "../crucible-core" }
