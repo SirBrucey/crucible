@@ -271,6 +271,7 @@ mod tests {
             service: "db".into(),
             observer: "mariadb".into(),
             observable: observable.iter().map(|s| (*s).to_string()).collect(),
+            args: Vec::new(),
             filter: filter.map(|(column, value)| (column.to_string(), value)),
             op: CmpOp::Eq,
             value: plan::Value::Int(3),

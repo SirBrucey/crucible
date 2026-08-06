@@ -260,7 +260,7 @@ impl<'a> Lowerer<'a> {
             );
             return None;
         };
-        self.check_args(step, sig, driver, services);
+        self.check_args(step, sig, &driver.node.clone(), driver, services);
         self.check_clauses(op, sig);
         Some(plan::Step {
             driver: driver.node.clone(),
@@ -270,23 +270,24 @@ impl<'a> Lowerer<'a> {
         })
     }
 
-    /// Validate a `do` action's positional arguments against the operation's
-    /// parameters.
+    /// Validate an operation's positional arguments against its parameters.
+    /// `label` is what the author wrote, for the message; `kind` is the plugin
+    /// answering it, which a service reference is checked against.
     fn check_args(
         &mut self,
-        step: &Spanned<OpCall>,
+        call: &Spanned<OpCall>,
         sig: &OpSig,
-        driver: &Spanned<String>,
+        label: &str,
+        kind: &Spanned<String>,
         services: &HashMap<String, ServiceModel>,
     ) {
-        let op = &step.node;
+        let op = &call.node;
         let required = sig.params.iter().filter(|param| param.required).count();
         if op.args.len() < required || op.args.len() > sig.params.len() {
             self.error(
-                step.span,
+                call.span,
                 format!(
-                    "`{}` takes {} argument(s), got {}",
-                    driver.node,
+                    "`{label}` takes {} argument(s), got {}",
                     sig.params.len(),
                     op.args.len()
                 ),
@@ -294,7 +295,7 @@ impl<'a> Lowerer<'a> {
             return;
         }
         for (arg, param) in op.args.iter().zip(&sig.params) {
-            self.check_param(arg, param, driver, services);
+            self.check_param(arg, param, kind, services);
         }
     }
 
@@ -383,12 +384,29 @@ impl<'a> Lowerer<'a> {
             );
             return None;
         };
+        let path_names: Vec<String> = path.iter().map(|segment| segment.node.clone()).collect();
+        let kind = Spanned::new(
+            observer.clone(),
+            path_span(path).unwrap_or(predicate.node.left.span),
+        );
+        self.check_args(
+            &predicate.node.left,
+            sig,
+            &path_names.join("."),
+            &kind,
+            services,
+        );
         self.check_clauses(observable, sig);
         self.check_comparison(&predicate.node, sig);
         Some(plan::Check {
             service: service_ref.node.clone(),
             observer,
-            observable: path.iter().map(|segment| segment.node.clone()).collect(),
+            observable: path_names,
+            args: observable
+                .args
+                .iter()
+                .map(|a| lower_value(&a.node))
+                .collect(),
             filter: where_of(observable),
             op: plugin_cmp(predicate.node.op.node),
             value: lower_value(&predicate.node.right.node),

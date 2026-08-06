@@ -157,6 +157,7 @@ mod tests {
                 service: "db".into(),
                 observer: "mariadb".into(),
                 observable: vec!["writes".into(), "count".into()],
+                args: Vec::new(),
                 filter: None,
                 op: crate::schema::CmpOp::Eq,
                 value: plan::Value::Int(survived),

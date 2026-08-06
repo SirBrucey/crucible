@@ -85,6 +85,8 @@ pub struct Check {
     pub service: String,
     pub observer: String,
     pub observable: Vec<String>,
+    /// The observable's positional arguments, as its plugin declared them.
+    pub args: Vec<Value>,
     pub filter: Option<(String, Value)>,
     pub op: CmpOp,
     pub value: Value,
@@ -206,6 +208,7 @@ fn example_scenario() -> Scenario {
             service: "db".into(),
             observer: "mariadb".into(),
             observable: vec!["orders".into(), "count".into()],
+            args: Vec::new(),
             filter: None,
             op: CmpOp::Eq,
             value: Value::Int(3),
