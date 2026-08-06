@@ -39,73 +39,56 @@ impl Driver for Durable {
             };
         }
 
-        // Weighing one tally of the whole run against one reading only says
-        // anything when the reading covers the whole run too. Until a run
-        // records what each step left behind, anything else is a question this
-        // cannot answer, and answering it anyway would be a verdict about
-        // something nobody asked.
-        let observed = match observations.checks.as_slice() {
-            [only] => only,
-            [] => {
-                return Verdict::Inconclusive {
-                    reason: "the scenario states nothing to check after heal".into(),
-                };
-            }
-            several => {
-                return Verdict::Inconclusive {
-                    reason: format!(
-                        "durability weighs what the run wrote against one reading, and the scenario states {}",
-                        several.len()
-                    ),
-                };
-            }
-        };
-        if observed.check.filter.is_some() {
+        if observations.outcomes.is_empty() {
             return Verdict::Inconclusive {
-                reason: "a filtered check reads part of what the run wrote, which the whole of it cannot be weighed against".into(),
+                reason: "the scenario drove nothing, so nothing was put at risk".into(),
+            };
+        }
+        if observations.checks.is_empty() {
+            return Verdict::Inconclusive {
+                reason: "the scenario states nothing to check after heal".into(),
             };
         }
 
-        let name = observed.check.observable.join(".");
-        let Some(reading) = observed.value.as_int() else {
+        // A step the caller was told had failed leaves the fleet somewhere the
+        // scenario never describes: not where it started and not where it was
+        // written to end. Saying where takes a checkpoint per step, so until
+        // there is one this declines rather than holding a partial run to an
+        // expectation written for a whole one.
+        let undelivered = observations.undelivered();
+        if undelivered > 0 {
             return Verdict::Inconclusive {
-                reason: format!("`{name}` did not read as a number of writes"),
+                reason: format!(
+                    "{undelivered} of {} step(s) did not complete, and where that leaves the fleet takes a checkpoint per step to say",
+                    observations.outcomes.len()
+                ),
             };
-        };
-        let Ok(survived) = usize::try_from(reading) else {
-            return Verdict::Inconclusive {
-                reason: format!("`{name}` read as {reading}, which is not a count"),
-            };
-        };
+        }
 
-        // The dual contract: everything acknowledged survived, and nothing
-        // survived that was never acknowledged. An operation left in doubt may
-        // legitimately land either way, so it only widens the upper bound. The
-        // scenario's own expectation is the fault-free one, which a kill
-        // legitimately changes, so the tally replaces it here.
-        let acked = observations.acked();
-        let unknown = observations.unknown();
-        // Both bounds hold trivially when the fleet took nothing on, so a run
-        // that never got a write in was not a durable one; it was not a test.
-        if acked + unknown == 0 {
-            return Verdict::Inconclusive {
-                reason: "the fleet acknowledged nothing, so nothing was there to survive".into(),
-            };
-        }
-        if survived < acked {
-            return Verdict::Fail {
-                reason: format!(
-                    "{acked} acked write(s), but `{name}` holds only {survived} after heal"
-                ),
-            };
-        }
-        if survived > acked + unknown {
-            return Verdict::Fail {
-                reason: format!(
-                    "`{name}` holds {survived}, but at most {} were acknowledged (zombie writes)",
-                    acked + unknown
-                ),
-            };
+        // Every step completed, so the fleet was told to reach the state the
+        // scenario describes and reported that it had. Anything else is state
+        // lost or invented behind the caller's back.
+        for observed in &observations.checks {
+            let observable = observed.observable();
+            match observed.holds() {
+                Some(true) => {}
+                Some(false) => {
+                    return Verdict::Fail {
+                        reason: format!(
+                            "every step completed, but `{observable}` holds {} rather than {}",
+                            observed.value, observed.check.value
+                        ),
+                    };
+                }
+                None => {
+                    return Verdict::Inconclusive {
+                        reason: format!(
+                            "`{observable}` read as {}, which the scenario's {} cannot be compared against",
+                            observed.value, observed.check.value
+                        ),
+                    };
+                }
+            }
         }
         Verdict::Pass
     }
@@ -151,27 +134,29 @@ mod tests {
         }
     }
 
-    fn read(survived: i64) -> Observed {
+    /// A check stating `writes.count == stated`, read as `read`.
+    fn reading(stated: i64, read: i64) -> Observed {
         Observed {
             check: plan::Check {
                 service: "db".into(),
                 observer: "mariadb".into(),
                 observable: vec!["writes".into(), "count".into()],
+                args: Vec::new(),
                 filter: None,
                 op: crate::schema::CmpOp::Eq,
-                value: plan::Value::Int(survived),
+                value: plan::Value::Int(stated),
             },
-            value: plan::Value::Int(survived),
+            value: plan::Value::Int(read),
         }
     }
 
-    /// A run whose fault fired and whose state was read, so the dual contract is
-    /// the only thing left to decide the verdict.
-    fn judged(acks: &[Ack], survived: i64) -> Verdict {
+    /// A run whose fault fired and whose state was read, so what the scenario
+    /// states is the only thing left to decide the verdict.
+    fn judged(acks: &[Ack], readings: Vec<Observed>) -> Verdict {
         let mut obs = Observations::empty();
         obs.kill = Some(fired_kill());
         obs.outcomes = acks.iter().copied().map(outcome).collect();
-        obs.checks = vec![read(survived)];
+        obs.checks = readings;
         Durable.drive(&obs)
     }
 
@@ -201,7 +186,7 @@ mod tests {
                 crucible_protocol::KillMissReason::ScenarioEndedBeforeAnchor,
             ),
         });
-        obs.checks = vec![read(0)];
+        obs.checks = vec![reading(0, 0)];
         assert!(matches!(Durable.drive(&obs), Verdict::Inconclusive { .. }));
     }
 
@@ -214,61 +199,100 @@ mod tests {
     }
 
     #[test]
-    fn a_run_the_fleet_took_nothing_on_is_not_a_test() {
-        // Both bounds hold at zero, so a fleet that refused everything and holds
-        // nothing would otherwise pass while having tested nothing at all.
+    fn a_scenario_that_drove_nothing_is_not_a_test() {
+        let mut obs = Observations::empty();
+        obs.kill = Some(fired_kill());
+        obs.checks = vec![reading(0, 0)];
+        assert!(matches!(Durable.drive(&obs), Verdict::Inconclusive { .. }));
+    }
+
+    #[test]
+    fn a_run_that_reached_what_the_scenario_states_is_pass() {
+        assert_eq!(
+            judged(&[Ack::Acked, Ack::Acked], vec![reading(2, 2)]),
+            Verdict::Pass,
+        );
+    }
+
+    #[test]
+    fn every_check_has_to_hold() {
+        assert_eq!(
+            judged(
+                &[Ack::Acked],
+                vec![reading(1, 1), reading(1, 1), reading(1, 1)],
+            ),
+            Verdict::Pass,
+        );
         assert!(matches!(
-            judged(&[Ack::Rejected, Ack::Rejected], 0),
-            Verdict::Inconclusive { .. }
+            judged(&[Ack::Acked], vec![reading(1, 1), reading(1, 0)]),
+            Verdict::Fail { .. },
         ));
     }
 
     #[test]
-    fn a_filtered_check_is_not_weighed_against_the_whole_run() {
-        // The tally counts every step; the reading counts the rows the filter
-        // matched. Comparing them fails whenever the filter matches less.
-        let mut obs = Observations::empty();
-        obs.kill = Some(fired_kill());
-        obs.outcomes = vec![outcome(Ack::Acked), outcome(Ack::Acked)];
-        let mut filtered = read(1);
+    fn state_the_run_never_reached_is_fail() {
+        assert!(matches!(
+            judged(&[Ack::Acked, Ack::Acked], vec![reading(2, 1)]),
+            Verdict::Fail { .. },
+        ));
+    }
+
+    #[test]
+    fn state_the_run_never_asked_for_is_fail() {
+        assert!(matches!(
+            judged(&[Ack::Acked], vec![reading(1, 2)]),
+            Verdict::Fail { .. },
+        ));
+    }
+
+    /// A step the caller was told had failed leaves the fleet part way through
+    /// the scenario, and the scenario only describes the end of it.
+    #[test]
+    fn a_step_that_did_not_complete_is_inconclusive() {
+        for ack in [Ack::Rejected, Ack::Unknown] {
+            assert!(matches!(
+                judged(&[Ack::Acked, ack], vec![reading(2, 1)]),
+                Verdict::Inconclusive { .. },
+            ));
+        }
+    }
+
+    #[test]
+    fn a_reading_of_another_shape_is_not_a_comparison() {
+        let mut mismatched = reading(1, 1);
+        mismatched.value = plan::Value::Str("one".into());
+        assert!(matches!(
+            judged(&[Ack::Acked], vec![mismatched]),
+            Verdict::Inconclusive { .. },
+        ));
+    }
+
+    #[test]
+    fn an_ordering_holds_as_well_as_an_equality() {
+        let mut at_least = reading(2, 3);
+        at_least.check.op = crate::schema::CmpOp::Ge;
+        assert_eq!(judged(&[Ack::Acked], vec![at_least]), Verdict::Pass);
+
+        let mut too_few = reading(2, 1);
+        too_few.check.op = crate::schema::CmpOp::Ge;
+        assert!(matches!(
+            judged(&[Ack::Acked], vec![too_few]),
+            Verdict::Fail { .. },
+        ));
+    }
+
+    #[test]
+    fn a_verdict_names_the_check_as_the_scenario_spells_it() {
+        let mut filtered = reading(96, 100);
+        filtered.check.observable = vec!["stock".into(), "select".into()];
+        filtered.check.args = vec![plan::Value::Ident("level".into())];
         filtered.check.filter = Some(("item".into(), plan::Value::Str("book".into())));
-        obs.checks = vec![filtered];
-        assert!(matches!(Durable.drive(&obs), Verdict::Inconclusive { .. }));
-    }
-
-    #[test]
-    fn several_checks_are_several_questions() {
-        let mut obs = Observations::empty();
-        obs.kill = Some(fired_kill());
-        obs.outcomes = vec![outcome(Ack::Acked)];
-        obs.checks = vec![read(1), read(1)];
-        assert!(matches!(Durable.drive(&obs), Verdict::Inconclusive { .. }));
-    }
-
-    #[test]
-    fn acked_writes_that_survive_are_pass() {
-        assert_eq!(judged(&[Ack::Acked, Ack::Acked], 2), Verdict::Pass);
-    }
-
-    #[test]
-    fn an_acked_write_that_did_not_survive_is_fail() {
-        assert!(matches!(
-            judged(&[Ack::Acked, Ack::Acked], 1),
-            Verdict::Fail { .. }
-        ));
-    }
-
-    #[test]
-    fn a_write_that_was_never_acked_is_a_zombie() {
-        assert!(matches!(
-            judged(&[Ack::Acked, Ack::Rejected], 2),
-            Verdict::Fail { .. }
-        ));
-    }
-
-    #[test]
-    fn a_write_left_in_doubt_may_land_either_way() {
-        assert_eq!(judged(&[Ack::Acked, Ack::Unknown], 1), Verdict::Pass);
-        assert_eq!(judged(&[Ack::Acked, Ack::Unknown], 2), Verdict::Pass);
+        let Verdict::Fail { reason } = judged(&[Ack::Acked], vec![filtered]) else {
+            panic!("a reading that misses what the scenario states is a failure");
+        };
+        assert!(
+            reason.contains(r#"stock.select level where item = "book""#),
+            "reason: {reason}"
+        );
     }
 }

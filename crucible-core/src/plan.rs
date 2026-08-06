@@ -85,6 +85,8 @@ pub struct Check {
     pub service: String,
     pub observer: String,
     pub observable: Vec<String>,
+    /// The observable's positional arguments, as its plugin declared them.
+    pub args: Vec<Value>,
     pub filter: Option<(String, Value)>,
     pub op: CmpOp,
     pub value: Value,
@@ -104,6 +106,31 @@ pub enum Value {
     Ident(String),
     List(Vec<Value>),
     Map(Vec<(String, Value)>),
+}
+
+/// As an author would have written it, so a verdict can quote a reading back
+/// in the terms of the scenario it came from.
+impl std::fmt::Display for Value {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Value::Str(s) => write!(f, "{s:?}"),
+            Value::Int(n) => write!(f, "{n}"),
+            Value::Bool(b) => write!(f, "{b}"),
+            Value::Duration(d) => write!(f, "{d:?}"),
+            Value::Ident(name) => write!(f, "{name}"),
+            Value::List(items) => {
+                let items: Vec<String> = items.iter().map(ToString::to_string).collect();
+                write!(f, "[{}]", items.join(", "))
+            }
+            Value::Map(entries) => {
+                let entries: Vec<String> = entries
+                    .iter()
+                    .map(|(key, value)| format!("{key}: {value}"))
+                    .collect();
+                write!(f, "{{ {} }}", entries.join(", "))
+            }
+        }
+    }
 }
 
 impl Value {
@@ -194,22 +221,33 @@ fn example_scenario() -> Scenario {
             ("quantity".into(), Value::Int(quantity)),
         ]),
     };
+    let level = |item: &str, level: i64| Check {
+        service: "db".into(),
+        observer: "mariadb".into(),
+        observable: vec!["stock".into(), "select".into()],
+        args: vec![Value::Ident("level".into())],
+        filter: Some(("item".into(), Value::Str(item.into()))),
+        op: CmpOp::Eq,
+        value: Value::Int(level),
+    };
     Scenario {
         name: "orders_durability".into(),
         consistent_within: Duration::from_secs(15),
-        steps: vec![
-            order("book", 4),
-            order("noodles", 10),
-            order("usb-c cable", 1),
+        steps: vec![order("book", 4), order("pen", 10), order("mug", 1)],
+        checks: vec![
+            Check {
+                service: "db".into(),
+                observer: "mariadb".into(),
+                observable: vec!["orders".into(), "count".into()],
+                args: Vec::new(),
+                filter: None,
+                op: CmpOp::Eq,
+                value: Value::Int(3),
+            },
+            level("book", 96),
+            level("pen", 490),
+            level("mug", 249),
         ],
-        checks: vec![Check {
-            service: "db".into(),
-            observer: "mariadb".into(),
-            observable: vec!["orders".into(), "count".into()],
-            filter: None,
-            op: CmpOp::Eq,
-            value: Value::Int(3),
-        }],
     }
 }
 

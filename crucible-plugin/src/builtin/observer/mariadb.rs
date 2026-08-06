@@ -4,17 +4,22 @@ use std::net::SocketAddr;
 
 use crucible_core::{
     plan,
-    schema::{AttrDecl, AttrSchema, ClauseDecl, ClauseShape, CmpOp, HeadPattern, OpSig, ValueType},
+    schema::{
+        AttrDecl, AttrSchema, ClauseDecl, ClauseShape, CmpOp, HeadPattern, OpSig, Param, ParamType,
+        ValueType,
+    },
 };
-use sqlx::{AssertSqlSafe, MySql, Pool, Row};
+use sqlx::{AssertSqlSafe, MySql, Pool, Row, mysql::MySqlRow};
 
 use crate::{
     error::Error as PluginError,
     role::{BoxFuture, Observer, ObserverRuntime, Query, Targeted},
 };
 
-/// The clause narrowing which rows are counted.
+/// The clause narrowing which rows are read.
 const WHERE: &str = "where";
+/// The alias every projection is named by.
+const ALIAS: &str = "n";
 /// Schemas the server keeps for itself, which are never the fleet's state.
 const RESERVED: [&str; 4] = ["information_schema", "mysql", "performance_schema", "sys"];
 
@@ -24,12 +29,24 @@ pub struct Mariadb {
     password: String,
 }
 
-/// One count, in the terms this plugin runs it.
+/// One reading, in the terms this plugin runs it: which table, which rows of it,
+/// and what to take from those rows.
 #[derive(Debug, PartialEq, Eq)]
-pub struct Count {
+pub struct Selection {
     pub service: String,
     pub table: String,
     pub filter: Option<Filter>,
+    pub take: Take,
+}
+
+/// What a reading takes from the rows it matched.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Take {
+    /// How many rows there are.
+    Count,
+    /// One column of the one row, so a reading can say what a value is rather
+    /// than only how many of something there are.
+    Column(String),
 }
 
 /// A column and what it is compared against, narrowed when the check binds to
@@ -54,6 +71,18 @@ pub enum Error {
     Name(String),
     #[error("a filter compares a column against a string or a number")]
     Filter,
+    #[error("`select` names the column to read")]
+    NoColumn,
+    #[error("`select` needs a `where` narrowing the read to one row")]
+    Unnarrowed,
+    #[error("`{column}` of `{table}` narrowed to {rows} row(s), and a reading is of one")]
+    NotOneRow {
+        table: String,
+        column: String,
+        rows: usize,
+    },
+    #[error("`{0}` holds nothing a plan can carry")]
+    Unreadable(String),
     #[error("the fleet holds no database to read")]
     NoDatabase,
     #[error("the fleet holds several databases, so which to read is ambiguous: {0}")]
@@ -90,7 +119,7 @@ impl Mariadb {
 
 impl Observer for Mariadb {
     const NAME: &'static str = "mariadb";
-    type Query = Count;
+    type Query = Selection;
     type Error = Error;
 
     fn signatures() -> Vec<OpSig> {
@@ -100,6 +129,13 @@ impl Observer for Mariadb {
                 ValueType::Int,
                 CmpOp::ALL.to_vec(),
             )
+            .with_clause(ClauseDecl::new(WHERE, ClauseShape::Filter)),
+            OpSig::observable(
+                HeadPattern::wildcard("table", "select"),
+                ValueType::Int,
+                CmpOp::ALL.to_vec(),
+            )
+            .with_param(Param::required("column", ParamType::Ident))
             .with_clause(ClauseDecl::new(WHERE, ClauseShape::Filter)),
         ]
     }
@@ -115,18 +151,28 @@ impl Observer for Mariadb {
     }
 
     fn bind(check: &plan::Check) -> Result<Self::Query, Self::Error> {
-        let [table, "count"] = check
-            .observable
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>()[..]
-        else {
-            return Err(Error::Observable(check.observable.join(".")));
+        let (table, take) = match check.observable.as_slice() {
+            [table, reading] if reading == "count" => (table, Take::Count),
+            [table, reading] if reading == "select" => {
+                let Some(plan::Value::Ident(column)) = check.args.first() else {
+                    return Err(Error::NoColumn);
+                };
+                if !is_bare_name(column) {
+                    return Err(Error::Name(column.clone()));
+                }
+                // A column is one value, so which row it comes from has to be
+                // settled before the read rather than after it.
+                if check.filter.is_none() {
+                    return Err(Error::Unnarrowed);
+                }
+                (table, Take::Column(column.clone()))
+            }
+            _ => return Err(Error::Observable(check.observable.join("."))),
         };
         // The table goes into the statement rather than a bound parameter, so it
         // must be a bare name and nothing else.
         if !is_bare_name(table) {
-            return Err(Error::Name(table.to_owned()));
+            return Err(Error::Name(table.clone()));
         }
         let filter = check
             .filter
@@ -146,10 +192,11 @@ impl Observer for Mariadb {
                 })
             })
             .transpose()?;
-        Ok(Count {
+        Ok(Selection {
             service: check.service.clone(),
-            table: table.to_owned(),
+            table: table.clone(),
             filter,
+            take,
         })
     }
 }
@@ -157,34 +204,34 @@ impl Observer for Mariadb {
 impl ObserverRuntime for Mariadb {
     fn prepare(&self, check: &plan::Check) -> Result<Box<dyn Query>, PluginError> {
         Ok(Box::new(Read {
-            count: Mariadb::bind(check)?,
+            selection: Mariadb::bind(check)?,
             user: self.user.clone(),
             password: self.password.clone(),
         }))
     }
 }
 
-/// A bound count and the credentials to read it with.
+/// A bound reading and the credentials to take it with.
 struct Read {
-    count: Count,
+    selection: Selection,
     user: String,
     password: String,
 }
 
 impl Targeted for Read {
     fn target(&self) -> &str {
-        &self.count.service
+        &self.selection.service
     }
 }
 
 impl Query for Read {
     fn read(&self, endpoint: SocketAddr) -> BoxFuture<'_, Result<plan::Value, PluginError>> {
-        Box::pin(async move { self.count(endpoint).await.map_err(PluginError::from) })
+        Box::pin(async move { self.take(endpoint).await.map_err(PluginError::from) })
     }
 }
 
 impl Read {
-    async fn count(&self, endpoint: SocketAddr) -> Result<plan::Value, Error> {
+    async fn take(&self, endpoint: SocketAddr) -> Result<plan::Value, Error> {
         let credentials = if self.password.is_empty() {
             self.user.clone()
         } else {
@@ -195,35 +242,64 @@ impl Read {
 
         // The clause and the value it binds come from one place, so a statement
         // can never be built with one and not the other.
-        let (clause, bound) = match &self.count.filter {
+        let (clause, bound) = match &self.selection.filter {
             Some(filter) => (
                 format!(" WHERE `{}` = ?", filter.column),
                 Some(&filter.value),
             ),
             None => (String::new(), None),
         };
-        // The table and column are bare names, checked when the check bound.
+        let projection = match &self.selection.take {
+            Take::Count => "COUNT(*)".to_owned(),
+            Take::Column(column) => format!("`{column}`"),
+        };
+        // The table and columns are bare names, checked when the check bound.
         // The database is the server's own, so it is quoted rather than trusted.
         let sql = format!(
-            "SELECT COUNT(*) AS n FROM `{}`.`{}`{clause}",
+            "SELECT {projection} AS {ALIAS} FROM `{}`.`{}`{clause}",
             quote(&database),
-            self.count.table
+            self.selection.table
         );
         // The statement is built rather than fixed, so what goes into it is
-        // checked: the table and column are bare names, and the value the filter
-        // compares against is bound rather than written in.
+        // checked: the table and columns are bare names, and the value the
+        // filter compares against is bound rather than written in.
         let mut query = sqlx::query(AssertSqlSafe(sql));
         query = match bound {
             Some(Value::Str(s)) => query.bind(s.clone()),
             Some(Value::Int(n)) => query.bind(*n),
             None => query,
         };
-        let n: i64 = query.fetch_one(&pool).await?.get("n");
+        let rows = query.fetch_all(&pool).await?;
         // A replica is killed and restarted under this observer, so its
         // connections are returned rather than left for the server to time out.
         pool.close().await;
-        Ok(plan::Value::Int(n))
+
+        match &self.selection.take {
+            // A count answers with one row whatever matched, including nothing.
+            Take::Count => value_of(&rows[0], "count"),
+            // A column is one value, so anything but one row has no answer.
+            Take::Column(column) => match rows.as_slice() {
+                [only] => value_of(only, column),
+                rows => Err(Error::NotOneRow {
+                    table: self.selection.table.clone(),
+                    column: column.clone(),
+                    rows: rows.len(),
+                }),
+            },
+        }
     }
+}
+
+/// What a statement projected, in the terms a plan speaks. Which column a
+/// `select` names is the author's, so its type is tried rather than declared.
+fn value_of(row: &MySqlRow, name: &str) -> Result<plan::Value, Error> {
+    if let Ok(n) = row.try_get::<i64, _>(ALIAS) {
+        return Ok(plan::Value::Int(n));
+    }
+    if let Ok(s) = row.try_get::<String, _>(ALIAS) {
+        return Ok(plan::Value::Str(s));
+    }
+    Err(Error::Unreadable(name.to_owned()))
 }
 
 /// The one database the fleet keeps its state in. The deployment creates it, so
@@ -259,7 +335,7 @@ fn quote(identifier: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Count, Error, Filter, Mariadb, Value};
+    use super::{Error, Filter, Mariadb, Selection, Take, Value};
     use crate::role::Observer;
     use crucible_core::{
         plan,
@@ -271,9 +347,18 @@ mod tests {
             service: "db".into(),
             observer: "mariadb".into(),
             observable: observable.iter().map(|s| (*s).to_string()).collect(),
+            args: Vec::new(),
             filter: filter.map(|(column, value)| (column.to_string(), value)),
             op: CmpOp::Eq,
             value: plan::Value::Int(3),
+        }
+    }
+
+    /// A `select` check: the column it names, and the row it narrows to.
+    fn select(table: &str, column: &str, filter: Option<(&str, plan::Value)>) -> plan::Check {
+        plan::Check {
+            args: vec![plan::Value::Ident(column.into())],
+            ..check(&[table, "select"], filter)
         }
     }
 
@@ -300,12 +385,46 @@ mod tests {
         let bound = Mariadb::bind(&check(&["orders", "count"], None)).expect("binds");
         assert_eq!(
             bound,
-            Count {
+            Selection {
                 service: "db".into(),
                 table: "orders".into(),
                 filter: None,
+                take: Take::Count,
             },
         );
+    }
+
+    #[test]
+    fn a_select_binds_to_the_column_it_names() {
+        let bound = Mariadb::bind(&select(
+            "stock",
+            "level",
+            Some(("item", plan::Value::Str("book".into()))),
+        ))
+        .expect("binds");
+        assert_eq!(bound.take, Take::Column("level".into()));
+        assert_eq!(bound.table, "stock");
+    }
+
+    #[test]
+    fn a_select_without_a_column_is_rejected() {
+        let unnamed = plan::Check {
+            args: Vec::new(),
+            ..select(
+                "stock",
+                "level",
+                Some(("item", plan::Value::Str("book".into()))),
+            )
+        };
+        assert!(matches!(Mariadb::bind(&unnamed), Err(Error::NoColumn)));
+    }
+
+    #[test]
+    fn a_select_reading_more_than_one_row_is_rejected() {
+        assert!(matches!(
+            Mariadb::bind(&select("stock", "level", None)),
+            Err(Error::Unnarrowed),
+        ));
     }
 
     #[test]
