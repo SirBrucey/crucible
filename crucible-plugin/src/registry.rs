@@ -21,8 +21,8 @@ use crate::{
 #[derive(Default)]
 pub struct Registry {
     deployments: HashMap<&'static str, AttrSchema>,
-    drivers: HashMap<&'static str, Vec<OpSig>>,
-    observers: HashMap<&'static str, Vec<OpSig>>,
+    drivers: HashMap<&'static str, RegisteredDriver>,
+    observers: HashMap<&'static str, RegisteredObserver>,
 }
 
 impl Registry {
@@ -41,11 +41,24 @@ impl Registry {
     }
 
     fn add_driver<D: Driver>(&mut self) {
-        self.drivers.insert(D::NAME, D::signatures());
+        self.drivers.insert(
+            D::NAME,
+            RegisteredDriver {
+                signatures: D::signatures(),
+                attrs: D::attr_schema(),
+            },
+        );
     }
 
-    fn add_observer<O: Observer>(&mut self) {
-        self.observers.insert(O::NAME, O::signatures());
+    fn add_observer<O: Observer + 'static>(&mut self) {
+        self.observers.insert(
+            O::NAME,
+            RegisteredObserver {
+                signatures: O::signatures(),
+                attrs: O::attr_schema(),
+                runtime: |service| Box::new(O::runtime(service)),
+            },
+        );
     }
 
     /// The attribute schema of the named deployment plugin.
@@ -57,13 +70,17 @@ impl Registry {
     /// The action signatures of the named driver plugin.
     #[must_use]
     pub fn driver(&self, name: &str) -> Option<&[OpSig]> {
-        self.drivers.get(name).map(Vec::as_slice)
+        self.drivers
+            .get(name)
+            .map(|driver| driver.signatures.as_slice())
     }
 
     /// The observable signatures of the named observer plugin.
     #[must_use]
     pub fn observer(&self, name: &str) -> Option<&[OpSig]> {
-        self.observers.get(name).map(Vec::as_slice)
+        self.observers
+            .get(name)
+            .map(|observer| observer.signatures.as_slice())
     }
 
     /// The names of the registered deployment plugins.
@@ -134,17 +151,11 @@ impl Registry {
     /// name it is registered under. A kind that is not registered reads nothing:
     /// naming it is reported where the kind itself is resolved.
     fn kind_attrs(&self, kind: &str) -> Option<(&'static str, AttrSchema)> {
-        match kind {
-            Http::NAME => self
-                .drivers
-                .get_key_value(kind)
-                .map(|(name, _)| (*name, Http::attr_schema())),
-            Mariadb::NAME => self
-                .observers
-                .get_key_value(kind)
-                .map(|(name, _)| (*name, Mariadb::attr_schema())),
-            _ => None,
+        if let Some((name, driver)) = self.drivers.get_key_value(kind) {
+            return Some((*name, driver.attrs.clone()));
         }
+        let (name, observer) = self.observers.get_key_value(kind)?;
+        Some((*name, observer.attrs.clone()))
     }
 
     /// Prepare each step, bound to the driver it names, in the order given.
@@ -215,16 +226,27 @@ impl Registry {
         name: &str,
         service: &plan::Service,
     ) -> Result<Box<dyn ObserverRuntime>, Error> {
-        match name {
-            Mariadb::NAME if self.observers.contains_key(name) => {
-                Ok(Box::new(Mariadb::new(service)))
-            }
-            other => Err(Error::new(
-                "registry",
-                format!("no observer plugin named `{other}`"),
-            )),
-        }
+        let observer = self
+            .observers
+            .get(name)
+            .ok_or_else(|| Error::new("registry", format!("no observer plugin named `{name}`")))?;
+        Ok((observer.runtime)(service))
     }
+}
+
+/// A registered driver: the operations it runs, and what it reads of a service
+/// that speaks it.
+struct RegisteredDriver {
+    signatures: Vec<OpSig>,
+    attrs: AttrSchema,
+}
+
+/// A registered observer: the observables it answers, what it reads of a
+/// service that speaks it, and how to make one that reads a given service.
+struct RegisteredObserver {
+    signatures: Vec<OpSig>,
+    attrs: AttrSchema,
+    runtime: fn(&plan::Service) -> Box<dyn ObserverRuntime>,
 }
 
 /// A check and the query bound to answer it.

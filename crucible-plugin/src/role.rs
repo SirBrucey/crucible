@@ -118,7 +118,7 @@ pub trait Action: Targeted + Send + Sync {
 
 /// An observer plugin: it advertises the observables an `expect { ... }`
 /// predicate can read.
-pub trait Observer {
+pub trait Observer: ObserverRuntime + Sized {
     /// Stable identifier used to select this plugin.
     const NAME: &'static str;
     /// One check of a plan, in this plugin's own terms.
@@ -126,6 +126,10 @@ pub trait Observer {
     type Error: std::error::Error + Send + Sync + 'static;
 
     fn signatures() -> Vec<OpSig>;
+
+    /// Construct an observer for `service`, configured from the attributes that
+    /// service declares for this plugin.
+    fn runtime(service: &plan::Service) -> Self;
 
     /// Bind a check to a query this observer can answer.
     ///

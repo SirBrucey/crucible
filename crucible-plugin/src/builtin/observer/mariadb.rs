@@ -97,11 +97,14 @@ impl From<Error> for PluginError {
     }
 }
 
-impl Mariadb {
-    /// An observer reading as the credentials a service declares, defaulting to
-    /// the unprivileged case a test fleet is usually brought up with.
-    #[must_use]
-    pub fn new(service: &plan::Service) -> Self {
+impl Observer for Mariadb {
+    const NAME: &'static str = "mariadb";
+    type Query = Selection;
+    type Error = Error;
+
+    /// Reads as the credentials the service declares, defaulting to root with
+    /// no password.
+    fn runtime(service: &plan::Service) -> Self {
         Self {
             user: service
                 .attr("user")
@@ -115,12 +118,6 @@ impl Mariadb {
                 .to_owned(),
         }
     }
-}
-
-impl Observer for Mariadb {
-    const NAME: &'static str = "mariadb";
-    type Query = Selection;
-    type Error = Error;
 
     fn signatures() -> Vec<OpSig> {
         vec![
