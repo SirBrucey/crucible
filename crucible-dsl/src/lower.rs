@@ -508,6 +508,7 @@ impl<'a> Lowerer<'a> {
 
 fn lower_value(value: &Value) -> plan::Value {
     match value {
+        Value::Null => plan::Value::Null,
         Value::Str(s) => plan::Value::Str(s.clone()),
         Value::Int(n) => plan::Value::Int(*n),
         Value::Bool(b) => plan::Value::Bool(*b),
@@ -656,6 +657,22 @@ mod tests {
     #[test]
     fn the_example_shape_validates_clean() {
         assert!(diagnose(VALID).is_empty(), "{:?}", diagnose(VALID));
+    }
+
+    #[test]
+    fn a_body_may_state_a_value_is_absent() {
+        let plan = lower_ok(&VALID.replace(r#"item: "book", quantity: 1"#, "item: null"));
+        let body = plan.scenarios[0].steps[0]
+            .body
+            .as_ref()
+            .expect("the step carries a body");
+        assert_eq!(body[0].1, plan::Value::Null);
+    }
+
+    #[test]
+    fn an_attribute_of_a_stated_type_may_not_be_absent() {
+        let diags = diagnose(&VALID.replace("port: 80", "port: null"));
+        find(&diags, "expected an integer");
     }
 
     #[test]

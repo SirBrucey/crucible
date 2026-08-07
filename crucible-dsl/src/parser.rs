@@ -496,6 +496,7 @@ impl Parser {
             TokenKind::Ident(s) => match s.as_str() {
                 "true" => Value::Bool(true),
                 "false" => Value::Bool(false),
+                "null" => Value::Null,
                 _ => Value::Ident(s.clone()),
             },
             TokenKind::LBracket => return Some(self.list()),

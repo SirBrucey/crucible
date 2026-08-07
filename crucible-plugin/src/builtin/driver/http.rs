@@ -81,6 +81,7 @@ fn encode(fields: &[(String, plan::Value)]) -> Result<Vec<u8>, Error> {
 
 fn json(value: &plan::Value) -> Result<serde_json::Value, Error> {
     let json = match value {
+        plan::Value::Null => serde_json::Value::Null,
         plan::Value::Str(s) | plan::Value::Ident(s) => serde_json::Value::from(s.clone()),
         plan::Value::Int(n) => serde_json::Value::from(*n),
         plan::Value::Bool(b) => serde_json::Value::from(*b),

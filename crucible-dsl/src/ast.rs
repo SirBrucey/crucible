@@ -84,6 +84,8 @@ pub enum CmpOp {
 /// A literal or composite value.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Value {
+    /// Stated, and stated to be absent.
+    Null,
     Str(String),
     Int(i64),
     Bool(bool),
