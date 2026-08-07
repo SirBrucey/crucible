@@ -128,7 +128,7 @@ enum Cmd {
 #[tokio::main]
 async fn main() -> ExitCode {
     match Cli::parse().command {
-        Cmd::Check { file } => run_check(&file),
+        Cmd::Check { file } => run_check(&file).await,
         Cmd::Run { file } => run_campaign(&file).await,
     }
 }
@@ -143,7 +143,7 @@ async fn run_campaign(file: &Path) -> ExitCode {
         .with_writer(std::io::stderr)
         .init();
 
-    let plan = match load(file) {
+    let plan = match load(file).await {
         Ok(plan) => plan,
         // Already rendered to stderr with source context.
         Err(Error::ScenarioRejected(_)) => return ExitCode::from(2),
@@ -165,7 +165,7 @@ async fn run_campaign(file: &Path) -> ExitCode {
 /// Lower a `.cru` file to the plan a campaign runs, rendering diagnostics for
 /// anything that stops it. Both commands come through here, so both accept
 /// exactly the same files and reject them for the same reasons.
-fn load(file: &Path) -> Result<plan::Plan> {
+async fn load(file: &Path) -> Result<plan::Plan> {
     let name = file.display().to_string();
     if file.extension().and_then(std::ffi::OsStr::to_str) != Some("cru") {
         return Err(Error::NotAScenarioFile(name));
@@ -174,7 +174,8 @@ fn load(file: &Path) -> Result<plan::Plan> {
         path: name.clone(),
         source,
     })?;
-    crucible_dsl::compile(&src, &crucible_plugin::Registry::builtins()).map_err(|diags| {
+    let registry = crucible_plugin::Registry::load().await;
+    crucible_dsl::compile(&src, &registry).map_err(|diags| {
         if let Err(e) = crucible_dsl::diagnostics::emit_to_stderr(&name, &src, &diags) {
             eprintln!("crucible: failed to render diagnostics: {e}");
         }
@@ -185,8 +186,8 @@ fn load(file: &Path) -> Result<plan::Plan> {
 /// Check a `.cru` file and describe what it says. Exits 0 on success, 1 if the
 /// file was read but says something we cannot run, and 2 if it could not be
 /// read at all.
-fn run_check(file: &Path) -> ExitCode {
-    let plan = match load(file) {
+async fn run_check(file: &Path) -> ExitCode {
+    let plan = match load(file).await {
         Ok(plan) => plan,
         Err(Error::ScenarioRejected(_)) => return ExitCode::from(1),
         Err(e) => {
