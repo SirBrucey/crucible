@@ -195,30 +195,27 @@ impl Registry {
     /// Errors if a check names an observer this registry does not hold or a
     /// service the fleet does not describe, or does not bind to an observable
     /// that observer reads.
-    pub fn queries_for(
+    pub async fn queries_for(
         &self,
         fleet: &plan::Fleet,
         checks: &[plan::Check],
     ) -> Result<Vec<PreparedCheck>, Error> {
-        checks
-            .iter()
-            .map(|check| {
-                let service = fleet
-                    .services
-                    .iter()
-                    .find(|service| service.name == check.service)
-                    .ok_or_else(|| {
-                        Error::new(
-                            "registry",
-                            format!("the fleet has no service named `{}`", check.service),
-                        )
-                    })?;
-                let query = self
-                    .observer_runtime(&check.observer, service)?
-                    .prepare(check)?;
-                Ok((check.clone(), query))
-            })
-            .collect()
+        let mut prepared = Vec::with_capacity(checks.len());
+        for check in checks {
+            let service = fleet
+                .services
+                .iter()
+                .find(|service| service.name == check.service)
+                .ok_or_else(|| {
+                    Error::new(
+                        "registry",
+                        format!("the fleet has no service named `{}`", check.service),
+                    )
+                })?;
+            let observer = self.observer_runtime(&check.observer, service)?;
+            prepared.push((check.clone(), observer.prepare(check).await?));
+        }
+        Ok(prepared)
     }
 
     fn observer_runtime(
@@ -344,11 +341,12 @@ mod tests {
         assert_eq!(targets, ["api", "api", "api"]);
     }
 
-    #[test]
-    fn every_check_of_the_example_scenario_prepares() {
+    #[tokio::test]
+    async fn every_check_of_the_example_scenario_prepares() {
         let plan = crucible_core::plan::example();
         let queries = Registry::builtins()
             .queries_for(&plan.fleet, &plan.scenarios[0].checks)
+            .await
             .expect("every check binds to its observer");
         let targets: Vec<&str> = queries.iter().map(|(_, query)| query.target()).collect();
         let named: Vec<&str> = plan.scenarios[0]
@@ -359,13 +357,14 @@ mod tests {
         assert_eq!(targets, named);
     }
 
-    #[test]
-    fn a_check_naming_a_service_the_fleet_lacks_is_rejected() {
+    #[tokio::test]
+    async fn a_check_naming_a_service_the_fleet_lacks_is_rejected() {
         let mut plan = crucible_core::plan::example();
         plan.scenarios[0].checks[0].service = "ledger".into();
         assert!(
             Registry::builtins()
                 .queries_for(&plan.fleet, &plan.scenarios[0].checks)
+                .await
                 .is_err()
         );
     }

@@ -58,7 +58,7 @@ async fn answer<O: Observer + 'static>(request: Request) -> Result<Response, Err
         }),
         Request::Observer(request) => match *request {
             observer::Request::Bind { service, check } => {
-                O::runtime(&service).prepare(&check)?;
+                O::runtime(&service).prepare(&check).await?;
                 Response::Observer(observer::Response::Bound)
             }
             observer::Request::Read {
@@ -66,7 +66,7 @@ async fn answer<O: Observer + 'static>(request: Request) -> Result<Response, Err
                 check,
                 endpoint,
             } => {
-                let query = O::runtime(&service).prepare(&check)?;
+                let query = O::runtime(&service).prepare(&check).await?;
                 let value = query.read(endpoint).await?;
                 Response::Observer(observer::Response::Read(value))
             }

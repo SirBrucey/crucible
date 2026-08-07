@@ -199,12 +199,17 @@ impl Observer for Mariadb {
 }
 
 impl ObserverRuntime for Mariadb {
-    fn prepare(&self, check: &plan::Check) -> Result<Box<dyn Query>, PluginError> {
-        Ok(Box::new(Read {
-            selection: Mariadb::bind(check)?,
-            user: self.user.clone(),
-            password: self.password.clone(),
-        }))
+    fn prepare<'a>(
+        &'a self,
+        check: &'a plan::Check,
+    ) -> BoxFuture<'a, Result<Box<dyn Query>, PluginError>> {
+        Box::pin(async move {
+            Ok(Box::new(Read {
+                selection: Mariadb::bind(check)?,
+                user: self.user.clone(),
+                password: self.password.clone(),
+            }) as Box<dyn Query>)
+        })
     }
 }
 

@@ -262,7 +262,10 @@ impl Worker<Executing> {
         // container), where a direct ephemeral port would not. The anchor is
         // dormant during setup and released before a check reads, so the proxy
         // path is never actually frozen under it.
-        let queries = match Registry::builtins().queries_for(&schedule.fleet, &schedule.checks) {
+        let queries = match Registry::builtins()
+            .queries_for(&schedule.fleet, &schedule.checks)
+            .await
+        {
             Ok(queries) => queries,
             Err(e) => {
                 let _ = orchestrator.teardown().await;

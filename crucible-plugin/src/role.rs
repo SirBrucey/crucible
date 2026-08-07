@@ -148,11 +148,16 @@ pub trait Observer: ObserverRuntime + Sized {
 
 /// An observer, ready to read settled state.
 pub trait ObserverRuntime: Send + Sync {
-    /// Bind a check to a runnable query, without a live fleet.
+    /// Bind a check to a runnable query, without a live fleet. Asking an
+    /// observer that runs as its own process is a round trip, so this is where
+    /// a check it cannot answer is refused, before a replica is spent on it.
     ///
     /// # Errors
     /// Errors if the check does not bind to an observable this observer reads.
-    fn prepare(&self, check: &plan::Check) -> Result<Box<dyn Query>, Error>;
+    fn prepare<'a>(
+        &'a self,
+        check: &'a plan::Check,
+    ) -> BoxFuture<'a, Result<Box<dyn Query>, Error>>;
 }
 
 /// One bound check, readable against the service it names. It yields what was
