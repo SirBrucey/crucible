@@ -6,7 +6,6 @@ use std::{io::Write, net::SocketAddr};
 use clap::Parser;
 use crucible_protocol::Direction;
 use tokio::{
-    net::lookup_host,
     signal::unix::{SignalKind, signal},
     sync::watch,
 };
@@ -114,13 +113,7 @@ async fn main() -> Result<()> {
             addr: listen_str.to_string(),
             source,
         })?;
-        let upstream =
-            lookup_host(upstream_str)
-                .await?
-                .next()
-                .ok_or_else(|| Error::UpstreamUnresolved {
-                    upstream: upstream_str.to_string(),
-                })?;
+        let upstream = upstream_str.to_string();
         // Only the pair fronting the anchored service counts toward the freeze.
         let pair_anchor = if freeze.as_ref().is_some_and(|f| f.service == service) {
             anchor.clone()
@@ -128,7 +121,7 @@ async fn main() -> Result<()> {
             None
         };
         let (proxy, _local_addr, mut events) =
-            Proxy::bind(listen, upstream, pause_rx.clone(), pair_anchor).await?;
+            Proxy::bind(listen, upstream.clone(), pause_rx.clone(), pair_anchor).await?;
         tracing::info!(%service, %listen, %upstream, "proxy pair up");
 
         tokio::spawn(async move {
