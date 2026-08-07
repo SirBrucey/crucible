@@ -50,6 +50,19 @@ pub enum Role {
     Observer { signatures: Vec<OpSig> },
 }
 
+impl Role {
+    /// Which part this is, without what it offers in it. One name may be
+    /// claimed once per role: a service naming a kind means a driver for what
+    /// it drives and an observer for what it reads, and those need not be the
+    /// same plugin.
+    #[must_use]
+    pub fn part(&self) -> &'static str {
+        match self {
+            Role::Observer { .. } => "observer",
+        }
+    }
+}
+
 /// What an observer is asked, and what it answers.
 pub mod observer {
     use std::net::SocketAddr;

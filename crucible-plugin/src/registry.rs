@@ -1,6 +1,9 @@
 //! The in-process registry of the compiled-in plugins, resolved to their schemas.
 
-use std::collections::{HashMap, hash_map::Entry};
+use std::{
+    collections::{HashMap, hash_map::Entry},
+    sync::Arc,
+};
 
 use crucible_core::{
     fault::Anchor,
@@ -10,7 +13,10 @@ use crucible_core::{
 
 use crate::{
     builtin::{Docker, Http, Mariadb},
+    discovery,
     error::Error,
+    external::Plugin,
+    protocol::{self, Role},
     role::{
         Action, Deployment, DeploymentRuntime, Driver, DriverRuntime, Observer, ObserverRuntime,
         Query,
@@ -36,6 +42,77 @@ impl Registry {
         registry
     }
 
+    /// The first-party plugins, plus every plugin installed on this machine.
+    ///
+    /// A plugin is an executable the framework runs, so what may install one is
+    /// the trust boundary: the search directories are the package manager's,
+    /// and `CRUCIBLE_PLUGIN_PATH` is someone choosing otherwise.
+    pub async fn load() -> Self {
+        let mut registry = Self::builtins();
+        let mut claims: HashMap<(String, &'static str), Vec<discovery::Found>> = HashMap::new();
+        for found in discovery::discover().await {
+            let claim = (
+                found.description.name.clone(),
+                found.description.role.part(),
+            );
+            claims.entry(claim).or_default().push(found);
+        }
+        for ((name, part), claimants) in claims {
+            match <[discovery::Found; 1]>::try_from(claimants) {
+                Ok([only]) => registry.add_installed(only),
+                // Picking one would be arbitrary and invisible to whoever wrote
+                // the scenario, so the name is left unclaimed and anything that
+                // asks for it says so.
+                Err(several) => {
+                    let paths: Vec<String> = several
+                        .iter()
+                        .map(|found| found.path.display().to_string())
+                        .collect();
+                    tracing::warn!(
+                        plugin = %name,
+                        paths = %paths.join(", "),
+                        "several {part} plugins claim this name, so none of them is loaded",
+                    );
+                }
+            }
+        }
+        registry
+    }
+
+    fn add_installed(&mut self, found: discovery::Found) {
+        let discovery::Found { description, path } = found;
+        let at = path.display().to_string();
+        if description.protocol != protocol::VERSION {
+            tracing::warn!(
+                path = %at,
+                plugin = %description.name,
+                theirs = description.protocol,
+                ours = protocol::VERSION,
+                "ignoring plugin built against another protocol",
+            );
+            return;
+        }
+        let plugin = Arc::new(Plugin::new(description.name.clone(), path));
+        let Role::Observer { signatures } = description.role;
+        if self.observers.contains_key(&description.name) {
+            tracing::warn!(
+                path = %at,
+                plugin = %description.name,
+                "ignoring plugin claiming the name of an observer built in",
+            );
+            return;
+        }
+        tracing::info!(path = %at, plugin = %description.name, "loaded observer plugin");
+        self.observers.insert(
+            description.name,
+            RegisteredObserver {
+                signatures,
+                attrs: description.attrs,
+                source: Source::Process(plugin),
+            },
+        );
+    }
+
     fn add_deployment<D: Deployment>(&mut self) {
         self.deployments
             .insert(D::NAME.to_owned(), D::attr_schema());
@@ -57,7 +134,7 @@ impl Registry {
             RegisteredObserver {
                 signatures: O::signatures(),
                 attrs: O::attr_schema(),
-                runtime: |service| Box::new(O::runtime(service)),
+                source: Source::Builtin(|service| Box::new(O::runtime(service))),
             },
         );
     }
@@ -228,7 +305,7 @@ impl Registry {
             .observers
             .get(name)
             .ok_or_else(|| Error::new("registry", format!("no observer plugin named `{name}`")))?;
-        Ok((observer.runtime)(service))
+        Ok(observer.source.reading(service))
     }
 }
 
@@ -240,11 +317,28 @@ struct RegisteredDriver {
 }
 
 /// A registered observer: the observables it answers, what it reads of a
-/// service that speaks it, and how to make one that reads a given service.
+/// service that speaks it, and where the code that answers lives.
 struct RegisteredObserver {
     signatures: Vec<OpSig>,
     attrs: AttrSchema,
-    runtime: fn(&plan::Service) -> Box<dyn ObserverRuntime>,
+    source: Source,
+}
+
+/// Where an observer's answers come from.
+enum Source {
+    /// Compiled in, and called.
+    Builtin(fn(&plan::Service) -> Box<dyn ObserverRuntime>),
+    /// Installed on the machine, and asked.
+    Process(Arc<Plugin>),
+}
+
+impl Source {
+    fn reading(&self, service: &plan::Service) -> Box<dyn ObserverRuntime> {
+        match self {
+            Source::Builtin(new) => new(service),
+            Source::Process(plugin) => plugin.observing(service),
+        }
+    }
 }
 
 /// A check and the query bound to answer it.

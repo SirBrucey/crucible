@@ -3,6 +3,7 @@
 //! process rather than being compiled in.
 
 pub mod builtin;
+pub mod discovery;
 pub mod error;
 pub mod external;
 pub mod protocol;
