@@ -7,6 +7,7 @@ pub mod error;
 pub mod protocol;
 pub mod registry;
 pub mod role;
+pub mod serve;
 
 pub use error::Error;
 pub use registry::Registry;
@@ -14,3 +15,4 @@ pub use role::{
     Action, Deployment, DeploymentRuntime, Driver, DriverRuntime, FaultPrimitives, Observer,
     ObserverRuntime, Query, Targeted,
 };
+pub use serve::serve_observer;

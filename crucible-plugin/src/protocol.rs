@@ -18,7 +18,7 @@ pub const VERSION: u32 = 1;
 pub enum Request {
     /// What are you?
     Describe,
-    Observer(observer::Request),
+    Observer(Box<observer::Request>),
 }
 
 /// What a plugin answers.
