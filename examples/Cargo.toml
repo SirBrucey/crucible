@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["orders/api", "orders/inventory"]
+members = ["dns-observer", "orders/api", "orders/inventory"]
 
 [workspace.package]
 edition = "2024"
