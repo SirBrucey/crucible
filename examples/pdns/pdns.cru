@@ -1,0 +1,53 @@
+// The `pdns` example fleet. A record is written through one service and
+// resolved through another, and the observer that reads the answer is a plugin
+// the framework knows nothing about until it finds it installed.
+
+fleet "pdns" {
+  deployment: docker;
+
+  service api {
+    kinds: [http],
+    image: "crucible-example/pdns-api:0.1",
+    ports: { http: 8080 },
+    env: [
+      "DATABASE_URL=mysql://root@db:3306/pdns",
+      "RUST_LOG=info"
+    ],
+    healthcheck: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/healthz"],
+    depends_on: [db]
+  };
+
+  service db {
+    kinds: [mariadb],
+    image: "crucible-example/pdns-db:0.1",
+    ports: { mariadb: 3306 },
+    env: ["MARIADB_ALLOW_EMPTY_ROOT_PASSWORD=yes"],
+    healthcheck: ["CMD", "mariadb-admin", "ping", "-h", "127.0.0.1"]
+  };
+
+  // Served by a plugin, so `dns` means whatever the plugin installed under that
+  // name says it does.
+  service ns {
+    kinds: [dns],
+    image: "crucible-example/pdns-ns:0.1",
+    ports: { dns: 53 },
+    healthcheck: ["CMD", "bash", "-c", ": < /dev/tcp/127.0.0.1/53"],
+    // PowerDNS exits rather than retries if its database is not there yet.
+    depends_on: [db]
+  };
+}
+
+scenario "records_resolve" {
+  consistent_within: 15s;
+
+  do { http POST api "/records" body { type: "A", name: "www.example.test", value: "192.0.2.1" } };
+  do { http POST api "/records" body { type: "A", name: "mail.example.test", value: "192.0.2.2" } };
+
+  // The rows are what the API wrote; the answers are what the nameserver serves
+  // from them, which is the half a fault can lose without the API noticing.
+  expect {
+    db.records.count where type = "A" == 2;
+    ns.resolve "www.example.test" == "192.0.2.1";
+    ns.resolve "mail.example.test" == "192.0.2.2";
+  }
+}
