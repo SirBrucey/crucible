@@ -15,11 +15,11 @@ use bollard::{
     },
     query_parameters::{
         CreateContainerOptionsBuilder, CreateImageOptionsBuilder, KillContainerOptionsBuilder,
-        RemoveContainerOptionsBuilder, StartContainerOptions,
+        LogsOptionsBuilder, RemoveContainerOptionsBuilder, StartContainerOptions,
     },
 };
 use crucible_protocol::{Direction, now_ns};
-use futures_util::TryStreamExt;
+use futures_util::{StreamExt, TryStreamExt};
 use tokio::time::sleep;
 
 use crucible_core::{
@@ -648,8 +648,31 @@ impl DeploymentRuntime for Docker {
         self.endpoints.get(service).copied()
     }
 
+    /// The proxy writes its event lines to its container's stdout, so following
+    /// that container's log is how this deployment hands the observer its feed.
     fn start_session_observer(&self) -> SessionObserver {
-        SessionObserver::start(&self.client, self.proxy_container_name())
+        let container = self.proxy_container_name();
+        let options = LogsOptionsBuilder::default()
+            .stdout(true)
+            .stderr(false)
+            .follow(true)
+            .tail("all")
+            .build();
+        let chunks = self
+            .client
+            .logs(&container, Some(options))
+            .scan((), move |(), chunk| {
+                // A stream that ends is how a failed read reaches the observer,
+                // which has no way to ask docker what went wrong.
+                std::future::ready(match chunk {
+                    Ok(bytes) => Some(bytes.as_ref().to_vec()),
+                    Err(e) => {
+                        tracing::warn!(target: "session_observer", %container, error = %e, "log stream error");
+                        None
+                    }
+                })
+            });
+        SessionObserver::start(chunks)
     }
 }
 

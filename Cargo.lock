@@ -504,7 +504,6 @@ dependencies = [
 name = "crucible-core"
 version = "0.1.0"
 dependencies = [
- "bollard",
  "criterion",
  "crucible-protocol",
  "futures-util",
