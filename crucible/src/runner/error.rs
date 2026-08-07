@@ -44,4 +44,22 @@ pub enum Error {
     },
 }
 
+impl Error {
+    /// Whether a fresh replica could plausibly get further. Retrying costs a
+    /// fleet bring-up, so a failure that will recur identically says so and the
+    /// campaign stops rather than spending its budget proving it.
+    #[must_use]
+    pub fn is_transient(&self) -> bool {
+        !matches!(
+            self,
+            Error::RunnerExeParentless
+                | Error::WorkerBinMissing { .. }
+                | Error::NotAScenarioFile(_)
+                | Error::ScenarioUnreadable { .. }
+                | Error::ScenarioRejected(_)
+                | Error::VersionMismatch { .. }
+        )
+    }
+}
+
 pub type Result<T> = std::result::Result<T, Error>;

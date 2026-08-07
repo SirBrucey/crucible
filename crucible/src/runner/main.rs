@@ -519,7 +519,10 @@ impl<'a> Pool<'a> {
                 );
             }
             Ok((schedule, attempt, Err(e)))
-                if !self.gave_up && self.within_budget() && Recovery::may_respawn(attempt) =>
+                if e.is_transient()
+                    && !self.gave_up
+                    && self.within_budget()
+                    && Recovery::may_respawn(attempt) =>
             {
                 tracing::warn!(
                     schedule_id = schedule.id,
@@ -645,7 +648,7 @@ async fn run_learn(
         reclaim_fleet(id, fleet).await;
         match outcome {
             Ok(result) => return Ok(result),
-            Err(e) if attempt < LEARN_MAX_ATTEMPTS => {
+            Err(e) if e.is_transient() && attempt < LEARN_MAX_ATTEMPTS => {
                 tracing::warn!(attempt, error = %e, "learn failed; retrying on a fresh replica");
                 attempt += 1;
             }
