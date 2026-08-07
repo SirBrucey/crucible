@@ -4,6 +4,7 @@
 
 pub mod builtin;
 pub mod error;
+pub mod external;
 pub mod protocol;
 pub mod registry;
 pub mod role;
