@@ -221,6 +221,10 @@ struct Read {
 }
 
 impl Targeted for Read {
+    fn kind(&self) -> &str {
+        Mariadb::NAME
+    }
+
     fn target(&self) -> &str {
         &self.selection.service
     }

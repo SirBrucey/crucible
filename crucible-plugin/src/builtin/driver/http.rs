@@ -181,6 +181,10 @@ struct Call {
 }
 
 impl Targeted for Call {
+    fn kind(&self) -> &str {
+        Http::NAME
+    }
+
     fn target(&self) -> &str {
         &self.request.service
     }

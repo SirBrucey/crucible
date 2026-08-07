@@ -8,7 +8,7 @@ fleet "orders" {
   service api {
     kinds: [http],
     image: "crucible-example/orders-api:0.1",
-    port: 8080,
+    ports: { http: 8080 },
     env: [
       "DATABASE_URL=mysql://root@db:3306/orders",
       "BROKER_URL=amqp://broker:5672",
@@ -20,7 +20,7 @@ fleet "orders" {
   service broker {
     kinds: [amqp],
     image: "rabbitmq:3.13-management",
-    port: 5672,
+    ports: { amqp: 5672 },
     // Probe the AMQP port rather than run `rabbitmq-diagnostics`. That command
     // starts an Erlang node, and Docker runs healthchecks as the image's default
     // user (root here), so under a slow concurrent boot a probe can create a
@@ -34,7 +34,7 @@ fleet "orders" {
   service db {
     kinds: [mariadb],
     image: "mariadb:11.4",
-    port: 3306,
+    ports: { mariadb: 3306 },
     env: [
       "MARIADB_ALLOW_EMPTY_ROOT_PASSWORD=yes",
       "MARIADB_DATABASE=orders"
@@ -42,10 +42,12 @@ fleet "orders" {
     healthcheck: ["CMD", "mariadb-admin", "ping", "-h", "127.0.0.1"]
   };
 
+  // It consumes from the broker rather than being reached over AMQP, so the
+  // only port it answers on is the one its healthcheck asks.
   service inventory {
-    kinds: [amqp],
+    kinds: [http],
     image: "crucible-example/orders-inventory:0.1",
-    port: 8081,
+    ports: { http: 8081 },
     env: [
       "DATABASE_URL=mysql://root@db:3306/orders",
       "BROKER_URL=amqp://broker:5672",

@@ -59,8 +59,8 @@ pub trait DeploymentRuntime: FaultPrimitives {
     fn wait_ready(&self) -> BoxFuture<'_, Result<(), Error>>;
     fn teardown(&mut self) -> BoxFuture<'_, Result<(), Error>>;
 
-    /// Where the named service can be reached, once the replica is up.
-    fn endpoint(&self, service: &str) -> Option<SocketAddr>;
+    /// Where the named service answers `kind`, once the replica is up.
+    fn endpoint(&self, service: &str, kind: &str) -> Option<SocketAddr>;
 
     /// Start streaming what the replica's substrate sees on the wire. The
     /// deployment runs that substrate, so only it can open the stream. The
@@ -104,10 +104,14 @@ pub trait DriverRuntime: Send + Sync {
     fn prepare(&self, step: &plan::Step) -> Result<Box<dyn Action>, Error>;
 }
 
-/// Something bound to one service of the fleet.
+/// Something bound to one service of the fleet, speaking one of the kinds that
+/// service declares. A service may answer several kinds on several ports, so
+/// which one this speaks is what says where to reach it.
 pub trait Targeted {
     /// The service this is bound to.
     fn target(&self) -> &str;
+    /// The kind this speaks to it.
+    fn kind(&self) -> &str;
 }
 
 /// One bound step, runnable against the service it names.

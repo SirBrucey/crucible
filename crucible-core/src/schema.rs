@@ -9,6 +9,8 @@ pub enum ValueType {
     Bool,
     Duration,
     List(Box<ValueType>),
+    /// A map whose keys are names and whose values are all of one type.
+    MapOf(Box<ValueType>),
     Map,
     ServiceRef,
 }

@@ -148,6 +148,10 @@ struct Reading {
 }
 
 impl Targeted for Reading {
+    fn kind(&self) -> &str {
+        &self.plugin.name
+    }
+
     fn target(&self) -> &str {
         &self.check.service
     }

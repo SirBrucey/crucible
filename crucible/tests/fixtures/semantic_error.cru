@@ -1,6 +1,6 @@
 fleet "f" {
   deployment: docker;
-  service api { kinds: [http], image: "example/api:1", port: 80 };
+  service api { kinds: [http], image: "example/api:1", ports: { http: 80 } };
 }
 
 scenario "s" {
