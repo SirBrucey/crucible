@@ -10,6 +10,11 @@ pub enum Error {
     Codec(#[from] codec::Error),
     #[error("runner exe has no parent directory")]
     RunnerExeParentless,
+    #[error("no worker binary at {} or {}", beside.display(), installed.display())]
+    WorkerBinMissing {
+        beside: std::path::PathBuf,
+        installed: std::path::PathBuf,
+    },
     #[error("expected a `.cru` file, got `{0}`")]
     NotAScenarioFile(String),
     #[error("cannot read {path}: {source}")]

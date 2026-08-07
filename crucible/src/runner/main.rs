@@ -33,6 +33,11 @@ use crate::{
     session::{Dispatching, Session},
 };
 
+/// The worker binary's name, the same in a build tree and once installed.
+const WORKER_BIN: &str = "crucible-worker";
+/// Where a package puts the parts of crucible that are not commands.
+const LIBEXEC_DIR: &str = "/usr/lib/crucible";
+
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const TOTAL_BUDGET: Duration = Duration::from_mins(5);
 const SCHEDULE_MARGIN: Duration = Duration::from_secs(30);
@@ -80,14 +85,22 @@ async fn bind_worker_listener(worker_id: u32) -> Result<(PathBuf, UnixListener)>
     Ok((path, listener))
 }
 
+/// Where the worker binary is, beside the runner in a build tree and in the
+/// install's own directory once packaged, since it is not a command anyone runs.
 fn worker_bin_path() -> Result<PathBuf> {
     let runner = std::env::current_exe()?;
-    let mut path = runner
+    let beside = runner
         .parent()
         .ok_or(Error::RunnerExeParentless)?
-        .to_path_buf();
-    path.push("crucible-worker");
-    Ok(path)
+        .join(WORKER_BIN);
+    if beside.is_file() {
+        return Ok(beside);
+    }
+    let installed = PathBuf::from(LIBEXEC_DIR).join(WORKER_BIN);
+    if installed.is_file() {
+        return Ok(installed);
+    }
+    Err(Error::WorkerBinMissing { beside, installed })
 }
 
 /// Crucible: fault-injection testing for event-driven microservice fleets.
