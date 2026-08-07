@@ -59,6 +59,10 @@ pub enum Error {
          rewrite the consumer's endpoint, which is not wired yet"
     )]
     PortCollision(u16),
+    #[error("service `{service}` depends on `{missing}`, which the fleet does not describe")]
+    UnknownDependency { service: String, missing: String },
+    #[error("these services depend on each other, so none of them can start first: {0}")]
+    DependencyCycle(String),
 }
 
 /// Items teardown could not remove, paired with the daemon's reason.
@@ -138,6 +142,8 @@ pub struct ServiceConfig {
     /// Command to run inside the container as a healthcheck; empty means the
     /// image's own healthcheck.
     pub healthcheck: Vec<String>,
+    /// Services that must be healthy before this one starts.
+    pub depends_on: Vec<String>,
 }
 
 /// Brings services up as Docker containers.
@@ -413,14 +419,51 @@ impl Docker {
             })
             .await?;
 
-        // Bring up every backing container concurrently, then the one proxy that
-        // fronts the whole fleet. The proxy resolves its upstreams lazily, so the
-        // backings need not be ready first.
-        let docker = &*self;
-        futures_util::future::try_join_all(docker.services.iter().map(|s| docker.start_service(s)))
-            .await?;
-        let endpoints = docker.start_proxy().await?;
+        // The proxy first: every service reaches its peers by a name the proxy
+        // answers for, so until it is up a service that talks to another on
+        // startup has nothing to talk to. It resolves its own upstreams per
+        // connection, so it does not need them yet.
+        let endpoints = self.start_proxy().await?;
         self.endpoints.extend(endpoints);
+        self.start_services().await?;
+        Ok(())
+    }
+
+    /// Start each service once everything it depends on is healthy, and those
+    /// that depend on nothing together.
+    async fn start_services(&self) -> Result<()> {
+        for service in &self.services {
+            for needed in &service.depends_on {
+                if !self.services.iter().any(|s| &s.name == needed) {
+                    return Err(Error::UnknownDependency {
+                        service: service.name.clone(),
+                        missing: needed.clone(),
+                    });
+                }
+            }
+        }
+
+        let mut healthy: HashSet<&str> = HashSet::new();
+        let mut waiting: Vec<&ServiceConfig> = self.services.iter().collect();
+        while !waiting.is_empty() {
+            let (ready, blocked): (Vec<_>, Vec<_>) = waiting.into_iter().partition(|service| {
+                service
+                    .depends_on
+                    .iter()
+                    .all(|needed| healthy.contains(needed.as_str()))
+            });
+            if ready.is_empty() {
+                let names: Vec<&str> = blocked.iter().map(|s| s.name.as_str()).collect();
+                return Err(Error::DependencyCycle(names.join(", ")));
+            }
+            futures_util::future::try_join_all(ready.iter().map(|s| self.start_service(s))).await?;
+            futures_util::future::try_join_all(ready.iter().map(|service| async move {
+                wait_container_ready(&self.client, &self.backing_container_name(service)).await
+            }))
+            .await?;
+            healthy.extend(ready.iter().map(|service| service.name.as_str()));
+            waiting = blocked;
+        }
         Ok(())
     }
 
@@ -573,6 +616,10 @@ impl Deployment for Docker {
             AttrDecl::required("ports", ValueType::MapOf(Box::new(ValueType::Int))),
             AttrDecl::optional("env", ValueType::List(Box::new(ValueType::Str))),
             AttrDecl::optional("healthcheck", ValueType::List(Box::new(ValueType::Str))),
+            AttrDecl::optional(
+                "depends_on",
+                ValueType::List(Box::new(ValueType::ServiceRef)),
+            ),
         ])
     }
 
@@ -626,6 +673,7 @@ impl Deployment for Docker {
             ports,
             env: owned_strs(service, "env")?,
             healthcheck: owned_strs(service, "healthcheck")?,
+            depends_on: owned_idents(service, "depends_on")?,
         })
     }
 }
@@ -640,6 +688,23 @@ fn owned_strs(service: &plan::Service, attr: &'static str) -> Result<Vec<String>
         attr,
     })?;
     Ok(strs.into_iter().map(str::to_owned).collect())
+}
+
+/// An optional list-of-names attribute, empty when the service omits it.
+fn owned_idents(service: &plan::Service, attr: &'static str) -> Result<Vec<String>, BindError> {
+    let Some(plan::Value::List(items)) = service.attr(attr) else {
+        return Ok(Vec::new());
+    };
+    items
+        .iter()
+        .map(|item| match item {
+            plan::Value::Ident(name) => Ok(name.clone()),
+            _ => Err(BindError::Attr {
+                service: service.name.clone(),
+                attr,
+            }),
+        })
+        .collect()
 }
 
 impl FaultPrimitives for Docker {
@@ -790,6 +855,7 @@ mod tests {
             ports: BTreeMap::from([(kind.to_owned(), port)]),
             env: Vec::new(),
             healthcheck: Vec::new(),
+            depends_on: Vec::new(),
         }
     }
 
@@ -926,6 +992,7 @@ mod tests {
                 ports: BTreeMap::from([("http".to_owned(), 8080)]),
                 env: vec!["A=1".into()],
                 healthcheck: Vec::new(),
+                depends_on: Vec::new(),
             },
         );
     }
