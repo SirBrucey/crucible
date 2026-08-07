@@ -11,10 +11,14 @@ pub mod registry;
 pub mod role;
 pub mod serve;
 
+/// The pieces of a plan a plugin is handed, and the vocabulary it declares
+/// itself in. Re-exported so writing a plugin means depending on this crate and
+/// nothing else of crucible's.
+pub use crucible_core::{plan, schema};
 pub use error::Error;
 pub use registry::Registry;
 pub use role::{
-    Action, Deployment, DeploymentRuntime, Driver, DriverRuntime, FaultPrimitives, Observer,
-    ObserverRuntime, Query, Targeted,
+    Action, BoxFuture, Deployment, DeploymentRuntime, Driver, DriverRuntime, FaultPrimitives,
+    Observer, ObserverRuntime, Query, Targeted,
 };
 pub use serve::serve_observer;
