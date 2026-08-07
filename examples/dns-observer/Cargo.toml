@@ -1,17 +1,26 @@
+# Its own workspace, not a member of the examples one: a plugin is built and
+# shipped by whoever wrote it, and depends on crucible-plugin the way anyone
+# else's would.
+[workspace]
+
 [package]
 name = "crucible-observer-dns"
 version = "0.1.0"
-edition.workspace = true
-authors.workspace = true
-publish.workspace = true
-license.workspace = true
+edition = "2024"
+authors = ["Stuart Bruce"]
+publish = false
+license = "UNLICENSED"
 description = "A crucible observer plugin that reads what a nameserver answers"
 
 [dependencies]
 crucible-plugin = { path = "../../crucible-plugin" }
 hickory-resolver = "0.26"
 thiserror = "2"
-tokio = { workspace = true }
+tokio = { version = "1", features = ["full"] }
 
-[lints]
-workspace = true
+[lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }

@@ -12,7 +12,9 @@ use crucible_plugin::{
 };
 use hickory_resolver::{
     Resolver,
-    config::{ConnectionConfig, NameServerConfig, ProtocolConfig, ResolverConfig},
+    config::{
+        ConnectionConfig, LookupIpStrategy, NameServerConfig, ProtocolConfig, ResolverConfig,
+    },
     net::{NetError, runtime::TokioRuntimeProvider},
 };
 
@@ -27,8 +29,6 @@ enum Error {
     NoHost,
     #[error("`{host}` did not resolve: {source}")]
     Unresolved { host: String, source: NetError },
-    #[error("`{0}` resolved to nothing")]
-    NoAddress(String),
 }
 
 impl From<Error> for PluginError {
@@ -90,6 +90,10 @@ struct Lookup {
 }
 
 impl Targeted for Lookup {
+    fn kind(&self) -> &str {
+        Dns::NAME
+    }
+
     fn target(&self) -> &str {
         &self.service
     }
@@ -104,32 +108,41 @@ impl Query for Lookup {
 impl Lookup {
     /// Ask the nameserver at `endpoint` rather than whatever this host resolves
     /// through: the answer being tested is the fleet's, not the machine's.
+    ///
+    /// Over TCP, because a fleet is reached through a proxy that carries TCP,
+    /// and a question asked over UDP would not arrive.
     async fn resolve(&self, endpoint: SocketAddr) -> Result<plan::Value, Error> {
         // The endpoint is where the deployment published the service, so the
         // port is the replica's rather than 53.
-        let mut connection = ConnectionConfig::new(ProtocolConfig::Udp);
+        let mut connection = ConnectionConfig::new(ProtocolConfig::Tcp);
         connection.port = endpoint.port();
-        let mut nameserver = NameServerConfig::udp(endpoint.ip());
+        let mut nameserver = NameServerConfig::tcp(endpoint.ip());
         nameserver.connections = vec![connection];
         let config = ResolverConfig::from_parts(None, Vec::new(), vec![nameserver]);
-        let resolver = Resolver::builder_with_config(config, TokioRuntimeProvider::default())
-            .build()
-            .map_err(|source| Error::Unresolved {
-                host: self.host.clone(),
-                source,
-            })?;
-        let answer = resolver
-            .lookup_ip(&self.host)
-            .await
-            .map_err(|source| Error::Unresolved {
-                host: self.host.clone(),
-                source,
-            })?;
-        let address = answer
-            .iter()
-            .next()
-            .ok_or_else(|| Error::NoAddress(self.host.clone()))?;
-        Ok(plan::Value::Str(address.to_string()))
+        let mut builder = Resolver::builder_with_config(config, TokioRuntimeProvider::default());
+        // An address, not both kinds of address: asking for each and requiring
+        // both makes a name that has only one of them look unresolvable.
+        builder.options_mut().ip_strategy = LookupIpStrategy::Ipv4thenIpv6;
+        let resolver = builder.build().map_err(|source| Error::Unresolved {
+            host: self.host.clone(),
+            source,
+        })?;
+        // A name that is not there is something the nameserver answered, not
+        // a failure to ask it: a scenario that expected an address wants to be
+        // told it is absent rather than told the reading could not be taken.
+        let answer = match resolver.lookup_ip(&self.host).await {
+            Ok(answer) => answer,
+            Err(source) if source.is_no_records_found() => return Ok(plan::Value::Null),
+            Err(source) => {
+                return Err(Error::Unresolved {
+                    host: self.host.clone(),
+                    source,
+                });
+            }
+        };
+        Ok(answer.iter().next().map_or(plan::Value::Null, |address| {
+            plan::Value::Str(address.to_string())
+        }))
     }
 }
 
