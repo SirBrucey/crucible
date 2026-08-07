@@ -12,6 +12,7 @@ crucible-core = { path = "../crucible-core" }
 crucible-protocol = { path = "../crucible-protocol" }
 futures-util = { workspace = true }
 reqwest = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 sqlx = { workspace = true }
 thiserror = { workspace = true }

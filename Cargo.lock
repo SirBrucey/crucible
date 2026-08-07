@@ -549,6 +549,7 @@ dependencies = [
  "crucible-protocol",
  "futures-util",
  "reqwest",
+ "serde",
  "serde_json",
  "sqlx",
  "thiserror",
