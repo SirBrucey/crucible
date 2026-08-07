@@ -5,19 +5,35 @@ edition.workspace = true
 authors.workspace = true
 publish.workspace = true
 license.workspace = true
+description = "The contract a crucible plugin implements, and the loop that serves one"
+
+[features]
+# What the framework needs of plugins, rather than what a plugin needs to be
+# one: the plugins it ships, how it finds those installed, and the registry that
+# resolves a name to either. Off by default, so a plugin author depends on this
+# crate plainly and compiles the contract alone.
+framework = [
+    "dep:bollard",
+    "dep:crucible-protocol",
+    "dep:futures-util",
+    "dep:reqwest",
+    "dep:serde_json",
+    "dep:sqlx",
+    "dep:tracing",
+]
 
 [dependencies]
-bollard = { workspace = true }
+bollard = { workspace = true, optional = true }
 crucible-core = { path = "../crucible-core" }
-crucible-protocol = { path = "../crucible-protocol" }
-futures-util = { workspace = true }
-reqwest = { workspace = true }
+crucible-protocol = { path = "../crucible-protocol", optional = true }
+futures-util = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
-sqlx = { workspace = true }
+serde_json = { workspace = true, optional = true }
+sqlx = { workspace = true, optional = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
-tracing = { workspace = true }
+tracing = { workspace = true, optional = true }
 
 [lints]
 workspace = true
