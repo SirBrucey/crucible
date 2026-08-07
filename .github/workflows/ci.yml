@@ -70,6 +70,24 @@ jobs:
           RUSTDOCFLAGS: "-D warnings -D rustdoc::broken_intra_doc_links"
         run: cargo doc --workspace --no-deps --all-features
 
+  package:
+    name: package
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deb
+      - run: cargo deb -p crucible
+      # Both binaries, and the worker where the runner looks for it.
+      - run: |
+          dpkg-deb -c target/debian/crucible_*_amd64.deb | tee contents
+          grep -q ' ./usr/bin/crucible$' contents
+          grep -q ' ./usr/lib/crucible/crucible-worker$' contents
+
   machete:
     name: machete
     runs-on: ubuntu-latest

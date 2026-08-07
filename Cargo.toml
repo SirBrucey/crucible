@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crucible", "crucible-core", "crucible-dsl", "crucible-engine", "crucible-plugin", "crucible-protocol", "crucible-proxy", "crucible-worker"]
+members = ["crucible", "crucible-core", "crucible-dsl", "crucible-engine", "crucible-plugin", "crucible-protocol", "crucible-proxy"]
 exclude = ["examples"]
 
 [workspace.package]

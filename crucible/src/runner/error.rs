@@ -10,6 +10,11 @@ pub enum Error {
     Codec(#[from] codec::Error),
     #[error("runner exe has no parent directory")]
     RunnerExeParentless,
+    #[error("no worker binary at {} or {}", beside.display(), installed.display())]
+    WorkerBinMissing {
+        beside: std::path::PathBuf,
+        installed: std::path::PathBuf,
+    },
     #[error("expected a `.cru` file, got `{0}`")]
     NotAScenarioFile(String),
     #[error("cannot read {path}: {source}")]
@@ -37,6 +42,24 @@ pub enum Error {
         expected: &'static str,
         got: String,
     },
+}
+
+impl Error {
+    /// Whether a fresh replica could plausibly get further. Retrying costs a
+    /// fleet bring-up, so a failure that will recur identically says so and the
+    /// campaign stops rather than spending its budget proving it.
+    #[must_use]
+    pub fn is_transient(&self) -> bool {
+        !matches!(
+            self,
+            Error::RunnerExeParentless
+                | Error::WorkerBinMissing { .. }
+                | Error::NotAScenarioFile(_)
+                | Error::ScenarioUnreadable { .. }
+                | Error::ScenarioRejected(_)
+                | Error::VersionMismatch { .. }
+        )
+    }
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
