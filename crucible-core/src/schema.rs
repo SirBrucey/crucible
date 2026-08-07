@@ -2,7 +2,7 @@
 //! operations, and observables it accepts.
 
 /// The type of a value in a schema.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub enum ValueType {
     Str,
     Int,
@@ -14,7 +14,7 @@ pub enum ValueType {
 }
 
 /// One attribute a deployment plugin accepts inside a `service { ... }` body.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct AttrDecl {
     pub name: String,
     pub ty: ValueType,
@@ -42,7 +42,7 @@ impl AttrDecl {
 }
 
 /// The attribute schema for a deployment plugin's service body.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct AttrSchema {
     pub attrs: Vec<AttrDecl>,
 }
@@ -61,7 +61,7 @@ impl AttrSchema {
 }
 
 /// How an operation's head is matched against a `do` or `expect` head.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub enum HeadPattern {
     /// A fixed operation name, e.g. `POST`.
     Exact(String),
@@ -86,7 +86,7 @@ impl HeadPattern {
 }
 
 /// The type of a positional operation argument.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub enum ParamType {
     ServiceRef,
     Str,
@@ -97,7 +97,7 @@ pub enum ParamType {
 }
 
 /// One positional parameter of an operation.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct Param {
     pub name: String,
     pub ty: ParamType,
@@ -125,7 +125,7 @@ impl Param {
 }
 
 /// The shape of a keyword clause's payload.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub enum ClauseShape {
     /// A single `<column> = <value>` filter, as in `where`.
     Filter,
@@ -136,7 +136,7 @@ pub enum ClauseShape {
 }
 
 /// An optional keyword clause an operation accepts, e.g. `where` or `body`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct ClauseDecl {
     pub keyword: String,
     pub shape: ClauseShape,
@@ -177,7 +177,7 @@ impl CmpOp {
 
 /// The signature of one operation: a driver action (a `do` step) or an observer
 /// observable (an `expect` predicate's left side).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct OpSig {
     pub head: HeadPattern,
     pub params: Vec<Param>,
