@@ -97,12 +97,7 @@ impl<'a> Lowerer<'a> {
     fn fleet(&mut self, fleet: &Fleet) -> (plan::Fleet, HashMap<String, ServiceModel>) {
         let schema = self.registry.deployment(&fleet.deployment.node);
         if schema.is_none() {
-            let known = sorted(
-                self.registry
-                    .deployment_names()
-                    .into_iter()
-                    .map(String::from),
-            );
+            let known = sorted(self.registry.deployment_names());
             self.error_suggesting(
                 fleet.deployment.span,
                 format!("unknown deployment plugin `{}`", fleet.deployment.node),
@@ -238,7 +233,7 @@ impl<'a> Lowerer<'a> {
             return None;
         };
         let Some(signatures) = self.registry.driver(&driver.node) else {
-            let known = sorted(self.registry.driver_names().into_iter().map(String::from));
+            let known = sorted(self.registry.driver_names());
             self.error_suggesting(
                 driver.span,
                 format!("unknown driver `{}`", driver.node),

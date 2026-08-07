@@ -20,9 +20,9 @@ use crate::{
 /// The available plugins, keyed by name and resolved to their schemas.
 #[derive(Default)]
 pub struct Registry {
-    deployments: HashMap<&'static str, AttrSchema>,
-    drivers: HashMap<&'static str, RegisteredDriver>,
-    observers: HashMap<&'static str, RegisteredObserver>,
+    deployments: HashMap<String, AttrSchema>,
+    drivers: HashMap<String, RegisteredDriver>,
+    observers: HashMap<String, RegisteredObserver>,
 }
 
 impl Registry {
@@ -37,12 +37,13 @@ impl Registry {
     }
 
     fn add_deployment<D: Deployment>(&mut self) {
-        self.deployments.insert(D::NAME, D::attr_schema());
+        self.deployments
+            .insert(D::NAME.to_owned(), D::attr_schema());
     }
 
     fn add_driver<D: Driver>(&mut self) {
         self.drivers.insert(
-            D::NAME,
+            D::NAME.to_owned(),
             RegisteredDriver {
                 signatures: D::signatures(),
                 attrs: D::attr_schema(),
@@ -52,7 +53,7 @@ impl Registry {
 
     fn add_observer<O: Observer + 'static>(&mut self) {
         self.observers.insert(
-            O::NAME,
+            O::NAME.to_owned(),
             RegisteredObserver {
                 signatures: O::signatures(),
                 attrs: O::attr_schema(),
@@ -85,14 +86,14 @@ impl Registry {
 
     /// The names of the registered deployment plugins.
     #[must_use]
-    pub fn deployment_names(&self) -> Vec<&'static str> {
-        self.deployments.keys().copied().collect()
+    pub fn deployment_names(&self) -> Vec<String> {
+        self.deployments.keys().cloned().collect()
     }
 
     /// The names of the registered driver plugins.
     #[must_use]
-    pub fn driver_names(&self) -> Vec<&'static str> {
-        self.drivers.keys().copied().collect()
+    pub fn driver_names(&self) -> Vec<String> {
+        self.drivers.keys().cloned().collect()
     }
 
     /// Build the replica the planned fleet describes, ready to be brought up by
@@ -141,7 +142,7 @@ impl Registry {
         schema.extend(name, attrs.clone())?;
         for kind in kinds {
             if let Some((name, attrs)) = self.kind_attrs(kind) {
-                schema.extend(name, attrs)?;
+                schema.extend(&name, attrs)?;
             }
         }
         Ok(schema)
@@ -150,12 +151,12 @@ impl Registry {
     /// The attributes the named kind reads of a service that speaks it, and the
     /// name it is registered under. A kind that is not registered reads nothing:
     /// naming it is reported where the kind itself is resolved.
-    fn kind_attrs(&self, kind: &str) -> Option<(&'static str, AttrSchema)> {
+    fn kind_attrs(&self, kind: &str) -> Option<(String, AttrSchema)> {
         if let Some((name, driver)) = self.drivers.get_key_value(kind) {
-            return Some((*name, driver.attrs.clone()));
+            return Some((name.clone(), driver.attrs.clone()));
         }
         let (name, observer) = self.observers.get_key_value(kind)?;
-        Some((*name, observer.attrs.clone()))
+        Some((name.clone(), observer.attrs.clone()))
     }
 
     /// Prepare each step, bound to the driver it names, in the order given.
@@ -252,7 +253,7 @@ pub type PreparedCheck = (plan::Check, Box<dyn Query>);
 /// What one service may declare: the attributes its deployment reads, plus
 /// those read by each plugin it speaks, and which plugin reads each.
 pub struct ServiceSchema {
-    attrs: Vec<(AttrDecl, &'static str)>,
+    attrs: Vec<(AttrDecl, String)>,
 }
 
 impl ServiceSchema {
@@ -267,11 +268,11 @@ impl ServiceSchema {
 
     /// The plugin that reads `name`.
     #[must_use]
-    pub fn reader(&self, name: &str) -> Option<&'static str> {
+    pub fn reader(&self, name: &str) -> Option<&str> {
         self.attrs
             .iter()
             .find(|(decl, _)| decl.name == name)
-            .map(|(_, plugin)| *plugin)
+            .map(|(_, plugin)| plugin.as_str())
     }
 
     /// Every attribute a service may declare.
@@ -282,7 +283,7 @@ impl ServiceSchema {
     /// Take on `schema`, whose attributes `plugin` reads. Two plugins may read
     /// the same attribute, which is how a service states a fact once for both,
     /// but only if they agree on what it holds.
-    fn extend(&mut self, plugin: &'static str, schema: AttrSchema) -> Result<(), Error> {
+    fn extend(&mut self, plugin: &str, schema: AttrSchema) -> Result<(), Error> {
         for decl in schema.attrs {
             match self.attrs.iter().find(|(held, _)| held.name == decl.name) {
                 Some((held, other)) if held.ty != decl.ty => {
@@ -295,7 +296,7 @@ impl ServiceSchema {
                     ));
                 }
                 Some(_) => {}
-                None => self.attrs.push((decl, plugin)),
+                None => self.attrs.push((decl, plugin.to_owned())),
             }
         }
         Ok(())
