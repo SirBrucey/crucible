@@ -88,6 +88,28 @@ jobs:
           grep -q ' ./usr/bin/crucible$' contents
           grep -q ' ./usr/lib/crucible/crucible-worker$' contents
 
+  plugin:
+    name: plugin
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deb
+      # Built against the contract as anyone else's plugin would be, so a change
+      # that breaks a third party breaks here rather than after release.
+      - run: cargo clippy --manifest-path examples/dns-observer/Cargo.toml --all-targets -- -A clippy::pedantic -D warnings
+      - run: cargo deb --manifest-path examples/dns-observer/Cargo.toml
+      # The binary where crucible looks for it.
+      - run: |
+          dpkg-deb -c examples/dns-observer/target/debian/crucible-observer-dns_*_amd64.deb | tee contents
+          grep -q ' ./usr/lib/crucible/plugins/crucible-observer-dns$' contents
+
   machete:
     name: machete
     runs-on: ubuntu-latest
