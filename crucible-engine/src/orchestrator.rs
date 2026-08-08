@@ -25,6 +25,14 @@ const HEAL_MIN_SETTLE: Duration = Duration::from_millis(500);
 /// Before the learn snapshot, wait at least this long so post-ack async writes
 /// have a chance to begin before the fleet can be judged quiescent.
 const LEARN_SETTLE: Duration = Duration::from_millis(100);
+/// Between steps, wait at least this long before the fleet can be judged to
+/// have finished with one, so work a step starts after answering its caller has
+/// begun before anything looks for it.
+const STEP_SETTLE: Duration = Duration::from_millis(100);
+/// How long a step's effects have to settle before the next one starts. A fleet
+/// still working after this is one the scenario has outrun, which is a result
+/// rather than something to keep waiting on.
+const STEP_BUDGET: Duration = Duration::from_secs(15);
 /// Consider the fleet quiescent once no sidecar has forwarded traffic for this
 /// long. Comfortably larger than a DB write plus docker-log delivery latency.
 const QUIESCENCE_IDLE: Duration = Duration::from_secs(1);
@@ -169,7 +177,7 @@ impl Orchestrator<Ready> {
             },
         } = self;
         let scenario_start_ns = now_ns();
-        let mut observations = match run_actions(&actions).await {
+        let mut observations = match run_actions(&actions, &session_observer).await {
             Ok(observations) => observations,
             Err(e) => {
                 // A failed scenario leaves the replica up; tear it down rather
@@ -232,7 +240,7 @@ impl Orchestrator<Ready> {
             let (scenario_end_tx, mut scenario_end_rx) = tokio::sync::oneshot::channel::<()>();
             let scenario_start = Instant::now();
             let scenario_fut = async {
-                let result = run_actions(&actions).await;
+                let result = run_actions(&actions, &session_observer).await;
                 let _ = scenario_end_tx.send(());
                 result
             };
@@ -372,10 +380,23 @@ async fn read_checks(
 
 /// Run a scenario's actions in order against the fleet, collecting what each
 /// one observed.
-async fn run_actions(actions: &[TargetedAction]) -> Result<Observations, crucible_plugin::Error> {
+/// Run the scenario's steps one at a time, each starting only once the fleet
+/// has stopped working on the one before.
+///
+/// A step's effects outlast its response: the caller is answered before a
+/// consumer has read what the step published. Overlapping steps therefore leave
+/// a state no one step accounts for, and the traffic a fault is anchored in
+/// belongs to whichever step happened to be in flight.
+async fn run_actions(
+    actions: &[TargetedAction],
+    session_observer: &SessionObserver,
+) -> Result<Observations, crucible_plugin::Error> {
     let mut observations = Observations::empty();
     for (action, endpoint) in actions {
         observations.outcomes.push(action.run(*endpoint).await?);
+        session_observer
+            .wait_for_quiescence(STEP_SETTLE, QUIESCENCE_IDLE, STEP_BUDGET)
+            .await;
     }
     Ok(observations)
 }
