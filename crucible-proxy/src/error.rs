@@ -15,8 +15,6 @@ pub enum Error {
         addr: String,
         source: AddrParseError,
     },
-    #[error("resolve upstream `{upstream}` produced no addresses")]
-    UpstreamUnresolved { upstream: String },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

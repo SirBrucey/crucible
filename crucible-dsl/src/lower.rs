@@ -97,12 +97,7 @@ impl<'a> Lowerer<'a> {
     fn fleet(&mut self, fleet: &Fleet) -> (plan::Fleet, HashMap<String, ServiceModel>) {
         let schema = self.registry.deployment(&fleet.deployment.node);
         if schema.is_none() {
-            let known = sorted(
-                self.registry
-                    .deployment_names()
-                    .into_iter()
-                    .map(String::from),
-            );
+            let known = sorted(self.registry.deployment_names());
             self.error_suggesting(
                 fleet.deployment.span,
                 format!("unknown deployment plugin `{}`", fleet.deployment.node),
@@ -238,7 +233,7 @@ impl<'a> Lowerer<'a> {
             return None;
         };
         let Some(signatures) = self.registry.driver(&driver.node) else {
-            let known = sorted(self.registry.driver_names().into_iter().map(String::from));
+            let known = sorted(self.registry.driver_names());
             self.error_suggesting(
                 driver.span,
                 format!("unknown driver `{}`", driver.node),
@@ -496,6 +491,16 @@ impl<'a> Lowerer<'a> {
             }
             return;
         }
+        if let ValueType::MapOf(inner) = ty {
+            let Value::Map(entries) = &value.node else {
+                self.error(value.span, "expected a map");
+                return;
+            };
+            for (_, entry) in entries {
+                self.check_type(entry, inner);
+            }
+            return;
+        }
         let matches = matches!(
             (ty, &value.node),
             (ValueType::Str, Value::Str(_))
@@ -513,6 +518,7 @@ impl<'a> Lowerer<'a> {
 
 fn lower_value(value: &Value) -> plan::Value {
     match value {
+        Value::Null => plan::Value::Null,
         Value::Str(s) => plan::Value::Str(s.clone()),
         Value::Int(n) => plan::Value::Int(*n),
         Value::Bool(b) => plan::Value::Bool(*b),
@@ -610,7 +616,7 @@ fn type_name(ty: &ValueType) -> &'static str {
         ValueType::Bool => "a boolean",
         ValueType::Duration => "a duration",
         ValueType::List(_) => "a list",
-        ValueType::Map => "a map",
+        ValueType::MapOf(_) | ValueType::Map => "a map",
         ValueType::ServiceRef => "a service name",
     }
 }
@@ -648,8 +654,8 @@ mod tests {
     const VALID: &str = r#"
         fleet "orders" {
           deployment: docker;
-          service api { kinds: [http], image: "api:1", port: 80 };
-          service db  { kinds: [mariadb], image: "mariadb:11", port: 3306 };
+          service api { kinds: [http], image: "api:1", ports: { http: 80 } };
+          service db  { kinds: [mariadb], image: "mariadb:11", ports: { mariadb: 3306 } };
         }
         scenario "s" {
           consistent_within: 10s;
@@ -661,6 +667,22 @@ mod tests {
     #[test]
     fn the_example_shape_validates_clean() {
         assert!(diagnose(VALID).is_empty(), "{:?}", diagnose(VALID));
+    }
+
+    #[test]
+    fn a_body_may_state_a_value_is_absent() {
+        let plan = lower_ok(&VALID.replace(r#"item: "book", quantity: 1"#, "item: null"));
+        let body = plan.scenarios[0].steps[0]
+            .body
+            .as_ref()
+            .expect("the step carries a body");
+        assert_eq!(body[0].1, plan::Value::Null);
+    }
+
+    #[test]
+    fn an_attribute_of_a_stated_type_may_not_be_absent() {
+        let diags = diagnose(&VALID.replace("http: 80", "http: null"));
+        find(&diags, "expected an integer");
     }
 
     #[test]
@@ -691,7 +713,7 @@ mod tests {
 
     #[test]
     fn lowering_fails_on_a_semantic_error() {
-        let src = r#"fleet "f" { deployment: docker; service api { kinds: [http], image: "x", port: 80 } }
+        let src = r#"fleet "f" { deployment: docker; service api { kinds: [http], image: "x", ports: { http: 80 } } }
                      scenario "s" { consistent_within: 1s; expect { db.orders.count == 1; } }"#;
         let error = lower(&parse_file(src), &Registry::builtins()).unwrap_err();
         assert!(
@@ -739,13 +761,13 @@ mod tests {
         // Naming the plugin that reads it says where the requirement came from,
         // which matters once several plugins read a service's attributes.
         let diags = diagnose(src);
-        let diag = find(&diags, "is missing `port`");
+        let diag = find(&diags, "is missing `ports`");
         assert!(diag.message.contains("docker"), "{}", diag.message);
     }
 
     #[test]
     fn an_unknown_service_lists_the_defined_ones() {
-        let src = r#"fleet "f" { deployment: docker; service api { kinds: [http], image: "x", port: 80 } }
+        let src = r#"fleet "f" { deployment: docker; service api { kinds: [http], image: "x", ports: { http: 80 } } }
                      scenario "s" { consistent_within: 1s; do { http POST gateway "/x" }; }"#;
         let diags = diagnose(src);
         let diag = find(&diags, "unknown service `gateway`");
@@ -755,7 +777,7 @@ mod tests {
     #[test]
     fn a_service_that_does_not_speak_the_driver_has_no_driver_to_suggest() {
         // api's only kind, mariadb, is an observer, so there is no driver to suggest.
-        let src = r#"fleet "f" { deployment: docker; service api { kinds: [mariadb], image: "x", port: 80 } }
+        let src = r#"fleet "f" { deployment: docker; service api { kinds: [mariadb], image: "x", ports: { mariadb: 80 } } }
                      scenario "s" { consistent_within: 1s; do { http POST api "/x" }; }"#;
         let diags = diagnose(src);
         let diag = find(&diags, "does not speak `http`");
@@ -766,7 +788,7 @@ mod tests {
 
     #[test]
     fn an_unknown_observable_suggests_the_observables() {
-        let src = r#"fleet "f" { deployment: docker; service db { kinds: [mariadb], image: "x", port: 80 } }
+        let src = r#"fleet "f" { deployment: docker; service db { kinds: [mariadb], image: "x", ports: { mariadb: 80 } } }
                      scenario "s" { consistent_within: 1s; expect { db.orders.rows == 1; } }"#;
         let diags = diagnose(src);
         let diag = find(&diags, "no observable `orders.rows`");

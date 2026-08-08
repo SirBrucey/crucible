@@ -6,9 +6,8 @@ use std::{
     time::Duration,
 };
 
-use bollard::{Docker as DockerClient, query_parameters::LogsOptionsBuilder};
 use crucible_protocol::{ConnEvent, ConnEventKind, Direction, Session, now_ns};
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt};
 use tokio::{sync::mpsc, task::JoinHandle};
 
 use crate::{proxy_log::Sessions, verdict::Observations};
@@ -114,11 +113,15 @@ pub struct SessionObserver {
 }
 
 impl SessionObserver {
-    /// Stream the fleet's single proxy container. Every pair in that proxy tags
-    /// its event lines with its service, so the interleaved stream stays
+    /// Read the fleet's proxy log from `chunks`, which the deployment opens
+    /// because only it knows where its proxy writes. Every pair in that proxy
+    /// tags its event lines with its service, so the interleaved stream stays
     /// attributable per service.
     #[must_use]
-    pub fn start(client: &DockerClient, proxy_container: String) -> Self {
+    pub fn start<S>(chunks: S) -> Self
+    where
+        S: Stream<Item = Vec<u8>> + Send + 'static,
+    {
         let (mpsc_tx, mut mpsc_rx) = mpsc::unbounded_channel::<(String, ConnEvent)>();
         let index: Arc<Mutex<EventIndex>> = Arc::new(Mutex::new(EventIndex::default()));
 
@@ -132,12 +135,9 @@ impl SessionObserver {
             }
         });
 
-        let stream = {
-            let client = client.clone();
-            tokio::spawn(async move {
-                stream_sidecar(client, proxy_container, mpsc_tx).await;
-            })
-        };
+        let stream = tokio::spawn(async move {
+            read_events(chunks, mpsc_tx).await;
+        });
 
         Self {
             index,
@@ -226,28 +226,17 @@ impl SessionObserver {
     }
 }
 
-async fn stream_sidecar(
-    client: DockerClient,
-    container: String,
-    tx: mpsc::UnboundedSender<(String, ConnEvent)>,
-) {
-    let options = LogsOptionsBuilder::default()
-        .stdout(true)
-        .stderr(false)
-        .follow(true)
-        .tail("all")
-        .build();
-    let mut stream = client.logs(&container, Some(options));
+/// Assemble `chunks` into lines and record the events they carry. Each line is
+/// `service\tjson`: the proxy tags every event with the pair's service so one
+/// interleaved stream stays attributable.
+async fn read_events<S>(chunks: S, tx: mpsc::UnboundedSender<(String, ConnEvent)>)
+where
+    S: Stream<Item = Vec<u8>> + Send + 'static,
+{
+    let mut chunks = std::pin::pin!(chunks);
     let mut buffer: Vec<u8> = Vec::new();
-    while let Some(chunk_result) = stream.next().await {
-        let chunk = match chunk_result {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!(target: "session_observer", %container, error = %e, "log stream error");
-                return;
-            }
-        };
-        buffer.extend_from_slice(chunk.as_ref());
+    while let Some(chunk) = chunks.next().await {
+        buffer.extend_from_slice(&chunk);
         while let Some(nl) = buffer.iter().position(|&b| b == b'\n') {
             let line: Vec<u8> = buffer.drain(..=nl).collect();
             let text = String::from_utf8_lossy(&line[..line.len() - 1]);
@@ -255,10 +244,8 @@ async fn stream_sidecar(
             if trimmed.is_empty() {
                 continue;
             }
-            // Each line is `service\tjson`: the proxy tags every event with the
-            // pair's service so one interleaved stream stays attributable.
             let Some((service, json)) = trimmed.split_once('\t') else {
-                tracing::warn!(target: "session_observer", %container, line = %trimmed, "conn event line missing service tag");
+                tracing::warn!(target: "session_observer", line = %trimmed, "conn event line missing service tag");
                 continue;
             };
             match serde_json::from_str::<ConnEvent>(json) {
@@ -268,7 +255,7 @@ async fn stream_sidecar(
                     }
                 }
                 Err(e) => {
-                    tracing::warn!(target: "session_observer", %container, error = %e, line = %json, "parse conn event");
+                    tracing::warn!(target: "session_observer", error = %e, line = %json, "parse conn event");
                 }
             }
         }

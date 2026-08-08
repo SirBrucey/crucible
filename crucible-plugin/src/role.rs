@@ -59,8 +59,8 @@ pub trait DeploymentRuntime: FaultPrimitives {
     fn wait_ready(&self) -> BoxFuture<'_, Result<(), Error>>;
     fn teardown(&mut self) -> BoxFuture<'_, Result<(), Error>>;
 
-    /// Where the named service can be reached, once the replica is up.
-    fn endpoint(&self, service: &str) -> Option<SocketAddr>;
+    /// Where the named service answers `kind`, once the replica is up.
+    fn endpoint(&self, service: &str, kind: &str) -> Option<SocketAddr>;
 
     /// Start streaming what the replica's substrate sees on the wire. The
     /// deployment runs that substrate, so only it can open the stream. The
@@ -104,10 +104,14 @@ pub trait DriverRuntime: Send + Sync {
     fn prepare(&self, step: &plan::Step) -> Result<Box<dyn Action>, Error>;
 }
 
-/// Something bound to one service of the fleet.
+/// Something bound to one service of the fleet, speaking one of the kinds that
+/// service declares. A service may answer several kinds on several ports, so
+/// which one this speaks is what says where to reach it.
 pub trait Targeted {
     /// The service this is bound to.
     fn target(&self) -> &str;
+    /// The kind this speaks to it.
+    fn kind(&self) -> &str;
 }
 
 /// One bound step, runnable against the service it names.
@@ -118,7 +122,7 @@ pub trait Action: Targeted + Send + Sync {
 
 /// An observer plugin: it advertises the observables an `expect { ... }`
 /// predicate can read.
-pub trait Observer {
+pub trait Observer: ObserverRuntime + Sized {
     /// Stable identifier used to select this plugin.
     const NAME: &'static str;
     /// One check of a plan, in this plugin's own terms.
@@ -126,6 +130,10 @@ pub trait Observer {
     type Error: std::error::Error + Send + Sync + 'static;
 
     fn signatures() -> Vec<OpSig>;
+
+    /// Construct an observer for `service`, configured from the attributes that
+    /// service declares for this plugin.
+    fn runtime(service: &plan::Service) -> Self;
 
     /// Bind a check to a query this observer can answer.
     ///
@@ -144,11 +152,16 @@ pub trait Observer {
 
 /// An observer, ready to read settled state.
 pub trait ObserverRuntime: Send + Sync {
-    /// Bind a check to a runnable query, without a live fleet.
+    /// Bind a check to a runnable query, without a live fleet. Asking an
+    /// observer that runs as its own process is a round trip, so this is where
+    /// a check it cannot answer is refused, before a replica is spent on it.
     ///
     /// # Errors
     /// Errors if the check does not bind to an observable this observer reads.
-    fn prepare(&self, check: &plan::Check) -> Result<Box<dyn Query>, Error>;
+    fn prepare<'a>(
+        &'a self,
+        check: &'a plan::Check,
+    ) -> BoxFuture<'a, Result<Box<dyn Query>, Error>>;
 }
 
 /// One bound check, readable against the service it names. It yields what was

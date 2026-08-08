@@ -97,11 +97,14 @@ impl From<Error> for PluginError {
     }
 }
 
-impl Mariadb {
-    /// An observer reading as the credentials a service declares, defaulting to
-    /// the unprivileged case a test fleet is usually brought up with.
-    #[must_use]
-    pub fn new(service: &plan::Service) -> Self {
+impl Observer for Mariadb {
+    const NAME: &'static str = "mariadb";
+    type Query = Selection;
+    type Error = Error;
+
+    /// Reads as the credentials the service declares, defaulting to root with
+    /// no password.
+    fn runtime(service: &plan::Service) -> Self {
         Self {
             user: service
                 .attr("user")
@@ -115,12 +118,6 @@ impl Mariadb {
                 .to_owned(),
         }
     }
-}
-
-impl Observer for Mariadb {
-    const NAME: &'static str = "mariadb";
-    type Query = Selection;
-    type Error = Error;
 
     fn signatures() -> Vec<OpSig> {
         vec![
@@ -202,12 +199,17 @@ impl Observer for Mariadb {
 }
 
 impl ObserverRuntime for Mariadb {
-    fn prepare(&self, check: &plan::Check) -> Result<Box<dyn Query>, PluginError> {
-        Ok(Box::new(Read {
-            selection: Mariadb::bind(check)?,
-            user: self.user.clone(),
-            password: self.password.clone(),
-        }))
+    fn prepare<'a>(
+        &'a self,
+        check: &'a plan::Check,
+    ) -> BoxFuture<'a, Result<Box<dyn Query>, PluginError>> {
+        Box::pin(async move {
+            Ok(Box::new(Read {
+                selection: Mariadb::bind(check)?,
+                user: self.user.clone(),
+                password: self.password.clone(),
+            }) as Box<dyn Query>)
+        })
     }
 }
 
@@ -219,6 +221,10 @@ struct Read {
 }
 
 impl Targeted for Read {
+    fn kind(&self) -> &str {
+        Mariadb::NAME
+    }
+
     fn target(&self) -> &str {
         &self.selection.service
     }

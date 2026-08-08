@@ -2,7 +2,7 @@
 //! binds a service to that, and runs the replica.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     time::Duration,
 };
@@ -15,11 +15,11 @@ use bollard::{
     },
     query_parameters::{
         CreateContainerOptionsBuilder, CreateImageOptionsBuilder, KillContainerOptionsBuilder,
-        RemoveContainerOptionsBuilder, StartContainerOptions,
+        LogsOptionsBuilder, RemoveContainerOptionsBuilder, StartContainerOptions,
     },
 };
 use crucible_protocol::{Direction, now_ns};
-use futures_util::TryStreamExt;
+use futures_util::{StreamExt, TryStreamExt};
 use tokio::time::sleep;
 
 use crucible_core::{
@@ -59,6 +59,10 @@ pub enum Error {
          rewrite the consumer's endpoint, which is not wired yet"
     )]
     PortCollision(u16),
+    #[error("service `{service}` depends on `{missing}`, which the fleet does not describe")]
+    UnknownDependency { service: String, missing: String },
+    #[error("these services depend on each other, so none of them can start first: {0}")]
+    DependencyCycle(String),
 }
 
 /// Items teardown could not remove, paired with the daemon's reason.
@@ -112,8 +116,16 @@ impl std::fmt::Display for TeardownFailures {
 pub enum BindError {
     #[error("service `{service}` has no usable `{attr}`")]
     Attr { service: String, attr: &'static str },
-    #[error("service `{service}`: {port} is not a port number")]
-    Port { service: String, port: i64 },
+    #[error("service `{service}`: {port} is not a port number for `{kind}`")]
+    Port {
+        service: String,
+        kind: String,
+        port: i64,
+    },
+    #[error("service `{service}` states a port for `{kind}`, which it does not speak")]
+    UnspokenKind { service: String, kind: String },
+    #[error("service `{service}` states no port for `{kind}`, which it speaks")]
+    MissingKind { service: String, kind: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -123,12 +135,15 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 pub struct ServiceConfig {
     pub name: String,
     pub image: String,
-    pub port: u16,
+    /// The port each kind the service speaks answers on.
+    pub ports: BTreeMap<String, u16>,
     /// Environment variables, one per entry in `KEY=value` form.
     pub env: Vec<String>,
     /// Command to run inside the container as a healthcheck; empty means the
     /// image's own healthcheck.
     pub healthcheck: Vec<String>,
+    /// Services that must be healthy before this one starts.
+    pub depends_on: Vec<String>,
 }
 
 /// Brings services up as Docker containers.
@@ -136,7 +151,7 @@ pub struct Docker {
     client: DockerClient,
     network: String,
     services: Vec<ServiceConfig>,
-    endpoints: HashMap<String, SocketAddr>,
+    endpoints: HashMap<(String, String), SocketAddr>,
     anchor: Option<Anchor>,
 }
 
@@ -212,7 +227,11 @@ impl Docker {
         ensure_image(&self.client, &service.image).await?;
 
         let container_name = self.backing_container_name(service);
-        let exposed_port = format!("{}/tcp", service.port);
+        let exposed: Vec<String> = service
+            .ports
+            .values()
+            .map(|port| format!("{port}/tcp"))
+            .collect();
 
         let mut endpoints_config = HashMap::new();
         endpoints_config.insert(
@@ -232,7 +251,7 @@ impl Docker {
 
         let config = ContainerCreateBody {
             image: Some(service.image.clone()),
-            exposed_ports: Some(vec![exposed_port]),
+            exposed_ports: Some(exposed),
             env: (!service.env.is_empty()).then(|| service.env.clone()),
             healthcheck,
             networking_config: Some(NetworkingConfig {
@@ -263,7 +282,7 @@ impl Docker {
     /// as a network alias, and all ports published to the host. Returns each
     /// service's published host endpoint. Every pair shares one process-wide
     /// pause gate, so a single signal freezes the whole fleet atomically.
-    async fn start_proxy(&self) -> Result<Vec<(String, SocketAddr)>> {
+    async fn start_proxy(&self) -> Result<Vec<((String, String), SocketAddr)>> {
         ensure_image(&self.client, PROXY_IMAGE).await?;
 
         // The proxy binds one listener per service port. Distinct ports map
@@ -271,22 +290,28 @@ impl Docker {
         // container IP, so reject it rather than misroute.
         let mut seen = HashSet::new();
         for service in &self.services {
-            if !seen.insert(service.port) {
-                return Err(Error::PortCollision(service.port));
+            for port in service.ports.values() {
+                if !seen.insert(*port) {
+                    return Err(Error::PortCollision(*port));
+                }
             }
         }
 
         let container_name = self.proxy_container_name();
 
-        let mut cmd = Vec::with_capacity(self.services.len() * 2 + 2);
+        let mut cmd = Vec::new();
         for service in &self.services {
-            cmd.push("--pair".to_string());
-            cmd.push(format!(
-                "{name}=0.0.0.0:{port}={upstream}:{port}",
-                name = service.name,
-                port = service.port,
-                upstream = Self::backing_alias(service),
-            ));
+            // A pair per port, each tagged with the service rather than the
+            // kind: what a fault is anchored to is the service, however many
+            // ports its traffic arrives on.
+            for port in service.ports.values() {
+                cmd.push("--pair".to_string());
+                cmd.push(format!(
+                    "{name}=0.0.0.0:{port}={upstream}:{port}",
+                    name = service.name,
+                    upstream = Self::backing_alias(service),
+                ));
+            }
         }
         if let Some(anchor) = &self.anchor {
             let direction = match anchor.direction {
@@ -300,7 +325,8 @@ impl Docker {
         let exposed_ports: Vec<String> = self
             .services
             .iter()
-            .map(|s| format!("{}/tcp", s.port))
+            .flat_map(|s| s.ports.values())
+            .map(|port| format!("{port}/tcp"))
             .collect();
 
         let aliases: Vec<String> = self.services.iter().map(|s| s.name.clone()).collect();
@@ -342,13 +368,15 @@ impl Docker {
             .start_container(&container_name, None::<StartContainerOptions>)
             .await?;
 
-        let mut endpoints = Vec::with_capacity(self.services.len());
+        let mut endpoints = Vec::new();
         for service in &self.services {
-            let host_port = published_port(&self.client, &container_name, service.port).await?;
-            endpoints.push((
-                service.name.clone(),
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), host_port),
-            ));
+            for (kind, port) in &service.ports {
+                let host_port = published_port(&self.client, &container_name, *port).await?;
+                endpoints.push((
+                    (service.name.clone(), kind.clone()),
+                    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), host_port),
+                ));
+            }
         }
         Ok(endpoints)
     }
@@ -391,14 +419,51 @@ impl Docker {
             })
             .await?;
 
-        // Bring up every backing container concurrently, then the one proxy that
-        // fronts the whole fleet. The proxy resolves its upstreams lazily, so the
-        // backings need not be ready first.
-        let docker = &*self;
-        futures_util::future::try_join_all(docker.services.iter().map(|s| docker.start_service(s)))
-            .await?;
-        let endpoints = docker.start_proxy().await?;
+        // The proxy first: every service reaches its peers by a name the proxy
+        // answers for, so until it is up a service that talks to another on
+        // startup has nothing to talk to. It resolves its own upstreams per
+        // connection, so it does not need them yet.
+        let endpoints = self.start_proxy().await?;
         self.endpoints.extend(endpoints);
+        self.start_services().await?;
+        Ok(())
+    }
+
+    /// Start each service once everything it depends on is healthy, and those
+    /// that depend on nothing together.
+    async fn start_services(&self) -> Result<()> {
+        for service in &self.services {
+            for needed in &service.depends_on {
+                if !self.services.iter().any(|s| &s.name == needed) {
+                    return Err(Error::UnknownDependency {
+                        service: service.name.clone(),
+                        missing: needed.clone(),
+                    });
+                }
+            }
+        }
+
+        let mut healthy: HashSet<&str> = HashSet::new();
+        let mut waiting: Vec<&ServiceConfig> = self.services.iter().collect();
+        while !waiting.is_empty() {
+            let (ready, blocked): (Vec<_>, Vec<_>) = waiting.into_iter().partition(|service| {
+                service
+                    .depends_on
+                    .iter()
+                    .all(|needed| healthy.contains(needed.as_str()))
+            });
+            if ready.is_empty() {
+                let names: Vec<&str> = blocked.iter().map(|s| s.name.as_str()).collect();
+                return Err(Error::DependencyCycle(names.join(", ")));
+            }
+            futures_util::future::try_join_all(ready.iter().map(|s| self.start_service(s))).await?;
+            futures_util::future::try_join_all(ready.iter().map(|service| async move {
+                wait_container_ready(&self.client, &self.backing_container_name(service)).await
+            }))
+            .await?;
+            healthy.extend(ready.iter().map(|service| service.name.as_str()));
+            waiting = blocked;
+        }
         Ok(())
     }
 
@@ -548,9 +613,13 @@ impl Deployment for Docker {
     fn attr_schema() -> AttrSchema {
         AttrSchema::new(vec![
             AttrDecl::required("image", ValueType::Str),
-            AttrDecl::required("port", ValueType::Int),
+            AttrDecl::required("ports", ValueType::MapOf(Box::new(ValueType::Int))),
             AttrDecl::optional("env", ValueType::List(Box::new(ValueType::Str))),
             AttrDecl::optional("healthcheck", ValueType::List(Box::new(ValueType::Str))),
+            AttrDecl::optional(
+                "depends_on",
+                ValueType::List(Box::new(ValueType::ServiceRef)),
+            ),
         ])
     }
 
@@ -564,20 +633,47 @@ impl Deployment for Docker {
             .attr("image")
             .and_then(plan::Value::as_str)
             .ok_or_else(|| missing("image"))?;
-        let port = service
-            .attr("port")
-            .and_then(plan::Value::as_int)
-            .ok_or_else(|| missing("port"))?;
+        let stated = service
+            .attr("ports")
+            .and_then(plan::Value::as_map)
+            .ok_or_else(|| missing("ports"))?;
+
+        let mut ports = BTreeMap::new();
+        for (kind, port) in stated {
+            if !service.kinds.contains(kind) {
+                return Err(BindError::UnspokenKind {
+                    service: service.name.clone(),
+                    kind: kind.clone(),
+                });
+            }
+            let port = port.as_int().ok_or_else(|| BindError::Port {
+                service: service.name.clone(),
+                kind: kind.clone(),
+                port: 0,
+            })?;
+            let port = u16::try_from(port).map_err(|_| BindError::Port {
+                service: service.name.clone(),
+                kind: kind.clone(),
+                port,
+            })?;
+            ports.insert(kind.clone(), port);
+        }
+        // A kind with no port could never be reached, so the service says one
+        // for each rather than failing when something tries.
+        if let Some(kind) = service.kinds.iter().find(|kind| !ports.contains_key(*kind)) {
+            return Err(BindError::MissingKind {
+                service: service.name.clone(),
+                kind: kind.clone(),
+            });
+        }
 
         Ok(ServiceConfig {
             name: service.name.clone(),
             image: image.to_owned(),
-            port: u16::try_from(port).map_err(|_| BindError::Port {
-                service: service.name.clone(),
-                port,
-            })?,
+            ports,
             env: owned_strs(service, "env")?,
             healthcheck: owned_strs(service, "healthcheck")?,
+            depends_on: owned_idents(service, "depends_on")?,
         })
     }
 }
@@ -592,6 +688,23 @@ fn owned_strs(service: &plan::Service, attr: &'static str) -> Result<Vec<String>
         attr,
     })?;
     Ok(strs.into_iter().map(str::to_owned).collect())
+}
+
+/// An optional list-of-names attribute, empty when the service omits it.
+fn owned_idents(service: &plan::Service, attr: &'static str) -> Result<Vec<String>, BindError> {
+    let Some(plan::Value::List(items)) = service.attr(attr) else {
+        return Ok(Vec::new());
+    };
+    items
+        .iter()
+        .map(|item| match item {
+            plan::Value::Ident(name) => Ok(name.clone()),
+            _ => Err(BindError::Attr {
+                service: service.name.clone(),
+                attr,
+            }),
+        })
+        .collect()
 }
 
 impl FaultPrimitives for Docker {
@@ -644,12 +757,37 @@ impl DeploymentRuntime for Docker {
         Box::pin(async move { self.destroy_replica().await.map_err(PluginError::from) })
     }
 
-    fn endpoint(&self, service: &str) -> Option<SocketAddr> {
-        self.endpoints.get(service).copied()
+    fn endpoint(&self, service: &str, kind: &str) -> Option<SocketAddr> {
+        self.endpoints
+            .get(&(service.to_owned(), kind.to_owned()))
+            .copied()
     }
 
+    /// The proxy writes its event lines to its container's stdout, so following
+    /// that container's log is how this deployment hands the observer its feed.
     fn start_session_observer(&self) -> SessionObserver {
-        SessionObserver::start(&self.client, self.proxy_container_name())
+        let container = self.proxy_container_name();
+        let options = LogsOptionsBuilder::default()
+            .stdout(true)
+            .stderr(false)
+            .follow(true)
+            .tail("all")
+            .build();
+        let chunks = self
+            .client
+            .logs(&container, Some(options))
+            .scan((), move |(), chunk| {
+                // A stream that ends is how a failed read reaches the observer,
+                // which has no way to ask docker what went wrong.
+                std::future::ready(match chunk {
+                    Ok(bytes) => Some(bytes.as_ref().to_vec()),
+                    Err(e) => {
+                        tracing::warn!(target: "session_observer", %container, error = %e, "log stream error");
+                        None
+                    }
+                })
+            });
+        SessionObserver::start(chunks)
     }
 }
 
@@ -705,18 +843,19 @@ mod tests {
     // port, so two services must not share one (see `Error::PortCollision`).
     fn lifecycle_test_fleet() -> Vec<ServiceConfig> {
         vec![
-            test_service("web-a", "nginx:alpine", 80),
-            test_service("cache-b", "redis:alpine", 6379),
+            test_service("web-a", "nginx:alpine", "http", 80),
+            test_service("cache-b", "redis:alpine", "redis", 6379),
         ]
     }
 
-    fn test_service(name: &str, image: &str, port: u16) -> ServiceConfig {
+    fn test_service(name: &str, image: &str, kind: &str, port: u16) -> ServiceConfig {
         ServiceConfig {
             name: name.to_owned(),
             image: image.to_owned(),
-            port,
+            ports: BTreeMap::from([(kind.to_owned(), port)]),
             env: Vec::new(),
             healthcheck: Vec::new(),
+            depends_on: Vec::new(),
         }
     }
 
@@ -732,11 +871,13 @@ mod tests {
 
         let setup_outcome = deployment.setup().await;
         for service in &fleet {
-            assert!(
-                deployment.endpoint(&service.name).is_some(),
-                "expected endpoint for `{}`",
-                service.name
-            );
+            for kind in service.ports.keys() {
+                assert!(
+                    deployment.endpoint(&service.name, kind).is_some(),
+                    "expected endpoint for `{}` speaking `{kind}`",
+                    service.name
+                );
+            }
         }
 
         let wait_outcome = deployment.wait_ready().await;
@@ -748,16 +889,18 @@ mod tests {
         teardown_outcome.expect("teardown should succeed");
 
         for service in &fleet {
-            assert!(
-                deployment.endpoint(&service.name).is_none(),
-                "endpoint for `{}` should be cleared after teardown",
-                service.name
-            );
+            for kind in service.ports.keys() {
+                assert!(
+                    deployment.endpoint(&service.name, kind).is_none(),
+                    "endpoint for `{}` speaking `{kind}` should be cleared after teardown",
+                    service.name
+                );
+            }
         }
     }
 
     fn orphan_test_fleet() -> Vec<ServiceConfig> {
-        vec![test_service("orphan", "nginx:alpine", 80)]
+        vec![test_service("orphan", "nginx:alpine", "http", 80)]
     }
 
     #[tokio::test]
@@ -812,16 +955,16 @@ mod tests {
     }
 
     #[test]
-    fn image_and_port_are_required_env_is_optional() {
+    fn image_and_ports_are_required_env_is_optional() {
         let schema = Docker::attr_schema();
 
         let image = schema.attr("image").expect("image is declared");
         assert!(image.required);
         assert_eq!(image.ty, ValueType::Str);
 
-        let port = schema.attr("port").expect("port is declared");
-        assert!(port.required);
-        assert_eq!(port.ty, ValueType::Int);
+        let ports = schema.attr("ports").expect("ports is declared");
+        assert!(ports.required);
+        assert_eq!(ports.ty, ValueType::MapOf(Box::new(ValueType::Int)));
 
         assert!(!schema.attr("env").expect("env is declared").required);
     }
@@ -830,7 +973,10 @@ mod tests {
     fn a_service_binds_to_a_container_config() {
         let bound = Docker::bind(&service(vec![
             ("image", plan::Value::Str("example/api:1".into())),
-            ("port", plan::Value::Int(8080)),
+            (
+                "ports",
+                plan::Value::Map(vec![("http".into(), plan::Value::Int(8080))]),
+            ),
             (
                 "env",
                 plan::Value::List(vec![plan::Value::Str("A=1".into())]),
@@ -843,9 +989,10 @@ mod tests {
             ServiceConfig {
                 name: "api".into(),
                 image: "example/api:1".into(),
-                port: 8080,
+                ports: BTreeMap::from([("http".to_owned(), 8080)]),
                 env: vec!["A=1".into()],
                 healthcheck: Vec::new(),
+                depends_on: Vec::new(),
             },
         );
     }
@@ -864,8 +1011,37 @@ mod tests {
     fn a_port_outside_the_port_range_is_rejected() {
         let bound = Docker::bind(&service(vec![
             ("image", plan::Value::Str("example/api:1".into())),
-            ("port", plan::Value::Int(70_000)),
+            (
+                "ports",
+                plan::Value::Map(vec![("http".into(), plan::Value::Int(70_000))]),
+            ),
         ]));
         assert!(matches!(bound, Err(BindError::Port { .. })));
+    }
+
+    #[test]
+    fn a_port_for_a_kind_the_service_does_not_speak_is_rejected() {
+        let bound = Docker::bind(&service(vec![
+            ("image", plan::Value::Str("example/api:1".into())),
+            (
+                "ports",
+                plan::Value::Map(vec![
+                    ("http".into(), plan::Value::Int(80)),
+                    ("dns".into(), plan::Value::Int(53)),
+                ]),
+            ),
+        ]));
+        assert!(matches!(bound, Err(BindError::UnspokenKind { .. })));
+    }
+
+    /// A kind with no port could never be reached, so it is refused where the
+    /// service is described rather than when something tries to reach it.
+    #[test]
+    fn a_kind_the_service_speaks_needs_a_port() {
+        let bound = Docker::bind(&service(vec![
+            ("image", plan::Value::Str("example/api:1".into())),
+            ("ports", plan::Value::Map(Vec::new())),
+        ]));
+        assert!(matches!(bound, Err(BindError::MissingKind { .. })));
     }
 }

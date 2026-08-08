@@ -127,21 +127,22 @@ fn resolve_targets<T: Targeted + ?Sized>(
     bound
         .into_iter()
         .map(|bound| {
-            let endpoint = endpoint_for(deployment, bound.target())?;
+            let endpoint = endpoint_for(deployment, bound.as_ref())?;
             Ok((bound, endpoint))
         })
         .collect()
 }
 
-/// Where the named service answers, once the replica is up.
+/// Where this reaches the service it is bound to, once the replica is up.
 fn endpoint_for(
     deployment: &dyn DeploymentRuntime,
-    target: &str,
+    bound: &(impl Targeted + ?Sized),
 ) -> Result<SocketAddr, crucible_plugin::Error> {
-    deployment.endpoint(target).ok_or_else(|| {
+    let (target, kind) = (bound.target(), bound.kind());
+    deployment.endpoint(target, kind).ok_or_else(|| {
         crucible_plugin::Error::new(
             "orchestrator",
-            format!("the fleet published no endpoint for `{target}`"),
+            format!("the fleet published no endpoint for `{target}` speaking `{kind}`"),
         )
     })
 }
@@ -360,7 +361,7 @@ async fn read_checks(
 ) -> Result<Vec<Observed>, crucible_plugin::Error> {
     let mut readings = Vec::with_capacity(queries.len());
     for (check, query) in queries {
-        let endpoint = endpoint_for(deployment, query.target())?;
+        let endpoint = endpoint_for(deployment, query.as_ref())?;
         readings.push(Observed {
             value: query.read(endpoint).await?,
             check,

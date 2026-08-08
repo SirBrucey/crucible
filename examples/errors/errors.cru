@@ -8,13 +8,13 @@
 fleet "broken" {
   deployment: docker;
 
-  service api { kinds: [http],    image: "example/api:1", port: 80 };
-  service db  { kinds: [mariadb], image: "example/db:1",  port: 3306 };
+  service api { kinds: [http],    image: "example/api:1", ports: { http: 80 } };
+  service db  { kinds: [mariadb], image: "example/db:1",  ports: { mariadb: 3306 } };
 
-  service missing_port { kinds: [http], image: "example/x:1" };
-  service bad_port     { kinds: [http], image: "example/x:1", port: "eighty" };
-  service stray_attr   { kinds: [http], image: "example/x:1", port: 80, colour: "red" };
-  service bad_kinds    { kinds: "http", image: "example/x:1", port: 80 };
+  service missing_ports { kinds: [http], image: "example/x:1" };
+  service bad_port     { kinds: [http], image: "example/x:1", ports: { http: "eighty" } };
+  service stray_attr   { kinds: [http], image: "example/x:1", ports: { http: 80 }, colour: "red" };
+  service bad_kinds    { kinds: "http", image: "example/x:1", ports: { http: 80 } };
 }
 
 scenario "demo" {

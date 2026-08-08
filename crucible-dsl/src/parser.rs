@@ -496,6 +496,7 @@ impl Parser {
             TokenKind::Ident(s) => match s.as_str() {
                 "true" => Value::Bool(true),
                 "false" => Value::Bool(false),
+                "null" => Value::Null,
                 _ => Value::Ident(s.clone()),
             },
             TokenKind::LBracket => return Some(self.list()),
@@ -535,7 +536,7 @@ mod tests {
     #[test]
     fn a_fleet_with_services_parses() {
         let file = parse_fleet(
-            r#"fleet "orders" { deployment: docker; service api { kind: http, port: 8080 }; service db { kind: sql, port: 3306 }; }"#,
+            r#"fleet "orders" { deployment: docker; service api { kind: http, ports: { http: 8080 } }; service db { kind: sql, ports: { sql: 3306 } }; }"#,
         )
         .expect("parses");
         assert_eq!(file.fleet.node.name.node, "orders");
@@ -560,7 +561,7 @@ mod tests {
     #[test]
     fn service_attrs_parse_as_a_map() {
         let file = parse_fleet(
-            r#"fleet "f" { deployment: docker; service api { kind: http, port: 8080 } }"#,
+            r#"fleet "f" { deployment: docker; service api { kind: http, ports: { http: 8080 } } }"#,
         )
         .expect("parses");
         let Value::Map(entries) = &file.fleet.node.services[0].node.attrs.node else {
@@ -569,8 +570,12 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].0.node, "kind");
         assert_eq!(entries[0].1.node, Value::Ident("http".to_string()));
-        assert_eq!(entries[1].0.node, "port");
-        assert_eq!(entries[1].1.node, Value::Int(8080));
+        assert_eq!(entries[1].0.node, "ports");
+        let Value::Map(ports) = &entries[1].1.node else {
+            panic!("expected a map of ports");
+        };
+        assert_eq!(ports[0].0.node, "http");
+        assert_eq!(ports[0].1.node, Value::Int(8080));
     }
 
     #[test]

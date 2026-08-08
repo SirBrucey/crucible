@@ -99,6 +99,8 @@ pub struct Check {
 /// schema, so a `None` means the plugin asked for a shape it never declared.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Deserialize, serde::Serialize)]
 pub enum Value {
+    /// Stated, and stated to be absent.
+    Null,
     Str(String),
     Int(i64),
     Bool(bool),
@@ -113,6 +115,7 @@ pub enum Value {
 impl std::fmt::Display for Value {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Value::Null => write!(f, "null"),
             Value::Str(s) => write!(f, "{s:?}"),
             Value::Int(n) => write!(f, "{n}"),
             Value::Bool(b) => write!(f, "{b}"),
@@ -296,7 +299,7 @@ fn example_fleet() -> Fleet {
             ),
             service(
                 "inventory",
-                &["amqp"],
+                &["http"],
                 "crucible-example/orders-inventory:0.1",
                 8081,
                 &[
@@ -322,7 +325,15 @@ fn service(
     // the `.cru` describing the same fleet stay comparable.
     let mut attrs = vec![
         ("image".to_owned(), Value::Str(image.to_owned())),
-        ("port".to_owned(), Value::Int(port)),
+        (
+            "ports".to_owned(),
+            Value::Map(
+                kinds
+                    .iter()
+                    .map(|kind| ((*kind).to_owned(), Value::Int(port)))
+                    .collect(),
+            ),
+        ),
     ];
     if !env.is_empty() {
         attrs.push(("env".to_owned(), strs(env)));

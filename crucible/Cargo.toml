@@ -22,7 +22,7 @@ clap = { workspace = true }
 crucible-core = { path = "../crucible-core" }
 crucible-dsl = { path = "../crucible-dsl" }
 crucible-engine = { path = "../crucible-engine" }
-crucible-plugin = { path = "../crucible-plugin" }
+crucible-plugin = { path = "../crucible-plugin", features = ["framework"] }
 libc = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }

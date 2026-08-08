@@ -1,6 +1,9 @@
 //! The in-process registry of the compiled-in plugins, resolved to their schemas.
 
-use std::collections::{HashMap, hash_map::Entry};
+use std::{
+    collections::{HashMap, hash_map::Entry},
+    sync::Arc,
+};
 
 use crucible_core::{
     fault::Anchor,
@@ -10,7 +13,10 @@ use crucible_core::{
 
 use crate::{
     builtin::{Docker, Http, Mariadb},
+    discovery,
     error::Error,
+    external::Plugin,
+    protocol::{self, Role},
     role::{
         Action, Deployment, DeploymentRuntime, Driver, DriverRuntime, Observer, ObserverRuntime,
         Query,
@@ -20,9 +26,9 @@ use crate::{
 /// The available plugins, keyed by name and resolved to their schemas.
 #[derive(Default)]
 pub struct Registry {
-    deployments: HashMap<&'static str, AttrSchema>,
-    drivers: HashMap<&'static str, Vec<OpSig>>,
-    observers: HashMap<&'static str, Vec<OpSig>>,
+    deployments: HashMap<String, AttrSchema>,
+    drivers: HashMap<String, RegisteredDriver>,
+    observers: HashMap<String, RegisteredObserver>,
 }
 
 impl Registry {
@@ -36,16 +42,101 @@ impl Registry {
         registry
     }
 
+    /// The first-party plugins, plus every plugin installed on this machine.
+    ///
+    /// A plugin is an executable the framework runs, so what may install one is
+    /// the trust boundary: the search directories are the package manager's,
+    /// and `CRUCIBLE_PLUGIN_PATH` is someone choosing otherwise.
+    pub async fn load() -> Self {
+        let mut registry = Self::builtins();
+        let mut claims: HashMap<(String, &'static str), Vec<discovery::Found>> = HashMap::new();
+        for found in discovery::discover().await {
+            let claim = (
+                found.description.name.clone(),
+                found.description.role.part(),
+            );
+            claims.entry(claim).or_default().push(found);
+        }
+        for ((name, part), claimants) in claims {
+            match <[discovery::Found; 1]>::try_from(claimants) {
+                Ok([only]) => registry.add_installed(only),
+                // Picking one would be arbitrary and invisible to whoever wrote
+                // the scenario, so the name is left unclaimed and anything that
+                // asks for it says so.
+                Err(several) => {
+                    let paths: Vec<String> = several
+                        .iter()
+                        .map(|found| found.path.display().to_string())
+                        .collect();
+                    tracing::warn!(
+                        plugin = %name,
+                        paths = %paths.join(", "),
+                        "several {part} plugins claim this name, so none of them is loaded",
+                    );
+                }
+            }
+        }
+        registry
+    }
+
+    fn add_installed(&mut self, found: discovery::Found) {
+        let discovery::Found { description, path } = found;
+        let at = path.display().to_string();
+        if description.protocol != protocol::VERSION {
+            tracing::warn!(
+                path = %at,
+                plugin = %description.name,
+                theirs = description.protocol,
+                ours = protocol::VERSION,
+                "ignoring plugin built against another protocol",
+            );
+            return;
+        }
+        let plugin = Arc::new(Plugin::new(description.name.clone(), path));
+        let Role::Observer { signatures } = description.role;
+        if self.observers.contains_key(&description.name) {
+            tracing::warn!(
+                path = %at,
+                plugin = %description.name,
+                "ignoring plugin claiming the name of an observer built in",
+            );
+            return;
+        }
+        tracing::info!(path = %at, plugin = %description.name, "loaded observer plugin");
+        self.observers.insert(
+            description.name,
+            RegisteredObserver {
+                signatures,
+                attrs: description.attrs,
+                source: Source::Process(plugin),
+            },
+        );
+    }
+
     fn add_deployment<D: Deployment>(&mut self) {
-        self.deployments.insert(D::NAME, D::attr_schema());
+        self.deployments
+            .insert(D::NAME.to_owned(), D::attr_schema());
     }
 
     fn add_driver<D: Driver>(&mut self) {
-        self.drivers.insert(D::NAME, D::signatures());
+        self.drivers.insert(
+            D::NAME.to_owned(),
+            RegisteredDriver {
+                signatures: D::signatures(),
+                attrs: D::attr_schema(),
+            },
+        );
     }
 
-    fn add_observer<O: Observer>(&mut self) {
-        self.observers.insert(O::NAME, O::signatures());
+    fn add_observer<O: Observer + 'static>(&mut self) {
+        self.observers.insert(
+            O::NAME.to_owned(),
+            RegisteredObserver {
+                signatures: O::signatures(),
+                attrs: O::attr_schema(),
+                source: Source::Builtin(|service| Box::new(O::runtime(service))),
+            },
+        );
     }
 
     /// The attribute schema of the named deployment plugin.
@@ -57,25 +148,29 @@ impl Registry {
     /// The action signatures of the named driver plugin.
     #[must_use]
     pub fn driver(&self, name: &str) -> Option<&[OpSig]> {
-        self.drivers.get(name).map(Vec::as_slice)
+        self.drivers
+            .get(name)
+            .map(|driver| driver.signatures.as_slice())
     }
 
     /// The observable signatures of the named observer plugin.
     #[must_use]
     pub fn observer(&self, name: &str) -> Option<&[OpSig]> {
-        self.observers.get(name).map(Vec::as_slice)
+        self.observers
+            .get(name)
+            .map(|observer| observer.signatures.as_slice())
     }
 
     /// The names of the registered deployment plugins.
     #[must_use]
-    pub fn deployment_names(&self) -> Vec<&'static str> {
-        self.deployments.keys().copied().collect()
+    pub fn deployment_names(&self) -> Vec<String> {
+        self.deployments.keys().cloned().collect()
     }
 
     /// The names of the registered driver plugins.
     #[must_use]
-    pub fn driver_names(&self) -> Vec<&'static str> {
-        self.drivers.keys().copied().collect()
+    pub fn driver_names(&self) -> Vec<String> {
+        self.drivers.keys().cloned().collect()
     }
 
     /// Build the replica the planned fleet describes, ready to be brought up by
@@ -124,7 +219,7 @@ impl Registry {
         schema.extend(name, attrs.clone())?;
         for kind in kinds {
             if let Some((name, attrs)) = self.kind_attrs(kind) {
-                schema.extend(name, attrs)?;
+                schema.extend(&name, attrs)?;
             }
         }
         Ok(schema)
@@ -133,18 +228,12 @@ impl Registry {
     /// The attributes the named kind reads of a service that speaks it, and the
     /// name it is registered under. A kind that is not registered reads nothing:
     /// naming it is reported where the kind itself is resolved.
-    fn kind_attrs(&self, kind: &str) -> Option<(&'static str, AttrSchema)> {
-        match kind {
-            Http::NAME => self
-                .drivers
-                .get_key_value(kind)
-                .map(|(name, _)| (*name, Http::attr_schema())),
-            Mariadb::NAME => self
-                .observers
-                .get_key_value(kind)
-                .map(|(name, _)| (*name, Mariadb::attr_schema())),
-            _ => None,
+    fn kind_attrs(&self, kind: &str) -> Option<(String, AttrSchema)> {
+        if let Some((name, driver)) = self.drivers.get_key_value(kind) {
+            return Some((name.clone(), driver.attrs.clone()));
         }
+        let (name, observer) = self.observers.get_key_value(kind)?;
+        Some((name.clone(), observer.attrs.clone()))
     }
 
     /// Prepare each step, bound to the driver it names, in the order given.
@@ -184,30 +273,27 @@ impl Registry {
     /// Errors if a check names an observer this registry does not hold or a
     /// service the fleet does not describe, or does not bind to an observable
     /// that observer reads.
-    pub fn queries_for(
+    pub async fn queries_for(
         &self,
         fleet: &plan::Fleet,
         checks: &[plan::Check],
     ) -> Result<Vec<PreparedCheck>, Error> {
-        checks
-            .iter()
-            .map(|check| {
-                let service = fleet
-                    .services
-                    .iter()
-                    .find(|service| service.name == check.service)
-                    .ok_or_else(|| {
-                        Error::new(
-                            "registry",
-                            format!("the fleet has no service named `{}`", check.service),
-                        )
-                    })?;
-                let query = self
-                    .observer_runtime(&check.observer, service)?
-                    .prepare(check)?;
-                Ok((check.clone(), query))
-            })
-            .collect()
+        let mut prepared = Vec::with_capacity(checks.len());
+        for check in checks {
+            let service = fleet
+                .services
+                .iter()
+                .find(|service| service.name == check.service)
+                .ok_or_else(|| {
+                    Error::new(
+                        "registry",
+                        format!("the fleet has no service named `{}`", check.service),
+                    )
+                })?;
+            let observer = self.observer_runtime(&check.observer, service)?;
+            prepared.push((check.clone(), observer.prepare(check).await?));
+        }
+        Ok(prepared)
     }
 
     fn observer_runtime(
@@ -215,14 +301,42 @@ impl Registry {
         name: &str,
         service: &plan::Service,
     ) -> Result<Box<dyn ObserverRuntime>, Error> {
-        match name {
-            Mariadb::NAME if self.observers.contains_key(name) => {
-                Ok(Box::new(Mariadb::new(service)))
-            }
-            other => Err(Error::new(
-                "registry",
-                format!("no observer plugin named `{other}`"),
-            )),
+        let observer = self
+            .observers
+            .get(name)
+            .ok_or_else(|| Error::new("registry", format!("no observer plugin named `{name}`")))?;
+        Ok(observer.source.reading(service))
+    }
+}
+
+/// A registered driver: the operations it runs, and what it reads of a service
+/// that speaks it.
+struct RegisteredDriver {
+    signatures: Vec<OpSig>,
+    attrs: AttrSchema,
+}
+
+/// A registered observer: the observables it answers, what it reads of a
+/// service that speaks it, and where the code that answers lives.
+struct RegisteredObserver {
+    signatures: Vec<OpSig>,
+    attrs: AttrSchema,
+    source: Source,
+}
+
+/// Where an observer's answers come from.
+enum Source {
+    /// Compiled in, and called.
+    Builtin(fn(&plan::Service) -> Box<dyn ObserverRuntime>),
+    /// Installed on the machine, and asked.
+    Process(Arc<Plugin>),
+}
+
+impl Source {
+    fn reading(&self, service: &plan::Service) -> Box<dyn ObserverRuntime> {
+        match self {
+            Source::Builtin(new) => new(service),
+            Source::Process(plugin) => plugin.observing(service),
         }
     }
 }
@@ -233,7 +347,7 @@ pub type PreparedCheck = (plan::Check, Box<dyn Query>);
 /// What one service may declare: the attributes its deployment reads, plus
 /// those read by each plugin it speaks, and which plugin reads each.
 pub struct ServiceSchema {
-    attrs: Vec<(AttrDecl, &'static str)>,
+    attrs: Vec<(AttrDecl, String)>,
 }
 
 impl ServiceSchema {
@@ -248,11 +362,11 @@ impl ServiceSchema {
 
     /// The plugin that reads `name`.
     #[must_use]
-    pub fn reader(&self, name: &str) -> Option<&'static str> {
+    pub fn reader(&self, name: &str) -> Option<&str> {
         self.attrs
             .iter()
             .find(|(decl, _)| decl.name == name)
-            .map(|(_, plugin)| *plugin)
+            .map(|(_, plugin)| plugin.as_str())
     }
 
     /// Every attribute a service may declare.
@@ -263,7 +377,7 @@ impl ServiceSchema {
     /// Take on `schema`, whose attributes `plugin` reads. Two plugins may read
     /// the same attribute, which is how a service states a fact once for both,
     /// but only if they agree on what it holds.
-    fn extend(&mut self, plugin: &'static str, schema: AttrSchema) -> Result<(), Error> {
+    fn extend(&mut self, plugin: &str, schema: AttrSchema) -> Result<(), Error> {
         for decl in schema.attrs {
             match self.attrs.iter().find(|(held, _)| held.name == decl.name) {
                 Some((held, other)) if held.ty != decl.ty => {
@@ -276,7 +390,7 @@ impl ServiceSchema {
                     ));
                 }
                 Some(_) => {}
-                None => self.attrs.push((decl, plugin)),
+                None => self.attrs.push((decl, plugin.to_owned())),
             }
         }
         Ok(())
@@ -322,11 +436,12 @@ mod tests {
         assert_eq!(targets, ["api", "api", "api"]);
     }
 
-    #[test]
-    fn every_check_of_the_example_scenario_prepares() {
+    #[tokio::test]
+    async fn every_check_of_the_example_scenario_prepares() {
         let plan = crucible_core::plan::example();
         let queries = Registry::builtins()
             .queries_for(&plan.fleet, &plan.scenarios[0].checks)
+            .await
             .expect("every check binds to its observer");
         let targets: Vec<&str> = queries.iter().map(|(_, query)| query.target()).collect();
         let named: Vec<&str> = plan.scenarios[0]
@@ -337,13 +452,14 @@ mod tests {
         assert_eq!(targets, named);
     }
 
-    #[test]
-    fn a_check_naming_a_service_the_fleet_lacks_is_rejected() {
+    #[tokio::test]
+    async fn a_check_naming_a_service_the_fleet_lacks_is_rejected() {
         let mut plan = crucible_core::plan::example();
         plan.scenarios[0].checks[0].service = "ledger".into();
         assert!(
             Registry::builtins()
                 .queries_for(&plan.fleet, &plan.scenarios[0].checks)
+                .await
                 .is_err()
         );
     }

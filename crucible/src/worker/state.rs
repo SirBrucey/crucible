@@ -147,8 +147,11 @@ pub enum IdleNext {
 /// arming the proxy with the schedule's fault if it has one. Tears the replica
 /// down on any bring-up failure so a worker that dies here (a flaky readiness
 /// timeout, a crash) does not leak its containers.
-async fn bring_up(worker_id: u32, schedule: &Schedule) -> Result<Orchestrator<Ready>> {
-    let registry = Registry::builtins();
+async fn bring_up(
+    registry: &Registry,
+    worker_id: u32,
+    schedule: &Schedule,
+) -> Result<Orchestrator<Ready>> {
     let deployment = registry.deployment_for(&schedule.fleet, worker_id, schedule.fault.clone())?;
     let actions = registry.actions_for(&schedule.steps)?;
     let orchestrator = Orchestrator::new(deployment, actions).setup().await?;
@@ -234,8 +237,9 @@ impl Worker<Idle> {
 
 impl Worker<Learning> {
     pub async fn execute_learn(self) -> Result<Worker<ShuttingDown>> {
+        let registry = Registry::load().await;
         let heartbeat = self.conn.start_heartbeat();
-        let orchestrator = bring_up(self.id, &self.state.schedule).await?;
+        let orchestrator = bring_up(&registry, self.id, &self.state.schedule).await?;
         let (services, orchestrator) = orchestrator
             .learn()
             .await
@@ -254,15 +258,19 @@ impl Worker<Executing> {
     pub async fn execute_and_report(self) -> Result<Worker<ShuttingDown>> {
         let schedule = &self.state.schedule;
         let schedule_id = schedule.id;
+        let registry = Registry::load().await;
         let heartbeat = self.conn.start_heartbeat();
-        let orchestrator = bring_up(self.id, schedule).await?;
+        let orchestrator = bring_up(&registry, self.id, schedule).await?;
 
         // A check reads through the proxy's stable host port: it survives the
         // target being killed and restarted (the alias re-resolves to the new
         // container), where a direct ephemeral port would not. The anchor is
         // dormant during setup and released before a check reads, so the proxy
         // path is never actually frozen under it.
-        let queries = match Registry::builtins().queries_for(&schedule.fleet, &schedule.checks) {
+        let queries = match registry
+            .queries_for(&schedule.fleet, &schedule.checks)
+            .await
+        {
             Ok(queries) => queries,
             Err(e) => {
                 let _ = orchestrator.teardown().await;

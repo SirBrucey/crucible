@@ -101,7 +101,10 @@ impl Anchor {
 
 pub struct Proxy {
     listener: TcpListener,
-    upstream: SocketAddr,
+    /// Resolved per connection rather than once: the upstream is a container
+    /// that may not exist when this binds, and may be a different one after a
+    /// kill and restart.
+    upstream: String,
     events_tx: mpsc::UnboundedSender<ConnEvent>,
     next_id: Arc<AtomicU64>,
     pause: watch::Receiver<bool>,
@@ -116,7 +119,7 @@ impl Proxy {
     /// Returns the proxy, its bound local address, and the receiver for connection events.
     pub async fn bind(
         listen: SocketAddr,
-        upstream: SocketAddr,
+        upstream: String,
         pause: watch::Receiver<bool>,
         anchor: Option<Anchor>,
     ) -> io::Result<(Self, SocketAddr, mpsc::UnboundedReceiver<ConnEvent>)> {
@@ -143,7 +146,7 @@ impl Proxy {
                 id,
                 client,
                 peer,
-                self.upstream,
+                self.upstream.clone(),
                 self.events_tx.clone(),
                 self.pause.clone(),
                 self.anchor.clone(),
@@ -177,12 +180,12 @@ async fn forward(
     id: ConnId,
     client: TcpStream,
     peer: SocketAddr,
-    upstream: SocketAddr,
+    upstream: String,
     events_tx: mpsc::UnboundedSender<ConnEvent>,
     pause: watch::Receiver<bool>,
     anchor: Option<Anchor>,
 ) {
-    let upstream_conn = match TcpStream::connect(upstream).await {
+    let upstream_conn = match TcpStream::connect(&upstream).await {
         Ok(s) => s,
         Err(e) => {
             emit(
@@ -321,10 +324,14 @@ mod tests {
     #[tokio::test]
     async fn two_concurrent_connections_round_trip_and_emit_distinct_events() {
         let echo = spawn_echo().await;
-        let (proxy, proxy_addr, mut events) =
-            Proxy::bind((Ipv4Addr::LOCALHOST, 0).into(), echo, never_paused(), None)
-                .await
-                .unwrap();
+        let (proxy, proxy_addr, mut events) = Proxy::bind(
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            echo.to_string(),
+            never_paused(),
+            None,
+        )
+        .await
+        .unwrap();
         tokio::spawn(proxy.run());
 
         let mut a = TcpStream::connect(proxy_addr).await.unwrap();
@@ -385,7 +392,7 @@ mod tests {
         };
         let (proxy, proxy_addr, mut events) = Proxy::bind(
             (Ipv4Addr::LOCALHOST, 0).into(),
-            unused,
+            unused.to_string(),
             never_paused(),
             None,
         )
@@ -403,10 +410,14 @@ mod tests {
     async fn paused_proxy_holds_bytes_until_resumed() {
         let echo = spawn_echo().await;
         let (pause_tx, pause_rx) = watch::channel(false);
-        let (proxy, proxy_addr, _events) =
-            Proxy::bind((Ipv4Addr::LOCALHOST, 0).into(), echo, pause_rx, None)
-                .await
-                .unwrap();
+        let (proxy, proxy_addr, _events) = Proxy::bind(
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            echo.to_string(),
+            pause_rx,
+            None,
+        )
+        .await
+        .unwrap();
         tokio::spawn(proxy.run());
 
         let mut client = TcpStream::connect(proxy_addr).await.unwrap();
@@ -478,7 +489,7 @@ mod tests {
         let anchor = Anchor::new(Direction::ClientToUpstream, 2, pause_tx);
         let (proxy, proxy_addr, mut events) = Proxy::bind(
             (Ipv4Addr::LOCALHOST, 0).into(),
-            echo,
+            echo.to_string(),
             pause_rx,
             Some(anchor.clone()),
         )
@@ -512,7 +523,7 @@ mod tests {
         let anchor = Anchor::new(Direction::ClientToUpstream, 2, pause_tx);
         let (proxy, proxy_addr, _events) = Proxy::bind(
             (Ipv4Addr::LOCALHOST, 0).into(),
-            echo,
+            echo.to_string(),
             pause_rx.clone(),
             Some(anchor.clone()),
         )
