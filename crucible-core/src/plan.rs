@@ -77,6 +77,9 @@ pub struct Step {
     pub operation: String,
     pub args: Vec<Value>,
     pub body: Option<Vec<(String, Value)>>,
+    /// What the author says this produces, in the driver's own terms. None
+    /// leaves the driver's default for the operation standing.
+    pub expect: Option<Value>,
 }
 
 /// A settled-state check, carrying the service and observer that answer it.
@@ -223,6 +226,7 @@ fn example_scenario() -> Scenario {
             ("item".into(), Value::Str(item.into())),
             ("quantity".into(), Value::Int(quantity)),
         ]),
+        expect: None,
     };
     let level = |item: &str, level: i64| Check {
         service: "db".into(),

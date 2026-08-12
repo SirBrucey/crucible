@@ -224,10 +224,11 @@ impl<'a> Lowerer<'a> {
     /// Lower a `do` action against its driver's signature.
     fn do_step(
         &mut self,
-        step: &Spanned<OpCall>,
+        step: &Spanned<ast::Step>,
         services: &HashMap<String, ServiceModel>,
     ) -> Option<plan::Step> {
-        let op = &step.node;
+        let action = &step.node.action;
+        let op = &action.node;
         let [driver, operation] = op.head.as_slice() else {
             self.error(step.span, "a `do` action names a driver and an operation");
             return None;
@@ -255,13 +256,18 @@ impl<'a> Lowerer<'a> {
             );
             return None;
         };
-        self.check_args(step, sig, &driver.node.clone(), driver, services);
+        self.check_args(action, sig, &driver.node.clone(), driver, services);
         self.check_clauses(op, sig);
         Some(plan::Step {
             driver: driver.node.clone(),
             operation: operation.node.clone(),
             args: op.args.iter().map(|arg| lower_value(&arg.node)).collect(),
             body: body_of(op),
+            expect: step
+                .node
+                .expect
+                .as_ref()
+                .map(|stated| lower_value(&stated.node)),
         })
     }
 

@@ -2,7 +2,7 @@
 //! at statement and block boundaries so one error does not abort the parse.
 
 use crate::{
-    ast::{Clause, CmpOp, File, Filter, Fleet, OpCall, Predicate, Scenario, Service, Value},
+    ast::{Clause, CmpOp, File, Filter, Fleet, OpCall, Predicate, Scenario, Service, Step, Value},
     diagnostics::Diag,
     lexer::{Token, TokenKind},
     span::{Span, Spanned},
@@ -287,15 +287,25 @@ impl Parser {
     }
 
     /// Parse `do { <operation> };`, one driver step.
-    fn do_step(&mut self) -> Option<Spanned<OpCall>> {
+    fn do_step(&mut self) -> Option<Spanned<Step>> {
         let start = self.peek_span();
         self.consume_kw("do");
         self.expect(&TokenKind::LBrace, "`{`");
-        let op = self.op_call()?;
-        let end = self.peek_span();
+        let action = self.op_call()?;
+        let mut end = self.peek_span();
         self.expect(&TokenKind::RBrace, "`}`");
+        let expect = if self.consume_kw("expect") {
+            let stated = self.value()?;
+            end = stated.span;
+            Some(stated)
+        } else {
+            None
+        };
         self.consume(&TokenKind::Semi);
-        Some(Spanned::new(op.node, Span::new(start.start, end.end)))
+        Some(Spanned::new(
+            Step { action, expect },
+            Span::new(start.start, end.end),
+        ))
     }
 
     /// Parse an action operation: a `driver op` head, positional arguments, and
@@ -621,7 +631,7 @@ mod tests {
             std::time::Duration::from_secs(30),
         );
 
-        let step = &scenario.steps[0].node;
+        let step = &scenario.steps[0].node.action.node;
         let head: Vec<&str> = step.head.iter().map(|h| h.node.as_str()).collect();
         assert_eq!(head, ["http", "POST"]);
         let args: Vec<&Value> = step.args.iter().map(|a| &a.node).collect();
