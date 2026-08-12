@@ -32,13 +32,15 @@ pub struct Request {
     pub path: String,
     pub body: Option<Vec<u8>>,
     /// The status the step says this answers with.
-    pub expect: Option<plan::Value>,
+    pub expect: Option<StatusCode>,
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("`{0}` is not an HTTP method")]
     Method(String),
+    #[error("`{0}` is not a status this could answer with")]
+    Status(plan::Value),
     #[error("a request names a service and a path")]
     Arguments,
     #[error("`{0}` is not a path: a path starts with `/`")]
@@ -147,7 +149,7 @@ impl Driver for Http {
             service: service.to_owned(),
             path: path.to_owned(),
             body: step.body.as_deref().map(encode).transpose()?,
-            expect: step.expect.clone(),
+            expect: expected_status(step.expect.as_ref())?,
         })
     }
 }
@@ -219,7 +221,7 @@ impl Call {
 
         let outcome = match builder.send().await {
             Ok(response) => {
-                let ack = classify(response.status(), self.request.expect.as_ref());
+                let ack = classify(response.status(), self.request.expect);
                 let body = response.bytes().await.unwrap_or_default();
                 Outcome {
                     operation,
@@ -248,6 +250,19 @@ impl Call {
     }
 }
 
+/// The status a step states it answers with, if it states one.
+fn expected_status(stated: Option<&plan::Value>) -> Result<Option<StatusCode>, Error> {
+    let Some(stated) = stated else {
+        return Ok(None);
+    };
+    stated
+        .as_int()
+        .and_then(|status| u16::try_from(status).ok())
+        .and_then(|status| StatusCode::from_u16(status).ok())
+        .map(Some)
+        .ok_or_else(|| Error::Status(stated.clone()))
+}
+
 /// Whether the response is what the step said it would be.
 ///
 /// A step that states its status is held to that one, so a request written to
@@ -255,9 +270,9 @@ impl Call {
 /// succeeds. Without a stated status the step is held to the protocol: a
 /// success delivers, a client error does not, and a server error leaves the
 /// caller unable to tell.
-fn classify(status: StatusCode, stated: Option<&plan::Value>) -> Ack {
-    match stated.and_then(plan::Value::as_int) {
-        Some(expected) if i64::from(status.as_u16()) == expected => Ack::Acked,
+fn classify(status: StatusCode, stated: Option<StatusCode>) -> Ack {
+    match stated {
+        Some(stated) if stated == status => Ack::Acked,
         Some(_) => Ack::Rejected,
         None if status.is_success() => Ack::Acked,
         None if status.is_client_error() => Ack::Rejected,
@@ -268,6 +283,7 @@ fn classify(status: StatusCode, stated: Option<&plan::Value>) -> Ack {
 #[cfg(test)]
 mod tests {
     use super::{Ack, Error, Http, Request, StatusCode, classify};
+
     use crate::role::Driver;
     use crucible_core::{
         plan,
@@ -297,12 +313,19 @@ mod tests {
 
     #[test]
     fn a_stated_status_is_what_the_step_is_held_to() {
-        let stated = Some(plan::Value::Int(409));
-        assert_eq!(classify(StatusCode::CONFLICT, stated.as_ref()), Ack::Acked);
-        assert_eq!(
-            classify(StatusCode::CREATED, stated.as_ref()),
-            Ack::Rejected
-        );
+        let stated = Some(StatusCode::CONFLICT);
+        assert_eq!(classify(StatusCode::CONFLICT, stated), Ack::Acked);
+        assert_eq!(classify(StatusCode::CREATED, stated), Ack::Rejected);
+    }
+
+    #[test]
+    fn an_outcome_that_is_not_a_status_is_refused() {
+        let mut step = post_to("api", "/orders");
+        step.expect = Some(plan::Value::Str("banana".into()));
+        assert!(matches!(Http::bind(&step), Err(Error::Status(_))));
+
+        step.expect = Some(plan::Value::Int(7));
+        assert!(matches!(Http::bind(&step), Err(Error::Status(_))));
     }
 
     #[test]
