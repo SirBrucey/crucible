@@ -10,6 +10,7 @@ use crucible_core::{
         codec::{read_frame, write_frame},
     },
     schedule::Schedule,
+    verdict::Checkpoint,
 };
 use crucible_engine::event_bus::{EventBus, RunnerEvent};
 use tokio::{net::UnixStream, time::timeout};
@@ -114,7 +115,7 @@ impl Session<Dispatching> {
         mut self,
         bus: &EventBus,
         schedule: Schedule,
-    ) -> Result<Vec<ServiceProfile>> {
+    ) -> Result<(Vec<ServiceProfile>, Vec<Checkpoint>)> {
         self.read_ready(bus, "Learning").await?;
 
         let outbound = RunnerToWorker::Run(schedule);
@@ -123,8 +124,11 @@ impl Session<Dispatching> {
 
         loop {
             let msg = read_live(&mut self.stream).await?;
-            let services = match &msg {
-                WorkerToRunner::SessionCatalogue { services } => Some(services.clone()),
+            let learned = match &msg {
+                WorkerToRunner::SessionCatalogue {
+                    services,
+                    trajectory,
+                } => Some((services.clone(), trajectory.clone())),
                 WorkerToRunner::Event(_) => None,
                 other => {
                     return Err(Error::UnexpectedMessage {
@@ -135,8 +139,8 @@ impl Session<Dispatching> {
                 }
             };
             journal_in(bus, self.state.worker_id, msg).await;
-            if let Some(services) = services {
-                return Ok(services);
+            if let Some(learned) = learned {
+                return Ok(learned);
             }
         }
     }

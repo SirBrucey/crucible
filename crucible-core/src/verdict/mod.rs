@@ -26,9 +26,17 @@ pub struct Observations {
     /// What the scenario's checks read once the fleet settled, in the order the
     /// scenario states them.
     pub checks: Vec<Observed>,
+    /// What those checks read at each point of the run: the baseline before the
+    /// first step, then one per step. A step's effects are what separates its
+    /// checkpoint from the one before it.
+    pub trajectory: Vec<Checkpoint>,
     pub sessions: Vec<crucible_protocol::Session>,
     pub kill: Option<crucible_protocol::KillReport>,
 }
+
+/// What every check the scenario states read at one point in a run, in the
+/// order the scenario states them.
+pub type Checkpoint = Vec<crate::plan::Value>;
 
 /// A check and what the fleet was actually holding when it was read.
 #[derive(Debug)]

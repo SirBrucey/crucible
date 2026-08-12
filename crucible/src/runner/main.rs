@@ -13,6 +13,7 @@ use crucible_core::{
     ipc::{ServiceProfile, Verdict},
     plan,
     schedule::Schedule,
+    verdict::Checkpoint,
 };
 use crucible_engine::{
     event_bus::EventBus,
@@ -576,9 +577,11 @@ async fn drive(bus: &EventBus, plan: &plan::Plan) -> Result<CampaignOutcome> {
         .expect("the grammar requires a scenario, so a lowered plan states one");
 
     // Learn is a barrier: schedules derive from its observed traffic profiles.
-    let (services, run_cost) = run_learn(bus, &mut worker_id, &plan.fleet, scenario).await?;
+    let (services, trajectory, run_cost) =
+        run_learn(bus, &mut worker_id, &plan.fleet, scenario).await?;
     tracing::info!(
         services = services.len(),
+        checkpoints = trajectory.len(),
         run_cost_ms = run_cost.as_millis(),
         "session catalogue received"
     );
@@ -635,7 +638,7 @@ async fn run_learn(
     worker_id: &mut u32,
     fleet: &plan::Fleet,
     scenario: &plan::Scenario,
-) -> Result<(Vec<ServiceProfile>, Duration)> {
+) -> Result<(Vec<ServiceProfile>, Vec<Checkpoint>, Duration)> {
     let mut attempt = 1;
     loop {
         let id = *worker_id;
@@ -666,17 +669,17 @@ async fn execute_learn(
     bus: &EventBus,
     worker_id: u32,
     schedule: Schedule,
-) -> Result<(Vec<ServiceProfile>, Duration)> {
+) -> Result<(Vec<ServiceProfile>, Vec<Checkpoint>, Duration)> {
     let (socket_path, listener) = bind_worker_listener(worker_id).await?;
     let (mut child, stderr_relay) = spawn_worker(&socket_path, worker_id)?;
     let learn_start = Instant::now();
     let pipeline = async {
         let session = accept_and_handshake(&listener, bus).await?;
-        let services = session.learn(bus, schedule).await?;
-        Ok::<_, Error>((services, learn_start.elapsed()))
+        let (services, trajectory) = session.learn(bus, schedule).await?;
+        Ok::<_, Error>((services, trajectory, learn_start.elapsed()))
     };
     match tokio::time::timeout(LEARN_BUDGET, pipeline).await {
-        Ok(Ok((services, run_cost))) => {
+        Ok(Ok((services, trajectory, run_cost))) => {
             // The catalogue is in hand; a failure while the worker finishes
             // teardown must not discard it. wait_worker has already reaped the
             // child on every error path, so here we only log and keep it.
@@ -687,7 +690,7 @@ async fn execute_learn(
                     "learn worker teardown failed after delivering its catalogue; keeping it"
                 );
             }
-            Ok((services, run_cost))
+            Ok((services, trajectory, run_cost))
         }
         Ok(Err(e)) => {
             reap_worker(&mut child, stderr_relay).await;

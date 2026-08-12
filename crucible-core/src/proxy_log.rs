@@ -274,7 +274,10 @@ mod tests {
             sessions in prop::collection::vec(a_session(), 0..8),
         ) {
             let profiles = service_profiles_from_sessions(&sessions, 0);
-            let catalogue = WorkerToRunner::SessionCatalogue { services: profiles };
+            let catalogue = WorkerToRunner::SessionCatalogue {
+                services: profiles,
+                trajectory: Vec::new(),
+            };
             let mut buf = vec![0u8; 2_000_000];
             let encoded = postcard::to_slice(&catalogue, &mut buf)
                 .expect("catalogue fits the oversized test buffer");
