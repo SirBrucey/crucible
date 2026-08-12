@@ -258,6 +258,9 @@ impl<'a> Lowerer<'a> {
         };
         self.check_args(action, sig, &driver.node.clone(), driver, services);
         self.check_clauses(op, sig);
+        if let (Some(stated), Some(outcome)) = (&step.node.expect, &sig.result) {
+            self.check_type(stated, outcome);
+        }
         Some(plan::Step {
             driver: driver.node.clone(),
             operation: operation.node.clone(),

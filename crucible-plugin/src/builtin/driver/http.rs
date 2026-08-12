@@ -4,7 +4,7 @@ use std::{net::SocketAddr, time::Duration};
 
 use crucible_core::{
     plan,
-    schema::{ClauseDecl, ClauseShape, HeadPattern, OpSig, Param, ParamType},
+    schema::{ClauseDecl, ClauseShape, HeadPattern, OpSig, Param, ParamType, ValueType},
     verdict::{Ack, Outcome},
 };
 use reqwest::{Client, Method, StatusCode};
@@ -114,10 +114,14 @@ impl Driver for Http {
 
     fn signatures() -> Vec<OpSig> {
         vec![
-            OpSig::action(HeadPattern::exact("POST"), request_params())
+            OpSig::action(HeadPattern::exact("POST"), request_params(), ValueType::Int)
                 .with_clause(ClauseDecl::new(BODY, ClauseShape::Block)),
-            OpSig::action(HeadPattern::exact("GET"), request_params()),
-            OpSig::action(HeadPattern::exact("DELETE"), request_params()),
+            OpSig::action(HeadPattern::exact("GET"), request_params(), ValueType::Int),
+            OpSig::action(
+                HeadPattern::exact("DELETE"),
+                request_params(),
+                ValueType::Int,
+            ),
         ]
     }
 
