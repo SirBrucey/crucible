@@ -2,6 +2,7 @@ mod error;
 mod session;
 
 use std::{
+    collections::BTreeSet,
     path::{Path, PathBuf},
     process::{ExitCode, Stdio},
     time::{Duration, Instant},
@@ -10,16 +11,19 @@ use std::{
 use clap::{Parser, Subcommand};
 use crucible_core::{
     HEAL_BUDGET,
-    ipc::{ServiceProfile, Verdict},
+    fault::Primitive,
+    ipc::Verdict,
+    learned::Learned,
     plan,
     schedule::Schedule,
-    verdict::{self, Checkpoint},
+    verdict::{self, Invariant},
 };
 use crucible_engine::{
     event_bus::EventBus,
     journal,
     scheduler::{BurstScheduler, Scheduler},
 };
+use strum::IntoEnumIterator;
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
     net::UnixListener,
@@ -586,6 +590,23 @@ impl<'a> Pool<'a> {
     }
 }
 
+/// Say which invariants this fleet could be tested for and which it could not,
+/// and return the ones worth scheduling. A fleet nothing can break still runs
+/// its fault-free scenario; this is just a plain e2e test.
+fn report_reach(available: &BTreeSet<Primitive>) -> Vec<Invariant> {
+    let mut testable = Vec::new();
+    for invariant in Invariant::iter() {
+        match invariant.reachable(available) {
+            Ok(()) => {
+                tracing::info!("{invariant:?} is testable against this fleet");
+                testable.push(invariant);
+            }
+            Err(why) => tracing::info!("{invariant:?} is out of reach: {why}"),
+        }
+    }
+    testable
+}
+
 async fn drive(bus: &EventBus, plan: &plan::Plan) -> Result<CampaignOutcome> {
     let campaign_start = Instant::now();
     let mut worker_id: u32 = 0;
@@ -597,25 +618,25 @@ async fn drive(bus: &EventBus, plan: &plan::Plan) -> Result<CampaignOutcome> {
         .expect("the grammar requires a scenario, so a lowered plan states one");
 
     // Learn is a barrier: schedules derive from its observed traffic profiles.
-    let (services, trajectory, run_cost) =
-        run_learn(bus, &mut worker_id, &plan.fleet, scenario).await?;
-    let readings = trajectory.iter().flatten();
+    let (learned, run_cost) = run_learn(bus, &mut worker_id, &plan.fleet, scenario).await?;
+    let readings = learned.trajectory.iter().flatten();
     tracing::info!(
-        services = services.len(),
-        checkpoints = trajectory.len(),
+        services = learned.profiles.len(),
+        checkpoints = learned.trajectory.len(),
         read = readings.clone().filter(|r| r.is_some()).count(),
         unread = readings.filter(|r| r.is_none()).count(),
         run_cost_ms = run_cost.as_millis(),
         "session catalogue received"
     );
 
-    let settled = trajectory.last().map_or(&[][..], Vec::as_slice);
+    let settled = learned.trajectory.last().map_or(&[][..], Vec::as_slice);
     if let Some(unmet) = verdict::unmet(&scenario.checks, settled) {
         tracing::error!("the scenario states {unmet} in its own fault-free run");
         return Ok(CampaignOutcome::Indecisive);
     }
 
-    let mut scheduler = BurstScheduler::new(&plan.fleet, scenario, &services, &trajectory);
+    let testable = report_reach(&learned.primitives);
+    let mut scheduler = BurstScheduler::new(&plan.fleet, scenario, &learned, &testable);
     let total = scheduler.total();
     let mut pool = Pool::new(
         bus,
@@ -674,7 +695,7 @@ async fn run_learn(
     worker_id: &mut u32,
     fleet: &plan::Fleet,
     scenario: &plan::Scenario,
-) -> Result<(Vec<ServiceProfile>, Vec<Checkpoint>, Duration)> {
+) -> Result<(Learned, Duration)> {
     let mut attempt = 1;
     loop {
         let id = *worker_id;
@@ -705,17 +726,17 @@ async fn execute_learn(
     bus: &EventBus,
     worker_id: u32,
     schedule: Schedule,
-) -> Result<(Vec<ServiceProfile>, Vec<Checkpoint>, Duration)> {
+) -> Result<(Learned, Duration)> {
     let (socket_path, listener) = bind_worker_listener(worker_id).await?;
     let (mut child, stderr_relay) = spawn_worker(&socket_path, worker_id)?;
     let learn_start = Instant::now();
     let pipeline = async {
         let session = accept_and_handshake(&listener, bus).await?;
-        let (services, trajectory) = session.learn(bus, schedule).await?;
-        Ok::<_, Error>((services, trajectory, learn_start.elapsed()))
+        let learned = session.learn(bus, schedule).await?;
+        Ok::<_, Error>((learned, learn_start.elapsed()))
     };
     match tokio::time::timeout(LEARN_BUDGET, pipeline).await {
-        Ok(Ok((services, trajectory, run_cost))) => {
+        Ok(Ok((learned, run_cost))) => {
             // The catalogue is in hand; a failure while the worker finishes
             // teardown must not discard it. wait_worker has already reaped the
             // child on every error path, so here we only log and keep it.
@@ -726,7 +747,7 @@ async fn execute_learn(
                     "learn worker teardown failed after delivering its catalogue; keeping it"
                 );
             }
-            Ok((services, trajectory, run_cost))
+            Ok((learned, run_cost))
         }
         Ok(Err(e)) => {
             reap_worker(&mut child, stderr_relay).await;

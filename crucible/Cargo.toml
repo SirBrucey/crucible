@@ -24,6 +24,7 @@ crucible-dsl = { path = "../crucible-dsl" }
 crucible-engine = { path = "../crucible-engine" }
 crucible-plugin = { path = "../crucible-plugin", features = ["framework"] }
 libc = { workspace = true }
+strum = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

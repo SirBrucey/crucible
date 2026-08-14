@@ -6,9 +6,15 @@
 //! across `(service, direction)` so a budget-truncated campaign samples every
 //! edge evenly rather than exhausting one service and never reaching another.
 
-use crucible_protocol::{Direction, ServiceProfile};
+use crucible_protocol::Direction;
 
-use crucible_core::{fault::Anchor, plan, schedule::Schedule, verdict::Checkpoint};
+use crucible_core::{
+    fault::{Anchor, Fault},
+    learned::Learned,
+    plan,
+    schedule::Schedule,
+    verdict::Invariant,
+};
 
 use super::Scheduler;
 
@@ -26,10 +32,11 @@ impl BurstScheduler {
     pub fn new(
         fleet: &plan::Fleet,
         scenario: &plan::Scenario,
-        profiles: &[ServiceProfile],
-        trajectory: &[Checkpoint],
+        learned: &Learned,
+        testable: &[Invariant],
     ) -> Self {
-        let anchored: Vec<(&str, Direction, &[u32])> = profiles
+        let anchored: Vec<(&str, Direction, &[u32])> = learned
+            .profiles
             .iter()
             .flat_map(|p| {
                 [
@@ -53,18 +60,20 @@ impl BurstScheduler {
         let mut next_id: u32 = Schedule::LEARN_ID + 1;
         for i in 0..max_len {
             for (service, direction, anchors) in &anchored {
-                if let Some(&k) = anchors.get(i) {
+                let Some(&k) = anchors.get(i) else { continue };
+                let anchor = Anchor {
+                    service: (*service).to_string(),
+                    direction: *direction,
+                    k,
+                };
+                for fault in testable.iter().filter_map(|i| faults(*i, &anchor)) {
                     schedules.push(Schedule::faulted(
                         next_id,
                         fleet.clone(),
                         scenario.steps.clone(),
                         scenario.checks.clone(),
-                        Anchor {
-                            service: (*service).to_string(),
-                            direction: *direction,
-                            k,
-                        },
-                        trajectory.to_vec(),
+                        fault,
+                        learned.trajectory.clone(),
                     ));
                     next_id += 1;
                 }
@@ -84,6 +93,16 @@ impl BurstScheduler {
     }
 }
 
+/// The fault that puts `invariant` under pressure at `anchor`, where a burst is
+/// the right shape for it. Recovery degrades the fleet from the start rather
+/// than part way through, so a burst has nowhere to put it.
+fn faults(invariant: Invariant, anchor: &Anchor) -> Option<Fault> {
+    match invariant {
+        Invariant::Durable => Some(Fault::Durable(anchor.clone())),
+        Invariant::Recovers | Invariant::Idempotent | Invariant::Converges => None,
+    }
+}
+
 impl Scheduler for BurstScheduler {
     fn next(&mut self) -> Option<Schedule> {
         self.schedules.next()
@@ -92,6 +111,11 @@ impl Scheduler for BurstScheduler {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
+    use crucible_core::fault::Primitive;
+    use crucible_protocol::ServiceProfile;
+
     use super::*;
 
     fn profile(service: &str, c2u: Vec<u32>, u2c: Vec<u32>) -> ServiceProfile {
@@ -102,17 +126,44 @@ mod tests {
         }
     }
 
+    /// A campaign against a fleet that can be killed, so durability is on.
     fn scheduler(profiles: &[ServiceProfile]) -> BurstScheduler {
         let plan = plan::example();
-        BurstScheduler::new(&plan.fleet, &plan.scenarios[0], profiles, &[])
+        let learned = Learned {
+            profiles: profiles.to_vec(),
+            trajectory: Vec::new(),
+            primitives: BTreeSet::from([Primitive::Kill]),
+        };
+        BurstScheduler::new(
+            &plan.fleet,
+            &plan.scenarios[0],
+            &learned,
+            &[Invariant::Durable],
+        )
     }
 
-    /// The fault a burst schedule carries.
+    /// Where a burst schedule's fault lands.
     fn fault(schedule: &Schedule) -> &Anchor {
         schedule
             .fault
             .as_ref()
             .expect("a burst schedule always faults")
+            .anchor()
+    }
+
+    /// A fleet whose loaded plugins cannot break anything cannot schedule any
+    /// faults, so the campaign is a fault-free run only.
+    #[test]
+    fn nothing_testable_yields_nothing() {
+        let plan = plan::example();
+        let learned = Learned {
+            profiles: vec![profile("db", vec![1, 2], vec![3])],
+            trajectory: Vec::new(),
+            primitives: BTreeSet::new(),
+        };
+        let mut s = BurstScheduler::new(&plan.fleet, &plan.scenarios[0], &learned, &[]);
+        assert_eq!(s.total(), 0);
+        assert!(s.next().is_none());
     }
 
     #[test]

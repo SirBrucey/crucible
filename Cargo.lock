@@ -494,6 +494,7 @@ dependencies = [
  "crucible-engine",
  "crucible-plugin",
  "libc",
+ "strum",
  "thiserror",
  "tokio",
  "tracing",

@@ -1,7 +1,7 @@
 //! One unit of work a worker runs: a fleet to bring up, what to do to it, what
 //! to read afterwards, and what to break in the middle.
 
-use crate::{fault::Anchor, plan, verdict::Checkpoint};
+use crate::{fault::Fault, plan, verdict::Checkpoint};
 
 /// Everything a worker needs to run once. Derived from a plan rather than
 /// copied out of it: the steps and checks are the scenario's, plus whatever the
@@ -16,11 +16,9 @@ pub struct Schedule {
     pub steps: Vec<plan::Step>,
     /// What to read once the fleet has settled.
     pub checks: Vec<plan::Check>,
-    /// Where to kill. None is the fault-free run every other schedule is judged
-    /// against.
-    // Killing is the only primitive, so where the fault lands is all there is
-    // to say about it and an anchor states the whole fault.
-    pub fault: Option<Anchor>,
+    /// What to break and what that tests. None is the fault-free run every
+    /// other schedule is judged against.
+    pub fault: Option<Fault>,
     /// What the fault-free run left after each step, which we judge against.
     /// Empty for the fault-free run itself.
     pub trajectory: Vec<Checkpoint>,
@@ -52,7 +50,7 @@ impl Schedule {
         fleet: plan::Fleet,
         steps: Vec<plan::Step>,
         checks: Vec<plan::Check>,
-        fault: Anchor,
+        fault: Fault,
         trajectory: Vec<Checkpoint>,
     ) -> Self {
         Self {

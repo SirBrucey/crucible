@@ -4,6 +4,7 @@
 
 pub mod fault;
 pub mod ipc;
+pub mod learned;
 pub mod observer;
 pub mod plan;
 pub mod proxy_log;

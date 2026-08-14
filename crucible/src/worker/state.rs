@@ -10,7 +10,7 @@
 use std::sync::Arc;
 
 use crucible_core::{
-    fault::Anchor,
+    fault::Fault,
     ipc::{
         HEARTBEAT_INTERVAL, RunnerToWorker, WorkerEvent, WorkerToRunner,
         codec::{read_frame, write_frame},
@@ -131,7 +131,7 @@ pub struct Learning {
 /// state is what proves there is one to inject.
 pub struct Executing {
     schedule: Schedule,
-    fault: Anchor,
+    fault: Fault,
 }
 
 pub struct ShuttingDown {
@@ -152,7 +152,8 @@ async fn bring_up(
     worker_id: u32,
     schedule: &Schedule,
 ) -> Result<Orchestrator<Ready>> {
-    let deployment = registry.deployment_for(&schedule.fleet, worker_id, schedule.fault.clone())?;
+    let anchor = schedule.fault.as_ref().map(|fault| fault.anchor().clone());
+    let deployment = registry.deployment_for(&schedule.fleet, worker_id, anchor)?;
     let actions = registry.actions_for(&schedule.steps)?;
     let orchestrator = Orchestrator::new(deployment, actions).setup().await?;
     Ok(orchestrator)
@@ -218,7 +219,8 @@ impl Worker<Idle> {
                     tracing::info!(
                         worker_id = self.id,
                         schedule_id = schedule.id,
-                        service = fault.service,
+                        service = fault.anchor().service,
+                        invariant = ?fault.invariant(),
                         "received schedule"
                     );
                     Ok(IdleNext::Work(
@@ -253,17 +255,18 @@ impl Worker<Learning> {
                 return Err(e.into());
             }
         };
-        let (services, trajectory, orchestrator) = orchestrator
-            .learn(&queries)
+        // FIXME: this should be the union across every plugin driving the
+        // scenario, not the deployment's alone. Kind plugins are built per
+        // action and per check rather than held, so there is nothing to ask yet.
+        let primitives = orchestrator.deployment().primitives();
+        let (learned, orchestrator) = orchestrator
+            .learn(&queries, primitives)
             .await
             .inspect_err(|e| tracing::error!(worker_id = self.id, error = %e, "learn failed"))?;
         drop(heartbeat);
-        let count = services.len();
+        let count = learned.profiles.len();
         self.conn
-            .send(&WorkerToRunner::SessionCatalogue {
-                services,
-                trajectory,
-            })
+            .send(&WorkerToRunner::SessionCatalogue(learned))
             .await?;
         tracing::info!(worker_id = self.id, count, "sent session catalogue");
         Ok(self.transition(ShuttingDown { orchestrator }))

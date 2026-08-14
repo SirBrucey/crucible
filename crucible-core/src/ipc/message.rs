@@ -1,6 +1,6 @@
 pub use crucible_protocol::{KillReport, ServiceProfile, Session};
 
-use crate::{schedule::Schedule, verdict::Checkpoint};
+use crate::{learned::Learned, schedule::Schedule};
 
 /// Messages passed from one of the worker processes to the main runner.
 #[derive(Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -21,13 +21,8 @@ pub enum WorkerToRunner {
         /// Outcome of the run, carrying the driver's explanation.
         verdict: Verdict,
     },
-    /// Worker returns the per-service fault anchors the fault-free run derived
-    /// from its observed traffic, already scenario-relative, and the state each
-    /// of its steps left behind.
-    SessionCatalogue {
-        services: Vec<ServiceProfile>,
-        trajectory: Vec<Checkpoint>,
-    },
+    /// Worker returns what the fault-free run found out about the fleet.
+    SessionCatalogue(Learned),
     /// Worker emits an observational event for the runner to record.
     Event(WorkerEvent),
     /// Periodic liveness ping the worker sends while it works, so the runner's
