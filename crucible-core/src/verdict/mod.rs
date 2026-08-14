@@ -26,9 +26,32 @@ pub struct Observations {
     /// What the scenario's checks read once the fleet settled, in the order the
     /// scenario states them.
     pub checks: Vec<Observed>,
+    /// What those checks read at each point of the run: the baseline before the
+    /// first step, then one per step. A step's effects are what separates its
+    /// checkpoint from the one before it.
+    pub trajectory: Vec<Checkpoint>,
+    /// The fault-free run's trajectory, which this run is judged against. Empty
+    /// in the fault-free run itself.
+    pub fault_free: Vec<Checkpoint>,
+    /// When each step ran, in the order the scenario states them.
+    pub windows: Vec<StepWindow>,
     pub sessions: Vec<crucible_protocol::Session>,
     pub kill: Option<crucible_protocol::KillReport>,
 }
+
+/// When a step ran, as nanoseconds from scenario start. The fault records the
+/// same origin, so a verdict can say which steps it landed among.
+#[derive(Clone, Copy, Debug)]
+pub struct StepWindow {
+    pub start_ns: u128,
+    pub end_ns: u128,
+}
+
+/// What every check the scenario states read at one point in a run, in the
+/// order the scenario states them. `None` where the reading could not be taken,
+/// which under a fault is most of the point: a service that is down cannot be
+/// asked, and that is a thing to record rather than to fail on.
+pub type Checkpoint = Vec<Option<crate::plan::Value>>;
 
 /// A check and what the fleet was actually holding when it was read.
 #[derive(Debug)]
@@ -59,17 +82,32 @@ impl Observed {
             CmpOp::Ge => order(reading, stated).map(Ordering::is_ge),
         }
     }
+}
 
-    /// The check as the scenario spells it, for a verdict to point at.
-    #[must_use]
-    pub fn observable(&self) -> String {
-        let mut spelling = vec![self.check.observable.join(".")];
-        spelling.extend(self.check.args.iter().map(ToString::to_string));
-        if let Some((column, value)) = &self.check.filter {
-            spelling.push(format!("where {column} = {value}"));
+/// Why a fault-free run missed what the scenario stated.
+///
+/// If the fault-free run cannot satisfy its predicate then it is mis-authored.
+/// We cannot judge a faulted run against a non-deterministic result.
+#[must_use]
+pub fn unmet(
+    checks: &[crate::plan::Check],
+    settled: &[Option<crate::plan::Value>],
+) -> Option<String> {
+    for (check, reading) in checks.iter().zip(settled) {
+        let Some(value) = reading else {
+            return Some(format!("`{}` could not be read", check.observable()));
+        };
+        let observed = Observed {
+            check: check.clone(),
+            value: value.clone(),
+        };
+        if observed.holds() != Some(true) {
+            return Some(format!("`{}` reads {value}", check.stated()));
         }
-        spelling.join(" ")
     }
+    checks
+        .get(settled.len())
+        .map(|check| format!("`{}` was never read", check.observable()))
 }
 
 /// How two readings of the same shape order, for the shapes that have an order.
@@ -136,5 +174,52 @@ pub fn driver_for(invariant: Invariant) -> Box<dyn Driver> {
         Invariant::Converges => Box::new(Converges),
         Invariant::Durable => Box::new(Durable),
         Invariant::Recovers => Box::new(Recovers),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::plan::{Check, Value};
+
+    /// A scenario stating `orders.count >= 2`.
+    fn check() -> Check {
+        Check {
+            service: "db".into(),
+            observer: "mariadb".into(),
+            observable: vec!["orders".into(), "count".into()],
+            args: Vec::new(),
+            filter: None,
+            op: CmpOp::Ge,
+            value: Value::Int(2),
+        }
+    }
+
+    #[test]
+    fn a_fault_free_run_that_satisfies_the_scenario_has_nothing_unmet() {
+        assert_eq!(unmet(&[check()], &[Some(Value::Int(3))]), None);
+    }
+
+    #[test]
+    fn a_reading_the_scenario_rules_out_is_quoted_back_as_written() {
+        assert_eq!(
+            unmet(&[check()], &[Some(Value::Int(1))]),
+            Some("`orders.count >= 2` reads 1".into())
+        );
+    }
+
+    #[test]
+    fn a_reading_of_another_shape_is_not_a_comparison() {
+        assert!(unmet(&[check()], &[Some(Value::Str("two".into()))]).is_some());
+    }
+
+    #[test]
+    fn a_check_the_run_could_not_read_is_unmet() {
+        assert!(unmet(&[check()], &[None]).is_some());
+    }
+
+    #[test]
+    fn a_check_the_run_never_read_is_unmet() {
+        assert!(unmet(&[check()], &[]).is_some());
     }
 }

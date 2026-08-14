@@ -33,8 +33,16 @@ pub struct Service {
 pub struct Scenario {
     pub name: Spanned<String>,
     pub consistent_within: Spanned<Duration>,
-    pub steps: Vec<Spanned<OpCall>>,
+    pub steps: Vec<Spanned<Step>>,
     pub expect: Vec<Spanned<Predicate>>,
+}
+
+/// One `do` step: an action, and what its author says it produces. Without a
+/// stated outcome the driver's own default for the operation stands.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Step {
+    pub action: Spanned<OpCall>,
+    pub expect: Option<Spanned<Value>>,
 }
 
 /// An operation call: a head (`http POST`, `db.orders.count`), positional

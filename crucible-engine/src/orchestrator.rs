@@ -13,7 +13,7 @@ use crucible_core::{
     ipc::Verdict,
     observer::SessionObserver,
     proxy_log::service_profiles_from_sessions,
-    verdict::{Invariant, Observations, Observed, driver_for},
+    verdict::{Checkpoint, Invariant, Observations, Observed, StepWindow, driver_for},
 };
 use crucible_plugin::{
     Action, DeploymentRuntime, FaultPrimitives, Targeted, registry::PreparedCheck,
@@ -25,6 +25,14 @@ const HEAL_MIN_SETTLE: Duration = Duration::from_millis(500);
 /// Before the learn snapshot, wait at least this long so post-ack async writes
 /// have a chance to begin before the fleet can be judged quiescent.
 const LEARN_SETTLE: Duration = Duration::from_millis(100);
+/// Between steps, wait at least this long before the fleet can be judged to
+/// have finished with one, so work a step starts after answering its caller has
+/// begun before anything looks for it.
+const STEP_SETTLE: Duration = Duration::from_millis(100);
+/// How long a step's effects have to settle before the next one starts. A fleet
+/// still working after this is one the scenario has outrun, which is a result
+/// rather than something to keep waiting on.
+const STEP_BUDGET: Duration = Duration::from_secs(15);
 /// Consider the fleet quiescent once no sidecar has forwarded traffic for this
 /// long. Comfortably larger than a DB write plus docker-log delivery latency.
 const QUIESCENCE_IDLE: Duration = Duration::from_secs(1);
@@ -127,24 +135,41 @@ fn resolve_targets<T: Targeted + ?Sized>(
     bound
         .into_iter()
         .map(|bound| {
-            let endpoint = endpoint_for(deployment, bound.as_ref())?;
+            let endpoint = endpoint_for_data_plane(deployment, bound.as_ref())?;
             Ok((bound, endpoint))
         })
         .collect()
 }
 
-/// Where this reaches the service it is bound to, once the replica is up.
-fn endpoint_for(
+/// The data plane address for whatever this is bound to. Steps drive the fleet
+/// here, so the traffic counts as the fleet's.
+fn endpoint_for_data_plane(
     deployment: &dyn DeploymentRuntime,
     bound: &(impl Targeted + ?Sized),
 ) -> Result<SocketAddr, crucible_plugin::Error> {
     let (target, kind) = (bound.target(), bound.kind());
-    deployment.endpoint(target, kind).ok_or_else(|| {
-        crucible_plugin::Error::new(
-            "orchestrator",
-            format!("the fleet published no endpoint for `{target}` speaking `{kind}`"),
-        )
-    })
+    deployment
+        .endpoint(target, kind)
+        .ok_or_else(|| unreachable(target, kind))
+}
+
+/// The control plane address for whatever this is bound to. Checks read here, so
+/// the reading is not mistaken for the fleet doing something.
+fn endpoint_for_control_plane(
+    deployment: &dyn DeploymentRuntime,
+    bound: &(impl Targeted + ?Sized),
+) -> Result<SocketAddr, crucible_plugin::Error> {
+    let (target, kind) = (bound.target(), bound.kind());
+    deployment
+        .control_endpoint(target, kind)
+        .ok_or_else(|| unreachable(target, kind))
+}
+
+fn unreachable(target: &str, kind: &str) -> crucible_plugin::Error {
+    crucible_plugin::Error::new(
+        "orchestrator",
+        format!("the fleet published no endpoint for `{target}` speaking `{kind}`"),
+    )
 }
 
 impl Orchestrator<Ready> {
@@ -153,14 +178,18 @@ impl Orchestrator<Ready> {
         self.deployment.as_ref()
     }
 
-    /// Run the scenario fault-free and return per-service profiles so the
-    /// scheduler can cluster them into bursts.
+    /// Run the scenario fault-free, returning per-service profiles for the
+    /// scheduler to cluster into bursts, and the state each step left behind
+    /// for every other run to be judged against.
     ///
     /// # Errors
-    /// Errors if the scenario fails to run against the fleet.
+    /// Errors if the scenario fails to run against the fleet, or if a check
+    /// cannot be read.
     pub async fn learn(
         self,
-    ) -> Result<(Vec<ServiceProfile>, Orchestrator<Done>), crucible_plugin::Error> {
+        queries: &[PreparedCheck],
+    ) -> Result<(Vec<ServiceProfile>, Vec<Checkpoint>, Orchestrator<Done>), crucible_plugin::Error>
+    {
         let Orchestrator {
             deployment,
             state: Ready {
@@ -169,11 +198,20 @@ impl Orchestrator<Ready> {
             },
         } = self;
         let scenario_start_ns = now_ns();
-        let mut observations = match run_actions(&actions).await {
+        let mut observations = match run_actions(
+            deployment.as_ref(),
+            &actions,
+            queries,
+            &session_observer,
+            Instant::now(),
+        )
+        .await
+        {
             Ok(observations) => observations,
             Err(e) => {
-                // A failed scenario leaves the replica up; tear it down rather
-                // than dropping the only handle to it and its observer tasks.
+                // A failed scenario leaves the replica up; tear it down
+                // rather than dropping the only handle to it and its
+                // observer tasks.
                 let _ = teardown_replica(deployment, session_observer).await;
                 return Err(e);
             }
@@ -192,7 +230,7 @@ impl Orchestrator<Ready> {
             deployment,
             state: Done { session_observer },
         };
-        Ok((profiles, done))
+        Ok((profiles, observations.trajectory, done))
     }
 
     /// Run the scenario; the proxy self-freezes the fleet once `fault`'s target
@@ -208,6 +246,7 @@ impl Orchestrator<Ready> {
         schedule_id: u32,
         fault: &Anchor,
         queries: Vec<PreparedCheck>,
+        fault_free: Vec<Checkpoint>,
     ) -> Result<((Verdict, KillReport), Orchestrator<Done>), crucible_plugin::Error> {
         let Orchestrator {
             deployment,
@@ -232,7 +271,14 @@ impl Orchestrator<Ready> {
             let (scenario_end_tx, mut scenario_end_rx) = tokio::sync::oneshot::channel::<()>();
             let scenario_start = Instant::now();
             let scenario_fut = async {
-                let result = run_actions(&actions).await;
+                let result = run_actions(
+                    deployment.as_ref(),
+                    &actions,
+                    &queries,
+                    &session_observer,
+                    scenario_start,
+                )
+                .await;
                 let _ = scenario_end_tx.send(());
                 result
             };
@@ -295,7 +341,8 @@ impl Orchestrator<Ready> {
                     .await;
             }
 
-            observations.checks = read_checks(deployment.as_ref(), queries).await?;
+            observations.checks = read_checks(deployment.as_ref(), &queries).await?;
+            observations.fault_free = fault_free;
             session_observer.observe(&mut observations);
             let verdict = driver_for(Invariant::Durable).drive(&observations);
             Ok((verdict, kill_report))
@@ -357,25 +404,84 @@ fn missed(id: u32, fault: &Anchor, reason: KillMissReason) -> KillReport {
 /// Read what the fleet settled on, one reading per check the scenario states.
 async fn read_checks(
     deployment: &dyn DeploymentRuntime,
-    queries: Vec<PreparedCheck>,
+    queries: &[PreparedCheck],
 ) -> Result<Vec<Observed>, crucible_plugin::Error> {
     let mut readings = Vec::with_capacity(queries.len());
     for (check, query) in queries {
-        let endpoint = endpoint_for(deployment, query.as_ref())?;
+        let endpoint = endpoint_for_control_plane(deployment, query.as_ref())?;
         readings.push(Observed {
             value: query.read(endpoint).await?,
-            check,
+            check: check.clone(),
         });
     }
     Ok(readings)
 }
 
-/// Run a scenario's actions in order against the fleet, collecting what each
-/// one observed.
-async fn run_actions(actions: &[TargetedAction]) -> Result<Observations, crucible_plugin::Error> {
+/// What every check reads right now, for the trajectory rather than for a
+/// verdict: the values alone, since which check each answers is the scenario's
+/// and does not change between one point of a run and another.
+async fn read_checkpoint(
+    deployment: &dyn DeploymentRuntime,
+    queries: &[PreparedCheck],
+) -> Checkpoint {
+    let mut checkpoint = Vec::with_capacity(queries.len());
+    for (check, query) in queries {
+        let reading = match endpoint_for_control_plane(deployment, query.as_ref()) {
+            Ok(endpoint) => query.read(endpoint).await,
+            Err(e) => Err(e),
+        };
+        checkpoint.push(match reading {
+            Ok(value) => Some(value),
+            Err(e) => {
+                tracing::debug!(
+                    observable = %check.observable.join("."),
+                    service = %check.service,
+                    error = %e,
+                    "state could not be read at this point of the run",
+                );
+                None
+            }
+        });
+    }
+    checkpoint
+}
+
+/// Run the scenario's steps one at a time, each starting only once the fleet
+/// has stopped working on the one before.
+///
+/// A step's effects outlast its response: the caller is answered before a
+/// consumer has read what the step published. Overlapping steps therefore leave
+/// a state no one step accounts for, and the traffic a fault is anchored in
+/// belongs to whichever step happened to be in flight.
+async fn run_actions(
+    deployment: &dyn DeploymentRuntime,
+    actions: &[TargetedAction],
+    queries: &[PreparedCheck],
+    session_observer: &SessionObserver,
+    scenario_start: Instant,
+) -> Result<Observations, crucible_plugin::Error> {
     let mut observations = Observations::empty();
+    // The state before anything ran, so a step that changed nothing has a
+    // checkpoint equal to the one before it rather than no checkpoint at all.
+    observations
+        .trajectory
+        .push(read_checkpoint(deployment, queries).await);
     for (action, endpoint) in actions {
+        let start_ns = scenario_start.elapsed().as_nanos();
         observations.outcomes.push(action.run(*endpoint).await?);
+        session_observer
+            .wait_for_quiescence(STEP_SETTLE, QUIESCENCE_IDLE, STEP_BUDGET)
+            .await;
+        // The step is only over once the fleet has stopped working on it, so a
+        // fault that lands on the consumer's half of the step is still that
+        // step's.
+        observations.windows.push(StepWindow {
+            start_ns,
+            end_ns: scenario_start.elapsed().as_nanos(),
+        });
+        observations
+            .trajectory
+            .push(read_checkpoint(deployment, queries).await);
     }
     Ok(observations)
 }

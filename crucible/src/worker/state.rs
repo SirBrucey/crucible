@@ -240,14 +240,30 @@ impl Worker<Learning> {
         let registry = Registry::load().await;
         let heartbeat = self.conn.start_heartbeat();
         let orchestrator = bring_up(&registry, self.id, &self.state.schedule).await?;
-        let (services, orchestrator) = orchestrator
-            .learn()
+        let schedule = &self.state.schedule;
+        // The checks are read at every step, so the fault-free run says what
+        // state each step left behind rather than only where it ended.
+        let queries = match registry
+            .queries_for(&schedule.fleet, &schedule.checks)
+            .await
+        {
+            Ok(queries) => queries,
+            Err(e) => {
+                let _ = orchestrator.teardown().await;
+                return Err(e.into());
+            }
+        };
+        let (services, trajectory, orchestrator) = orchestrator
+            .learn(&queries)
             .await
             .inspect_err(|e| tracing::error!(worker_id = self.id, error = %e, "learn failed"))?;
         drop(heartbeat);
         let count = services.len();
         self.conn
-            .send(&WorkerToRunner::SessionCatalogue { services })
+            .send(&WorkerToRunner::SessionCatalogue {
+                services,
+                trajectory,
+            })
             .await?;
         tracing::info!(worker_id = self.id, count, "sent session catalogue");
         Ok(self.transition(ShuttingDown { orchestrator }))
@@ -279,7 +295,12 @@ impl Worker<Executing> {
         };
 
         let ((verdict, kill_report), orchestrator) = orchestrator
-            .execute(schedule_id, &self.state.fault, queries)
+            .execute(
+                schedule_id,
+                &self.state.fault,
+                queries,
+                schedule.trajectory.clone(),
+            )
             .await
             .inspect_err(
                 |e| tracing::error!(worker_id = self.id, schedule_id, error = %e, "execute failed"),

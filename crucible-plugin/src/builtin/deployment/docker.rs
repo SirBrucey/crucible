@@ -39,6 +39,8 @@ const READINESS_POLL: Duration = Duration::from_millis(500);
 const HEALTHCHECK_INTERVAL: Duration = Duration::from_secs(1);
 const HEALTHCHECK_START_PERIOD: Duration = Duration::from_secs(30);
 const PROXY_IMAGE: &str = "crucible-proxy:0.1";
+/// Control-plane listeners start here, above anything a fleet would use.
+const CONTROL_BASE: u16 = 40000;
 const PROXY_SUFFIX: &str = "proxy";
 const BACKING_SUFFIX: &str = "actual";
 
@@ -151,8 +153,28 @@ pub struct Docker {
     client: DockerClient,
     network: String,
     services: Vec<ServiceConfig>,
-    endpoints: HashMap<(String, String), SocketAddr>,
+    endpoints: Endpoints,
     anchor: Option<Anchor>,
+}
+
+/// Where each service answers, keyed by service and kind. The proxy fronts every
+/// service twice, once per plane.
+#[derive(Default)]
+struct Endpoints {
+    /// The test traffic: watched, and frozen when a fault fires.
+    data: HashMap<(String, String), SocketAddr>,
+    /// The side channel, for faulting and observation.
+    control: HashMap<(String, String), SocketAddr>,
+}
+
+/// Where a service's control plane listens inside the proxy. Far enough above
+/// the fleet's own ports that it cannot land on one of them.
+fn control_port(port: u16) -> u16 {
+    CONTROL_BASE + port % CONTROL_BASE
+}
+
+fn local(port: u16) -> SocketAddr {
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
 }
 
 impl Docker {
@@ -171,7 +193,7 @@ impl Docker {
             client,
             network: format!("crucible-{worker_id}"),
             services,
-            endpoints: HashMap::new(),
+            endpoints: Endpoints::default(),
             anchor,
         })
     }
@@ -282,7 +304,7 @@ impl Docker {
     /// as a network alias, and all ports published to the host. Returns each
     /// service's published host endpoint. Every pair shares one process-wide
     /// pause gate, so a single signal freezes the whole fleet atomically.
-    async fn start_proxy(&self) -> Result<Vec<((String, String), SocketAddr)>> {
+    async fn start_proxy(&self) -> Result<Endpoints> {
         ensure_image(&self.client, PROXY_IMAGE).await?;
 
         // The proxy binds one listener per service port. Distinct ports map
@@ -311,6 +333,13 @@ impl Docker {
                     name = service.name,
                     upstream = Self::backing_alias(service),
                 ));
+                cmd.push("--control".to_string());
+                cmd.push(format!(
+                    "{name}=0.0.0.0:{listen}={upstream}:{port}",
+                    name = service.name,
+                    listen = control_port(*port),
+                    upstream = Self::backing_alias(service),
+                ));
             }
         }
         if let Some(anchor) = &self.anchor {
@@ -326,7 +355,12 @@ impl Docker {
             .services
             .iter()
             .flat_map(|s| s.ports.values())
-            .map(|port| format!("{port}/tcp"))
+            .flat_map(|port| {
+                [
+                    format!("{port}/tcp"),
+                    format!("{}/tcp", control_port(*port)),
+                ]
+            })
             .collect();
 
         let aliases: Vec<String> = self.services.iter().map(|s| s.name.clone()).collect();
@@ -368,14 +402,15 @@ impl Docker {
             .start_container(&container_name, None::<StartContainerOptions>)
             .await?;
 
-        let mut endpoints = Vec::new();
+        let mut endpoints = Endpoints::default();
         for service in &self.services {
             for (kind, port) in &service.ports {
-                let host_port = published_port(&self.client, &container_name, *port).await?;
-                endpoints.push((
-                    (service.name.clone(), kind.clone()),
-                    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), host_port),
-                ));
+                let key = (service.name.clone(), kind.clone());
+                let observed = published_port(&self.client, &container_name, *port).await?;
+                let control =
+                    published_port(&self.client, &container_name, control_port(*port)).await?;
+                endpoints.data.insert(key.clone(), local(observed));
+                endpoints.control.insert(key, local(control));
             }
         }
         Ok(endpoints)
@@ -423,8 +458,7 @@ impl Docker {
         // answers for, so until it is up a service that talks to another on
         // startup has nothing to talk to. It resolves its own upstreams per
         // connection, so it does not need them yet.
-        let endpoints = self.start_proxy().await?;
-        self.endpoints.extend(endpoints);
+        self.endpoints = self.start_proxy().await?;
         self.start_services().await?;
         Ok(())
     }
@@ -477,7 +511,13 @@ impl Docker {
     }
 
     async fn destroy_replica(&mut self) -> Result<()> {
-        let opts = RemoveContainerOptionsBuilder::default().force(true).build();
+        // `v` takes the anonymous volumes with it. A replica is thrown away
+        // after every schedule, and a database image makes one of these per
+        // container, so without it a campaign can leave hundreds behind.
+        let opts = RemoveContainerOptionsBuilder::default()
+            .force(true)
+            .v(true)
+            .build();
         let mut failures = TeardownFailures::new();
         let removals =
             futures_util::future::join_all(self.container_names().into_iter().map(|name| {
@@ -496,7 +536,7 @@ impl Docker {
                 Err(e) => failures.append_container(name, e.to_string()),
             }
         }
-        self.endpoints.clear();
+        self.endpoints = Endpoints::default();
         match self.client.remove_network(&self.network).await {
             Ok(()) => {}
             Err(e) if is_not_found(&e) => {}
@@ -589,10 +629,17 @@ async fn published_port(
             port: container_port,
         })?;
     let key = format!("{container_port}/tcp");
-    let bindings = ports
-        .get(&key)
-        .and_then(Option::as_ref)
-        .and_then(|v| v.first());
+    // Docker binds a port on IPv4 and IPv6 separately, and gives each its own
+    // host port. Endpoints here are IPv4, and taking whichever came first would
+    // sometimes hand back the v6 one, which is some other service's v4 port.
+    let bindings = ports.get(&key).and_then(Option::as_ref).and_then(|v| {
+        v.iter().find(|binding| {
+            binding
+                .host_ip
+                .as_deref()
+                .is_some_and(|ip| !ip.contains(':'))
+        })
+    });
     let host_port = bindings
         .and_then(|pb| pb.host_port.as_ref())
         .ok_or_else(|| Error::MissingPort {
@@ -759,6 +806,14 @@ impl DeploymentRuntime for Docker {
 
     fn endpoint(&self, service: &str, kind: &str) -> Option<SocketAddr> {
         self.endpoints
+            .data
+            .get(&(service.to_owned(), kind.to_owned()))
+            .copied()
+    }
+
+    fn control_endpoint(&self, service: &str, kind: &str) -> Option<SocketAddr> {
+        self.endpoints
+            .control
             .get(&(service.to_owned(), kind.to_owned()))
             .copied()
     }

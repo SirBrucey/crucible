@@ -12,16 +12,23 @@ use tokio::{
 
 use crate::{
     error::{Error, Result},
-    proxy::{Anchor, Proxy},
+    proxy::{Anchor, Proxy, Relay},
 };
 
 #[derive(Parser)]
 #[command(about = "Multi-listener bytes-through proxy for a crucible fleet")]
 struct Cli {
     /// Listen and upstream pair in the form `SERVICE=LISTEN=UPSTREAM`
-    /// (e.g. `db=0.0.0.0:3306=db-actual:3306`).
+    /// (e.g. `db=0.0.0.0:3306=db-actual:3306`). A pair connects a service to
+    /// the proxy, and a service-to-service edge is two of them. Test traffic is
+    /// driven and monitored here.
     #[arg(long = "pair", required = true)]
     pairs: Vec<String>,
+    /// A side channel to the same services, in the same form, for faulting and
+    /// observation. Nothing here is reported or frozen, so the test traffic is
+    /// not infected by the framework's own.
+    #[arg(long = "control")]
+    control: Vec<String>,
     /// Fault anchor `SERVICE=DIRECTION=K` (DIRECTION is `c2u` or `u2c`): freeze
     /// the fleet once `SERVICE` has forwarded `K` packets on that direction.
     #[arg(long = "freeze-at")]
@@ -99,21 +106,11 @@ async fn main() -> Result<()> {
     spawn_pause_control(pause_tx.clone(), anchor.clone());
 
     for spec in cli.pairs {
-        // `SERVICE=LISTEN=UPSTREAM`. One process fronts the whole fleet, so every
-        // pair tags its events with its service; the runner attributes the
-        // interleaved stream by that tag.
-        let mut parts = spec.splitn(3, '=');
-        let (Some(service), Some(listen_str), Some(upstream_str)) =
-            (parts.next(), parts.next(), parts.next())
-        else {
-            return Err(Error::MalformedPair { pair: spec.clone() });
-        };
-        let service = service.to_string();
-        let listen: SocketAddr = listen_str.parse().map_err(|source| Error::ParseListen {
-            addr: listen_str.to_string(),
-            source,
-        })?;
-        let upstream = upstream_str.to_string();
+        let Pair {
+            service,
+            listen,
+            upstream,
+        } = Pair::parse(&spec)?;
         // Only the pair fronting the anchored service counts toward the freeze.
         let pair_anchor = if freeze.as_ref().is_some_and(|f| f.service == service) {
             anchor.clone()
@@ -129,6 +126,8 @@ async fn main() -> Result<()> {
                 tracing::error!(?e, "proxy accept loop ended");
             }
         });
+        // One process fronts the whole fleet, so every pair tags its events with
+        // its service; the runner attributes the interleaved stream by that tag.
         tokio::spawn(async move {
             while let Some(event) = events.recv().await {
                 match serde_json::to_string(&event) {
@@ -142,8 +141,51 @@ async fn main() -> Result<()> {
         });
     }
 
+    for spec in cli.control {
+        let Pair {
+            service,
+            listen,
+            upstream,
+        } = Pair::parse(&spec)?;
+        let relay = Relay::bind(listen, upstream.clone()).await?;
+        tracing::info!(%service, %listen, %upstream, "control pair up");
+        tokio::spawn(async move {
+            if let Err(e) = relay.run().await {
+                tracing::error!(?e, "control accept loop ended");
+            }
+        });
+    }
+
     std::future::pending::<()>().await;
     Ok(())
+}
+
+/// One listener and where it forwards to, as `SERVICE=LISTEN=UPSTREAM`.
+struct Pair {
+    service: String,
+    listen: SocketAddr,
+    upstream: String,
+}
+
+impl Pair {
+    fn parse(spec: &str) -> Result<Self> {
+        let mut parts = spec.splitn(3, '=');
+        let (Some(service), Some(listen), Some(upstream)) =
+            (parts.next(), parts.next(), parts.next())
+        else {
+            return Err(Error::MalformedPair {
+                pair: spec.to_string(),
+            });
+        };
+        Ok(Self {
+            service: service.to_string(),
+            listen: listen.parse().map_err(|source| Error::ParseListen {
+                addr: listen.to_string(),
+                source,
+            })?,
+            upstream: upstream.to_string(),
+        })
+    }
 }
 
 /// Listen for SIGUSR1 (arm the anchor at scenario start) and SIGUSR2 (release

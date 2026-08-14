@@ -88,18 +88,20 @@ pub fn service_profiles_from_sessions(
     sessions: &[Session],
     scenario_start_ns: u128,
 ) -> Vec<ServiceProfile> {
-    // Per service: (client-to-upstream timestamps, upstream-to-client timestamps).
-    let mut by_service: BTreeMap<String, (Vec<u128>, Vec<u128>)> = BTreeMap::new();
+    // Per service: (client-to-upstream packets, upstream-to-client packets).
+    let mut by_service: BTreeMap<String, (Vec<Packet>, Vec<Packet>)> = BTreeMap::new();
     for session in sessions {
         for write in &session.writes {
             if write.ts_ns < scenario_start_ns {
                 continue;
             }
-            let rel = write.ts_ns - scenario_start_ns;
+            let packet = Packet {
+                at: write.ts_ns - scenario_start_ns,
+            };
             let entry = by_service.entry(session.service.clone()).or_default();
             match write.direction {
-                Direction::ClientToUpstream => entry.0.push(rel),
-                Direction::UpstreamToClient => entry.1.push(rel),
+                Direction::ClientToUpstream => entry.0.push(packet),
+                Direction::UpstreamToClient => entry.1.push(packet),
             }
         }
     }
@@ -107,8 +109,8 @@ pub fn service_profiles_from_sessions(
     let mut profiles: Vec<ServiceProfile> = by_service
         .into_iter()
         .map(|(service, (mut c2u, mut u2c))| {
-            c2u.sort_unstable();
-            u2c.sort_unstable();
+            c2u.sort_unstable_by_key(|packet| packet.at);
+            u2c.sort_unstable_by_key(|packet| packet.at);
             ServiceProfile {
                 service,
                 client_to_upstream: burst_anchors(&c2u),
@@ -118,6 +120,13 @@ pub fn service_profiles_from_sessions(
         .collect();
     sample_to_frame(&mut profiles);
     profiles
+}
+
+/// One packet the proxy forwarded, at its time relative to scenario start. The
+/// order of these is what an anchor's index counts.
+#[derive(Clone, Copy, Debug)]
+struct Packet {
+    at: u128,
 }
 
 /// Cluster `packets` (sorted timestamps) into bursts by inter-packet gap and
@@ -131,7 +140,7 @@ pub fn service_profiles_from_sessions(
 /// traffic across the edge, so it probes no point within that edge's traffic the
 /// way the `K >= 1` anchors do. "Kill before first contact" would be a deliberate
 /// fault to add, not a by-product of this enumeration.
-fn burst_anchors(packets: &[u128]) -> Vec<u32> {
+fn burst_anchors(packets: &[Packet]) -> Vec<u32> {
     let n = packets.len();
     if n == 0 {
         return Vec::new();
@@ -139,7 +148,7 @@ fn burst_anchors(packets: &[u128]) -> Vec<u32> {
     let mut anchors: BTreeSet<u32> = BTreeSet::new();
     let mut start = 0usize; // 0-based index of the current burst's first packet
     for j in 0..n {
-        let ends_burst = j + 1 == n || packets[j + 1] - packets[j] > BURST_GAP_NS;
+        let ends_burst = j + 1 == n || packets[j + 1].at - packets[j].at > BURST_GAP_NS;
         if ends_burst {
             // 1-based packet counts; a single learn run should never approach u32.
             let first_count = u32::try_from(start + 1).expect("packet count fits in u32");
@@ -274,7 +283,10 @@ mod tests {
             sessions in prop::collection::vec(a_session(), 0..8),
         ) {
             let profiles = service_profiles_from_sessions(&sessions, 0);
-            let catalogue = WorkerToRunner::SessionCatalogue { services: profiles };
+            let catalogue = WorkerToRunner::SessionCatalogue {
+                services: profiles,
+                trajectory: Vec::new(),
+            };
             let mut buf = vec![0u8; 2_000_000];
             let encoded = postcard::to_slice(&catalogue, &mut buf)
                 .expect("catalogue fits the oversized test buffer");
@@ -287,22 +299,29 @@ mod tests {
         }
     }
 
+    fn driven(at: &[u128]) -> Vec<Packet> {
+        at.iter().map(|&at| Packet { at }).collect()
+    }
+
     #[test]
     fn single_packet_yields_only_the_after_anchor() {
         // before is K=0 (dropped); during and after both collapse to K=1.
-        assert_eq!(burst_anchors(&[1_000]), vec![1]);
+        assert_eq!(burst_anchors(&driven(&[1_000])), vec![1]);
     }
 
     #[test]
     fn k_zero_is_never_an_anchor() {
-        assert!(!burst_anchors(&[1_000]).contains(&0));
-        assert!(!burst_anchors(&[1_000, 2_000, 3_000]).contains(&0));
+        assert!(!burst_anchors(&driven(&[1_000])).contains(&0));
+        assert!(!burst_anchors(&driven(&[1_000, 2_000, 3_000])).contains(&0));
     }
 
     #[test]
     fn contiguous_packets_are_one_burst() {
         // Four packets inside the gap: one burst, during=midpoint(1,4)=2, after=4.
-        assert_eq!(burst_anchors(&[1_000, 2_000, 3_000, 4_000]), vec![2, 4]);
+        assert_eq!(
+            burst_anchors(&driven(&[1_000, 2_000, 3_000, 4_000])),
+            vec![2, 4]
+        );
     }
 
     #[test]
@@ -310,7 +329,7 @@ mod tests {
         // Packets 1-2 form the first burst, 3-4 the second (gap > BURST_GAP_NS).
         // Burst 1 -> {during 1, after 2}; burst 2 -> {before 2, during 3, after 4}.
         // The shared boundary count 2 is deduped away by the anchor set.
-        let packets = [1_000, 2_000, 100_000_000, 101_000_000];
+        let packets = driven(&[1_000, 2_000, 100_000_000, 101_000_000]);
         assert_eq!(burst_anchors(&packets), vec![1, 2, 3, 4]);
     }
 

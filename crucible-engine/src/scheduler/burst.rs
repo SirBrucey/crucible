@@ -8,7 +8,7 @@
 
 use crucible_protocol::{Direction, ServiceProfile};
 
-use crucible_core::{fault::Anchor, plan, schedule::Schedule};
+use crucible_core::{fault::Anchor, plan, schedule::Schedule, verdict::Checkpoint};
 
 use super::Scheduler;
 
@@ -27,6 +27,7 @@ impl BurstScheduler {
         fleet: &plan::Fleet,
         scenario: &plan::Scenario,
         profiles: &[ServiceProfile],
+        trajectory: &[Checkpoint],
     ) -> Self {
         let anchored: Vec<(&str, Direction, &[u32])> = profiles
             .iter()
@@ -63,6 +64,7 @@ impl BurstScheduler {
                             direction: *direction,
                             k,
                         },
+                        trajectory.to_vec(),
                     ));
                     next_id += 1;
                 }
@@ -102,7 +104,7 @@ mod tests {
 
     fn scheduler(profiles: &[ServiceProfile]) -> BurstScheduler {
         let plan = plan::example();
-        BurstScheduler::new(&plan.fleet, &plan.scenarios[0], profiles)
+        BurstScheduler::new(&plan.fleet, &plan.scenarios[0], profiles, &[])
     }
 
     /// The fault a burst schedule carries.

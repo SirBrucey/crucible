@@ -13,6 +13,7 @@ use crucible_core::{
     ipc::{ServiceProfile, Verdict},
     plan,
     schedule::Schedule,
+    verdict::{self, Checkpoint},
 };
 use crucible_engine::{
     event_bus::EventBus,
@@ -39,6 +40,8 @@ const WORKER_BIN: &str = "crucible-worker";
 const LIBEXEC_DIR: &str = "/usr/lib/crucible";
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a campaign may run before it stops dispatching and reports what it
+/// has.
 const TOTAL_BUDGET: Duration = Duration::from_mins(5);
 const SCHEDULE_MARGIN: Duration = Duration::from_secs(30);
 const LEARN_MARGIN: Duration = Duration::from_secs(30);
@@ -362,9 +365,9 @@ impl Outcomes {
     }
 
     /// Log the end-of-campaign summary. `total` is how many schedules the
-    /// scheduler produced; fewer completed means the wall-clock budget cut the
-    /// run short.
-    fn report(&self, total: usize, elapsed_s: u64) {
+    /// scheduler produced; `stopped` says why the rest were not run, when some
+    /// were not.
+    fn report(&self, total: usize, elapsed_s: u64, stopped: Stopped) {
         if self.completed() < total {
             tracing::warn!(
                 passed = self.passed,
@@ -374,7 +377,7 @@ impl Outcomes {
                 total,
                 elapsed_s,
                 budget_s = TOTAL_BUDGET.as_secs(),
-                "campaign hit its wall-clock budget; remaining schedules skipped"
+                "{stopped}, so the remaining schedules were skipped"
             );
         } else {
             tracing::info!(
@@ -386,6 +389,24 @@ impl Outcomes {
                 elapsed_s,
                 "campaign complete"
             );
+        }
+    }
+}
+
+/// Why a campaign stopped dispatching with schedules left.
+#[derive(Clone, Copy, Debug)]
+enum Stopped {
+    Budget,
+    GaveUp,
+    Interrupted,
+}
+
+impl std::fmt::Display for Stopped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Stopped::Budget => f.write_str("the campaign ran out of wall-clock budget"),
+            Stopped::GaveUp => f.write_str("too many schedules failed in a row"),
+            Stopped::Interrupted => f.write_str("the campaign was interrupted"),
         }
     }
 }
@@ -576,14 +597,25 @@ async fn drive(bus: &EventBus, plan: &plan::Plan) -> Result<CampaignOutcome> {
         .expect("the grammar requires a scenario, so a lowered plan states one");
 
     // Learn is a barrier: schedules derive from its observed traffic profiles.
-    let (services, run_cost) = run_learn(bus, &mut worker_id, &plan.fleet, scenario).await?;
+    let (services, trajectory, run_cost) =
+        run_learn(bus, &mut worker_id, &plan.fleet, scenario).await?;
+    let readings = trajectory.iter().flatten();
     tracing::info!(
         services = services.len(),
+        checkpoints = trajectory.len(),
+        read = readings.clone().filter(|r| r.is_some()).count(),
+        unread = readings.filter(|r| r.is_none()).count(),
         run_cost_ms = run_cost.as_millis(),
         "session catalogue received"
     );
 
-    let mut scheduler = BurstScheduler::new(&plan.fleet, scenario, &services);
+    let settled = trajectory.last().map_or(&[][..], Vec::as_slice);
+    if let Some(unmet) = verdict::unmet(&scenario.checks, settled) {
+        tracing::error!("the scenario states {unmet} in its own fault-free run");
+        return Ok(CampaignOutcome::Indecisive);
+    }
+
+    let mut scheduler = BurstScheduler::new(&plan.fleet, scenario, &services, &trajectory);
     let total = scheduler.total();
     let mut pool = Pool::new(
         bus,
@@ -620,8 +652,15 @@ async fn drive(bus: &EventBus, plan: &plan::Plan) -> Result<CampaignOutcome> {
         pool.reclaim_all().await;
     }
 
+    let stopped = if interrupted {
+        Stopped::Interrupted
+    } else if pool.gave_up {
+        Stopped::GaveUp
+    } else {
+        Stopped::Budget
+    };
     pool.outcomes
-        .report(total, campaign_start.elapsed().as_secs());
+        .report(total, campaign_start.elapsed().as_secs(), stopped);
     Ok(pool.outcomes.outcome())
 }
 
@@ -635,7 +674,7 @@ async fn run_learn(
     worker_id: &mut u32,
     fleet: &plan::Fleet,
     scenario: &plan::Scenario,
-) -> Result<(Vec<ServiceProfile>, Duration)> {
+) -> Result<(Vec<ServiceProfile>, Vec<Checkpoint>, Duration)> {
     let mut attempt = 1;
     loop {
         let id = *worker_id;
@@ -666,17 +705,17 @@ async fn execute_learn(
     bus: &EventBus,
     worker_id: u32,
     schedule: Schedule,
-) -> Result<(Vec<ServiceProfile>, Duration)> {
+) -> Result<(Vec<ServiceProfile>, Vec<Checkpoint>, Duration)> {
     let (socket_path, listener) = bind_worker_listener(worker_id).await?;
     let (mut child, stderr_relay) = spawn_worker(&socket_path, worker_id)?;
     let learn_start = Instant::now();
     let pipeline = async {
         let session = accept_and_handshake(&listener, bus).await?;
-        let services = session.learn(bus, schedule).await?;
-        Ok::<_, Error>((services, learn_start.elapsed()))
+        let (services, trajectory) = session.learn(bus, schedule).await?;
+        Ok::<_, Error>((services, trajectory, learn_start.elapsed()))
     };
     match tokio::time::timeout(LEARN_BUDGET, pipeline).await {
-        Ok(Ok((services, run_cost))) => {
+        Ok(Ok((services, trajectory, run_cost))) => {
             // The catalogue is in hand; a failure while the worker finishes
             // teardown must not discard it. wait_worker has already reaped the
             // child on every error path, so here we only log and keep it.
@@ -687,7 +726,7 @@ async fn execute_learn(
                     "learn worker teardown failed after delivering its catalogue; keeping it"
                 );
             }
-            Ok((services, run_cost))
+            Ok((services, trajectory, run_cost))
         }
         Ok(Err(e)) => {
             reap_worker(&mut child, stderr_relay).await;

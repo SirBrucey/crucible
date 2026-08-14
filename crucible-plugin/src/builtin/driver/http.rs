@@ -4,7 +4,7 @@ use std::{net::SocketAddr, time::Duration};
 
 use crucible_core::{
     plan,
-    schema::{ClauseDecl, ClauseShape, HeadPattern, OpSig, Param, ParamType},
+    schema::{ClauseDecl, ClauseShape, HeadPattern, OpSig, Param, ParamType, ValueType},
     verdict::{Ack, Outcome},
 };
 use reqwest::{Client, Method, StatusCode};
@@ -31,12 +31,16 @@ pub struct Request {
     pub service: String,
     pub path: String,
     pub body: Option<Vec<u8>>,
+    /// The status the step says this answers with.
+    pub expect: Option<StatusCode>,
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("`{0}` is not an HTTP method")]
     Method(String),
+    #[error("`{0}` is not a status this could answer with")]
+    Status(plan::Value),
     #[error("a request names a service and a path")]
     Arguments,
     #[error("`{0}` is not a path: a path starts with `/`")]
@@ -110,10 +114,14 @@ impl Driver for Http {
 
     fn signatures() -> Vec<OpSig> {
         vec![
-            OpSig::action(HeadPattern::exact("POST"), request_params())
+            OpSig::action(HeadPattern::exact("POST"), request_params(), ValueType::Int)
                 .with_clause(ClauseDecl::new(BODY, ClauseShape::Block)),
-            OpSig::action(HeadPattern::exact("GET"), request_params()),
-            OpSig::action(HeadPattern::exact("DELETE"), request_params()),
+            OpSig::action(HeadPattern::exact("GET"), request_params(), ValueType::Int),
+            OpSig::action(
+                HeadPattern::exact("DELETE"),
+                request_params(),
+                ValueType::Int,
+            ),
         ]
     }
 
@@ -145,6 +153,7 @@ impl Driver for Http {
             service: service.to_owned(),
             path: path.to_owned(),
             body: step.body.as_deref().map(encode).transpose()?,
+            expect: expected_status(step.expect.as_ref())?,
         })
     }
 }
@@ -216,7 +225,7 @@ impl Call {
 
         let outcome = match builder.send().await {
             Ok(response) => {
-                let ack = classify(response.status());
+                let ack = classify(response.status(), self.request.expect);
                 let body = response.bytes().await.unwrap_or_default();
                 Outcome {
                     operation,
@@ -245,22 +254,40 @@ impl Call {
     }
 }
 
-/// The status decides whether the service took responsibility: a success
-/// acknowledges the request, a client error refuses it, and a server error
-/// leaves the caller unable to tell.
-fn classify(status: StatusCode) -> Ack {
-    if status.is_success() {
-        Ack::Acked
-    } else if status.is_client_error() {
-        Ack::Rejected
-    } else {
-        Ack::Unknown
+/// The status a step states it answers with, if it states one.
+fn expected_status(stated: Option<&plan::Value>) -> Result<Option<StatusCode>, Error> {
+    let Some(stated) = stated else {
+        return Ok(None);
+    };
+    stated
+        .as_int()
+        .and_then(|status| u16::try_from(status).ok())
+        .and_then(|status| StatusCode::from_u16(status).ok())
+        .map(Some)
+        .ok_or_else(|| Error::Status(stated.clone()))
+}
+
+/// Whether the response is what the step said it would be.
+///
+/// A step that states its status is held to that one, so a request written to
+/// be refused counts as delivered when it is refused, and as a failure when it
+/// succeeds. Without a stated status the step is held to the protocol: a
+/// success delivers, a client error does not, and a server error leaves the
+/// caller unable to tell.
+fn classify(status: StatusCode, stated: Option<StatusCode>) -> Ack {
+    match stated {
+        Some(stated) if stated == status => Ack::Acked,
+        Some(_) => Ack::Rejected,
+        None if status.is_success() => Ack::Acked,
+        None if status.is_client_error() => Ack::Rejected,
+        None => Ack::Unknown,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Error, Http, Request};
+    use super::{Ack, Error, Http, Request, StatusCode, classify};
+
     use crate::role::Driver;
     use crucible_core::{
         plan,
@@ -274,6 +301,7 @@ mod tests {
             operation: operation.into(),
             args,
             body: None,
+            expect: None,
         }
     }
 
@@ -285,6 +313,30 @@ mod tests {
                 plan::Value::Str(path.into()),
             ],
         )
+    }
+
+    #[test]
+    fn a_stated_status_is_what_the_step_is_held_to() {
+        let stated = Some(StatusCode::CONFLICT);
+        assert_eq!(classify(StatusCode::CONFLICT, stated), Ack::Acked);
+        assert_eq!(classify(StatusCode::CREATED, stated), Ack::Rejected);
+    }
+
+    #[test]
+    fn an_outcome_that_is_not_a_status_is_refused() {
+        let mut step = post_to("api", "/orders");
+        step.expect = Some(plan::Value::Str("banana".into()));
+        assert!(matches!(Http::bind(&step), Err(Error::Status(_))));
+
+        step.expect = Some(plan::Value::Int(7));
+        assert!(matches!(Http::bind(&step), Err(Error::Status(_))));
+    }
+
+    #[test]
+    fn an_unstated_status_is_held_to_the_protocol() {
+        assert_eq!(classify(StatusCode::CREATED, None), Ack::Acked);
+        assert_eq!(classify(StatusCode::CONFLICT, None), Ack::Rejected);
+        assert_eq!(classify(StatusCode::BAD_GATEWAY, None), Ack::Unknown);
     }
 
     #[test]
@@ -322,6 +374,7 @@ mod tests {
                 service: "api".into(),
                 path: "/orders".into(),
                 body: None,
+                expect: None,
             },
         );
     }

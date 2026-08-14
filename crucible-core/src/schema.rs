@@ -177,6 +177,20 @@ impl CmpOp {
     ];
 }
 
+/// Spelled as a scenario writes it.
+impl std::fmt::Display for CmpOp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            CmpOp::Eq => "==",
+            CmpOp::Ne => "!=",
+            CmpOp::Lt => "<",
+            CmpOp::Le => "<=",
+            CmpOp::Gt => ">",
+            CmpOp::Ge => ">=",
+        })
+    }
+}
+
 /// The signature of one operation: a driver action (a `do` step) or an observer
 /// observable (an `expect` predicate's left side).
 #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -184,21 +198,23 @@ pub struct OpSig {
     pub head: HeadPattern,
     pub params: Vec<Param>,
     pub clauses: Vec<ClauseDecl>,
-    /// An observable's result type; `None` for an action.
+    /// What this produces: an observable's reading, or the outcome an action
+    /// answers with. `None` when the plugin does not say.
     pub result: Option<ValueType>,
     /// The comparisons allowed on an observable's result; empty for an action.
     pub cmp_ops: Vec<CmpOp>,
 }
 
 impl OpSig {
-    /// A driver action: positional `params`, no result to compare.
+    /// A driver action: positional `params`, answering with `outcome`, which a
+    /// step may state to be held to.
     #[must_use]
-    pub fn action(head: HeadPattern, params: Vec<Param>) -> Self {
+    pub fn action(head: HeadPattern, params: Vec<Param>, outcome: ValueType) -> Self {
         Self {
             head,
             params,
             clauses: Vec::new(),
-            result: None,
+            result: Some(outcome),
             cmp_ops: Vec::new(),
         }
     }
