@@ -295,7 +295,12 @@ impl Worker<Executing> {
         };
 
         let ((verdict, kill_report), orchestrator) = orchestrator
-            .execute(schedule_id, &self.state.fault, queries)
+            .execute(
+                schedule_id,
+                &self.state.fault,
+                queries,
+                schedule.trajectory.clone(),
+            )
             .await
             .inspect_err(
                 |e| tracing::error!(worker_id = self.id, schedule_id, error = %e, "execute failed"),

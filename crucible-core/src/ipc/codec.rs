@@ -148,6 +148,10 @@ mod tests {
                 direction: Direction::ClientToUpstream,
                 k: 3,
             },
+            vec![
+                vec![Some(crate::plan::Value::Int(0))],
+                vec![Some(crate::plan::Value::Int(3))],
+            ],
         )))
         .await;
     }

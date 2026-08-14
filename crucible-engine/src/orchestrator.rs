@@ -239,6 +239,7 @@ impl Orchestrator<Ready> {
         schedule_id: u32,
         fault: &Anchor,
         queries: Vec<PreparedCheck>,
+        fault_free: Vec<Checkpoint>,
     ) -> Result<((Verdict, KillReport), Orchestrator<Done>), crucible_plugin::Error> {
         let Orchestrator {
             deployment,
@@ -328,6 +329,7 @@ impl Orchestrator<Ready> {
             }
 
             observations.checks = read_checks(deployment.as_ref(), &queries).await?;
+            observations.fault_free = fault_free;
             session_observer.observe(&mut observations);
             let verdict = driver_for(Invariant::Durable).drive(&observations);
             Ok((verdict, kill_report))

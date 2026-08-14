@@ -609,7 +609,7 @@ async fn drive(bus: &EventBus, plan: &plan::Plan) -> Result<CampaignOutcome> {
         "session catalogue received"
     );
 
-    let mut scheduler = BurstScheduler::new(&plan.fleet, scenario, &services);
+    let mut scheduler = BurstScheduler::new(&plan.fleet, scenario, &services, &trajectory);
     let total = scheduler.total();
     let mut pool = Pool::new(
         bus,

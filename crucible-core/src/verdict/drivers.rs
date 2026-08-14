@@ -1,7 +1,7 @@
 //! Verdict drivers for the four invariants. Idempotent, Converges, and
 //! Recovers remain stubs until their invariants land.
 
-use super::{Driver, Observations};
+use super::{Ack, Checkpoint, Driver, Observations, Observed};
 use crate::ipc::Verdict;
 
 pub struct Idempotent;
@@ -50,48 +50,114 @@ impl Driver for Durable {
             };
         }
 
-        // A step the caller was told had failed leaves the fleet somewhere the
-        // scenario never describes: not where it started and not where it was
-        // written to end. Saying where takes a checkpoint per step, so until
-        // there is one this declines rather than holding a partial run to an
-        // expectation written for a whole one.
-        let undelivered = observations.undelivered();
-        if undelivered > 0 {
+        // A checkpoint says where the fleet stands once the first N steps have
+        // landed. If every step landed we hold the run to the last one, in
+        // whatever order they got there. If a step in the middle did not land
+        // and a later one did, no checkpoint says where that leaves things.
+        let landed = match steps_landed(observations) {
+            Ok(landed) => landed,
+            Err(reason) => return Verdict::Inconclusive { reason },
+        };
+        let Some(expected) = observations.fault_free.get(landed) else {
             return Verdict::Inconclusive {
                 reason: format!(
-                    "{undelivered} of {} step(s) did not complete, and where that leaves the fleet takes a checkpoint per step to say",
-                    observations.outcomes.len()
+                    "the fault-free run left {} checkpoint(s), so it cannot say where {landed} step(s) leave the fleet",
+                    observations.fault_free.len()
                 ),
             };
-        }
+        };
 
-        // Every step completed, so the fleet was told to reach the state the
-        // scenario describes and reported that it had. Anything else is state
-        // lost or invented behind the caller's back.
-        for observed in &observations.checks {
-            let observable = observed.observable();
-            match observed.holds() {
-                Some(true) => {}
-                Some(false) => {
-                    return Verdict::Fail {
-                        reason: format!(
-                            "every step completed, but `{observable}` holds {} rather than {}",
-                            observed.value, observed.check.value
-                        ),
-                    };
-                }
-                None => {
-                    return Verdict::Inconclusive {
-                        reason: format!(
-                            "`{observable}` read as {}, which the scenario's {} cannot be compared against",
-                            observed.value, observed.check.value
-                        ),
-                    };
-                }
-            }
+        // What the fleet settled on once the target was back, which is the only
+        // state the verdict turns on. Diverging part way through and coming back
+        // is a fleet that recovered, not a fleet that lost something.
+        let settled: Checkpoint = observations
+            .checks
+            .iter()
+            .map(|observed| Some(observed.value.clone()))
+            .collect();
+        match differing(&settled, expected) {
+            Ok(None) => Verdict::Pass,
+            Ok(Some(at)) => Verdict::Fail {
+                reason: failure(observations, &settled, expected, landed, at),
+            },
+            Err(at) => Verdict::Inconclusive {
+                reason: format!(
+                    "`{}` could not be read in both runs",
+                    observable(observations, at)
+                ),
+            },
         }
-        Verdict::Pass
     }
+}
+
+/// How many steps the fleet took responsibility for. Counts from the first, and
+/// refuses a run that skipped one and carried on, since no checkpoint says where
+/// that leaves the fleet.
+fn steps_landed(observations: &Observations) -> Result<usize, String> {
+    let landed: Vec<bool> = observations
+        .outcomes
+        .iter()
+        .map(|outcome| outcome.ack == Ack::Acked)
+        .collect();
+    let counted = landed.iter().take_while(|landed| **landed).count();
+    if landed[counted..].iter().any(|landed| *landed) {
+        return Err(format!(
+            "step {} did not land and a later one did, which no checkpoint describes",
+            counted + 1
+        ));
+    }
+    Ok(counted)
+}
+
+/// The first observable the two readings disagree on, `None` if they agree, and
+/// the index of one that could not be read on either side.
+fn differing(reached: &Checkpoint, expected: &Checkpoint) -> Result<Option<usize>, usize> {
+    for (i, (reached, expected)) in reached.iter().zip(expected).enumerate() {
+        match (reached, expected) {
+            (Some(reached), Some(expected)) if reached == expected => {}
+            (Some(_), Some(_)) => return Ok(Some(i)),
+            _ => return Err(i),
+        }
+    }
+    Ok(None)
+}
+
+/// What went wrong, and the step the fleet started getting it wrong at.
+fn failure(
+    observations: &Observations,
+    settled: &Checkpoint,
+    expected: &Checkpoint,
+    landed: usize,
+    at: usize,
+) -> String {
+    let observable = observable(observations, at);
+    let reason = match (&settled[at], &expected[at]) {
+        (Some(settled), Some(expected)) => format!(
+            "the fleet took {landed} step(s), which leaves `{observable}` at {expected}, and it \
+             holds {settled}"
+        ),
+        _ => format!("`{observable}` disagrees with the fault-free run"),
+    };
+    match diverged_at(observations) {
+        Some(0) | None => reason,
+        Some(step) => format!("{reason}; it first differed after step {step}"),
+    }
+}
+
+/// The step this run's state first parted from the fault-free run's.
+fn diverged_at(observations: &Observations) -> Option<usize> {
+    observations
+        .trajectory
+        .iter()
+        .zip(&observations.fault_free)
+        .position(|(reached, expected)| reached != expected)
+}
+
+fn observable(observations: &Observations, i: usize) -> String {
+    observations
+        .checks
+        .get(i)
+        .map_or_else(|| format!("observable {i}"), Observed::observable)
 }
 
 impl Driver for Recovers {
@@ -134,8 +200,8 @@ mod tests {
         }
     }
 
-    /// A check stating `writes.count == stated`, read as `read`.
-    fn reading(stated: i64, read: i64) -> Observed {
+    /// A reading of `writes.count`.
+    fn reading(read: i64) -> Observed {
         Observed {
             check: plan::Check {
                 service: "db".into(),
@@ -144,19 +210,26 @@ mod tests {
                 args: Vec::new(),
                 filter: None,
                 op: crate::schema::CmpOp::Eq,
-                value: plan::Value::Int(stated),
+                value: plan::Value::Int(read),
             },
             value: plan::Value::Int(read),
         }
     }
 
-    /// A run whose fault fired and whose state was read, so what the scenario
-    /// states is the only thing left to decide the verdict.
-    fn judged(acks: &[Ack], readings: Vec<Observed>) -> Verdict {
+    /// One point of a run, where the scenario states a single check.
+    fn checkpoint(value: i64) -> Checkpoint {
+        vec![Some(plan::Value::Int(value))]
+    }
+
+    /// A run whose fault fired, judged against a fault-free run that stood at
+    /// `fault_free` after each step, and that settled at `settled` once the
+    /// target was back.
+    fn judged(acks: &[Ack], fault_free: &[i64], settled: i64) -> Verdict {
         let mut obs = Observations::empty();
         obs.kill = Some(fired_kill());
         obs.outcomes = acks.iter().copied().map(outcome).collect();
-        obs.checks = readings;
+        obs.checks = vec![reading(settled)];
+        obs.fault_free = fault_free.iter().copied().map(checkpoint).collect();
         Durable.drive(&obs)
     }
 
@@ -186,7 +259,7 @@ mod tests {
                 crucible_protocol::KillMissReason::ScenarioEndedBeforeAnchor,
             ),
         });
-        obs.checks = vec![reading(0, 0)];
+        obs.checks = vec![reading(0)];
         assert!(matches!(Durable.drive(&obs), Verdict::Inconclusive { .. }));
     }
 
@@ -202,93 +275,108 @@ mod tests {
     fn a_scenario_that_drove_nothing_is_not_a_test() {
         let mut obs = Observations::empty();
         obs.kill = Some(fired_kill());
-        obs.checks = vec![reading(0, 0)];
+        obs.checks = vec![reading(0)];
         assert!(matches!(Durable.drive(&obs), Verdict::Inconclusive { .. }));
     }
 
     #[test]
-    fn a_run_that_reached_what_the_scenario_states_is_pass() {
+    fn settling_where_the_fault_free_run_ended_is_pass() {
         assert_eq!(
-            judged(&[Ack::Acked, Ack::Acked], vec![reading(2, 2)]),
+            judged(&[Ack::Acked, Ack::Acked], &[0, 1, 2], 2),
             Verdict::Pass,
         );
     }
 
     #[test]
-    fn every_check_has_to_hold() {
+    fn settling_anywhere_else_is_fail() {
+        assert!(matches!(
+            judged(&[Ack::Acked, Ack::Acked], &[0, 1, 2], 1),
+            Verdict::Fail { .. },
+        ));
+    }
+
+    /// The steps the fleet refused are steps it never owed anything for, so the
+    /// run answers to the checkpoint it got as far as.
+    #[test]
+    fn a_run_that_took_fewer_steps_answers_to_an_earlier_checkpoint() {
         assert_eq!(
-            judged(
-                &[Ack::Acked],
-                vec![reading(1, 1), reading(1, 1), reading(1, 1)],
-            ),
+            judged(&[Ack::Acked, Ack::Rejected], &[0, 1, 2], 1),
             Verdict::Pass,
         );
         assert!(matches!(
-            judged(&[Ack::Acked], vec![reading(1, 1), reading(1, 0)]),
+            judged(&[Ack::Acked, Ack::Rejected], &[0, 1, 2], 2),
             Verdict::Fail { .. },
         ));
     }
 
     #[test]
-    fn state_the_run_never_reached_is_fail() {
+    fn a_step_refused_while_a_later_one_landed_is_inconclusive() {
         assert!(matches!(
-            judged(&[Ack::Acked, Ack::Acked], vec![reading(2, 1)]),
-            Verdict::Fail { .. },
-        ));
-    }
-
-    #[test]
-    fn state_the_run_never_asked_for_is_fail() {
-        assert!(matches!(
-            judged(&[Ack::Acked], vec![reading(1, 2)]),
-            Verdict::Fail { .. },
-        ));
-    }
-
-    /// A step the caller was told had failed leaves the fleet part way through
-    /// the scenario, and the scenario only describes the end of it.
-    #[test]
-    fn a_step_that_did_not_complete_is_inconclusive() {
-        for ack in [Ack::Rejected, Ack::Unknown] {
-            assert!(matches!(
-                judged(&[Ack::Acked, ack], vec![reading(2, 1)]),
-                Verdict::Inconclusive { .. },
-            ));
-        }
-    }
-
-    #[test]
-    fn a_reading_of_another_shape_is_not_a_comparison() {
-        let mut mismatched = reading(1, 1);
-        mismatched.value = plan::Value::Str("one".into());
-        assert!(matches!(
-            judged(&[Ack::Acked], vec![mismatched]),
+            judged(&[Ack::Rejected, Ack::Acked], &[0, 1, 2], 1),
             Verdict::Inconclusive { .. },
         ));
     }
 
     #[test]
-    fn an_ordering_holds_as_well_as_an_equality() {
-        let mut at_least = reading(2, 3);
-        at_least.check.op = crate::schema::CmpOp::Ge;
-        assert_eq!(judged(&[Ack::Acked], vec![at_least]), Verdict::Pass);
-
-        let mut too_few = reading(2, 1);
-        too_few.check.op = crate::schema::CmpOp::Ge;
+    fn a_fault_free_run_too_short_to_say_is_inconclusive() {
         assert!(matches!(
-            judged(&[Ack::Acked], vec![too_few]),
-            Verdict::Fail { .. },
+            judged(&[Ack::Acked, Ack::Acked], &[0, 1], 2),
+            Verdict::Inconclusive { .. },
         ));
+    }
+
+    /// The fault-free run could not read the state it is meant to be the
+    /// authority on, so there is nothing to hold this run to.
+    #[test]
+    fn an_unread_observable_is_inconclusive() {
+        let mut obs = Observations::empty();
+        obs.kill = Some(fired_kill());
+        obs.outcomes = vec![outcome(Ack::Acked)];
+        obs.checks = vec![reading(1)];
+        obs.fault_free = vec![checkpoint(0), vec![None]];
+        assert!(matches!(Durable.drive(&obs), Verdict::Inconclusive { .. }));
+    }
+
+    /// Falling behind under the fault and catching up afterwards is a fleet
+    /// that recovered, so only where it settled counts.
+    #[test]
+    fn diverging_and_coming_back_is_pass() {
+        let mut obs = Observations::empty();
+        obs.kill = Some(fired_kill());
+        obs.outcomes = vec![outcome(Ack::Acked), outcome(Ack::Acked)];
+        obs.checks = vec![reading(2)];
+        obs.trajectory = vec![checkpoint(0), checkpoint(0), checkpoint(2)];
+        obs.fault_free = vec![checkpoint(0), checkpoint(1), checkpoint(2)];
+        assert_eq!(Durable.drive(&obs), Verdict::Pass);
+    }
+
+    #[test]
+    fn a_failure_points_at_the_step_the_run_first_differed_after() {
+        let mut obs = Observations::empty();
+        obs.kill = Some(fired_kill());
+        obs.outcomes = vec![outcome(Ack::Acked), outcome(Ack::Acked)];
+        obs.checks = vec![reading(1)];
+        obs.trajectory = vec![checkpoint(0), checkpoint(1), checkpoint(1)];
+        obs.fault_free = vec![checkpoint(0), checkpoint(1), checkpoint(2)];
+        let Verdict::Fail { reason } = Durable.drive(&obs) else {
+            panic!("settling short of the fault-free run is a failure");
+        };
+        assert!(reason.contains("after step 2"), "reason: {reason}");
     }
 
     #[test]
     fn a_verdict_names_the_check_as_the_scenario_spells_it() {
-        let mut filtered = reading(96, 100);
+        let mut filtered = reading(100);
         filtered.check.observable = vec!["stock".into(), "select".into()];
         filtered.check.args = vec![plan::Value::Ident("level".into())];
         filtered.check.filter = Some(("item".into(), plan::Value::Str("book".into())));
-        let Verdict::Fail { reason } = judged(&[Ack::Acked], vec![filtered]) else {
-            panic!("a reading that misses what the scenario states is a failure");
+        let mut obs = Observations::empty();
+        obs.kill = Some(fired_kill());
+        obs.outcomes = vec![outcome(Ack::Acked)];
+        obs.checks = vec![filtered];
+        obs.fault_free = vec![checkpoint(100), checkpoint(96)];
+        let Verdict::Fail { reason } = Durable.drive(&obs) else {
+            panic!("settling somewhere the fault-free run never did is a failure");
         };
         assert!(
             reason.contains(r#"stock.select level where item = "book""#),

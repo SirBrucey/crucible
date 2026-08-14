@@ -30,6 +30,9 @@ pub struct Observations {
     /// first step, then one per step. A step's effects are what separates its
     /// checkpoint from the one before it.
     pub trajectory: Vec<Checkpoint>,
+    /// The fault-free run's trajectory, which this run is judged against. Empty
+    /// in the fault-free run itself.
+    pub fault_free: Vec<Checkpoint>,
     pub sessions: Vec<crucible_protocol::Session>,
     pub kill: Option<crucible_protocol::KillReport>,
 }
