@@ -33,8 +33,18 @@ pub struct Observations {
     /// The fault-free run's trajectory, which this run is judged against. Empty
     /// in the fault-free run itself.
     pub fault_free: Vec<Checkpoint>,
+    /// When each step ran, in the order the scenario states them.
+    pub windows: Vec<StepWindow>,
     pub sessions: Vec<crucible_protocol::Session>,
     pub kill: Option<crucible_protocol::KillReport>,
+}
+
+/// When a step ran, as nanoseconds from scenario start. The fault records the
+/// same origin, so a verdict can say which steps it landed among.
+#[derive(Clone, Copy, Debug)]
+pub struct StepWindow {
+    pub start_ns: u128,
+    pub end_ns: u128,
 }
 
 /// What every check the scenario states read at one point in a run, in the

@@ -1,7 +1,9 @@
 //! Verdict drivers for the four invariants. Idempotent, Converges, and
 //! Recovers remain stubs until their invariants land.
 
-use super::{Ack, Checkpoint, Driver, Observations};
+use crucible_protocol::{KillReport, KillResult};
+
+use super::{Ack, Checkpoint, Driver, Observations, StepWindow};
 use crate::ipc::Verdict;
 
 pub struct Idempotent;
@@ -28,16 +30,32 @@ impl Driver for Converges {
 impl Driver for Durable {
     fn drive(&mut self, observations: &Observations) -> Verdict {
         // No fault fired => nothing to test.
-        let Some(kill) = &observations.kill else {
-            return Verdict::Inconclusive {
-                reason: "no kill was scheduled".into(),
-            };
+        let fault = match &observations.kill {
+            None => {
+                return Verdict::Inconclusive {
+                    reason: "no kill was scheduled".into(),
+                };
+            }
+            Some(KillReport {
+                result: KillResult::Missed(miss),
+                ..
+            }) => {
+                return Verdict::Inconclusive {
+                    reason: format!("fault did not fire: {miss:?}"),
+                };
+            }
+            Some(KillReport {
+                service,
+                result:
+                    KillResult::Fired {
+                        actual_offset_ns, ..
+                    },
+                ..
+            }) => Kill {
+                service,
+                at_ns: *actual_offset_ns,
+            },
         };
-        if let crucible_protocol::KillResult::Missed(miss) = &kill.result {
-            return Verdict::Inconclusive {
-                reason: format!("fault did not fire: {miss:?}"),
-            };
-        }
 
         if observations.outcomes.is_empty() {
             return Verdict::Inconclusive {
@@ -78,7 +96,7 @@ impl Driver for Durable {
         match differing(&settled, expected) {
             Ok(None) => Verdict::Pass,
             Ok(Some(at)) => Verdict::Fail {
-                reason: failure(observations, &settled, expected, landed, at),
+                reason: failure(observations, fault, &settled, expected, landed, at),
             },
             Err(at) => Verdict::Inconclusive {
                 reason: format!(
@@ -122,9 +140,19 @@ fn differing(reached: &Checkpoint, expected: &Checkpoint) -> Result<Option<usize
     Ok(None)
 }
 
-/// What went wrong, and the step the fleet started getting it wrong at.
+/// The kill this run was judging, once it is known to have fired.
+#[derive(Clone, Copy)]
+struct Kill<'a> {
+    service: &'a str,
+    /// Nanoseconds from scenario start when the fault was placed.
+    at_ns: u128,
+}
+
+/// What the fault was, where it landed, what should have been true, and the step
+/// the fleet started getting it wrong at.
 fn failure(
     observations: &Observations,
+    fault: Kill<'_>,
     settled: &Checkpoint,
     expected: &Checkpoint,
     landed: usize,
@@ -133,14 +161,53 @@ fn failure(
     let observable = observable(observations, at);
     let reason = match (&settled[at], &expected[at]) {
         (Some(settled), Some(expected)) => format!(
-            "the fleet took {landed} step(s), which leaves `{observable}` at {expected}, and it \
-             holds {settled}"
+            "The fleet took {} which left `{observable}` at `{settled}`, expected value \
+             `{expected}`",
+            steps(landed)
         ),
         _ => format!("`{observable}` disagrees with the fault-free run"),
     };
-    match diverged_at(observations) {
-        Some(0) | None => reason,
-        Some(step) => format!("{reason}; it first differed after step {step}"),
+    // Only worth saying when the state parted on the way to the step being
+    // judged. Parting after that is downstream of the verdict, not evidence for
+    // it, and reads as a contradiction next to the count of steps that landed.
+    let diverged = match diverged_at(observations).filter(|step| (1..=landed).contains(step)) {
+        Some(step) => format!(". It first differed after step {step}"),
+        None => String::new(),
+    };
+    format!(
+        "`{}` was killed {}. {reason}{diverged}",
+        fault.service,
+        placement(&observations.windows, fault.at_ns)
+    )
+}
+
+/// Where a moment in the run sits against the scenario's steps.
+fn placement(windows: &[StepWindow], at_ns: u128) -> String {
+    let Some(first) = windows.first() else {
+        return "at an unknown point".into();
+    };
+    if at_ns < first.start_ns {
+        return "before step 1".into();
+    }
+    for (i, window) in windows.iter().enumerate() {
+        if at_ns <= window.end_ns {
+            // Past the previous step's end but short of this one's start: the
+            // fleet was between the two, with nothing of the scenario in flight.
+            if at_ns < window.start_ns {
+                return format!("between steps {i} and {}", i + 1);
+            }
+            return format!("during step {}", i + 1);
+        }
+    }
+    format!("after step {}", windows.len())
+}
+
+/// `n` steps, spelled so a verdict does not have to say "step(s)".
+fn steps(n: usize) -> String {
+    if n == 1 {
+        "1 step".into()
+    } else {
+        format!("{n} steps")
     }
 }
 
@@ -179,13 +246,18 @@ mod tests {
     };
 
     fn fired_kill() -> KillReport {
+        fired_kill_at(0)
+    }
+
+    /// A kill of `db` placed `at_ns` nanoseconds into the scenario.
+    fn fired_kill_at(at_ns: u128) -> KillReport {
         KillReport {
             schedule_id: 0,
             service: "db".into(),
             result: KillResult::Fired {
                 requested_direction: crucible_protocol::Direction::ClientToUpstream,
                 requested_packet_index: 1,
-                actual_offset_ns: 0,
+                actual_offset_ns: at_ns,
                 killed_at_ns: 0,
             },
         }
@@ -364,6 +436,22 @@ mod tests {
         assert!(reason.contains("after step 2"), "reason: {reason}");
     }
 
+    /// Parting after the step being judged says nothing about why the run
+    /// failed, and reads as a contradiction beside the count of steps it took.
+    #[test]
+    fn a_failure_keeps_quiet_about_a_divergence_past_the_step_it_judged() {
+        let mut obs = Observations::empty();
+        obs.kill = Some(fired_kill());
+        obs.outcomes = vec![outcome(Ack::Acked), outcome(Ack::Rejected)];
+        obs.checks = vec![reading(2)];
+        obs.trajectory = vec![checkpoint(0), checkpoint(1), checkpoint(5)];
+        obs.fault_free = vec![checkpoint(0), checkpoint(1), checkpoint(2)];
+        let Verdict::Fail { reason } = Durable.drive(&obs) else {
+            panic!("holding 2 where 1 step landed is a failure");
+        };
+        assert!(!reason.contains("first differed"), "reason: {reason}");
+    }
+
     #[test]
     fn a_verdict_names_the_check_as_the_scenario_spells_it() {
         let mut filtered = reading(100);
@@ -382,5 +470,48 @@ mod tests {
             reason.contains(r#"stock.select level where item = "book""#),
             "reason: {reason}"
         );
+    }
+
+    /// A verdict on its own says what moved, not what moved it, so it leads with
+    /// the fault and where in the scenario it landed.
+    #[test]
+    fn a_verdict_names_the_fault_that_caused_it() {
+        let mut obs = Observations::empty();
+        obs.kill = Some(fired_kill_at(150));
+        obs.outcomes = vec![outcome(Ack::Acked), outcome(Ack::Acked)];
+        obs.checks = vec![reading(1)];
+        obs.fault_free = vec![checkpoint(0), checkpoint(1), checkpoint(2)];
+        obs.windows = vec![window(0, 100), window(120, 200)];
+        let Verdict::Fail { reason } = Durable.drive(&obs) else {
+            panic!("settling short of the fault-free run is a failure");
+        };
+        assert!(
+            reason.starts_with("`db` was killed during step 2."),
+            "{reason}"
+        );
+    }
+
+    fn window(start_ns: u128, end_ns: u128) -> StepWindow {
+        StepWindow { start_ns, end_ns }
+    }
+
+    #[test]
+    fn a_fault_is_placed_against_the_step_that_was_in_flight() {
+        let windows = [window(10, 100), window(120, 200)];
+        for (at_ns, placed) in [
+            (5, "before step 1"),
+            (10, "during step 1"),
+            (100, "during step 1"),
+            (110, "between steps 1 and 2"),
+            (150, "during step 2"),
+            (900, "after step 2"),
+        ] {
+            assert_eq!(placement(&windows, at_ns), placed, "at {at_ns}ns");
+        }
+    }
+
+    #[test]
+    fn a_fault_with_no_steps_to_place_it_against_says_so() {
+        assert!(placement(&[], 150).contains("unknown"));
     }
 }

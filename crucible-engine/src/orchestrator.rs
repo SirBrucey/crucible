@@ -13,7 +13,7 @@ use crucible_core::{
     ipc::Verdict,
     observer::SessionObserver,
     proxy_log::service_profiles_from_sessions,
-    verdict::{Checkpoint, Invariant, Observations, Observed, driver_for},
+    verdict::{Checkpoint, Invariant, Observations, Observed, StepWindow, driver_for},
 };
 use crucible_plugin::{
     Action, DeploymentRuntime, FaultPrimitives, Targeted, registry::PreparedCheck,
@@ -198,17 +198,24 @@ impl Orchestrator<Ready> {
             },
         } = self;
         let scenario_start_ns = now_ns();
-        let mut observations =
-            match run_actions(deployment.as_ref(), &actions, queries, &session_observer).await {
-                Ok(observations) => observations,
-                Err(e) => {
-                    // A failed scenario leaves the replica up; tear it down
-                    // rather than dropping the only handle to it and its
-                    // observer tasks.
-                    let _ = teardown_replica(deployment, session_observer).await;
-                    return Err(e);
-                }
-            };
+        let mut observations = match run_actions(
+            deployment.as_ref(),
+            &actions,
+            queries,
+            &session_observer,
+            Instant::now(),
+        )
+        .await
+        {
+            Ok(observations) => observations,
+            Err(e) => {
+                // A failed scenario leaves the replica up; tear it down
+                // rather than dropping the only handle to it and its
+                // observer tasks.
+                let _ = teardown_replica(deployment, session_observer).await;
+                return Err(e);
+            }
+        };
         // Let the fleet fall quiescent before snapshotting, so writes that land
         // after their HTTP response is acked (the async consumer path) are
         // observed and yield anchors. Without this the snapshot is taken while
@@ -264,8 +271,14 @@ impl Orchestrator<Ready> {
             let (scenario_end_tx, mut scenario_end_rx) = tokio::sync::oneshot::channel::<()>();
             let scenario_start = Instant::now();
             let scenario_fut = async {
-                let result =
-                    run_actions(deployment.as_ref(), &actions, &queries, &session_observer).await;
+                let result = run_actions(
+                    deployment.as_ref(),
+                    &actions,
+                    &queries,
+                    &session_observer,
+                    scenario_start,
+                )
+                .await;
                 let _ = scenario_end_tx.send(());
                 result
             };
@@ -445,6 +458,7 @@ async fn run_actions(
     actions: &[TargetedAction],
     queries: &[PreparedCheck],
     session_observer: &SessionObserver,
+    scenario_start: Instant,
 ) -> Result<Observations, crucible_plugin::Error> {
     let mut observations = Observations::empty();
     // The state before anything ran, so a step that changed nothing has a
@@ -453,10 +467,18 @@ async fn run_actions(
         .trajectory
         .push(read_checkpoint(deployment, queries).await);
     for (action, endpoint) in actions {
+        let start_ns = scenario_start.elapsed().as_nanos();
         observations.outcomes.push(action.run(*endpoint).await?);
         session_observer
             .wait_for_quiescence(STEP_SETTLE, QUIESCENCE_IDLE, STEP_BUDGET)
             .await;
+        // The step is only over once the fleet has stopped working on it, so a
+        // fault that lands on the consumer's half of the step is still that
+        // step's.
+        observations.windows.push(StepWindow {
+            start_ns,
+            end_ns: scenario_start.elapsed().as_nanos(),
+        });
         observations
             .trajectory
             .push(read_checkpoint(deployment, queries).await);
