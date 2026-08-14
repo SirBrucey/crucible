@@ -31,7 +31,7 @@ use crucible_core::{
 
 use crate::{
     error::Error as PluginError,
-    role::{BoxFuture, Deployment, DeploymentRuntime, FaultPrimitives},
+    role::{BoxFuture, Deployment, DeploymentRuntime, Faults, Freeze, Kill},
 };
 
 const READINESS_TIMEOUT: Duration = Duration::from_mins(1);
@@ -754,7 +754,7 @@ fn owned_idents(service: &plan::Service, attr: &'static str) -> Result<Vec<Strin
         .collect()
 }
 
-impl FaultPrimitives for Docker {
+impl Freeze for Docker {
     /// SIGUSR1 the proxy: it resets its packet counter and begins counting, so
     /// the anchor lands relative to scenario traffic rather than the fleet's
     /// bring-up. When it reaches the scheduled packet the proxy freezes the
@@ -775,7 +775,16 @@ impl FaultPrimitives for Docker {
                 .map_err(PluginError::from)
         })
     }
+}
 
+/// Docker owns the containers behind the fleet, so it is what can take one away.
+impl Faults for Docker {
+    fn kills(&self) -> Option<&dyn Kill> {
+        Some(self)
+    }
+}
+
+impl Kill for Docker {
     fn kill(&self, service: &str) -> BoxFuture<'_, Result<u128, PluginError>> {
         let service = service.to_owned();
         Box::pin(async move { self.kill_backing(&service).await.map_err(PluginError::from) })

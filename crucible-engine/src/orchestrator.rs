@@ -15,9 +15,7 @@ use crucible_core::{
     proxy_log::service_profiles_from_sessions,
     verdict::{Checkpoint, Observations, Observed, StepWindow, driver_for},
 };
-use crucible_plugin::{
-    Action, DeploymentRuntime, FaultPrimitives, Targeted, registry::PreparedCheck,
-};
+use crucible_plugin::{Action, DeploymentRuntime, Freeze, Kill, Targeted, registry::PreparedCheck};
 
 /// After a restart, wait this long before judging the fleet quiescent, so
 /// recovery traffic has a chance to start.
@@ -256,6 +254,14 @@ impl Orchestrator<Ready> {
             },
         } = self;
         let anchor = fault.anchor();
+        // A kill is only ever scheduled where a loaded plugin can drive one, so
+        // this resolves for every schedule the scheduler produced.
+        let killer = deployment.kills().ok_or_else(|| {
+            crucible_plugin::Error::new(
+                "orchestrator",
+                format!("nothing loaded can kill `{}`", anchor.service),
+            )
+        })?;
 
         // Run the fault sequence borrowing the replica handles, so whatever the
         // outcome we still own them afterwards: on success they move into `Done`
@@ -307,7 +313,7 @@ impl Orchestrator<Ready> {
                         // fail; ops once it is back succeed) rather than the world
                         // stopping while we heal.
                         let actual = scenario_start.elapsed().as_nanos();
-                        Ok(fire_kill(deployment.as_ref(), schedule_id, anchor, actual).await?)
+                        Ok(fire_kill(deployment.as_ref(), killer, schedule_id, anchor, actual).await?)
                     }
                     _ = &mut scenario_end_rx => {
                         // The scenario finished before a freeze was seen. The freeze
@@ -317,7 +323,7 @@ impl Orchestrator<Ready> {
                         // concluding the anchor was missed.
                         if session_observer.wait_for_freeze(FREEZE_GRACE).await {
                             let actual = scenario_start.elapsed().as_nanos();
-                            Ok(fire_kill(deployment.as_ref(), schedule_id, anchor, actual).await?)
+                            Ok(fire_kill(deployment.as_ref(), killer, schedule_id, anchor, actual).await?)
                         } else {
                             // Genuinely no freeze; release it in case one is
                             // mid-flight and record the miss.
@@ -497,12 +503,13 @@ async fn run_actions(
 /// error rather than being reported as a successful kill. A failed kill, by
 /// contrast, is a miss (nothing fired), not an error.
 async fn fire_kill(
-    deployment: &dyn FaultPrimitives,
+    deployment: &dyn Freeze,
+    killer: &dyn Kill,
     id: u32,
     fault: &Anchor,
     actual_offset_ns: u128,
 ) -> Result<KillReport, crucible_plugin::Error> {
-    let killed_at_ns = match deployment.kill(&fault.service).await {
+    let killed_at_ns = match killer.kill(&fault.service).await {
         Ok(killed_at_ns) => killed_at_ns,
         Err(e) => {
             // The kill never landed, so nothing is dead; release the freeze the
@@ -513,7 +520,7 @@ async fn fire_kill(
         }
     };
     deployment.resume().await?;
-    deployment.restart(&fault.service).await?;
+    killer.restart(&fault.service).await?;
     Ok(KillReport {
         schedule_id: id,
         service: fault.service.clone(),
@@ -542,7 +549,7 @@ mod tests {
         restart_fails: bool,
     }
 
-    impl FaultPrimitives for FakeDeployment {
+    impl Freeze for FakeDeployment {
         fn arm_anchor(&self) -> BoxFuture<'_, Result<(), crucible_plugin::Error>> {
             Box::pin(async { Ok(()) })
         }
@@ -556,7 +563,9 @@ mod tests {
                 }
             })
         }
+    }
 
+    impl Kill for FakeDeployment {
         fn kill(&self, _service: &str) -> BoxFuture<'_, Result<u128, crucible_plugin::Error>> {
             Box::pin(async move {
                 if self.kill_fails {
@@ -593,7 +602,7 @@ mod tests {
     #[tokio::test]
     async fn fire_kill_reports_fired_when_recovery_succeeds() {
         let deployment = FakeDeployment::default();
-        let report = fire_kill(&deployment, 1, &fault(), 0)
+        let report = fire_kill(&deployment, &deployment, 1, &fault(), 0)
             .await
             .expect("recovery succeeded, so fire_kill returns a report");
         assert!(matches!(report.result, KillResult::Fired { .. }));
@@ -607,7 +616,7 @@ mod tests {
             restart_fails: true,
             ..Default::default()
         };
-        let result = fire_kill(&deployment, 1, &fault(), 0).await;
+        let result = fire_kill(&deployment, &deployment, 1, &fault(), 0).await;
         assert!(result.is_err());
     }
 
@@ -619,7 +628,7 @@ mod tests {
             resume_fails: true,
             ..Default::default()
         };
-        let result = fire_kill(&deployment, 1, &fault(), 0).await;
+        let result = fire_kill(&deployment, &deployment, 1, &fault(), 0).await;
         assert!(result.is_err());
     }
 
@@ -630,7 +639,7 @@ mod tests {
             kill_fails: true,
             ..Default::default()
         };
-        let report = fire_kill(&deployment, 1, &fault(), 0)
+        let report = fire_kill(&deployment, &deployment, 1, &fault(), 0)
             .await
             .expect("kill-failure is a miss, not an error");
         assert!(matches!(

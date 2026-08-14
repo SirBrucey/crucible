@@ -47,7 +47,7 @@ pub use error::Error;
 #[cfg(feature = "framework")]
 pub use registry::Registry;
 pub use role::{
-    Action, BoxFuture, Deployment, DeploymentRuntime, Driver, DriverRuntime, FaultPrimitives,
+    Action, BoxFuture, Deployment, DeploymentRuntime, Driver, DriverRuntime, Faults, Freeze, Kill,
     Observer, ObserverRuntime, Query, Targeted,
 };
 pub use serve::serve_observer;

@@ -39,14 +39,29 @@ pub trait Deployment {
     fn bind(service: &plan::Service) -> Result<Self::Config, Self::Error>;
 }
 
-/// The faults a schedule drives against a live replica. Separate from the
-/// replica's lifecycle, because a schedule only ever needs these.
-pub trait FaultPrimitives: Send + Sync {
+/// Hold the fleet still at the anchored moment and let it go again. Every
+/// deployment provides this: it is how a fault is placed precisely, not a fault
+/// in itself.
+pub trait Freeze: Send + Sync {
     /// Arm the fault anchor at scenario start, so the replica freezes once the
     /// target reaches the anchored point.
     fn arm_anchor(&self) -> BoxFuture<'_, Result<(), Error>>;
     /// Release the freeze.
     fn resume(&self) -> BoxFuture<'_, Result<(), Error>>;
+}
+
+/// What a plugin can do to a fleet beyond driving it. Each accessor answers with
+/// a provider when the plugin can do that thing, so nothing can claim a
+/// primitive it has not written.
+pub trait Faults: Send + Sync {
+    fn kills(&self) -> Option<&dyn Kill> {
+        None
+    }
+}
+
+/// Take a service out of the fleet and put it back. Both halves together: a
+/// service that cannot come back leaves a dead fleet rather than a fault.
+pub trait Kill: Send + Sync {
     /// Kill the named service, reporting the wall-clock nanoseconds when it died.
     fn kill(&self, service: &str) -> BoxFuture<'_, Result<u128, Error>>;
     /// Bring the named service back, reporting when it became ready.
@@ -54,7 +69,7 @@ pub trait FaultPrimitives: Send + Sync {
 }
 
 /// A live fleet replica: bring it up, probe it, fault it, and remove it.
-pub trait DeploymentRuntime: FaultPrimitives {
+pub trait DeploymentRuntime: Freeze + Faults {
     fn setup(&mut self) -> BoxFuture<'_, Result<(), Error>>;
     fn wait_ready(&self) -> BoxFuture<'_, Result<(), Error>>;
     fn teardown(&mut self) -> BoxFuture<'_, Result<(), Error>>;
