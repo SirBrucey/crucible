@@ -1,7 +1,7 @@
 //! Verdict drivers for the four invariants. Idempotent, Converges, and
 //! Recovers remain stubs until their invariants land.
 
-use super::{Ack, Checkpoint, Driver, Observations, Observed};
+use super::{Ack, Checkpoint, Driver, Observations};
 use crate::ipc::Verdict;
 
 pub struct Idempotent;
@@ -154,10 +154,10 @@ fn diverged_at(observations: &Observations) -> Option<usize> {
 }
 
 fn observable(observations: &Observations, i: usize) -> String {
-    observations
-        .checks
-        .get(i)
-        .map_or_else(|| format!("observable {i}"), Observed::observable)
+    observations.checks.get(i).map_or_else(
+        || format!("observable {i}"),
+        |observed| observed.check.observable(),
+    )
 }
 
 impl Driver for Recovers {

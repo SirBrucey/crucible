@@ -177,6 +177,20 @@ impl CmpOp {
     ];
 }
 
+/// Spelled as a scenario writes it.
+impl std::fmt::Display for CmpOp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            CmpOp::Eq => "==",
+            CmpOp::Ne => "!=",
+            CmpOp::Lt => "<",
+            CmpOp::Le => "<=",
+            CmpOp::Gt => ">",
+            CmpOp::Ge => ">=",
+        })
+    }
+}
+
 /// The signature of one operation: a driver action (a `do` step) or an observer
 /// observable (an `expect` predicate's left side).
 #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]

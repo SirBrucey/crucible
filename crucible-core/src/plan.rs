@@ -95,6 +95,25 @@ pub struct Check {
     pub value: Value,
 }
 
+impl Check {
+    /// The observable as the scenario spells it, for a verdict to point at.
+    #[must_use]
+    pub fn observable(&self) -> String {
+        let mut spelling = vec![self.observable.join(".")];
+        spelling.extend(self.args.iter().map(ToString::to_string));
+        if let Some((column, value)) = &self.filter {
+            spelling.push(format!("where {column} = {value}"));
+        }
+        spelling.join(" ")
+    }
+
+    /// The whole clause as the scenario spells it, observable and all.
+    #[must_use]
+    pub fn stated(&self) -> String {
+        format!("{} {} {}", self.observable(), self.op, self.value)
+    }
+}
+
 /// A literal value carried by a plan.
 ///
 /// The `as_*` accessors mirror [`crate::schema::ValueType`], one per shape a

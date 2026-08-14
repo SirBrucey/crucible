@@ -13,7 +13,7 @@ use crucible_core::{
     ipc::{ServiceProfile, Verdict},
     plan,
     schedule::Schedule,
-    verdict::Checkpoint,
+    verdict::{self, Checkpoint},
 };
 use crucible_engine::{
     event_bus::EventBus,
@@ -608,6 +608,12 @@ async fn drive(bus: &EventBus, plan: &plan::Plan) -> Result<CampaignOutcome> {
         run_cost_ms = run_cost.as_millis(),
         "session catalogue received"
     );
+
+    let settled = trajectory.last().map_or(&[][..], Vec::as_slice);
+    if let Some(unmet) = verdict::unmet(&scenario.checks, settled) {
+        tracing::error!("the scenario states {unmet} in its own fault-free run");
+        return Ok(CampaignOutcome::Indecisive);
+    }
 
     let mut scheduler = BurstScheduler::new(&plan.fleet, scenario, &services, &trajectory);
     let total = scheduler.total();
