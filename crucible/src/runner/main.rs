@@ -40,7 +40,10 @@ const WORKER_BIN: &str = "crucible-worker";
 const LIBEXEC_DIR: &str = "/usr/lib/crucible";
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
-const TOTAL_BUDGET: Duration = Duration::from_mins(5);
+/// How long a campaign may run before it stops dispatching and reports what it
+/// has. Wide enough that the example fleet finishes, which is what makes a
+/// count of what it found mean anything.
+const TOTAL_BUDGET: Duration = Duration::from_mins(15);
 const SCHEDULE_MARGIN: Duration = Duration::from_secs(30);
 const LEARN_MARGIN: Duration = Duration::from_secs(30);
 /// Bound for one learn attempt. A healthy learn brings the fleet up (bounded by
@@ -363,9 +366,9 @@ impl Outcomes {
     }
 
     /// Log the end-of-campaign summary. `total` is how many schedules the
-    /// scheduler produced; fewer completed means the wall-clock budget cut the
-    /// run short.
-    fn report(&self, total: usize, elapsed_s: u64) {
+    /// scheduler produced; `stopped` says why the rest were not run, when some
+    /// were not.
+    fn report(&self, total: usize, elapsed_s: u64, stopped: Stopped) {
         if self.completed() < total {
             tracing::warn!(
                 passed = self.passed,
@@ -375,7 +378,7 @@ impl Outcomes {
                 total,
                 elapsed_s,
                 budget_s = TOTAL_BUDGET.as_secs(),
-                "campaign hit its wall-clock budget; remaining schedules skipped"
+                "{stopped}, so the remaining schedules were skipped"
             );
         } else {
             tracing::info!(
@@ -387,6 +390,24 @@ impl Outcomes {
                 elapsed_s,
                 "campaign complete"
             );
+        }
+    }
+}
+
+/// Why a campaign stopped dispatching with schedules left.
+#[derive(Clone, Copy, Debug)]
+enum Stopped {
+    Budget,
+    GaveUp,
+    Interrupted,
+}
+
+impl std::fmt::Display for Stopped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Stopped::Budget => f.write_str("the campaign ran out of wall-clock budget"),
+            Stopped::GaveUp => f.write_str("too many schedules failed in a row"),
+            Stopped::Interrupted => f.write_str("the campaign was interrupted"),
         }
     }
 }
@@ -579,9 +600,12 @@ async fn drive(bus: &EventBus, plan: &plan::Plan) -> Result<CampaignOutcome> {
     // Learn is a barrier: schedules derive from its observed traffic profiles.
     let (services, trajectory, run_cost) =
         run_learn(bus, &mut worker_id, &plan.fleet, scenario).await?;
+    let readings = trajectory.iter().flatten();
     tracing::info!(
         services = services.len(),
         checkpoints = trajectory.len(),
+        read = readings.clone().filter(|r| r.is_some()).count(),
+        unread = readings.filter(|r| r.is_none()).count(),
         run_cost_ms = run_cost.as_millis(),
         "session catalogue received"
     );
@@ -623,8 +647,15 @@ async fn drive(bus: &EventBus, plan: &plan::Plan) -> Result<CampaignOutcome> {
         pool.reclaim_all().await;
     }
 
+    let stopped = if interrupted {
+        Stopped::Interrupted
+    } else if pool.gave_up {
+        Stopped::GaveUp
+    } else {
+        Stopped::Budget
+    };
     pool.outcomes
-        .report(total, campaign_start.elapsed().as_secs());
+        .report(total, campaign_start.elapsed().as_secs(), stopped);
     Ok(pool.outcomes.outcome())
 }
 
