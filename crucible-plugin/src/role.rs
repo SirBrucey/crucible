@@ -59,8 +59,11 @@ pub trait DeploymentRuntime: FaultPrimitives {
     fn wait_ready(&self) -> BoxFuture<'_, Result<(), Error>>;
     fn teardown(&mut self) -> BoxFuture<'_, Result<(), Error>>;
 
-    /// Where the named service answers `kind`, once the replica is up.
+    /// The data plane address for a service's kind, where the test traffic runs.
     fn endpoint(&self, service: &str, kind: &str) -> Option<SocketAddr>;
+
+    /// The control plane address for a service's kind.
+    fn control_endpoint(&self, service: &str, kind: &str) -> Option<SocketAddr>;
 
     /// Start streaming what the replica's substrate sees on the wire. The
     /// deployment runs that substrate, so only it can open the stream. The
