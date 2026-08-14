@@ -41,9 +41,8 @@ const LIBEXEC_DIR: &str = "/usr/lib/crucible";
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long a campaign may run before it stops dispatching and reports what it
-/// has. Wide enough that the example fleet finishes, which is what makes a
-/// count of what it found mean anything.
-const TOTAL_BUDGET: Duration = Duration::from_mins(15);
+/// has.
+const TOTAL_BUDGET: Duration = Duration::from_mins(5);
 const SCHEDULE_MARGIN: Duration = Duration::from_secs(30);
 const LEARN_MARGIN: Duration = Duration::from_secs(30);
 /// Bound for one learn attempt. A healthy learn brings the fleet up (bounded by
