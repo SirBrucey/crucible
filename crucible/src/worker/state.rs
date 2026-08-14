@@ -255,17 +255,18 @@ impl Worker<Learning> {
                 return Err(e.into());
             }
         };
-        let (services, trajectory, orchestrator) = orchestrator
-            .learn(&queries)
+        // FIXME: this should be the union across every plugin driving the
+        // scenario, not the deployment's alone. Kind plugins are built per
+        // action and per check rather than held, so there is nothing to ask yet.
+        let primitives = orchestrator.deployment().primitives();
+        let (learned, orchestrator) = orchestrator
+            .learn(&queries, primitives)
             .await
             .inspect_err(|e| tracing::error!(worker_id = self.id, error = %e, "learn failed"))?;
         drop(heartbeat);
-        let count = services.len();
+        let count = learned.profiles.len();
         self.conn
-            .send(&WorkerToRunner::SessionCatalogue {
-                services,
-                trajectory,
-            })
+            .send(&WorkerToRunner::SessionCatalogue(learned))
             .await?;
         tracing::info!(worker_id = self.id, count, "sent session catalogue");
         Ok(self.transition(ShuttingDown { orchestrator }))

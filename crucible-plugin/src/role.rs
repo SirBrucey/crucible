@@ -6,9 +6,10 @@
 //! the plugin's own types. The runtime trait is object-safe, so the framework
 //! can hold plugins whose types it cannot name.
 
-use std::{future::Future, net::SocketAddr, pin::Pin};
+use std::{collections::BTreeSet, future::Future, net::SocketAddr, pin::Pin};
 
 use crucible_core::{
+    fault::Primitive,
     observer::SessionObserver,
     plan,
     schema::{AttrSchema, OpSig},
@@ -56,6 +57,15 @@ pub trait Freeze: Send + Sync {
 pub trait Faults: Send + Sync {
     fn kills(&self) -> Option<&dyn Kill> {
         None
+    }
+
+    /// Everything this can do, so a campaign can report what it was able to
+    /// reach. Read off the accessors, so it says exactly what is there.
+    fn primitives(&self) -> BTreeSet<Primitive> {
+        [self.kills().map(|_| Primitive::Kill)]
+            .into_iter()
+            .flatten()
+            .collect()
     }
 }
 

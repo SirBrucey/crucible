@@ -4,6 +4,31 @@ use crucible_protocol::Direction;
 
 use crate::verdict::Invariant;
 
+/// Something that can be done to a running fleet to put an invariant under
+/// pressure. A plugin offers one by implementing it, so this is the vocabulary a
+/// campaign uses to say what it could and could not reach.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Deserialize, serde::Serialize,
+)]
+pub enum Primitive {
+    /// Take a service out of the fleet and put it back.
+    Kill,
+    /// Deliver a message the fleet has already handled a second time.
+    Redeliver,
+    /// Hold a message back until a later one has passed it.
+    Reorder,
+}
+
+impl std::fmt::Display for Primitive {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Primitive::Kill => "kill a service",
+            Primitive::Redeliver => "redeliver a message",
+            Primitive::Reorder => "reorder messages",
+        })
+    }
+}
+
 /// What to break and how to drive the operation.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub enum Fault {

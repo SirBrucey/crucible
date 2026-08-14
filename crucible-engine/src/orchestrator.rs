@@ -1,16 +1,18 @@
 //! L4 orchestrator: brings up the fleet replica, executes one schedule, tears it down.
 
 use std::{
+    collections::BTreeSet,
     net::SocketAddr,
     time::{Duration, Instant},
 };
 
-use crucible_protocol::{KillMissReason, KillReport, KillResult, ServiceProfile, now_ns};
+use crucible_protocol::{KillMissReason, KillReport, KillResult, now_ns};
 
 use crucible_core::{
     HEAL_BUDGET,
-    fault::{Anchor, Fault},
+    fault::{Anchor, Fault, Primitive},
     ipc::Verdict,
+    learned::Learned,
     observer::SessionObserver,
     proxy_log::service_profiles_from_sessions,
     verdict::{Checkpoint, Observations, Observed, StepWindow, driver_for},
@@ -163,6 +165,18 @@ fn endpoint_for_control_plane(
         .ok_or_else(|| unreachable(target, kind))
 }
 
+/// A schedule reached a worker that the worker cannot carry out, which means the
+/// scheduler and the plugins it asked disagree about what this fleet can do.
+fn unreachable_fault(fault: &Fault) -> crucible_plugin::Error {
+    crucible_plugin::Error::new(
+        "orchestrator",
+        format!(
+            "a schedule was generated for `{:?}`, which cannot be run against this fleet",
+            fault.invariant()
+        ),
+    )
+}
+
 fn unreachable(target: &str, kind: &str) -> crucible_plugin::Error {
     crucible_plugin::Error::new(
         "orchestrator",
@@ -186,8 +200,8 @@ impl Orchestrator<Ready> {
     pub async fn learn(
         self,
         queries: &[PreparedCheck],
-    ) -> Result<(Vec<ServiceProfile>, Vec<Checkpoint>, Orchestrator<Done>), crucible_plugin::Error>
-    {
+        primitives: BTreeSet<Primitive>,
+    ) -> Result<(Learned, Orchestrator<Done>), crucible_plugin::Error> {
         let Orchestrator {
             deployment,
             state: Ready {
@@ -223,12 +237,16 @@ impl Orchestrator<Ready> {
             .wait_for_quiescence(LEARN_SETTLE, QUIESCENCE_IDLE, HEAL_BUDGET)
             .await;
         session_observer.observe(&mut observations);
-        let profiles = service_profiles_from_sessions(&observations.sessions, scenario_start_ns);
+        let learned = Learned {
+            profiles: service_profiles_from_sessions(&observations.sessions, scenario_start_ns),
+            trajectory: observations.trajectory,
+            primitives,
+        };
         let done = Orchestrator {
             deployment,
             state: Done { session_observer },
         };
-        Ok((profiles, observations.trajectory, done))
+        Ok((learned, done))
     }
 
     /// Run the scenario; the proxy self-freezes the fleet once `fault`'s target
@@ -254,14 +272,10 @@ impl Orchestrator<Ready> {
             },
         } = self;
         let anchor = fault.anchor();
-        // A kill is only ever scheduled where a loaded plugin can drive one, so
-        // this resolves for every schedule the scheduler produced.
-        let killer = deployment.kills().ok_or_else(|| {
-            crucible_plugin::Error::new(
-                "orchestrator",
-                format!("nothing loaded can kill `{}`", anchor.service),
-            )
-        })?;
+        // The scheduler only emits a schedule whose fault it can drive and whose
+        // verdict it can read, so both of these resolve for anything it produced.
+        let killer = deployment.kills().ok_or_else(|| unreachable_fault(fault))?;
+        let mut driver = driver_for(fault.invariant()).ok_or_else(|| unreachable_fault(fault))?;
 
         // Run the fault sequence borrowing the replica handles, so whatever the
         // outcome we still own them afterwards: on success they move into `Done`
@@ -351,7 +365,7 @@ impl Orchestrator<Ready> {
             observations.checks = read_checks(deployment.as_ref(), &queries).await?;
             observations.fault_free = fault_free;
             session_observer.observe(&mut observations);
-            let verdict = driver_for(fault.invariant()).drive(&observations);
+            let verdict = driver.drive(&observations);
             Ok((verdict, kill_report))
         }
         .await;

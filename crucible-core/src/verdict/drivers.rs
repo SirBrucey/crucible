@@ -1,31 +1,11 @@
-//! Verdict drivers for the four invariants. Idempotent, Converges, and
-//! Recovers remain stubs until their invariants land.
+//! Verdict drivers: what a run's observations mean for the invariant it tested.
 
 use crucible_protocol::{KillReport, KillResult};
 
 use super::{Ack, Checkpoint, Driver, Observations, StepWindow};
 use crate::ipc::Verdict;
 
-pub struct Idempotent;
-pub struct Converges;
 pub struct Durable;
-pub struct Recovers;
-
-impl Driver for Idempotent {
-    fn drive(&mut self, _observations: &Observations) -> Verdict {
-        Verdict::Inconclusive {
-            reason: "idempotency driver not yet implemented".into(),
-        }
-    }
-}
-
-impl Driver for Converges {
-    fn drive(&mut self, _observations: &Observations) -> Verdict {
-        Verdict::Inconclusive {
-            reason: "convergence driver not yet implemented".into(),
-        }
-    }
-}
 
 impl Driver for Durable {
     fn drive(&mut self, observations: &Observations) -> Verdict {
@@ -227,14 +207,6 @@ fn observable(observations: &Observations, i: usize) -> String {
     )
 }
 
-impl Driver for Recovers {
-    fn drive(&mut self, _observations: &Observations) -> Verdict {
-        Verdict::Inconclusive {
-            reason: "recovery driver not yet implemented".into(),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use crucible_protocol::{KillReport, KillResult};
@@ -242,7 +214,7 @@ mod tests {
     use super::*;
     use crate::{
         plan,
-        verdict::{Ack, Invariant, Observed, Outcome, driver_for},
+        verdict::{Ack, Observed, Outcome},
     };
 
     fn fired_kill() -> KillReport {
@@ -306,19 +278,11 @@ mod tests {
     }
 
     #[test]
-    fn every_stub_yields_inconclusive_on_empty_observations() {
-        let obs = Observations::empty();
-        for invariant in [
-            Invariant::Idempotent,
-            Invariant::Converges,
-            Invariant::Durable,
-            Invariant::Recovers,
-        ] {
-            assert!(matches!(
-                driver_for(invariant).drive(&obs),
-                Verdict::Inconclusive { .. }
-            ));
-        }
+    fn a_run_that_observed_nothing_is_inconclusive() {
+        assert!(matches!(
+            Durable.drive(&Observations::empty()),
+            Verdict::Inconclusive { .. }
+        ));
     }
 
     #[test]

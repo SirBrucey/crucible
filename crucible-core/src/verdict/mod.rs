@@ -2,13 +2,13 @@
 
 pub mod drivers;
 
-use std::cmp::Ordering;
+use std::{cmp::Ordering, collections::BTreeSet};
 
-pub use drivers::{Converges, Durable, Idempotent, Recovers};
+pub use drivers::Durable;
 use serde::{Deserialize, Serialize};
 use strum::EnumIter;
 
-use crate::{ipc::Verdict, schema::CmpOp};
+use crate::{fault::Primitive, ipc::Verdict, schema::CmpOp};
 
 /// The four canonical event-driven invariants Crucible checks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize, EnumIter)]
@@ -17,6 +17,59 @@ pub enum Invariant {
     Converges,
     Durable,
     Recovers,
+}
+
+impl Invariant {
+    /// What a campaign has to be able to do to the fleet before it can put this
+    /// under pressure. Durability and recovery need the same verb and differ in
+    /// how they use it: one kills mid-flight, the other kills and waits.
+    #[must_use]
+    pub fn requires(self) -> &'static [Primitive] {
+        match self {
+            Invariant::Idempotent => &[Primitive::Redeliver],
+            Invariant::Converges => &[Primitive::Reorder],
+            Invariant::Durable | Invariant::Recovers => &[Primitive::Kill],
+        }
+    }
+
+    /// Whether a campaign against this fleet could test this invariant, given
+    /// what the loaded plugins turned out to be able to do.
+    ///
+    /// # Errors
+    /// Errors with the first thing standing in the way.
+    pub fn reachable(self, available: &BTreeSet<Primitive>) -> Result<(), Unreachable> {
+        if let Some(&needed) = self
+            .requires()
+            .iter()
+            .find(|needed| !available.contains(needed))
+        {
+            return Err(Unreachable::NoPrimitive(needed));
+        }
+        if driver_for(self).is_none() {
+            return Err(Unreachable::NoDriver);
+        }
+        Ok(())
+    }
+}
+
+/// What stops a campaign testing an invariant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Unreachable {
+    /// Nothing loaded can do what it needs done to the fleet.
+    NoPrimitive(Primitive),
+    /// Nothing reads a verdict for it yet.
+    NoDriver,
+}
+
+impl std::fmt::Display for Unreachable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Unreachable::NoPrimitive(needed) => {
+                write!(f, "nothing loaded can {needed}")
+            }
+            Unreachable::NoDriver => f.write_str("no verdict driver"),
+        }
+    }
 }
 
 /// Observations captured during schedule execution and fed to a [`Driver`].
@@ -166,21 +219,54 @@ pub trait Driver {
     fn drive(&mut self, observations: &Observations) -> Verdict;
 }
 
-/// Return the stub driver for the given invariant.
+/// The driver that reads a verdict for an invariant, where one has been written.
 #[must_use]
-pub fn driver_for(invariant: Invariant) -> Box<dyn Driver> {
+pub fn driver_for(invariant: Invariant) -> Option<Box<dyn Driver>> {
     match invariant {
-        Invariant::Idempotent => Box::new(Idempotent),
-        Invariant::Converges => Box::new(Converges),
-        Invariant::Durable => Box::new(Durable),
-        Invariant::Recovers => Box::new(Recovers),
+        Invariant::Durable => Some(Box::new(Durable)),
+        Invariant::Idempotent | Invariant::Converges | Invariant::Recovers => None,
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use strum::IntoEnumIterator;
+
     use super::*;
     use crate::plan::{Check, Value};
+
+    #[test]
+    fn an_invariant_nothing_can_break_is_out_of_reach() {
+        let nothing = BTreeSet::new();
+        for invariant in Invariant::iter() {
+            assert_eq!(
+                invariant.reachable(&nothing),
+                Err(Unreachable::NoPrimitive(invariant.requires()[0])),
+                "{invariant:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_invariant_nothing_reads_a_verdict_for_is_out_of_reach() {
+        let everything: BTreeSet<Primitive> =
+            [Primitive::Kill, Primitive::Redeliver, Primitive::Reorder].into();
+        for invariant in Invariant::iter().filter(|i| driver_for(*i).is_none()) {
+            assert_eq!(
+                invariant.reachable(&everything),
+                Err(Unreachable::NoDriver),
+                "{invariant:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn durability_is_in_reach_of_a_fleet_that_can_be_killed() {
+        assert_eq!(
+            Invariant::Durable.reachable(&BTreeSet::from([Primitive::Kill])),
+            Ok(())
+        );
+    }
 
     /// A scenario stating `orders.count >= 2`.
     fn check() -> Check {

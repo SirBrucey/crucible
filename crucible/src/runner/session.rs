@@ -6,11 +6,11 @@
 
 use crucible_core::{
     ipc::{
-        HEARTBEAT_TIMEOUT, RunnerToWorker, ServiceProfile, Verdict, WorkerToRunner,
+        HEARTBEAT_TIMEOUT, RunnerToWorker, Verdict, WorkerToRunner,
         codec::{read_frame, write_frame},
     },
+    learned::Learned,
     schedule::Schedule,
-    verdict::Checkpoint,
 };
 use crucible_engine::event_bus::{EventBus, RunnerEvent};
 use tokio::{net::UnixStream, time::timeout};
@@ -111,11 +111,7 @@ impl Session<Dispatching> {
     /// runs perform. Reads frames until the catalogue arrives, journalling every
     /// intervening `Event(_)` as [`Session::<AwaitingResult>::await_result`]
     /// does.
-    pub async fn learn(
-        mut self,
-        bus: &EventBus,
-        schedule: Schedule,
-    ) -> Result<(Vec<ServiceProfile>, Vec<Checkpoint>)> {
+    pub async fn learn(mut self, bus: &EventBus, schedule: Schedule) -> Result<Learned> {
         self.read_ready(bus, "Learning").await?;
 
         let outbound = RunnerToWorker::Run(schedule);
@@ -125,10 +121,7 @@ impl Session<Dispatching> {
         loop {
             let msg = read_live(&mut self.stream).await?;
             let learned = match &msg {
-                WorkerToRunner::SessionCatalogue {
-                    services,
-                    trajectory,
-                } => Some((services.clone(), trajectory.clone())),
+                WorkerToRunner::SessionCatalogue(learned) => Some(learned.clone()),
                 WorkerToRunner::Event(_) => None,
                 other => {
                     return Err(Error::UnexpectedMessage {
