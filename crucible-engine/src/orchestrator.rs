@@ -135,24 +135,41 @@ fn resolve_targets<T: Targeted + ?Sized>(
     bound
         .into_iter()
         .map(|bound| {
-            let endpoint = endpoint_for(deployment, bound.as_ref())?;
+            let endpoint = endpoint_for_data_plane(deployment, bound.as_ref())?;
             Ok((bound, endpoint))
         })
         .collect()
 }
 
-/// Where this reaches the service it is bound to, once the replica is up.
-fn endpoint_for(
+/// The data plane address for whatever this is bound to. Steps drive the fleet
+/// here, so the traffic counts as the fleet's.
+fn endpoint_for_data_plane(
     deployment: &dyn DeploymentRuntime,
     bound: &(impl Targeted + ?Sized),
 ) -> Result<SocketAddr, crucible_plugin::Error> {
     let (target, kind) = (bound.target(), bound.kind());
-    deployment.endpoint(target, kind).ok_or_else(|| {
-        crucible_plugin::Error::new(
-            "orchestrator",
-            format!("the fleet published no endpoint for `{target}` speaking `{kind}`"),
-        )
-    })
+    deployment
+        .endpoint(target, kind)
+        .ok_or_else(|| unreachable(target, kind))
+}
+
+/// The control plane address for whatever this is bound to. Checks read here, so
+/// the reading is not mistaken for the fleet doing something.
+fn endpoint_for_control_plane(
+    deployment: &dyn DeploymentRuntime,
+    bound: &(impl Targeted + ?Sized),
+) -> Result<SocketAddr, crucible_plugin::Error> {
+    let (target, kind) = (bound.target(), bound.kind());
+    deployment
+        .control_endpoint(target, kind)
+        .ok_or_else(|| unreachable(target, kind))
+}
+
+fn unreachable(target: &str, kind: &str) -> crucible_plugin::Error {
+    crucible_plugin::Error::new(
+        "orchestrator",
+        format!("the fleet published no endpoint for `{target}` speaking `{kind}`"),
+    )
 }
 
 impl Orchestrator<Ready> {
@@ -376,7 +393,7 @@ async fn read_checks(
 ) -> Result<Vec<Observed>, crucible_plugin::Error> {
     let mut readings = Vec::with_capacity(queries.len());
     for (check, query) in queries {
-        let endpoint = endpoint_for(deployment, query.as_ref())?;
+        let endpoint = endpoint_for_control_plane(deployment, query.as_ref())?;
         readings.push(Observed {
             value: query.read(endpoint).await?,
             check: check.clone(),
@@ -391,17 +408,29 @@ async fn read_checks(
 async fn read_checkpoint(
     deployment: &dyn DeploymentRuntime,
     queries: &[PreparedCheck],
-) -> Result<Checkpoint, crucible_plugin::Error> {
+) -> Checkpoint {
     let mut checkpoint = Vec::with_capacity(queries.len());
-    for (_, query) in queries {
-        let endpoint = endpoint_for(deployment, query.as_ref())?;
-        checkpoint.push(query.read(endpoint).await?);
+    for (check, query) in queries {
+        let reading = match endpoint_for_control_plane(deployment, query.as_ref()) {
+            Ok(endpoint) => query.read(endpoint).await,
+            Err(e) => Err(e),
+        };
+        checkpoint.push(match reading {
+            Ok(value) => Some(value),
+            Err(e) => {
+                tracing::debug!(
+                    observable = %check.observable.join("."),
+                    service = %check.service,
+                    error = %e,
+                    "state could not be read at this point of the run",
+                );
+                None
+            }
+        });
     }
-    Ok(checkpoint)
+    checkpoint
 }
 
-/// Run a scenario's actions in order against the fleet, collecting what each
-/// one observed.
 /// Run the scenario's steps one at a time, each starting only once the fleet
 /// has stopped working on the one before.
 ///
@@ -420,7 +449,7 @@ async fn run_actions(
     // checkpoint equal to the one before it rather than no checkpoint at all.
     observations
         .trajectory
-        .push(read_checkpoint(deployment, queries).await?);
+        .push(read_checkpoint(deployment, queries).await);
     for (action, endpoint) in actions {
         observations.outcomes.push(action.run(*endpoint).await?);
         session_observer
@@ -428,7 +457,7 @@ async fn run_actions(
             .await;
         observations
             .trajectory
-            .push(read_checkpoint(deployment, queries).await?);
+            .push(read_checkpoint(deployment, queries).await);
     }
     Ok(observations)
 }

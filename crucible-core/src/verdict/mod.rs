@@ -35,8 +35,10 @@ pub struct Observations {
 }
 
 /// What every check the scenario states read at one point in a run, in the
-/// order the scenario states them.
-pub type Checkpoint = Vec<crate::plan::Value>;
+/// order the scenario states them. `None` where the reading could not be taken,
+/// which under a fault is most of the point: a service that is down cannot be
+/// asked, and that is a thing to record rather than to fail on.
+pub type Checkpoint = Vec<Option<crate::plan::Value>>;
 
 /// A check and what the fleet was actually holding when it was read.
 #[derive(Debug)]
