@@ -155,6 +155,49 @@ impl Proxy {
     }
 }
 
+/// Fronts one service on the side channel: forwards bytes and nothing else.
+/// What crosses it is not reported, cannot be held, and cannot trip an anchor,
+/// so the framework can reach a service without that reaching the results.
+pub struct Relay {
+    listener: TcpListener,
+    upstream: String,
+}
+
+impl Relay {
+    /// Bind to `listen` and prepare to forward every accepted connection to
+    /// `upstream`.
+    ///
+    /// # Errors
+    /// Errors if `listen` cannot be bound.
+    pub async fn bind(listen: SocketAddr, upstream: String) -> io::Result<Self> {
+        Ok(Self {
+            listener: TcpListener::bind(listen).await?,
+            upstream,
+        })
+    }
+
+    /// Accept-forward loop; returns only if `accept()` errors.
+    ///
+    /// # Errors
+    /// Errors if accepting a connection fails.
+    pub async fn run(self) -> io::Result<()> {
+        loop {
+            let (mut client, peer) = self.listener.accept().await?;
+            let upstream = self.upstream.clone();
+            tokio::spawn(async move {
+                match TcpStream::connect(&upstream).await {
+                    Ok(mut server) => {
+                        let _ = tokio::io::copy_bidirectional(&mut client, &mut server).await;
+                    }
+                    Err(e) => {
+                        tracing::warn!(%peer, %upstream, ?e, "side channel could not reach upstream");
+                    }
+                }
+            });
+        }
+    }
+}
+
 /// Block while the pause gate holds `true`, returning as soon as it is `false`
 /// (or the sender is dropped, so forwarding never wedges if control goes away).
 async fn wait_while_paused(pause: &mut watch::Receiver<bool>) {
