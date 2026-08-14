@@ -9,11 +9,11 @@ use crucible_protocol::{KillMissReason, KillReport, KillResult, ServiceProfile, 
 
 use crucible_core::{
     HEAL_BUDGET,
-    fault::Anchor,
+    fault::{Anchor, Fault},
     ipc::Verdict,
     observer::SessionObserver,
     proxy_log::service_profiles_from_sessions,
-    verdict::{Checkpoint, Invariant, Observations, Observed, StepWindow, driver_for},
+    verdict::{Checkpoint, Observations, Observed, StepWindow, driver_for},
 };
 use crucible_plugin::{
     Action, DeploymentRuntime, FaultPrimitives, Targeted, registry::PreparedCheck,
@@ -244,7 +244,7 @@ impl Orchestrator<Ready> {
     pub async fn execute(
         self,
         schedule_id: u32,
-        fault: &Anchor,
+        fault: &Fault,
         queries: Vec<PreparedCheck>,
         fault_free: Vec<Checkpoint>,
     ) -> Result<((Verdict, KillReport), Orchestrator<Done>), crucible_plugin::Error> {
@@ -255,6 +255,7 @@ impl Orchestrator<Ready> {
                 actions,
             },
         } = self;
+        let anchor = fault.anchor();
 
         // Run the fault sequence borrowing the replica handles, so whatever the
         // outcome we still own them afterwards: on success they move into `Done`
@@ -294,7 +295,7 @@ impl Orchestrator<Ready> {
                             deployment.resume().await?;
                             return Ok::<_, crucible_plugin::Error>(missed(
                                 schedule_id,
-                                fault,
+                                anchor,
                                 KillMissReason::ScenarioEndedBeforeAnchor,
                             ));
                         }
@@ -306,7 +307,7 @@ impl Orchestrator<Ready> {
                         // fail; ops once it is back succeed) rather than the world
                         // stopping while we heal.
                         let actual = scenario_start.elapsed().as_nanos();
-                        Ok(fire_kill(deployment.as_ref(), schedule_id, fault, actual).await?)
+                        Ok(fire_kill(deployment.as_ref(), schedule_id, anchor, actual).await?)
                     }
                     _ = &mut scenario_end_rx => {
                         // The scenario finished before a freeze was seen. The freeze
@@ -316,12 +317,12 @@ impl Orchestrator<Ready> {
                         // concluding the anchor was missed.
                         if session_observer.wait_for_freeze(FREEZE_GRACE).await {
                             let actual = scenario_start.elapsed().as_nanos();
-                            Ok(fire_kill(deployment.as_ref(), schedule_id, fault, actual).await?)
+                            Ok(fire_kill(deployment.as_ref(), schedule_id, anchor, actual).await?)
                         } else {
                             // Genuinely no freeze; release it in case one is
                             // mid-flight and record the miss.
                             deployment.resume().await?;
-                            Ok(missed(schedule_id, fault, KillMissReason::ScenarioEndedBeforeAnchor))
+                            Ok(missed(schedule_id, anchor, KillMissReason::ScenarioEndedBeforeAnchor))
                         }
                     }
                 }
@@ -344,7 +345,7 @@ impl Orchestrator<Ready> {
             observations.checks = read_checks(deployment.as_ref(), &queries).await?;
             observations.fault_free = fault_free;
             session_observer.observe(&mut observations);
-            let verdict = driver_for(Invariant::Durable).drive(&observations);
+            let verdict = driver_for(fault.invariant()).drive(&observations);
             Ok((verdict, kill_report))
         }
         .await;
