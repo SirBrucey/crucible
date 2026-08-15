@@ -593,13 +593,17 @@ impl<'a> Pool<'a> {
 /// Say which invariants this fleet could be tested for and which it could not,
 /// and return the ones worth scheduling. A fleet nothing can break still runs
 /// its fault-free scenario; this is just a plain e2e test.
-fn report_reach(available: &BTreeSet<Primitive>) -> Vec<Invariant> {
+fn report_reach(available: &BTreeSet<Primitive>) -> Vec<(Invariant, Vec<Primitive>)> {
     let mut testable = Vec::new();
     for invariant in Invariant::iter() {
-        match invariant.reachable(available) {
-            Ok(()) => {
-                tracing::info!("{invariant:?} is testable against this fleet");
-                testable.push(invariant);
+        match invariant.driveable(available) {
+            Ok(ways) => {
+                let spelled: Vec<String> = ways.iter().map(ToString::to_string).collect();
+                tracing::info!(
+                    "{invariant:?} is testable against this fleet, by: {}",
+                    spelled.join(", ")
+                );
+                testable.push((invariant, ways));
             }
             Err(why) => tracing::info!("{invariant:?} is out of reach: {why}"),
         }

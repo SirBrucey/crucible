@@ -143,11 +143,14 @@ mod tests {
             plan.fleet,
             plan.scenarios[0].steps.clone(),
             plan.scenarios[0].checks.clone(),
-            crate::fault::Fault::Durable(crate::fault::Anchor {
-                service: "db".into(),
-                direction: Direction::ClientToUpstream,
-                k: 3,
-            }),
+            crate::fault::Fault::Durable {
+                anchor: crate::fault::Anchor {
+                    service: "db".into(),
+                    direction: Direction::ClientToUpstream,
+                    k: 3,
+                },
+                by: crate::fault::Primitive::Kill,
+            },
             vec![
                 vec![Some(crate::plan::Value::Int(0))],
                 vec![Some(crate::plan::Value::Int(3))],

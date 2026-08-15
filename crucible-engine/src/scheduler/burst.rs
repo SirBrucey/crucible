@@ -9,7 +9,7 @@
 use crucible_protocol::Direction;
 
 use crucible_core::{
-    fault::{Anchor, Fault},
+    fault::{Anchor, Fault, Primitive},
     learned::Learned,
     plan,
     schedule::Schedule,
@@ -33,7 +33,7 @@ impl BurstScheduler {
         fleet: &plan::Fleet,
         scenario: &plan::Scenario,
         learned: &Learned,
-        testable: &[Invariant],
+        testable: &[(Invariant, Vec<Primitive>)],
     ) -> Self {
         let anchored: Vec<(&str, Direction, &[u32])> = learned
             .profiles
@@ -66,7 +66,11 @@ impl BurstScheduler {
                     direction: *direction,
                     k,
                 };
-                for fault in testable.iter().filter_map(|i| faults(*i, &anchor)) {
+                let faults = testable.iter().flat_map(|(invariant, ways)| {
+                    ways.iter()
+                        .filter_map(|by| faults(*invariant, *by, &anchor))
+                });
+                for fault in faults {
                     schedules.push(Schedule::faulted(
                         next_id,
                         fleet.clone(),
@@ -93,12 +97,14 @@ impl BurstScheduler {
     }
 }
 
-/// The fault that puts `invariant` under pressure at `anchor`, where a burst is
-/// the right shape for it. Recovery degrades the fleet from the start rather
-/// than part way through, so a burst has nowhere to put it.
-fn faults(invariant: Invariant, anchor: &Anchor) -> Option<Fault> {
+/// The fault a burst places to test `invariant`. Recovery degrades the fleet
+/// from the start rather than part way through, so a burst cannot test it.
+fn faults(invariant: Invariant, by: Primitive, anchor: &Anchor) -> Option<Fault> {
     match invariant {
-        Invariant::Durable => Some(Fault::Durable(anchor.clone())),
+        Invariant::Durable => Some(Fault::Durable {
+            anchor: anchor.clone(),
+            by,
+        }),
         Invariant::Recovers | Invariant::Idempotent | Invariant::Converges => None,
     }
 }
@@ -128,17 +134,23 @@ mod tests {
 
     /// A campaign against a fleet that can be killed, so durability is on.
     fn scheduler(profiles: &[ServiceProfile]) -> BurstScheduler {
+        driven(profiles, vec![Primitive::Kill])
+    }
+
+    /// A campaign testing durability by every way of breaking the fleet in
+    /// `ways`.
+    fn driven(profiles: &[ServiceProfile], ways: Vec<Primitive>) -> BurstScheduler {
         let plan = plan::example();
         let learned = Learned {
             profiles: profiles.to_vec(),
             trajectory: Vec::new(),
-            primitives: BTreeSet::from([Primitive::Kill]),
+            primitives: ways.iter().copied().collect(),
         };
         BurstScheduler::new(
             &plan.fleet,
             &plan.scenarios[0],
             &learned,
-            &[Invariant::Durable],
+            &[(Invariant::Durable, ways)],
         )
     }
 
@@ -177,6 +189,15 @@ mod tests {
     fn one_schedule_per_anchor() {
         let s = scheduler(&[profile("db", vec![2, 3], vec![1])]);
         assert_eq!(s.total(), 3);
+    }
+
+    #[test]
+    fn every_way_of_breaking_the_fleet_gets_its_own_schedule() {
+        let s = driven(
+            &[profile("db", vec![2, 3], vec![1])],
+            vec![Primitive::Kill, Primitive::Cut],
+        );
+        assert_eq!(s.total(), 6);
     }
 
     #[test]

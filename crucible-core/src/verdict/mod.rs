@@ -20,43 +20,45 @@ pub enum Invariant {
 }
 
 impl Invariant {
-    /// What a campaign has to be able to do to the fleet before it can put this
-    /// under pressure. Durability and recovery need the same verb and differ in
-    /// how they use it: one kills mid-flight, the other kills and waits.
+    /// Anything that can put this invariant under pressure. Losing a write is
+    /// losing a write, so durability and recovery do not mind whether the
+    /// service went away or only the edge to it did.
     #[must_use]
-    pub fn requires(self) -> &'static [Primitive] {
+    pub fn driven_by(self) -> &'static [Primitive] {
         match self {
             Invariant::Idempotent => &[Primitive::Redeliver],
             Invariant::Converges => &[Primitive::Reorder],
-            Invariant::Durable | Invariant::Recovers => &[Primitive::Kill],
+            Invariant::Durable | Invariant::Recovers => &[Primitive::Kill, Primitive::Cut],
         }
     }
 
-    /// Whether a campaign against this fleet could test this invariant, given
-    /// what the loaded plugins turned out to be able to do.
+    /// What a campaign against this fleet could drive this invariant with,
+    /// given what the loaded plugins turned out to be able to do.
     ///
     /// # Errors
-    /// Errors with the first thing standing in the way.
-    pub fn reachable(self, available: &BTreeSet<Primitive>) -> Result<(), Unreachable> {
-        if let Some(&needed) = self
-            .requires()
-            .iter()
-            .find(|needed| !available.contains(needed))
-        {
-            return Err(Unreachable::NoPrimitive(needed));
-        }
+    /// Errors with what stands in the way of testing it at all.
+    pub fn driveable(self, available: &BTreeSet<Primitive>) -> Result<Vec<Primitive>, Unreachable> {
         if driver_for(self).is_none() {
             return Err(Unreachable::NoDriver);
         }
-        Ok(())
+        let driveable: Vec<Primitive> = self
+            .driven_by()
+            .iter()
+            .filter(|by| available.contains(by))
+            .copied()
+            .collect();
+        if driveable.is_empty() {
+            return Err(Unreachable::NoPrimitive(self.driven_by()));
+        }
+        Ok(driveable)
     }
 }
 
 /// What stops a campaign testing an invariant.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Unreachable {
-    /// Nothing loaded can do what it needs done to the fleet.
-    NoPrimitive(Primitive),
+    /// Nothing loaded can do any of what would put it under pressure.
+    NoPrimitive(&'static [Primitive]),
     /// Nothing reads a verdict for it yet.
     NoDriver,
 }
@@ -64,8 +66,9 @@ pub enum Unreachable {
 impl std::fmt::Display for Unreachable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Unreachable::NoPrimitive(needed) => {
-                write!(f, "nothing loaded can {needed}")
+            Unreachable::NoPrimitive(any_of) => {
+                let any_of: Vec<String> = any_of.iter().map(ToString::to_string).collect();
+                write!(f, "nothing loaded can {}", any_of.join(" or "))
             }
             Unreachable::NoDriver => f.write_str("no verdict driver"),
         }
@@ -238,10 +241,10 @@ mod tests {
     #[test]
     fn an_invariant_nothing_can_break_is_out_of_reach() {
         let nothing = BTreeSet::new();
-        for invariant in Invariant::iter() {
+        for invariant in Invariant::iter().filter(|i| driver_for(*i).is_some()) {
             assert_eq!(
-                invariant.reachable(&nothing),
-                Err(Unreachable::NoPrimitive(invariant.requires()[0])),
+                invariant.driveable(&nothing),
+                Err(Unreachable::NoPrimitive(invariant.driven_by())),
                 "{invariant:?}"
             );
         }
@@ -249,22 +252,27 @@ mod tests {
 
     #[test]
     fn an_invariant_nothing_reads_a_verdict_for_is_out_of_reach() {
-        let everything: BTreeSet<Primitive> =
-            [Primitive::Kill, Primitive::Redeliver, Primitive::Reorder].into();
+        let everything: BTreeSet<Primitive> = Primitive::iter().collect();
         for invariant in Invariant::iter().filter(|i| driver_for(*i).is_none()) {
             assert_eq!(
-                invariant.reachable(&everything),
+                invariant.driveable(&everything),
                 Err(Unreachable::NoDriver),
                 "{invariant:?}"
             );
         }
     }
 
+    /// Losing a write is losing a write, so either way of breaking the edge is
+    /// a way of testing that it was not lost.
     #[test]
-    fn durability_is_in_reach_of_a_fleet_that_can_be_killed() {
+    fn durability_is_driven_by_whichever_ways_of_breaking_the_fleet_are_loaded() {
         assert_eq!(
-            Invariant::Durable.reachable(&BTreeSet::from([Primitive::Kill])),
-            Ok(())
+            Invariant::Durable.driveable(&BTreeSet::from([Primitive::Kill])),
+            Ok(vec![Primitive::Kill])
+        );
+        assert_eq!(
+            Invariant::Durable.driveable(&BTreeSet::from([Primitive::Kill, Primitive::Cut])),
+            Ok(vec![Primitive::Kill, Primitive::Cut])
         );
     }
 
