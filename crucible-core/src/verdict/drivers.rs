@@ -1,8 +1,9 @@
 //! Verdict drivers: what a run's observations mean for the invariant it tested.
 
-use crucible_protocol::{KillReport, KillResult};
+use crucible_protocol::{FaultReport, FaultResult};
 
 use super::{Ack, Checkpoint, Driver, Observations, StepWindow};
+use crate::fault::Primitive;
 use crate::ipc::Verdict;
 
 pub struct Durable;
@@ -10,29 +11,32 @@ pub struct Durable;
 impl Driver for Durable {
     fn drive(&mut self, observations: &Observations) -> Verdict {
         // No fault fired => nothing to test.
-        let fault = match &observations.kill {
+        let fault = match &observations.fault {
             None => {
                 return Verdict::Inconclusive {
-                    reason: "no kill was scheduled".into(),
+                    reason: "no fault was scheduled".into(),
                 };
             }
-            Some(KillReport {
-                result: KillResult::Missed(miss),
+            Some(FaultReport {
+                result: FaultResult::Missed(miss),
                 ..
             }) => {
                 return Verdict::Inconclusive {
                     reason: format!("fault did not fire: {miss:?}"),
                 };
             }
-            Some(KillReport {
+            Some(FaultReport {
                 service,
                 result:
-                    KillResult::Fired {
-                        actual_offset_ns, ..
+                    FaultResult::Fired {
+                        by,
+                        actual_offset_ns,
+                        ..
                     },
                 ..
-            }) => Kill {
+            }) => Placed {
                 service,
+                by: *by,
                 at_ns: *actual_offset_ns,
             },
         };
@@ -120,19 +124,32 @@ fn differing(reached: &Checkpoint, expected: &Checkpoint) -> Result<Option<usize
     Ok(None)
 }
 
-/// The kill this run was judging, once it is known to have fired.
+/// The fault this run was judging, once it is known to have fired.
 #[derive(Clone, Copy)]
-struct Kill<'a> {
+struct Placed<'a> {
     service: &'a str,
+    by: Primitive,
     /// Nanoseconds from scenario start when the fault was placed.
     at_ns: u128,
+}
+
+impl Placed<'_> {
+    /// What was done, as a verdict says it happened.
+    fn done(self) -> &'static str {
+        match self.by {
+            Primitive::Kill => "was killed",
+            Primitive::Cut => "was cut off",
+            Primitive::Redeliver => "was redelivered to",
+            Primitive::Reorder => "was reordered around",
+        }
+    }
 }
 
 /// What the fault was, where it landed, what should have been true, and the step
 /// the fleet started getting it wrong at.
 fn failure(
     observations: &Observations,
-    fault: Kill<'_>,
+    fault: Placed<'_>,
     settled: &Checkpoint,
     expected: &Checkpoint,
     landed: usize,
@@ -155,8 +172,9 @@ fn failure(
         None => String::new(),
     };
     format!(
-        "`{}` was killed {}. {reason}{diverged}",
+        "`{}` {} {}. {reason}{diverged}",
         fault.service,
+        fault.done(),
         placement(&observations.windows, fault.at_ns)
     )
 }
@@ -209,7 +227,7 @@ fn observable(observations: &Observations, i: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crucible_protocol::{KillReport, KillResult};
+    use crucible_protocol::{FaultReport, FaultResult};
 
     use super::*;
     use crate::{
@@ -217,20 +235,21 @@ mod tests {
         verdict::{Ack, Observed, Outcome},
     };
 
-    fn fired_kill() -> KillReport {
+    fn fired_kill() -> FaultReport {
         fired_kill_at(0)
     }
 
     /// A kill of `db` placed `at_ns` nanoseconds into the scenario.
-    fn fired_kill_at(at_ns: u128) -> KillReport {
-        KillReport {
+    fn fired_kill_at(at_ns: u128) -> FaultReport {
+        FaultReport {
             schedule_id: 0,
             service: "db".into(),
-            result: KillResult::Fired {
+            result: FaultResult::Fired {
+                by: Primitive::Kill,
                 requested_direction: crucible_protocol::Direction::ClientToUpstream,
                 requested_packet_index: 1,
                 actual_offset_ns: at_ns,
-                killed_at_ns: 0,
+                placed_at_ns: 0,
             },
         }
     }
@@ -270,7 +289,7 @@ mod tests {
     /// target was back.
     fn judged(acks: &[Ack], fault_free: &[i64], settled: i64) -> Verdict {
         let mut obs = Observations::empty();
-        obs.kill = Some(fired_kill());
+        obs.fault = Some(fired_kill());
         obs.outcomes = acks.iter().copied().map(outcome).collect();
         obs.checks = vec![reading(settled)];
         obs.fault_free = fault_free.iter().copied().map(checkpoint).collect();
@@ -288,11 +307,11 @@ mod tests {
     #[test]
     fn missed_kill_is_inconclusive() {
         let mut obs = Observations::empty();
-        obs.kill = Some(KillReport {
+        obs.fault = Some(FaultReport {
             schedule_id: 0,
             service: "db".into(),
-            result: KillResult::Missed(
-                crucible_protocol::KillMissReason::ScenarioEndedBeforeAnchor,
+            result: FaultResult::Missed(
+                crucible_protocol::FaultMissReason::ScenarioEndedBeforeAnchor,
             ),
         });
         obs.checks = vec![reading(0)];
@@ -302,7 +321,7 @@ mod tests {
     #[test]
     fn a_scenario_with_nothing_to_check_is_inconclusive() {
         let mut obs = Observations::empty();
-        obs.kill = Some(fired_kill());
+        obs.fault = Some(fired_kill());
         obs.outcomes.push(outcome(Ack::Acked));
         assert!(matches!(Durable.drive(&obs), Verdict::Inconclusive { .. }));
     }
@@ -310,7 +329,7 @@ mod tests {
     #[test]
     fn a_scenario_that_drove_nothing_is_not_a_test() {
         let mut obs = Observations::empty();
-        obs.kill = Some(fired_kill());
+        obs.fault = Some(fired_kill());
         obs.checks = vec![reading(0)];
         assert!(matches!(Durable.drive(&obs), Verdict::Inconclusive { .. }));
     }
@@ -366,7 +385,7 @@ mod tests {
     #[test]
     fn an_unread_observable_is_inconclusive() {
         let mut obs = Observations::empty();
-        obs.kill = Some(fired_kill());
+        obs.fault = Some(fired_kill());
         obs.outcomes = vec![outcome(Ack::Acked)];
         obs.checks = vec![reading(1)];
         obs.fault_free = vec![checkpoint(0), vec![None]];
@@ -378,7 +397,7 @@ mod tests {
     #[test]
     fn diverging_and_coming_back_is_pass() {
         let mut obs = Observations::empty();
-        obs.kill = Some(fired_kill());
+        obs.fault = Some(fired_kill());
         obs.outcomes = vec![outcome(Ack::Acked), outcome(Ack::Acked)];
         obs.checks = vec![reading(2)];
         obs.trajectory = vec![checkpoint(0), checkpoint(0), checkpoint(2)];
@@ -389,7 +408,7 @@ mod tests {
     #[test]
     fn a_failure_points_at_the_step_the_run_first_differed_after() {
         let mut obs = Observations::empty();
-        obs.kill = Some(fired_kill());
+        obs.fault = Some(fired_kill());
         obs.outcomes = vec![outcome(Ack::Acked), outcome(Ack::Acked)];
         obs.checks = vec![reading(1)];
         obs.trajectory = vec![checkpoint(0), checkpoint(1), checkpoint(1)];
@@ -405,7 +424,7 @@ mod tests {
     #[test]
     fn a_failure_keeps_quiet_about_a_divergence_past_the_step_it_judged() {
         let mut obs = Observations::empty();
-        obs.kill = Some(fired_kill());
+        obs.fault = Some(fired_kill());
         obs.outcomes = vec![outcome(Ack::Acked), outcome(Ack::Rejected)];
         obs.checks = vec![reading(2)];
         obs.trajectory = vec![checkpoint(0), checkpoint(1), checkpoint(5)];
@@ -423,7 +442,7 @@ mod tests {
         filtered.check.args = vec![plan::Value::Ident("level".into())];
         filtered.check.filter = Some(("item".into(), plan::Value::Str("book".into())));
         let mut obs = Observations::empty();
-        obs.kill = Some(fired_kill());
+        obs.fault = Some(fired_kill());
         obs.outcomes = vec![outcome(Ack::Acked)];
         obs.checks = vec![filtered];
         obs.fault_free = vec![checkpoint(100), checkpoint(96)];
@@ -441,7 +460,7 @@ mod tests {
     #[test]
     fn a_verdict_names_the_fault_that_caused_it() {
         let mut obs = Observations::empty();
-        obs.kill = Some(fired_kill_at(150));
+        obs.fault = Some(fired_kill_at(150));
         obs.outcomes = vec![outcome(Ack::Acked), outcome(Ack::Acked)];
         obs.checks = vec![reading(1)];
         obs.fault_free = vec![checkpoint(0), checkpoint(1), checkpoint(2)];

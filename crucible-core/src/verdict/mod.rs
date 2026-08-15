@@ -92,7 +92,7 @@ pub struct Observations {
     /// When each step ran, in the order the scenario states them.
     pub windows: Vec<StepWindow>,
     pub sessions: Vec<crucible_protocol::Session>,
-    pub kill: Option<crucible_protocol::KillReport>,
+    pub fault: Option<crucible_protocol::FaultReport>,
 }
 
 /// When a step ran, as nanoseconds from scenario start. The fault records the

@@ -23,7 +23,7 @@ use futures_util::{StreamExt, TryStreamExt};
 use tokio::time::sleep;
 
 use crucible_core::{
-    fault::Anchor,
+    fault::Fault,
     observer::SessionObserver,
     plan,
     schema::{AttrDecl, AttrSchema, ValueType},
@@ -154,7 +154,7 @@ pub struct Docker {
     network: String,
     services: Vec<ServiceConfig>,
     endpoints: Endpoints,
-    anchor: Option<Anchor>,
+    fault: Option<Fault>,
 }
 
 /// Where each service answers, keyed by service and kind. The proxy fronts every
@@ -183,18 +183,14 @@ impl Docker {
     ///
     /// # Errors
     /// Errors if connecting to the Docker daemon socket fails.
-    pub fn new(
-        worker_id: u32,
-        services: Vec<ServiceConfig>,
-        anchor: Option<Anchor>,
-    ) -> Result<Self> {
+    pub fn new(worker_id: u32, services: Vec<ServiceConfig>, fault: Option<Fault>) -> Result<Self> {
         let client = DockerClient::connect_with_socket_defaults()?;
         Ok(Self {
             client,
             network: format!("crucible-{worker_id}"),
             services,
             endpoints: Endpoints::default(),
-            anchor,
+            fault,
         })
     }
 
@@ -342,13 +338,16 @@ impl Docker {
                 ));
             }
         }
-        if let Some(anchor) = &self.anchor {
+        if let Some(fault) = &self.fault {
+            let anchor = fault.anchor();
             let direction = match anchor.direction {
                 Direction::ClientToUpstream => "c2u",
                 Direction::UpstreamToClient => "u2c",
             };
             cmd.push("--fault-at".to_string());
             cmd.push(format!("{}={}={}", anchor.service, direction, anchor.k));
+            cmd.push("--fault".to_string());
+            cmd.push(fault.primitive().to_string());
         }
 
         let exposed_ports: Vec<String> = self

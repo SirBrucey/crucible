@@ -6,7 +6,7 @@ use std::{
 };
 
 use crucible_core::{
-    fault::Anchor,
+    fault::Fault,
     plan,
     schema::{AttrDecl, AttrSchema, OpSig},
 };
@@ -184,12 +184,12 @@ impl Registry {
         &self,
         planned: &plan::Fleet,
         worker_id: u32,
-        anchor: Option<Anchor>,
+        fault: Option<Fault>,
     ) -> Result<Box<dyn DeploymentRuntime>, Error> {
         match planned.deployment.as_str() {
             Docker::NAME if self.deployments.contains_key(Docker::NAME) => {
                 let services = bind_services::<Docker>(planned)?;
-                Ok(Box::new(Docker::new(worker_id, services, anchor)?))
+                Ok(Box::new(Docker::new(worker_id, services, fault)?))
             }
             other => Err(Error::new(
                 "registry",

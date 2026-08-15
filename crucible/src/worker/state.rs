@@ -152,8 +152,7 @@ async fn bring_up(
     worker_id: u32,
     schedule: &Schedule,
 ) -> Result<Orchestrator<Ready>> {
-    let anchor = schedule.fault.as_ref().map(|fault| fault.anchor().clone());
-    let deployment = registry.deployment_for(&schedule.fleet, worker_id, anchor)?;
+    let deployment = registry.deployment_for(&schedule.fleet, worker_id, schedule.fault.clone())?;
     let actions = registry.actions_for(&schedule.steps)?;
     let orchestrator = Orchestrator::new(deployment, actions).setup().await?;
     Ok(orchestrator)
@@ -297,7 +296,7 @@ impl Worker<Executing> {
             }
         };
 
-        let ((verdict, kill_report), orchestrator) = orchestrator
+        let ((verdict, fault_report), orchestrator) = orchestrator
             .execute(
                 schedule_id,
                 &self.state.fault,
@@ -310,14 +309,14 @@ impl Worker<Executing> {
             )?;
         drop(heartbeat);
         self.conn
-            .send(&WorkerToRunner::Event(WorkerEvent::Kill(
-                kill_report.clone(),
+            .send(&WorkerToRunner::Event(WorkerEvent::Fault(
+                fault_report.clone(),
             )))
             .await?;
         tracing::info!(
             worker_id = self.id,
             schedule_id,
-            ?kill_report,
+            ?fault_report,
             "sent kill event"
         );
         self.conn
