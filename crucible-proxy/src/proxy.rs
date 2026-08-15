@@ -19,9 +19,8 @@ use tokio::{
     sync::{mpsc, watch},
 };
 
-/// The fault anchor for a pair: once `k` packets have been forwarded on
-/// `direction` (counted across all this pair's connections), trip the shared
-/// pause gate so the whole fleet freezes on that packet.
+/// Where a fault lands on a pair: once `k` packets have been forwarded on
+/// `direction`, counted across all this pair's connections.
 ///
 /// Dormant until [`arm`](Self::arm), so it counts only scenario traffic, not the
 /// fleet's own bring-up handshakes. The runner arms it once the scenario starts,
@@ -29,28 +28,82 @@ use tokio::{
 /// match the scenario-relative one the learn pass measured.
 ///
 /// The count is shared across the pair's connections. With a single connection
-/// on `direction` (the common case) the freeze lands exactly on the k-th packet.
+/// on `direction` (the common case) the fault lands exactly on the k-th packet.
 /// With several connections forwarding at once, one that has already passed the
-/// pause gate can write a packet or two past `k` before it next observes the
-/// freeze, so under that contention the anchor freezes slightly late, never early.
+/// gate can write a packet or two past `k` before it next observes it, so under
+/// contention the fault lands slightly late, never early.
 #[derive(Clone)]
 pub struct Anchor {
     direction: Direction,
     k: u32,
     count: Arc<AtomicU32>,
     active: Arc<AtomicBool>,
-    tripwire: watch::Sender<bool>,
+    /// Fired once the anchored packet passes. What that sets off is the [`Gate`]
+    /// the connections were given.
+    trip: watch::Sender<bool>,
+}
+
+/// What a connection is subject to while the fleet runs.
+#[derive(Clone)]
+pub struct Gate {
+    /// Stop delivering packets by holding the bytes while this holds `true`.
+    /// The network is frozen for as long as the fault takes to run, so it lands
+    /// on the anchored packet however long it needs.
+    pause: watch::Receiver<bool>,
+    /// Drop the peer's connection when this fires.
+    cut: watch::Receiver<bool>,
+}
+
+impl Gate {
+    #[must_use]
+    pub fn new(pause: watch::Receiver<bool>, cut: watch::Receiver<bool>) -> Self {
+        Self { pause, cut }
+    }
+
+    /// Hold here while the network is frozen. Returns whether the connection
+    /// came through it: a fault that runs while it waits may have cut it.
+    async fn passable(&mut self) -> bool {
+        while *self.pause.borrow() {
+            if self.pause.changed().await.is_err() {
+                // Control has gone; forwarding must not wedge behind it.
+                break;
+            }
+        }
+        !*self.cut.borrow()
+    }
+}
+
+/// Resolves once this connection is cut, and never otherwise, so it can race
+/// something that would only end when a packet arrives.
+async fn cut(cut: &mut watch::Receiver<bool>) {
+    while !*cut.borrow() {
+        if cut.changed().await.is_err() {
+            // Nothing left to cut us; wait forever rather than report one.
+            std::future::pending::<()>().await;
+        }
+    }
 }
 
 impl Anchor {
-    pub fn new(direction: Direction, k: u32, tripwire: watch::Sender<bool>) -> Self {
+    pub fn new(direction: Direction, k: u32, trip: watch::Sender<bool>) -> Self {
         Self {
             direction,
             k,
             count: Arc::new(AtomicU32::new(0)),
             active: Arc::new(AtomicBool::new(false)),
-            tripwire,
+            trip,
         }
+    }
+
+    /// Tell the connections waiting on this that the anchored packet has passed.
+    fn fire(&self) {
+        // FIXME: propagate once arm and record can report failure. The watch
+        // keeps a receiver for the whole process, so this cannot fail; dropping
+        // it silently would leave the fault unplaced while the caller is told
+        // the anchor tripped.
+        self.trip
+            .send(true)
+            .expect("the anchor's watch has a live receiver");
     }
 
     /// Arm at scenario start: reset the count and begin counting. `k == 0`
@@ -60,13 +113,7 @@ impl Anchor {
         self.count.store(0, Ordering::SeqCst);
         self.active.store(true, Ordering::SeqCst);
         if self.k == 0 {
-            // FIXME: propagate once arm can report failure. The pause watch keeps
-            // a receiver for the whole process (main holds one), so this cannot
-            // fail; a silent failure would leave the gate unset and the fleet
-            // never frozen, so assert rather than drop it.
-            self.tripwire
-                .send(true)
-                .expect("pause watch has a live receiver");
+            self.fire();
         }
     }
 
@@ -79,12 +126,7 @@ impl Anchor {
         }
         let crossed = self.count.fetch_add(1, Ordering::SeqCst) + 1;
         if crossed == self.k {
-            // FIXME: as in arm(); this cannot fail while the pause watch has a
-            // receiver. Dropping it silently would leave the fleet unfrozen while
-            // record still reports the trip, reopening the kill-before-freeze race.
-            self.tripwire
-                .send(true)
-                .expect("pause watch has a live receiver");
+            self.fire();
             return true;
         }
         false
@@ -107,20 +149,19 @@ pub struct Proxy {
     upstream: String,
     events_tx: mpsc::UnboundedSender<ConnEvent>,
     next_id: Arc<AtomicU64>,
-    pause: watch::Receiver<bool>,
+    gate: Gate,
     anchor: Option<Anchor>,
 }
 
 impl Proxy {
-    /// Bind to `listen` and prepare to forward every accepted connection to `upstream`.
-    /// `pause` gates forwarding: while it holds `true`, every connection holds its
-    /// bytes (delivering none) until it flips back to `false`. `anchor`, if set,
-    /// freezes the fleet once this pair has forwarded `k` packets on its direction.
-    /// Returns the proxy, its bound local address, and the receiver for connection events.
+    /// Bind to `listen` and prepare to forward every accepted connection to
+    /// `upstream`, subject to `gate`. `anchor`, if set, trips once this pair has
+    /// forwarded `k` packets on its direction. Returns the proxy, its bound
+    /// local address, and the receiver for connection events.
     pub async fn bind(
         listen: SocketAddr,
         upstream: String,
-        pause: watch::Receiver<bool>,
+        gate: Gate,
         anchor: Option<Anchor>,
     ) -> io::Result<(Self, SocketAddr, mpsc::UnboundedReceiver<ConnEvent>)> {
         let listener = TcpListener::bind(listen).await?;
@@ -131,7 +172,7 @@ impl Proxy {
             upstream,
             events_tx,
             next_id: Arc::new(AtomicU64::new(0)),
-            pause,
+            gate,
             anchor,
         };
         Ok((proxy, local_addr, events_rx))
@@ -148,7 +189,7 @@ impl Proxy {
                 peer,
                 self.upstream.clone(),
                 self.events_tx.clone(),
-                self.pause.clone(),
+                self.gate.clone(),
                 self.anchor.clone(),
             ));
         }
@@ -198,16 +239,6 @@ impl Relay {
     }
 }
 
-/// Block while the pause gate holds `true`, returning as soon as it is `false`
-/// (or the sender is dropped, so forwarding never wedges if control goes away).
-async fn wait_while_paused(pause: &mut watch::Receiver<bool>) {
-    while *pause.borrow() {
-        if pause.changed().await.is_err() {
-            return;
-        }
-    }
-}
-
 /// Send a connection event to the drain task in `main`, which holds the receiver
 /// for as long as any forward task (or the accept loop) holds a sender.
 // FIXME: propagate this for real recovery once the forward tasks report failures
@@ -225,7 +256,7 @@ async fn forward(
     peer: SocketAddr,
     upstream: String,
     events_tx: mpsc::UnboundedSender<ConnEvent>,
-    pause: watch::Receiver<bool>,
+    gate: Gate,
     anchor: Option<Anchor>,
 ) {
     let upstream_conn = match TcpStream::connect(&upstream).await {
@@ -255,7 +286,7 @@ async fn forward(
         upstream_w,
         Direction::ClientToUpstream,
         events_tx.clone(),
-        pause.clone(),
+        gate.clone(),
         anchor_c2u,
     ));
     let u2c = tokio::spawn(forward_bytes(
@@ -264,7 +295,7 @@ async fn forward(
         client_w,
         Direction::UpstreamToClient,
         events_tx.clone(),
-        pause,
+        gate,
         anchor_u2c,
     ));
 
@@ -289,7 +320,7 @@ async fn forward_bytes(
     mut write: OwnedWriteHalf,
     direction: Direction,
     events: mpsc::UnboundedSender<ConnEvent>,
-    mut pause: watch::Receiver<bool>,
+    mut gate: Gate,
     anchor: Option<Anchor>,
 ) -> Result<u64, String> {
     let (read_label, write_label) = match direction {
@@ -299,13 +330,21 @@ async fn forward_bytes(
     let mut bytes_total: u64 = 0;
     let mut buf = vec![0u8; 4096];
     loop {
-        let n = match read.read(&mut buf).await {
+        // A cut severs an idle connection too, so it races the read rather than
+        // waiting for a packet that is never coming.
+        let read = tokio::select! {
+            read = read.read(&mut buf) => read,
+            () = cut(&mut gate.cut) => break Ok(bytes_total),
+        };
+        let n = match read {
             Ok(0) => break Ok(bytes_total),
             Ok(n) => n,
             Err(e) => break Err(format!("{read_label}: {e}")),
         };
         emit(&events, ConnEvent::wrote(id, direction, n as u64));
-        wait_while_paused(&mut pause).await;
+        if !gate.passable().await {
+            break Ok(bytes_total);
+        }
         if let Err(e) = write.write_all(&buf[..n]).await {
             break Err(format!("{write_label}: {e}"));
         }
@@ -331,9 +370,14 @@ mod tests {
 
     use super::*;
 
-    /// A pause receiver that never pauses, for tests that do not exercise the gate.
-    fn never_paused() -> watch::Receiver<bool> {
-        watch::channel(false).1
+    /// A gate that never closes.
+    fn open() -> Gate {
+        Gate::new(watch::channel(false).1, watch::channel(false).1)
+    }
+
+    /// A gate held by `pause`.
+    fn held(pause: watch::Receiver<bool>) -> Gate {
+        Gate::new(pause, watch::channel(false).1)
     }
 
     async fn spawn_echo() -> SocketAddr {
@@ -370,7 +414,7 @@ mod tests {
         let (proxy, proxy_addr, mut events) = Proxy::bind(
             (Ipv4Addr::LOCALHOST, 0).into(),
             echo.to_string(),
-            never_paused(),
+            open(),
             None,
         )
         .await
@@ -436,7 +480,7 @@ mod tests {
         let (proxy, proxy_addr, mut events) = Proxy::bind(
             (Ipv4Addr::LOCALHOST, 0).into(),
             unused.to_string(),
-            never_paused(),
+            open(),
             None,
         )
         .await
@@ -456,7 +500,7 @@ mod tests {
         let (proxy, proxy_addr, _events) = Proxy::bind(
             (Ipv4Addr::LOCALHOST, 0).into(),
             echo.to_string(),
-            pause_rx,
+            held(pause_rx),
             None,
         )
         .await
@@ -480,6 +524,37 @@ mod tests {
             .expect("echo within 2s after resume")
             .expect("read succeeds");
         assert_eq!(&buf, b"ping");
+    }
+
+    #[tokio::test]
+    async fn a_cut_takes_the_connection_out_from_under_an_idle_peer() {
+        let echo = spawn_echo().await;
+        let (cut_tx, cut_rx) = watch::channel(false);
+        let (proxy, proxy_addr, _events) = Proxy::bind(
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            echo.to_string(),
+            Gate::new(watch::channel(false).1, cut_rx),
+            None,
+        )
+        .await
+        .unwrap();
+        tokio::spawn(proxy.run());
+
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+        client.write_all(b"ping").await.unwrap();
+        let mut buf = [0u8; 4];
+        client.read_exact(&mut buf).await.unwrap();
+
+        // Nothing more is coming, so a cut that waited for the next packet would
+        // leave this connection sitting here.
+        cut_tx.send(true).unwrap();
+        let read = timeout(Duration::from_secs(2), client.read(&mut buf))
+            .await
+            .expect("the connection goes within 2s of the cut");
+        assert!(
+            matches!(read, Ok(0) | Err(_)),
+            "the peer sees the edge go away"
+        );
     }
 
     #[test]
@@ -533,7 +608,7 @@ mod tests {
         let (proxy, proxy_addr, mut events) = Proxy::bind(
             (Ipv4Addr::LOCALHOST, 0).into(),
             echo.to_string(),
-            pause_rx,
+            held(pause_rx),
             Some(anchor.clone()),
         )
         .await
@@ -567,7 +642,7 @@ mod tests {
         let (proxy, proxy_addr, _events) = Proxy::bind(
             (Ipv4Addr::LOCALHOST, 0).into(),
             echo.to_string(),
-            pause_rx.clone(),
+            held(pause_rx.clone()),
             Some(anchor.clone()),
         )
         .await

@@ -347,7 +347,7 @@ impl Docker {
                 Direction::ClientToUpstream => "c2u",
                 Direction::UpstreamToClient => "u2c",
             };
-            cmd.push("--freeze-at".to_string());
+            cmd.push("--fault-at".to_string());
             cmd.push(format!("{}={}={}", anchor.service, direction, anchor.k));
         }
 

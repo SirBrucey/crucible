@@ -12,7 +12,7 @@ use tokio::{
 
 use crate::{
     error::{Error, Result},
-    proxy::{Anchor, Proxy, Relay},
+    proxy::{Anchor, Gate, Proxy, Relay},
 };
 
 #[derive(Parser)]
@@ -29,15 +29,33 @@ struct Cli {
     /// not infected by the framework's own.
     #[arg(long = "control")]
     control: Vec<String>,
-    /// Fault anchor `SERVICE=DIRECTION=K` (DIRECTION is `c2u` or `u2c`): freeze
-    /// the fleet once `SERVICE` has forwarded `K` packets on that direction.
-    #[arg(long = "freeze-at")]
-    freeze_at: Option<String>,
+    /// Fault anchor `SERVICE=DIRECTION=K` (DIRECTION is `c2u` or `u2c`): place
+    /// the fault once `SERVICE` has forwarded `K` packets in that direction.
+    #[arg(long = "fault-at")]
+    fault_at: Option<String>,
+    /// What to do to the fleet at the anchored packet. `kill` freezes and waits
+    /// for the service to be killed and brought back from outside; `cut` severs
+    /// the connection between the proxy and the two services.
+    #[arg(long = "fault", default_value = "kill")]
+    fault: Fault,
 }
 
-/// A parsed `--freeze-at` anchor: freeze once `service` forwards `k` packets on
-/// `direction`.
-struct FreezeAt {
+/// What the proxy does to the fleet once the anchored packet is reached. The
+/// network is frozen before the fault is placed and released immediately after,
+/// to ensure the fault is placed deterministically.
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum Fault {
+    /// Wait to be told the service has been killed and brought back. That
+    /// happens outside the proxy, so the freeze is what holds the fleet for it.
+    Kill,
+    /// Sever the connection between the proxy and the two services, so both see
+    /// the edge go away mid-request while their processes and state survive.
+    Cut,
+}
+
+/// A parsed `--fault-at` anchor: place the fault once `service` forwards `k`
+/// packets in `direction`.
+struct FaultAt {
     service: String,
     direction: Direction,
     k: u32,
@@ -50,20 +68,20 @@ fn is_fronted(service: &str, pairs: &[String]) -> bool {
         .any(|spec| spec.split('=').next() == Some(service))
 }
 
-fn parse_freeze_at(spec: &str) -> Result<FreezeAt> {
+fn parse_fault_at(spec: &str) -> Result<FaultAt> {
     let mut parts = spec.splitn(3, '=');
     let (Some(service), Some(dir), Some(k)) = (parts.next(), parts.next(), parts.next()) else {
-        return Err(Error::MalformedFreezeAt { spec: spec.into() });
+        return Err(Error::MalformedFaultAt { spec: spec.into() });
     };
     let direction = match dir {
         "c2u" => Direction::ClientToUpstream,
         "u2c" => Direction::UpstreamToClient,
-        _ => return Err(Error::MalformedFreezeAt { spec: spec.into() }),
+        _ => return Err(Error::MalformedFaultAt { spec: spec.into() }),
     };
     let k = k
         .parse()
-        .map_err(|_| Error::MalformedFreezeAt { spec: spec.into() })?;
-    Ok(FreezeAt {
+        .map_err(|_| Error::MalformedFaultAt { spec: spec.into() })?;
+    Ok(FaultAt {
         service: service.into(),
         direction,
         k,
@@ -82,28 +100,31 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    // One pause gate shared by every pair in this sidecar. Control is by signal:
-    // SIGUSR1 arms the fault anchor at scenario start (so it counts only scenario
-    // traffic, not bring-up), and SIGUSR2 releases the freeze after the kill.
+    // The network every pair in this sidecar forwards on, frozen while a fault
+    // is placed. SIGUSR1 arms the anchor at scenario start, so it counts only
+    // scenario traffic and not bring-up.
     let (pause_tx, pause_rx) = watch::channel(false);
+    // Fired at the anchored packet, so the fault runs at the point the schedule
+    // named rather than wherever the fleet has got to since.
+    let (trip_tx, trip_rx) = watch::channel(false);
 
     // Build the fault anchor (if any) once, so the same handle both counts on the
     // matching pair and is armed by the SIGUSR1 handler.
-    let freeze = cli.freeze_at.as_deref().map(parse_freeze_at).transpose()?;
-    // A freeze-at must name a service some pair fronts. Otherwise it would
+    let at = cli.fault_at.as_deref().map(parse_fault_at).transpose()?;
+    // A fault-at must name a service some pair fronts. Otherwise it would
     // silently never count (k>0, no pair increments it) or, on arm, freeze the
     // whole fleet for a target that is not even fronted (k=0).
-    if let Some(f) = &freeze
-        && !is_fronted(&f.service, &cli.pairs)
+    if let Some(at) = &at
+        && !is_fronted(&at.service, &cli.pairs)
     {
-        return Err(Error::UnknownFreezeService {
-            service: f.service.clone(),
+        return Err(Error::UnknownFaultService {
+            service: at.service.clone(),
         });
     }
-    let anchor = freeze
+    let anchor = at
         .as_ref()
-        .map(|f| Anchor::new(f.direction, f.k, pause_tx.clone()));
-    spawn_pause_control(pause_tx.clone(), anchor.clone());
+        .map(|at| Anchor::new(at.direction, at.k, trip_tx));
+    let mut severs = None;
 
     for spec in cli.pairs {
         let Pair {
@@ -111,14 +132,17 @@ async fn main() -> Result<()> {
             listen,
             upstream,
         } = Pair::parse(&spec)?;
-        // Only the pair fronting the anchored service counts toward the freeze.
-        let pair_anchor = if freeze.as_ref().is_some_and(|f| f.service == service) {
+        // Only the pair fronting the anchored service counts toward the fault.
+        let (cut_tx, cut_rx) = watch::channel(false);
+        let pair_anchor = if at.as_ref().is_some_and(|at| at.service == service) {
+            severs = Some(cut_tx);
             anchor.clone()
         } else {
             None
         };
+        let gate = Gate::new(pause_rx.clone(), cut_rx);
         let (proxy, _local_addr, mut events) =
-            Proxy::bind(listen, upstream.clone(), pause_rx.clone(), pair_anchor).await?;
+            Proxy::bind(listen, upstream.clone(), gate, pair_anchor).await?;
         tracing::info!(%service, %listen, %upstream, "proxy pair up");
 
         tokio::spawn(async move {
@@ -140,6 +164,8 @@ async fn main() -> Result<()> {
             }
         });
     }
+
+    spawn_fault_control(cli.fault, anchor, trip_rx, pause_tx, severs);
 
     for spec in cli.control {
         let Pair {
@@ -188,52 +214,86 @@ impl Pair {
     }
 }
 
-/// Listen for SIGUSR1 (arm the anchor at scenario start) and SIGUSR2 (release
-/// the freeze) for the lifetime of the process. Holds a `watch::Sender`, so it
-/// must outlive the proxies; it never returns.
-fn spawn_pause_control(pause_tx: watch::Sender<bool>, anchor: Option<Anchor>) {
+/// Drive the fault for the lifetime of the process: arm the anchor when the
+/// scenario starts (SIGUSR1), and once the anchored packet passes, freeze the
+/// network, place the fault, and release it.
+///
+/// Holds a `watch::Sender`, so it must outlive the proxies; it never returns.
+fn spawn_fault_control(
+    fault: Fault,
+    anchor: Option<Anchor>,
+    mut trip: watch::Receiver<bool>,
+    pause: watch::Sender<bool>,
+    severs: Option<watch::Sender<bool>>,
+) {
     tokio::spawn(async move {
-        let mut arm = match signal(SignalKind::user_defined1()) {
-            Ok(sig) => sig,
-            Err(e) => {
-                tracing::error!(?e, "failed to install SIGUSR1 handler");
-                return;
-            }
-        };
-        let mut resume = match signal(SignalKind::user_defined2()) {
-            Ok(sig) => sig,
-            Err(e) => {
-                tracing::error!(?e, "failed to install SIGUSR2 handler");
+        let (mut arm, mut killed) = match (
+            signal(SignalKind::user_defined1()),
+            signal(SignalKind::user_defined2()),
+        ) {
+            (Ok(arm), Ok(killed)) => (arm, killed),
+            (Err(e), _) | (_, Err(e)) => {
+                tracing::error!(?e, "failed to install the fault-control signal handlers");
                 return;
             }
         };
         loop {
             tokio::select! {
-                _ = arm.recv() => {
-                    if let Some(anchor) = &anchor {
-                        anchor.arm();
-                        tracing::info!("anchor armed at scenario start (SIGUSR1)");
-                    } else {
-                        tracing::debug!("SIGUSR1 with no anchor; ignored");
+                _ = arm.recv() => if let Some(anchor) = &anchor {
+                    anchor.arm();
+                    tracing::info!("anchor armed at scenario start (SIGUSR1)");
+                } else {
+                    tracing::debug!("SIGUSR1 with no anchor; ignored");
+                },
+                Ok(()) = trip.changed() => {
+                    if !*trip.borrow() {
+                        continue;
                     }
-                }
-                _ = resume.recv() => {
-                    // Disarm before releasing: the anchor is one-shot, so a late
-                    // packet cannot re-trip the gate after we have resumed.
+                    freeze(&pause, true);
+                    match fault {
+                        // The service is killed and brought back from outside,
+                        // which says so by signalling; until then the fleet
+                        // waits, so nothing runs against a half-dead service.
+                        Fault::Kill => {
+                            killed.recv().await;
+                            tracing::info!("the service was killed and is back (SIGUSR2)");
+                        }
+                        Fault::Cut => if let Some(cut) = &severs {
+                            // FIXME: propagate once this loop can report
+                            // failure. Every connection on the pair holds a
+                            // receiver, so this cannot fail.
+                            cut.send(true).expect("the cut watch has live receivers");
+                            tracing::info!("severed the anchored pair");
+                        } else {
+                            tracing::warn!("nothing to sever; the fault did nothing");
+                        },
+                    }
+                    // The anchor is one-shot, so disarm before releasing: a late
+                    // packet cannot place a second fault behind this one.
                     if let Some(anchor) = &anchor {
                         anchor.disarm();
                     }
-                    // FIXME: propagate once the signal loop can report failure.
-                    // main holds a pause receiver for the process lifetime, so
-                    // this cannot fail; assert rather than drop it.
-                    pause_tx
-                        .send(false)
-                        .expect("pause watch has a live receiver");
-                    tracing::info!("forwarding resumed (SIGUSR2)");
+                    freeze(&pause, false);
+                }
+                // No fault was placed, so this is a give-up path: the scenario
+                // ended before the anchored packet, or the wait timed out.
+                _ = killed.recv() => {
+                    if let Some(anchor) = &anchor {
+                        anchor.disarm();
+                    }
+                    freeze(&pause, false);
                 }
             }
         }
     });
+}
+
+/// Hold the network still, or let it go.
+// FIXME: propagate once the fault-control loop can report failure. main holds a
+// pause receiver for the process lifetime, so this cannot fail; a silent failure
+// would leave the fleet frozen with nothing left to release it.
+fn freeze(pause: &watch::Sender<bool>, held: bool) {
+    pause.send(held).expect("pause watch has a live receiver");
 }
 
 #[cfg(test)]
@@ -242,37 +302,37 @@ mod tests {
 
     #[test]
     fn parses_a_client_to_upstream_anchor() {
-        let freeze = parse_freeze_at("db=c2u=3").expect("valid spec");
-        assert_eq!(freeze.service, "db");
-        assert_eq!(freeze.direction, Direction::ClientToUpstream);
-        assert_eq!(freeze.k, 3);
+        let at = parse_fault_at("db=c2u=3").expect("valid spec");
+        assert_eq!(at.service, "db");
+        assert_eq!(at.direction, Direction::ClientToUpstream);
+        assert_eq!(at.k, 3);
     }
 
     #[test]
     fn parses_an_upstream_to_client_anchor() {
-        let freeze = parse_freeze_at("api=u2c=0").expect("valid spec");
-        assert_eq!(freeze.service, "api");
-        assert_eq!(freeze.direction, Direction::UpstreamToClient);
-        assert_eq!(freeze.k, 0);
+        let at = parse_fault_at("api=u2c=0").expect("valid spec");
+        assert_eq!(at.service, "api");
+        assert_eq!(at.direction, Direction::UpstreamToClient);
+        assert_eq!(at.k, 0);
     }
 
     #[test]
     fn rejects_an_unknown_direction() {
-        assert!(parse_freeze_at("db=sideways=3").is_err());
+        assert!(parse_fault_at("db=sideways=3").is_err());
     }
 
     #[test]
     fn rejects_a_non_numeric_k() {
-        assert!(parse_freeze_at("db=c2u=three").is_err());
+        assert!(parse_fault_at("db=c2u=three").is_err());
     }
 
     #[test]
     fn rejects_a_missing_field() {
-        assert!(parse_freeze_at("db=c2u").is_err());
+        assert!(parse_fault_at("db=c2u").is_err());
     }
 
     #[test]
-    fn a_freeze_service_must_front_a_pair() {
+    fn a_fault_service_must_front_a_pair() {
         let pairs = vec!["db=0.0.0.0:3306=db-actual:3306".to_string()];
         assert!(is_fronted("db", &pairs));
         assert!(!is_fronted("api", &pairs));
