@@ -218,7 +218,7 @@ impl Worker<Idle> {
                     tracing::info!(
                         worker_id = self.id,
                         schedule_id = schedule.id,
-                        service = fault.anchor().service,
+                        service = fault.service(),
                         invariant = ?fault.invariant(),
                         "received schedule"
                     );

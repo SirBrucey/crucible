@@ -7,7 +7,7 @@ mod session;
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub use fault::{FaultMissReason, FaultReport, FaultResult};
+pub use fault::{At, FaultMissReason, FaultReport, FaultResult};
 pub use primitive::Primitive;
 pub use proxy::{ConnEvent, ConnEventKind, ConnId, Direction};
 pub use session::{Session, WriteRecord};
