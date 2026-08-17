@@ -137,8 +137,8 @@ impl Anchor {
     }
 
     /// Arm at scenario start: reset the count and begin counting. `k == 0`
-    /// (freeze before the first scenario packet) freezes right away, now that
-    /// the fleet is up rather than mid-bring-up.
+    /// (place the fault before the first scenario packet) fires right away, now
+    /// that the fleet is up rather than mid-bring-up.
     pub fn arm(&self) {
         self.count.store(0, Ordering::SeqCst);
         self.active.store(true, Ordering::SeqCst);
@@ -147,9 +147,9 @@ impl Anchor {
         }
     }
 
-    /// Count one forwarded packet; freeze the fleet on the one that reaches `k`.
-    /// A no-op until armed, so bring-up traffic is not counted. Returns whether
-    /// this call tripped the freeze, so the caller can announce it.
+    /// Count one forwarded packet, firing on the one that reaches `k`. A no-op
+    /// until armed, so bring-up traffic is not counted. Returns whether this
+    /// call fired, so the caller can announce it.
     fn record(&self) -> bool {
         if !self.active.load(Ordering::SeqCst) {
             return false;
@@ -162,10 +162,9 @@ impl Anchor {
         false
     }
 
-    /// Disarm: stop counting so the anchor cannot trip again. Paired with resume
-    /// on the give-up paths (the scenario ended, or the anchor timed out, before
-    /// `k` was reached), so a late packet cannot re-trip the gate after the flow
-    /// has been released with no one left to release it again.
+    /// Disarm: stop counting so the anchor cannot fire again. Paired with every
+    /// release, so a late packet cannot place a second fault once the fleet has
+    /// been let go with no one left to let it go again.
     pub fn disarm(&self) {
         self.active.store(false, Ordering::SeqCst);
     }

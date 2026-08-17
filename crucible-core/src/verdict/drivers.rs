@@ -235,12 +235,12 @@ mod tests {
         verdict::{Ack, Observed, Outcome},
     };
 
-    fn fired_kill() -> FaultReport {
-        fired_kill_at(0)
+    fn fired_fault() -> FaultReport {
+        fired_fault_at(0)
     }
 
     /// A kill of `db` placed `at_ns` nanoseconds into the scenario.
-    fn fired_kill_at(at_ns: u128) -> FaultReport {
+    fn fired_fault_at(at_ns: u128) -> FaultReport {
         FaultReport {
             schedule_id: 0,
             service: "db".into(),
@@ -289,7 +289,7 @@ mod tests {
     /// target was back.
     fn judged(acks: &[Ack], fault_free: &[i64], settled: i64) -> Verdict {
         let mut obs = Observations::empty();
-        obs.fault = Some(fired_kill());
+        obs.fault = Some(fired_fault());
         obs.outcomes = acks.iter().copied().map(outcome).collect();
         obs.checks = vec![reading(settled)];
         obs.fault_free = fault_free.iter().copied().map(checkpoint).collect();
@@ -305,7 +305,7 @@ mod tests {
     }
 
     #[test]
-    fn missed_kill_is_inconclusive() {
+    fn a_missed_fault_is_inconclusive() {
         let mut obs = Observations::empty();
         obs.fault = Some(FaultReport {
             schedule_id: 0,
@@ -321,7 +321,7 @@ mod tests {
     #[test]
     fn a_scenario_with_nothing_to_check_is_inconclusive() {
         let mut obs = Observations::empty();
-        obs.fault = Some(fired_kill());
+        obs.fault = Some(fired_fault());
         obs.outcomes.push(outcome(Ack::Acked));
         assert!(matches!(Durable.drive(&obs), Verdict::Inconclusive { .. }));
     }
@@ -329,7 +329,7 @@ mod tests {
     #[test]
     fn a_scenario_that_drove_nothing_is_not_a_test() {
         let mut obs = Observations::empty();
-        obs.fault = Some(fired_kill());
+        obs.fault = Some(fired_fault());
         obs.checks = vec![reading(0)];
         assert!(matches!(Durable.drive(&obs), Verdict::Inconclusive { .. }));
     }
@@ -385,7 +385,7 @@ mod tests {
     #[test]
     fn an_unread_observable_is_inconclusive() {
         let mut obs = Observations::empty();
-        obs.fault = Some(fired_kill());
+        obs.fault = Some(fired_fault());
         obs.outcomes = vec![outcome(Ack::Acked)];
         obs.checks = vec![reading(1)];
         obs.fault_free = vec![checkpoint(0), vec![None]];
@@ -397,7 +397,7 @@ mod tests {
     #[test]
     fn diverging_and_coming_back_is_pass() {
         let mut obs = Observations::empty();
-        obs.fault = Some(fired_kill());
+        obs.fault = Some(fired_fault());
         obs.outcomes = vec![outcome(Ack::Acked), outcome(Ack::Acked)];
         obs.checks = vec![reading(2)];
         obs.trajectory = vec![checkpoint(0), checkpoint(0), checkpoint(2)];
@@ -408,7 +408,7 @@ mod tests {
     #[test]
     fn a_failure_points_at_the_step_the_run_first_differed_after() {
         let mut obs = Observations::empty();
-        obs.fault = Some(fired_kill());
+        obs.fault = Some(fired_fault());
         obs.outcomes = vec![outcome(Ack::Acked), outcome(Ack::Acked)];
         obs.checks = vec![reading(1)];
         obs.trajectory = vec![checkpoint(0), checkpoint(1), checkpoint(1)];
@@ -424,7 +424,7 @@ mod tests {
     #[test]
     fn a_failure_keeps_quiet_about_a_divergence_past_the_step_it_judged() {
         let mut obs = Observations::empty();
-        obs.fault = Some(fired_kill());
+        obs.fault = Some(fired_fault());
         obs.outcomes = vec![outcome(Ack::Acked), outcome(Ack::Rejected)];
         obs.checks = vec![reading(2)];
         obs.trajectory = vec![checkpoint(0), checkpoint(1), checkpoint(5)];
@@ -442,7 +442,7 @@ mod tests {
         filtered.check.args = vec![plan::Value::Ident("level".into())];
         filtered.check.filter = Some(("item".into(), plan::Value::Str("book".into())));
         let mut obs = Observations::empty();
-        obs.fault = Some(fired_kill());
+        obs.fault = Some(fired_fault());
         obs.outcomes = vec![outcome(Ack::Acked)];
         obs.checks = vec![filtered];
         obs.fault_free = vec![checkpoint(100), checkpoint(96)];
@@ -460,7 +460,7 @@ mod tests {
     #[test]
     fn a_verdict_names_the_fault_that_caused_it() {
         let mut obs = Observations::empty();
-        obs.fault = Some(fired_kill_at(150));
+        obs.fault = Some(fired_fault_at(150));
         obs.outcomes = vec![outcome(Ack::Acked), outcome(Ack::Acked)];
         obs.checks = vec![reading(1)];
         obs.fault_free = vec![checkpoint(0), checkpoint(1), checkpoint(2)];

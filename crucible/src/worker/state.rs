@@ -322,7 +322,7 @@ impl Worker<Executing> {
             worker_id = self.id,
             schedule_id,
             ?fault_report,
-            "sent kill event"
+            "sent fault event"
         );
         self.conn
             .send(&WorkerToRunner::RunResult {

@@ -41,7 +41,7 @@ impl Fault {
     }
 }
 
-/// Where to freeze a fleet: once `service` has forwarded `k` packets on
+/// Where a fault lands: once `service` has forwarded `k` packets on
 /// `direction`. Anchoring to observed traffic rather than a wall clock is what
 /// makes a schedule reproducible across replicas.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]

@@ -592,8 +592,8 @@ mod tests {
 
     use super::*;
 
-    /// A deployment whose fault primitives can be told to fail, so `fire_kill`'s
-    /// error handling can be exercised without a real fleet.
+    /// A deployment whose kill can be told to fail, so placement's error handling
+    /// can be exercised without a real fleet.
     #[derive(Default)]
     struct FakeDeployment {
         kill_fails: bool,
@@ -655,7 +655,7 @@ mod tests {
         crucible_plugin::Error::new("fake", message)
     }
 
-    /// A kill of `db`, which is what a burst schedule carries.
+    /// A kill of `db`.
     fn fault() -> Fault {
         Fault::Durable {
             anchor: Anchor {
