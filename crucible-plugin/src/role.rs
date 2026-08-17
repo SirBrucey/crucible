@@ -46,8 +46,11 @@ pub trait Substrate: Faults {
     /// Arm the fault anchor at scenario start, so the replica holds still once
     /// the target reaches the anchored point.
     fn arm_anchor(&self) -> BoxFuture<'_, Result<(), Error>>;
-    /// Let the fleet go again.
-    fn resume(&self) -> BoxFuture<'_, Result<(), Error>>;
+    /// The half of the fault that happens outside here is done, so let the fleet
+    /// go.
+    fn proceed(&self) -> BoxFuture<'_, Result<(), Error>>;
+    /// Nothing was placed. Disarm and let the fleet go, wherever it had got to.
+    fn abandon(&self) -> BoxFuture<'_, Result<(), Error>>;
 }
 
 /// What a plugin can do to a fleet beyond driving it. Each accessor answers with

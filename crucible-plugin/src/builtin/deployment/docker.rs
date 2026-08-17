@@ -766,9 +766,16 @@ impl Substrate for Proxy {
         Box::pin(async move { self.signal("SIGUSR1").await.map_err(PluginError::from) })
     }
 
-    /// SIGUSR2 the proxy to let the fleet go, so the held bytes flow again.
-    fn resume(&self) -> BoxFuture<'_, Result<(), PluginError>> {
+    /// SIGUSR2 the proxy: the kill has landed, so the held bytes flow again.
+    fn proceed(&self) -> BoxFuture<'_, Result<(), PluginError>> {
         Box::pin(async move { self.signal("SIGUSR2").await.map_err(PluginError::from) })
+    }
+
+    /// SIGHUP the proxy: nothing was placed, so disarm and let the fleet go.
+    /// Separate from [`Self::proceed`] because a proxy waiting for a kill it
+    /// will never be told about would take one for the other.
+    fn abandon(&self) -> BoxFuture<'_, Result<(), PluginError>> {
+        Box::pin(async move { self.signal("SIGHUP").await.map_err(PluginError::from) })
     }
 }
 

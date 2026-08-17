@@ -230,12 +230,13 @@ fn spawn_fault_control(
     sever: watch::Sender<u64>,
 ) {
     tokio::spawn(async move {
-        let (mut arm, mut killed) = match (
+        let (mut arm, mut proceed, mut abandon) = match (
             signal(SignalKind::user_defined1()),
             signal(SignalKind::user_defined2()),
+            signal(SignalKind::hangup()),
         ) {
-            (Ok(arm), Ok(killed)) => (arm, killed),
-            (Err(e), _) | (_, Err(e)) => {
+            (Ok(arm), Ok(proceed), Ok(abandon)) => (arm, proceed, abandon),
+            (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => {
                 tracing::error!(?e, "failed to install the fault-control signal handlers");
                 return;
             }
@@ -252,15 +253,16 @@ fn spawn_fault_control(
                     if !*trip.borrow() {
                         continue;
                     }
-                    freeze(&pause, true);
                     match fault {
                         // The service is killed and brought back from outside,
                         // which says so by signalling; until then the fleet
                         // waits, so nothing runs against a half-dead service.
-                        Fault::Kill => {
-                            killed.recv().await;
-                            tracing::info!("the service was killed and is back (SIGUSR2)");
-                        }
+                        // Abandoning says the kill never landed, and releases
+                        // just the same.
+                        Fault::Kill => tokio::select! {
+                            _ = proceed.recv() => tracing::info!("the kill has landed (SIGUSR2)"),
+                            _ = abandon.recv() => tracing::info!("the kill was abandoned (SIGHUP)"),
+                        },
                         Fault::Cut => {
                             // FIXME: propagate once this loop can report
                             // failure. Every connection on the pair holds a
@@ -271,32 +273,26 @@ fn spawn_fault_control(
                             tracing::info!("severed the anchored pairs");
                         }
                     }
-                    // The anchor is one-shot, so disarm before releasing: a late
-                    // packet cannot place a second fault behind this one.
-                    if let Some(anchor) = &anchor {
-                        anchor.disarm();
-                    }
-                    freeze(&pause, false);
+                    release(anchor.as_ref(), &pause);
                 }
-                // No fault was placed, so this is a give-up path: the scenario
-                // ended before the anchored packet, or the wait timed out.
-                _ = killed.recv() => {
-                    if let Some(anchor) = &anchor {
-                        anchor.disarm();
-                    }
-                    freeze(&pause, false);
-                }
+                // Nothing was placed: the scenario ended before the anchored
+                // packet, or the wait for it timed out.
+                _ = abandon.recv() => release(anchor.as_ref(), &pause),
+                _ = proceed.recv() => tracing::debug!("SIGUSR2 with nothing held; ignored"),
             }
         }
     });
 }
 
-/// Hold the network still, or let it go.
+/// Let the fleet go, and stop the anchor placing a second fault behind this one.
 // FIXME: propagate once the fault-control loop can report failure. main holds a
 // pause receiver for the process lifetime, so this cannot fail; a silent failure
 // would leave the fleet frozen with nothing left to release it.
-fn freeze(pause: &watch::Sender<bool>, held: bool) {
-    pause.send(held).expect("pause watch has a live receiver");
+fn release(anchor: Option<&Anchor>, pause: &watch::Sender<bool>) {
+    if let Some(anchor) = anchor {
+        anchor.disarm();
+    }
+    pause.send(false).expect("pause watch has a live receiver");
 }
 
 #[cfg(test)]

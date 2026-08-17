@@ -314,7 +314,7 @@ impl Orchestrator<Ready> {
                             // The proxy never reported freezing (the target did not
                             // reach its Kth packet); release the freeze in case it is
                             // mid-flight and record a miss.
-                            deployment.substrate().resume().await?;
+                            deployment.substrate().abandon().await?;
                             return Ok::<_, crucible_plugin::Error>(missed(
                                 schedule_id,
                                 anchor,
@@ -343,7 +343,7 @@ impl Orchestrator<Ready> {
                         } else {
                             // Genuinely no freeze; release it in case one is
                             // mid-flight and record the miss.
-                            deployment.substrate().resume().await?;
+                            deployment.substrate().abandon().await?;
                             Ok(missed(schedule_id, anchor, FaultMissReason::ScenarioEndedBeforeAnchor))
                         }
                     }
@@ -554,15 +554,14 @@ async fn place(
         Placement::Cut => now_ns(),
         Placement::Kill(kills) => match kills.kill(&anchor.service).await {
             Ok(placed_at_ns) => {
-                substrate.resume().await?;
+                substrate.proceed().await?;
                 kills.restart(&anchor.service).await?;
                 placed_at_ns
             }
             Err(e) => {
-                // Nothing is dead, so release the freeze the proxy is holding
-                // and report the miss. A resume failure here still leaves the
-                // fleet wedged, so it is fatal.
-                substrate.resume().await?;
+                // Nothing is dead, so let the fleet go and report the miss. A
+                // failure here still leaves it wedged, so it is fatal.
+                substrate.abandon().await?;
                 return Ok(missed(id, anchor, FaultMissReason::Failed(e.to_string())));
             }
         },
@@ -603,10 +602,20 @@ mod tests {
             Box::pin(async { Ok(()) })
         }
 
-        fn resume(&self) -> BoxFuture<'_, Result<(), crucible_plugin::Error>> {
+        fn proceed(&self) -> BoxFuture<'_, Result<(), crucible_plugin::Error>> {
             Box::pin(async move {
                 if self.resume_fails {
                     Err(fake("resume failed"))
+                } else {
+                    Ok(())
+                }
+            })
+        }
+
+        fn abandon(&self) -> BoxFuture<'_, Result<(), crucible_plugin::Error>> {
+            Box::pin(async move {
+                if self.resume_fails {
+                    Err(fake("abandon failed"))
                 } else {
                     Ok(())
                 }
