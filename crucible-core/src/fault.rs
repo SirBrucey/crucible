@@ -12,6 +12,9 @@ pub enum Fault {
     /// takes its process and everything it held; cutting the edge leaves both
     /// sides running and only the caller the wiser.
     Durable { anchor: Anchor, by: Losing },
+    /// Run the whole scenario with `service` down, then bring it back and see
+    /// whether the fleet catches up on what it accepted while degraded.
+    Recovers { service: String },
 }
 
 /// A way of making the fleet lose something in flight. Narrower than
@@ -55,22 +58,35 @@ impl Fault {
     pub fn invariant(&self) -> Invariant {
         match self {
             Fault::Durable { .. } => Invariant::Durable,
+            Fault::Recovers { .. } => Invariant::Recovers,
         }
     }
 
     /// Where in the observed traffic the fault lands.
     #[must_use]
-    pub fn anchor(&self) -> &Anchor {
+    pub fn anchor(&self) -> Option<&Anchor> {
         match self {
-            Fault::Durable { anchor, .. } => anchor,
+            Fault::Durable { anchor, .. } => Some(anchor),
+            // Imposed before there is any traffic to land in.
+            Fault::Recovers { .. } => None,
         }
     }
 
-    /// What is done to the fleet at that point.
+    /// The service the fault is done to.
+    #[must_use]
+    pub fn service(&self) -> &str {
+        match self {
+            Fault::Durable { anchor, .. } => &anchor.service,
+            Fault::Recovers { service } => service,
+        }
+    }
+
+    /// What is done to the fleet.
     #[must_use]
     pub fn primitive(&self) -> Primitive {
         match self {
             Fault::Durable { by, .. } => (*by).into(),
+            Fault::Recovers { .. } => Primitive::Kill,
         }
     }
 }

@@ -58,22 +58,34 @@ pub struct Gate {
     severings: watch::Receiver<u64>,
     /// What `severings` read when this connection was accepted.
     opened_at: u64,
+    /// While `true` the pair carries nothing, so the peer meets a partition
+    /// rather than a blip.
+    down: watch::Receiver<bool>,
 }
 
 impl Gate {
     #[must_use]
-    pub fn new(pause: watch::Receiver<bool>, severings: watch::Receiver<u64>) -> Self {
+    pub fn new(
+        pause: watch::Receiver<bool>,
+        severings: watch::Receiver<u64>,
+        down: watch::Receiver<bool>,
+    ) -> Self {
         let opened_at = *severings.borrow();
         Self {
             pause,
             severings,
             opened_at,
+            down,
         }
     }
 
     /// The gate a connection accepted now is subject to.
     fn accept(&self) -> Self {
-        Self::new(self.pause.clone(), self.severings.clone())
+        Self::new(
+            self.pause.clone(),
+            self.severings.clone(),
+            self.down.clone(),
+        )
     }
 
     /// Hold here while the network is frozen. Returns whether the connection
@@ -89,18 +101,26 @@ impl Gate {
     }
 
     fn severed(&self) -> bool {
-        *self.severings.borrow() != self.opened_at
+        *self.severings.borrow() != self.opened_at || *self.down.borrow()
     }
 
     /// Resolves once this connection is severed, so it can race something that
     /// would only end when a packet arrives.
     async fn severing(&mut self) {
         while !self.severed() {
-            if self.severings.changed().await.is_err() {
-                // Nothing left to sever us; wait rather than report one.
-                std::future::pending::<()>().await;
+            tokio::select! {
+                () = changed(&mut self.severings) => {}
+                () = changed(&mut self.down) => {}
             }
         }
+    }
+}
+
+/// Resolves when `watch` changes, and never once nothing can change it, so one
+/// dead signal cannot stop another being waited on.
+async fn changed<T>(watch: &mut watch::Receiver<T>) {
+    if watch.changed().await.is_err() {
+        std::future::pending::<()>().await;
     }
 }
 
@@ -403,12 +423,16 @@ mod tests {
 
     /// A gate that never closes.
     fn open() -> Gate {
-        Gate::new(watch::channel(false).1, watch::channel(0).1)
+        Gate::new(
+            watch::channel(false).1,
+            watch::channel(0).1,
+            watch::channel(false).1,
+        )
     }
 
     /// A gate held by `pause`.
     fn held(pause: watch::Receiver<bool>) -> Gate {
-        Gate::new(pause, watch::channel(0).1)
+        Gate::new(pause, watch::channel(0).1, watch::channel(false).1)
     }
 
     /// An anchor of `k` packets, with the watches it fires.
@@ -569,13 +593,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_pair_held_down_refuses_reconnects_until_it_is_lifted() {
+        let echo = spawn_echo().await;
+        let (down_tx, down_rx) = watch::channel(false);
+        let (proxy, proxy_addr, _events) = Proxy::bind(
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            echo.to_string(),
+            Gate::new(watch::channel(false).1, watch::channel(0).1, down_rx),
+            None,
+        )
+        .await
+        .unwrap();
+        tokio::spawn(proxy.run());
+
+        down_tx.send(true).unwrap();
+        let mut refused = TcpStream::connect(proxy_addr).await.unwrap();
+        refused.write_all(b"ping").await.unwrap();
+        let mut buf = [0u8; 4];
+        let read = timeout(Duration::from_secs(2), refused.read(&mut buf))
+            .await
+            .expect("a connection opened while down goes, rather than hanging");
+        assert!(matches!(read, Ok(0) | Err(_)), "the edge is not carrying");
+
+        // Lifted, the edge carries again and the fleet can catch up.
+        down_tx.send(false).unwrap();
+        let mut restored = TcpStream::connect(proxy_addr).await.unwrap();
+        restored.write_all(b"pong").await.unwrap();
+        timeout(Duration::from_secs(2), restored.read_exact(&mut buf))
+            .await
+            .expect("the edge carries once lifted")
+            .expect("read succeeds");
+        assert_eq!(&buf, b"pong");
+    }
+
+    #[tokio::test]
     async fn a_cut_takes_the_connection_out_from_under_an_idle_peer() {
         let echo = spawn_echo().await;
         let (sever_tx, sever_rx) = watch::channel(0);
         let (proxy, proxy_addr, _events) = Proxy::bind(
             (Ipv4Addr::LOCALHOST, 0).into(),
             echo.to_string(),
-            Gate::new(watch::channel(false).1, sever_rx),
+            Gate::new(watch::channel(false).1, sever_rx, watch::channel(false).1),
             None,
         )
         .await
