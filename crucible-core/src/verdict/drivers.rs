@@ -8,6 +8,11 @@ use crate::ipc::Verdict;
 
 pub struct Durable;
 
+/// Recovery asks the same question of the settled state as durability: the fleet
+/// owes what it accepted, however it was degraded while accepting it. What
+/// differs is the fault, not the reading.
+pub struct Recovers;
+
 impl Driver for Durable {
     fn drive(&mut self, observations: &Observations) -> Verdict {
         // No fault fired => nothing to test.
@@ -84,6 +89,12 @@ impl Driver for Durable {
                 ),
             },
         }
+    }
+}
+
+impl Driver for Recovers {
+    fn drive(&mut self, observations: &Observations) -> Verdict {
+        Durable.drive(observations)
     }
 }
 
