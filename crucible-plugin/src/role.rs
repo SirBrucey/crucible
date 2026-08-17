@@ -61,20 +61,14 @@ pub trait Faults: Send + Sync {
         None
     }
 
-    fn cuts(&self) -> Option<&dyn Cut> {
-        None
-    }
-
     /// Everything this can do, so a campaign can report what it was able to
-    /// reach. Read off the accessors, so it says exactly what is there.
+    /// reach. Read off the accessors where there is something to call, so those
+    /// say exactly what is there.
     fn primitives(&self) -> BTreeSet<Primitive> {
-        [
-            self.kills().map(|_| Primitive::Kill),
-            self.cuts().map(|_| Primitive::Cut),
-        ]
-        .into_iter()
-        .flatten()
-        .collect()
+        [self.kills().map(|_| Primitive::Kill)]
+            .into_iter()
+            .flatten()
+            .collect()
     }
 }
 
@@ -86,11 +80,6 @@ pub trait Kill: Send + Sync {
     /// Bring the named service back, reporting when it became ready.
     fn restart(&self, service: &str) -> BoxFuture<'_, Result<u128, Error>>;
 }
-
-/// Sever an edge, leaving the services either side of it running. Nothing to
-/// call: whatever fronts the fleet does it at the anchored packet, so this says
-/// the deployment honours a cut rather than how to ask for one.
-pub trait Cut: Send + Sync {}
 
 /// A live fleet replica: bring it up, probe it, fault it, and remove it.
 pub trait DeploymentRuntime: Faults {

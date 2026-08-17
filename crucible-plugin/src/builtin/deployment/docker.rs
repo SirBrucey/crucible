@@ -2,7 +2,7 @@
 //! binds a service to that, and runs the replica.
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     time::Duration,
 };
@@ -23,7 +23,7 @@ use futures_util::{StreamExt, TryStreamExt};
 use tokio::time::sleep;
 
 use crucible_core::{
-    fault::Fault,
+    fault::{Fault, Primitive},
     observer::SessionObserver,
     plan,
     schema::{AttrDecl, AttrSchema, ValueType},
@@ -31,7 +31,7 @@ use crucible_core::{
 
 use crate::{
     error::Error as PluginError,
-    role::{BoxFuture, Cut, Deployment, DeploymentRuntime, Faults, Kill, Substrate},
+    role::{BoxFuture, Deployment, DeploymentRuntime, Faults, Kill, Substrate},
 };
 
 const READINESS_TIMEOUT: Duration = Duration::from_mins(1);
@@ -779,14 +779,14 @@ impl Substrate for Proxy {
     }
 }
 
-/// The proxy holds both sides of every edge, so it can let one go.
+/// The proxy holds both sides of every edge, so it can let one go. There is
+/// nothing to call: it severs at the anchored packet, having been told which
+/// fault to place when the replica was built.
 impl Faults for Proxy {
-    fn cuts(&self) -> Option<&dyn Cut> {
-        Some(self)
+    fn primitives(&self) -> BTreeSet<Primitive> {
+        [Primitive::Cut].into()
     }
 }
-
-impl Cut for Proxy {}
 
 impl Proxy {
     async fn signal(&self, signal: &str) -> Result<()> {

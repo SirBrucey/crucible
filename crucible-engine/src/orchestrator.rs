@@ -311,47 +311,26 @@ impl Orchestrator<Ready> {
             };
 
             let fault_fut = async {
-                tokio::select! {
+                let frozen = tokio::select! {
                     biased;
-                    frozen = session_observer.wait_for_freeze(ANCHOR_TIMEOUT) => {
-                        if !frozen {
-                            // The proxy never reported freezing (the target did not
-                            // reach its Kth packet); release the freeze in case it is
-                            // mid-flight and record a miss.
-                            deployment.substrate().abandon().await?;
-                            return Ok::<_, crucible_plugin::Error>(missed(
-                                schedule_id,
-                                anchor,
-                                FaultMissReason::ScenarioEndedBeforeAnchor,
-                            ));
-                        }
-                        // The proxy froze the fleet to place the kill precisely on the
-                        // anchored packet. Kill the target, then release the flow and
-                        // bring the target back concurrently: the scenario runs against
-                        // the dead-then-recovering service in real time. Its real
-                        // recovery time is part of the fault (ops in the outage window
-                        // fail; ops once it is back succeed) rather than the world
-                        // stopping while we heal.
-                        let placed = placed_at(&session_observer, scenario_start_ns);
-                        Ok(place(fault, placement, deployment.substrate(), schedule_id, placed).await?)
-                    }
-                    _ = &mut scenario_end_rx => {
-                        // The scenario finished before a freeze was seen. The freeze
-                        // is observed through the docker log stream, which lags real
-                        // traffic, so a freeze triggered by a post-ack edge may just
-                        // not be visible yet. Give it a short grace window before
-                        // concluding the anchor was missed.
-                        if session_observer.wait_for_freeze(FREEZE_GRACE).await {
-                            let placed = placed_at(&session_observer, scenario_start_ns);
-                            Ok(place(fault, placement, deployment.substrate(), schedule_id, placed).await?)
-                        } else {
-                            // Genuinely no freeze; release it in case one is
-                            // mid-flight and record the miss.
-                            deployment.substrate().abandon().await?;
-                            Ok(missed(schedule_id, anchor, FaultMissReason::ScenarioEndedBeforeAnchor))
-                        }
-                    }
+                    frozen = session_observer.wait_for_freeze(ANCHOR_TIMEOUT) => frozen,
+                    // The scenario finished before a freeze was seen. The freeze is
+                    // observed through the docker log stream, which lags real traffic,
+                    // so one triggered by a post-ack edge may just not be visible yet.
+                    _ = &mut scenario_end_rx => session_observer.wait_for_freeze(FREEZE_GRACE).await,
+                };
+                if !frozen {
+                    // The target never reached its Kth packet. Let the fleet go in
+                    // case a freeze is mid-flight, and record the miss.
+                    deployment.substrate().abandon().await?;
+                    return Ok::<_, crucible_plugin::Error>(missed(
+                        schedule_id,
+                        anchor,
+                        FaultMissReason::ScenarioEndedBeforeAnchor,
+                    ));
                 }
+                let placed = placed_at(&session_observer, scenario_start_ns);
+                place(fault, placement, deployment.substrate(), schedule_id, placed).await
             };
 
             let (scenario_result, fault_result) = tokio::join!(scenario_fut, fault_fut);
@@ -550,7 +529,14 @@ impl<'a> Placement<'a> {
                 .kills()
                 .map(Placement::Kill)
                 .ok_or_else(|| unreachable_fault(fault)),
-            Primitive::Cut => Ok(Placement::Cut),
+            // The substrate does this one on its own, so what it offers is all
+            // there is to check.
+            Primitive::Cut => deployment
+                .substrate()
+                .primitives()
+                .contains(&Primitive::Cut)
+                .then_some(Placement::Cut)
+                .ok_or_else(|| unreachable_fault(fault)),
             Primitive::Redeliver | Primitive::Reorder => Err(unreachable_fault(fault)),
         }
     }
