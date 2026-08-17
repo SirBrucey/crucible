@@ -121,10 +121,12 @@ async fn main() -> Result<()> {
             service: at.service.clone(),
         });
     }
+    // Bumped to sever the anchored pairs. A service may be fronted on several
+    // ports, and the anchor counts across all of them.
+    let (sever_tx, sever_rx) = watch::channel(0u64);
     let anchor = at
         .as_ref()
-        .map(|at| Anchor::new(at.direction, at.k, trip_tx));
-    let mut severs = None;
+        .map(|at| Anchor::new(at.direction, at.k, pause_tx.clone(), trip_tx));
 
     for spec in cli.pairs {
         let Pair {
@@ -132,15 +134,16 @@ async fn main() -> Result<()> {
             listen,
             upstream,
         } = Pair::parse(&spec)?;
-        // Only the pair fronting the anchored service counts toward the fault.
-        let (cut_tx, cut_rx) = watch::channel(false);
-        let pair_anchor = if at.as_ref().is_some_and(|at| at.service == service) {
-            severs = Some(cut_tx);
-            anchor.clone()
+        // Only the pairs fronting the anchored service count toward the fault,
+        // and only they can be severed by it.
+        let anchored = at.as_ref().is_some_and(|at| at.service == service);
+        let severings = if anchored {
+            sever_rx.clone()
         } else {
-            None
+            watch::channel(0u64).1
         };
-        let gate = Gate::new(pause_rx.clone(), cut_rx);
+        let gate = Gate::new(pause_rx.clone(), severings);
+        let pair_anchor = anchored.then(|| anchor.clone()).flatten();
         let (proxy, _local_addr, mut events) =
             Proxy::bind(listen, upstream.clone(), gate, pair_anchor).await?;
         tracing::info!(%service, %listen, %upstream, "proxy pair up");
@@ -165,7 +168,7 @@ async fn main() -> Result<()> {
         });
     }
 
-    spawn_fault_control(cli.fault, anchor, trip_rx, pause_tx, severs);
+    spawn_fault_control(cli.fault, anchor, trip_rx, pause_tx, sever_tx);
 
     for spec in cli.control {
         let Pair {
@@ -224,7 +227,7 @@ fn spawn_fault_control(
     anchor: Option<Anchor>,
     mut trip: watch::Receiver<bool>,
     pause: watch::Sender<bool>,
-    severs: Option<watch::Sender<bool>>,
+    sever: watch::Sender<u64>,
 ) {
     tokio::spawn(async move {
         let (mut arm, mut killed) = match (
@@ -258,15 +261,15 @@ fn spawn_fault_control(
                             killed.recv().await;
                             tracing::info!("the service was killed and is back (SIGUSR2)");
                         }
-                        Fault::Cut => if let Some(cut) = &severs {
+                        Fault::Cut => {
                             // FIXME: propagate once this loop can report
                             // failure. Every connection on the pair holds a
                             // receiver, so this cannot fail.
-                            cut.send(true).expect("the cut watch has live receivers");
-                            tracing::info!("severed the anchored pair");
-                        } else {
-                            tracing::warn!("nothing to sever; the fault did nothing");
-                        },
+                            sever
+                                .send(*sever.borrow() + 1)
+                                .expect("the sever watch has live receivers");
+                            tracing::info!("severed the anchored pairs");
+                        }
                     }
                     // The anchor is one-shot, so disarm before releasing: a late
                     // packet cannot place a second fault behind this one.

@@ -38,8 +38,10 @@ pub struct Anchor {
     k: u32,
     count: Arc<AtomicU32>,
     active: Arc<AtomicBool>,
-    /// Fired once the anchored packet passes. What that sets off is the [`Gate`]
-    /// the connections were given.
+    /// Held the moment the anchored packet passes, inside the task that carried
+    /// it, so nothing slips through while the fault is being decided.
+    pause: watch::Sender<bool>,
+    /// Says the anchored packet has passed.
     trip: watch::Sender<bool>,
 }
 
@@ -50,18 +52,32 @@ pub struct Gate {
     /// The network is frozen for as long as the fault takes to run, so it lands
     /// on the anchored packet however long it needs.
     pause: watch::Receiver<bool>,
-    /// Drop the peer's connection when this fires.
-    cut: watch::Receiver<bool>,
+    /// Severings of this pair. A connection lets go when it moves past what it
+    /// read at accept, so a peer that reconnects afterwards gets a working edge
+    /// and the fleet is left to recover.
+    severings: watch::Receiver<u64>,
+    /// What `severings` read when this connection was accepted.
+    opened_at: u64,
 }
 
 impl Gate {
     #[must_use]
-    pub fn new(pause: watch::Receiver<bool>, cut: watch::Receiver<bool>) -> Self {
-        Self { pause, cut }
+    pub fn new(pause: watch::Receiver<bool>, severings: watch::Receiver<u64>) -> Self {
+        let opened_at = *severings.borrow();
+        Self {
+            pause,
+            severings,
+            opened_at,
+        }
+    }
+
+    /// The gate a connection accepted now is subject to.
+    fn accept(&self) -> Self {
+        Self::new(self.pause.clone(), self.severings.clone())
     }
 
     /// Hold here while the network is frozen. Returns whether the connection
-    /// came through it: a fault that runs while it waits may have cut it.
+    /// came through it: a fault that runs while it waits may have severed it.
     async fn passable(&mut self) -> bool {
         while *self.pause.borrow() {
             if self.pause.changed().await.is_err() {
@@ -69,41 +85,55 @@ impl Gate {
                 break;
             }
         }
-        !*self.cut.borrow()
+        !self.severed()
     }
-}
 
-/// Resolves once this connection is cut, and never otherwise, so it can race
-/// something that would only end when a packet arrives.
-async fn cut(cut: &mut watch::Receiver<bool>) {
-    while !*cut.borrow() {
-        if cut.changed().await.is_err() {
-            // Nothing left to cut us; wait forever rather than report one.
-            std::future::pending::<()>().await;
+    fn severed(&self) -> bool {
+        *self.severings.borrow() != self.opened_at
+    }
+
+    /// Resolves once this connection is severed, so it can race something that
+    /// would only end when a packet arrives.
+    async fn severing(&mut self) {
+        while !self.severed() {
+            if self.severings.changed().await.is_err() {
+                // Nothing left to sever us; wait rather than report one.
+                std::future::pending::<()>().await;
+            }
         }
     }
 }
 
 impl Anchor {
-    pub fn new(direction: Direction, k: u32, trip: watch::Sender<bool>) -> Self {
+    pub fn new(
+        direction: Direction,
+        k: u32,
+        pause: watch::Sender<bool>,
+        trip: watch::Sender<bool>,
+    ) -> Self {
         Self {
             direction,
             k,
             count: Arc::new(AtomicU32::new(0)),
             active: Arc::new(AtomicBool::new(false)),
+            pause,
             trip,
         }
     }
 
-    /// Tell the connections waiting on this that the anchored packet has passed.
+    /// Hold the fleet. Holding it here rather than leaving it to whoever reads
+    /// the trip keeps the fault on the k-th packet.
     fn fire(&self) {
-        // FIXME: propagate once arm and record can report failure. The watch
-        // keeps a receiver for the whole process, so this cannot fail; dropping
+        // FIXME: propagate once arm and record can report failure. Both watches
+        // keep a receiver for the whole process, so this cannot fail; dropping
         // it silently would leave the fault unplaced while the caller is told
         // the anchor tripped.
+        self.pause
+            .send(true)
+            .expect("the pause watch has a live receiver");
         self.trip
             .send(true)
-            .expect("the anchor's watch has a live receiver");
+            .expect("the trip watch has a live receiver");
     }
 
     /// Arm at scenario start: reset the count and begin counting. `k == 0`
@@ -189,7 +219,7 @@ impl Proxy {
                 peer,
                 self.upstream.clone(),
                 self.events_tx.clone(),
-                self.gate.clone(),
+                self.gate.accept(),
                 self.anchor.clone(),
             ));
         }
@@ -334,7 +364,7 @@ async fn forward_bytes(
         // waiting for a packet that is never coming.
         let read = tokio::select! {
             read = read.read(&mut buf) => read,
-            () = cut(&mut gate.cut) => break Ok(bytes_total),
+            () = gate.severing() => break Ok(bytes_total),
         };
         let n = match read {
             Ok(0) => break Ok(bytes_total),
@@ -372,12 +402,23 @@ mod tests {
 
     /// A gate that never closes.
     fn open() -> Gate {
-        Gate::new(watch::channel(false).1, watch::channel(false).1)
+        Gate::new(watch::channel(false).1, watch::channel(0).1)
     }
 
     /// A gate held by `pause`.
     fn held(pause: watch::Receiver<bool>) -> Gate {
-        Gate::new(pause, watch::channel(false).1)
+        Gate::new(pause, watch::channel(0).1)
+    }
+
+    /// An anchor of `k` packets, with the watches it fires.
+    fn anchor(k: u32) -> (Anchor, watch::Receiver<bool>, watch::Receiver<bool>) {
+        let (pause_tx, pause_rx) = watch::channel(false);
+        let (trip_tx, trip_rx) = watch::channel(false);
+        (
+            Anchor::new(Direction::ClientToUpstream, k, pause_tx, trip_tx),
+            pause_rx,
+            trip_rx,
+        )
     }
 
     async fn spawn_echo() -> SocketAddr {
@@ -529,11 +570,11 @@ mod tests {
     #[tokio::test]
     async fn a_cut_takes_the_connection_out_from_under_an_idle_peer() {
         let echo = spawn_echo().await;
-        let (cut_tx, cut_rx) = watch::channel(false);
+        let (sever_tx, sever_rx) = watch::channel(0);
         let (proxy, proxy_addr, _events) = Proxy::bind(
             (Ipv4Addr::LOCALHOST, 0).into(),
             echo.to_string(),
-            Gate::new(watch::channel(false).1, cut_rx),
+            Gate::new(watch::channel(false).1, sever_rx),
             None,
         )
         .await
@@ -547,7 +588,7 @@ mod tests {
 
         // Nothing more is coming, so a cut that waited for the next packet would
         // leave this connection sitting here.
-        cut_tx.send(true).unwrap();
+        sever_tx.send(1).unwrap();
         let read = timeout(Duration::from_secs(2), client.read(&mut buf))
             .await
             .expect("the connection goes within 2s of the cut");
@@ -555,14 +596,23 @@ mod tests {
             matches!(read, Ok(0) | Err(_)),
             "the peer sees the edge go away"
         );
+
+        // The edge is severed, not removed, so whatever recovery the peer has
+        // gets to run.
+        let mut reconnected = TcpStream::connect(proxy_addr).await.unwrap();
+        reconnected.write_all(b"pong").await.unwrap();
+        timeout(Duration::from_secs(2), reconnected.read_exact(&mut buf))
+            .await
+            .expect("a connection opened after the cut still works")
+            .expect("read succeeds");
+        assert_eq!(&buf, b"pong");
     }
 
     #[test]
     fn a_dormant_anchor_does_not_count() {
         // Before arm, record is a no-op, so the fleet's bring-up traffic never
         // moves the counter or trips the gate.
-        let (tx, rx) = watch::channel(false);
-        let anchor = Anchor::new(Direction::ClientToUpstream, 1, tx);
+        let (anchor, _pause, rx) = anchor(1);
         assert!(!anchor.record(), "an unarmed record must not trip");
         assert!(!*rx.borrow(), "gate stays open while dormant");
         anchor.arm();
@@ -577,8 +627,7 @@ mod tests {
     fn a_zero_k_anchor_trips_on_arm() {
         // k=0 means freeze before the first scenario packet, so arming (after
         // bring-up) trips the gate immediately.
-        let (tx, rx) = watch::channel(false);
-        let anchor = Anchor::new(Direction::ClientToUpstream, 0, tx);
+        let (anchor, _pause, rx) = anchor(0);
         assert!(!*rx.borrow(), "not tripped before arm");
         anchor.arm();
         assert!(*rx.borrow(), "k=0 trips the gate on arm");
@@ -589,8 +638,7 @@ mod tests {
         // On a give-up path the runner releases the gate but the anchor stays
         // armed; a trailing packet that reaches k must not trip it again (there
         // would be no one left to resume). Disarming makes each arm a one-shot.
-        let (tx, rx) = watch::channel(false);
-        let anchor = Anchor::new(Direction::ClientToUpstream, 2, tx);
+        let (anchor, _pause, rx) = anchor(2);
         anchor.arm();
         anchor.record(); // count 1, below k
         assert!(!*rx.borrow(), "must not trip below k");
@@ -603,8 +651,7 @@ mod tests {
     #[tokio::test]
     async fn anchor_emits_a_froze_event_when_it_trips() {
         let echo = spawn_echo().await;
-        let (pause_tx, pause_rx) = watch::channel(false);
-        let anchor = Anchor::new(Direction::ClientToUpstream, 2, pause_tx);
+        let (anchor, pause_rx, _trip) = anchor(2);
         let (proxy, proxy_addr, mut events) = Proxy::bind(
             (Ipv4Addr::LOCALHOST, 0).into(),
             echo.to_string(),
@@ -637,8 +684,7 @@ mod tests {
     #[tokio::test]
     async fn anchor_trips_the_gate_after_k_packets() {
         let echo = spawn_echo().await;
-        let (pause_tx, mut pause_rx) = watch::channel(false);
-        let anchor = Anchor::new(Direction::ClientToUpstream, 2, pause_tx);
+        let (anchor, mut pause_rx, _trip) = anchor(2);
         let (proxy, proxy_addr, _events) = Proxy::bind(
             (Ipv4Addr::LOCALHOST, 0).into(),
             echo.to_string(),
