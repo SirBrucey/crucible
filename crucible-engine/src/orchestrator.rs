@@ -17,7 +17,9 @@ use crucible_core::{
     proxy_log::service_profiles_from_sessions,
     verdict::{Checkpoint, Observations, Observed, StepWindow, driver_for},
 };
-use crucible_plugin::{Action, DeploymentRuntime, Freeze, Kill, Targeted, registry::PreparedCheck};
+use crucible_plugin::{
+    Action, DeploymentRuntime, Kill, Substrate, Targeted, registry::PreparedCheck,
+};
 
 /// After a restart, wait this long before judging the fleet quiescent, so
 /// recovery traffic has a chance to start.
@@ -287,7 +289,7 @@ impl Orchestrator<Ready> {
             // baseline at the same moment, so both share the scenario-start origin.
             // A failed arm means the proxy never freezes, so the whole run would be
             // meaningless; surface it rather than pressing on.
-            deployment.arm_anchor().await?;
+            deployment.substrate().arm_anchor().await?;
 
             let (scenario_end_tx, mut scenario_end_rx) = tokio::sync::oneshot::channel::<()>();
             let scenario_start = Instant::now();
@@ -312,7 +314,7 @@ impl Orchestrator<Ready> {
                             // The proxy never reported freezing (the target did not
                             // reach its Kth packet); release the freeze in case it is
                             // mid-flight and record a miss.
-                            deployment.resume().await?;
+                            deployment.substrate().resume().await?;
                             return Ok::<_, crucible_plugin::Error>(missed(
                                 schedule_id,
                                 anchor,
@@ -327,7 +329,7 @@ impl Orchestrator<Ready> {
                         // fail; ops once it is back succeed) rather than the world
                         // stopping while we heal.
                         let actual = scenario_start.elapsed().as_nanos();
-                        Ok(place(fault, placement, deployment.as_ref(), schedule_id, actual).await?)
+                        Ok(place(fault, placement, deployment.substrate(), schedule_id, actual).await?)
                     }
                     _ = &mut scenario_end_rx => {
                         // The scenario finished before a freeze was seen. The freeze
@@ -337,11 +339,11 @@ impl Orchestrator<Ready> {
                         // concluding the anchor was missed.
                         if session_observer.wait_for_freeze(FREEZE_GRACE).await {
                             let actual = scenario_start.elapsed().as_nanos();
-                            Ok(place(fault, placement, deployment.as_ref(), schedule_id, actual).await?)
+                            Ok(place(fault, placement, deployment.substrate(), schedule_id, actual).await?)
                         } else {
                             // Genuinely no freeze; release it in case one is
                             // mid-flight and record the miss.
-                            deployment.resume().await?;
+                            deployment.substrate().resume().await?;
                             Ok(missed(schedule_id, anchor, FaultMissReason::ScenarioEndedBeforeAnchor))
                         }
                     }
@@ -543,7 +545,7 @@ impl<'a> Placement<'a> {
 async fn place(
     fault: &Fault,
     placement: Placement<'_>,
-    deployment: &dyn Freeze,
+    substrate: &dyn Substrate,
     id: u32,
     actual_offset_ns: u128,
 ) -> Result<FaultReport, crucible_plugin::Error> {
@@ -552,7 +554,7 @@ async fn place(
         Placement::Cut => now_ns(),
         Placement::Kill(kills) => match kills.kill(&anchor.service).await {
             Ok(placed_at_ns) => {
-                deployment.resume().await?;
+                substrate.resume().await?;
                 kills.restart(&anchor.service).await?;
                 placed_at_ns
             }
@@ -560,7 +562,7 @@ async fn place(
                 // Nothing is dead, so release the freeze the proxy is holding
                 // and report the miss. A resume failure here still leaves the
                 // fleet wedged, so it is fatal.
-                deployment.resume().await?;
+                substrate.resume().await?;
                 return Ok(missed(id, anchor, FaultMissReason::Failed(e.to_string())));
             }
         },
@@ -594,7 +596,9 @@ mod tests {
         restart_fails: bool,
     }
 
-    impl Freeze for FakeDeployment {
+    impl crucible_plugin::Faults for FakeDeployment {}
+
+    impl Substrate for FakeDeployment {
         fn arm_anchor(&self) -> BoxFuture<'_, Result<(), crucible_plugin::Error>> {
             Box::pin(async { Ok(()) })
         }

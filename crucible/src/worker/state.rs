@@ -7,7 +7,7 @@
 //! The fleet is brought up only after the worker knows its work, so a schedule
 //! can arm the proxy's fault anchor on its command line at startup.
 
-use std::sync::Arc;
+use std::{collections::BTreeSet, sync::Arc};
 
 use crucible_core::{
     fault::Fault,
@@ -254,10 +254,15 @@ impl Worker<Learning> {
                 return Err(e.into());
             }
         };
-        // FIXME: this should be the union across every plugin driving the
-        // scenario, not the deployment's alone. Kind plugins are built per
-        // action and per check rather than held, so there is nothing to ask yet.
-        let primitives = orchestrator.deployment().primitives();
+        // FIXME: kind plugins join this union once they can offer a primitive.
+        // They are built per action and per check rather than held, so there is
+        // nothing to ask yet.
+        let deployment = orchestrator.deployment();
+        let primitives: BTreeSet<_> = deployment
+            .primitives()
+            .union(&deployment.substrate().primitives())
+            .copied()
+            .collect();
         let (learned, orchestrator) = orchestrator
             .learn(&queries, primitives)
             .await

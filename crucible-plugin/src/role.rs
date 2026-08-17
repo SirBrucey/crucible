@@ -40,14 +40,13 @@ pub trait Deployment {
     fn bind(service: &plan::Service) -> Result<Self::Config, Self::Error>;
 }
 
-/// Hold the fleet still at the anchored moment and let it go again. Every
-/// deployment provides this: it is how a fault is placed precisely, not a fault
-/// in itself.
-pub trait Freeze: Send + Sync {
-    /// Arm the fault anchor at scenario start, so the replica freezes once the
-    /// target reaches the anchored point.
+/// What a deployment places in front of its fleet; it carries every edge's
+/// traffic.
+pub trait Substrate: Faults {
+    /// Arm the fault anchor at scenario start, so the replica holds still once
+    /// the target reaches the anchored point.
     fn arm_anchor(&self) -> BoxFuture<'_, Result<(), Error>>;
-    /// Release the freeze.
+    /// Let the fleet go again.
     fn resume(&self) -> BoxFuture<'_, Result<(), Error>>;
 }
 
@@ -59,13 +58,20 @@ pub trait Faults: Send + Sync {
         None
     }
 
+    fn cuts(&self) -> Option<&dyn Cut> {
+        None
+    }
+
     /// Everything this can do, so a campaign can report what it was able to
     /// reach. Read off the accessors, so it says exactly what is there.
     fn primitives(&self) -> BTreeSet<Primitive> {
-        [self.kills().map(|_| Primitive::Kill)]
-            .into_iter()
-            .flatten()
-            .collect()
+        [
+            self.kills().map(|_| Primitive::Kill),
+            self.cuts().map(|_| Primitive::Cut),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
     }
 }
 
@@ -78,8 +84,17 @@ pub trait Kill: Send + Sync {
     fn restart(&self, service: &str) -> BoxFuture<'_, Result<u128, Error>>;
 }
 
+/// Sever an edge, leaving the services either side of it running. Nothing to
+/// call: whatever fronts the fleet does it at the anchored packet, so this says
+/// the deployment honours a cut rather than how to ask for one.
+pub trait Cut: Send + Sync {}
+
 /// A live fleet replica: bring it up, probe it, fault it, and remove it.
-pub trait DeploymentRuntime: Freeze + Faults {
+pub trait DeploymentRuntime: Faults {
+    /// What this runs in front of the fleet. It carries the traffic, so it is
+    /// asked for anything done to an edge rather than to a service.
+    fn substrate(&self) -> &dyn Substrate;
+
     fn setup(&mut self) -> BoxFuture<'_, Result<(), Error>>;
     fn wait_ready(&self) -> BoxFuture<'_, Result<(), Error>>;
     fn teardown(&mut self) -> BoxFuture<'_, Result<(), Error>>;
