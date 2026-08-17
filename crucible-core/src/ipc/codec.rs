@@ -155,6 +155,7 @@ mod tests {
                 vec![Some(crate::plan::Value::Int(0))],
                 vec![Some(crate::plan::Value::Int(3))],
             ],
+            std::time::Duration::from_secs(15),
         )))
         .await;
     }

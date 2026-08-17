@@ -9,7 +9,6 @@ use std::{
 use crucible_protocol::{FaultMissReason, FaultReport, FaultResult, now_ns};
 
 use crucible_core::{
-    HEAL_BUDGET,
     fault::{Anchor, Fault, Losing, Primitive},
     ipc::Verdict,
     learned::Learned,
@@ -203,6 +202,7 @@ impl Orchestrator<Ready> {
         self,
         queries: &[PreparedCheck],
         primitives: BTreeSet<Primitive>,
+        consistent_within: Duration,
     ) -> Result<(Learned, Orchestrator<Done>), crucible_plugin::Error> {
         let Orchestrator {
             deployment,
@@ -236,7 +236,7 @@ impl Orchestrator<Ready> {
         // that traffic is still in flight, so the async write path gets no
         // anchors and the scheduler never faults it.
         session_observer
-            .wait_for_quiescence(LEARN_SETTLE, QUIESCENCE_IDLE, HEAL_BUDGET)
+            .wait_for_quiescence(LEARN_SETTLE, QUIESCENCE_IDLE, consistent_within)
             .await;
         session_observer.observe(&mut observations);
         let learned = Learned {
@@ -265,6 +265,7 @@ impl Orchestrator<Ready> {
         fault: &Fault,
         queries: Vec<PreparedCheck>,
         fault_free: Vec<Checkpoint>,
+        consistent_within: Duration,
     ) -> Result<((Verdict, FaultReport), Orchestrator<Done>), crucible_plugin::Error> {
         let Orchestrator {
             deployment,
@@ -343,7 +344,7 @@ impl Orchestrator<Ready> {
                 // for the fleet to settle (giving any outbox redelivery its chance)
                 // before reading the durability state.
                 session_observer
-                    .wait_for_quiescence(HEAL_MIN_SETTLE, QUIESCENCE_IDLE, HEAL_BUDGET)
+                    .wait_for_quiescence(HEAL_MIN_SETTLE, QUIESCENCE_IDLE, consistent_within)
                     .await;
             }
 

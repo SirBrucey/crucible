@@ -78,6 +78,7 @@ impl BurstScheduler {
                         scenario.checks.clone(),
                         fault,
                         learned.trajectory.clone(),
+                        scenario.consistent_within,
                     ));
                     next_id += 1;
                 }

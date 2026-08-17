@@ -1,6 +1,8 @@
 //! One unit of work a worker runs: a fleet to bring up, what to do to it, what
 //! to read afterwards, and what to break in the middle.
 
+use std::time::Duration;
+
 use crate::{fault::Fault, plan, verdict::Checkpoint};
 
 /// Everything a worker needs to run once. Derived from a plan rather than
@@ -22,6 +24,8 @@ pub struct Schedule {
     /// What the fault-free run left after each step, which we judge against.
     /// Empty for the fault-free run itself.
     pub trajectory: Vec<Checkpoint>,
+    /// How long the fleet may take to settle, as the scenario states it.
+    pub consistent_within: Duration,
 }
 
 impl Schedule {
@@ -31,7 +35,12 @@ impl Schedule {
 
     /// The fault-free run: the work, with nothing to break.
     #[must_use]
-    pub fn learn(fleet: plan::Fleet, steps: Vec<plan::Step>, checks: Vec<plan::Check>) -> Self {
+    pub fn learn(
+        fleet: plan::Fleet,
+        steps: Vec<plan::Step>,
+        checks: Vec<plan::Check>,
+        consistent_within: Duration,
+    ) -> Self {
         Self {
             id: Self::LEARN_ID,
             fleet,
@@ -39,6 +48,7 @@ impl Schedule {
             checks,
             fault: None,
             trajectory: Vec::new(),
+            consistent_within,
         }
     }
 
@@ -52,6 +62,7 @@ impl Schedule {
         checks: Vec<plan::Check>,
         fault: Fault,
         trajectory: Vec<Checkpoint>,
+        consistent_within: Duration,
     ) -> Self {
         Self {
             id,
@@ -60,6 +71,7 @@ impl Schedule {
             checks,
             fault: Some(fault),
             trajectory,
+            consistent_within,
         }
     }
 }

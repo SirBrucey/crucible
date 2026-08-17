@@ -10,7 +10,6 @@ use std::{
 
 use clap::{Parser, Subcommand};
 use crucible_core::{
-    HEAL_BUDGET,
     fault::Primitive,
     ipc::Verdict,
     learned::Learned,
@@ -646,7 +645,7 @@ async fn drive(bus: &EventBus, plan: &plan::Plan) -> Result<CampaignOutcome> {
         bus,
         &plan.fleet,
         worker_id,
-        run_cost + HEAL_BUDGET + SCHEDULE_MARGIN,
+        run_cost + scenario.consistent_within + SCHEDULE_MARGIN,
         campaign_start,
         concurrency(),
     );
@@ -708,6 +707,7 @@ async fn run_learn(
             fleet.clone(),
             scenario.steps.clone(),
             scenario.checks.clone(),
+            scenario.consistent_within,
         );
         let outcome = execute_learn(bus, id, schedule).await;
         reclaim_fleet(id, fleet).await;
