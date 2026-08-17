@@ -50,6 +50,8 @@ pub struct EventIndex {
     events: Vec<(String, ConnEvent)>,
     packet_counts: HashMap<String, DirectionCounts>,
     freezes: u32,
+    /// When the proxy last held the fleet, which is also when the fault landed.
+    froze_at: Option<u128>,
     last_ts: Option<u128>,
 }
 
@@ -70,6 +72,7 @@ impl EventIndex {
         }
         if matches!(event.kind, ConnEventKind::Froze { .. }) {
             self.freezes += 1;
+            self.froze_at = Some(event.ts_ns);
         }
         self.events.push((service, event));
     }
@@ -87,6 +90,13 @@ impl EventIndex {
     #[must_use]
     pub fn freeze_count(&self) -> u32 {
         self.freezes
+    }
+
+    /// Wall-clock nanoseconds of the last freeze, or `None` if the fleet has not
+    /// been held. O(1).
+    #[must_use]
+    pub fn froze_at_ns(&self) -> Option<u128> {
+        self.froze_at
     }
 
     /// Wall-clock nanoseconds of the most recent event, or `None` if nothing has
@@ -159,9 +169,11 @@ impl SessionObserver {
     /// tripped) since this call began, or until `timeout` elapses; returns
     /// whether the freeze was observed. The baseline is captured at call time,
     /// which the caller aligns with scenario start (the same moment it arms the
-    /// anchor). Because the freeze is a held state, released only by an explicit
-    /// resume, observing it even late still means the fleet is currently frozen,
-    /// so gating the kill on this cannot fire before the freeze is in place.
+    /// anchor).
+    ///
+    /// A freeze that the proxy itself releases may already be over by the time
+    /// it is seen here, so this says the fault was placed, not that the fleet is
+    /// still held. Use [`Self::froze_at_ns`] for when it landed.
     pub async fn wait_for_freeze(&self, timeout: Duration) -> bool {
         let baseline = self.freeze_count();
         let deadline = tokio::time::Instant::now() + timeout;
@@ -181,6 +193,17 @@ impl SessionObserver {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .freeze_count()
+    }
+
+    /// When the proxy last held the fleet, by its own clock. What reads this
+    /// stream sees the freeze later than that, so a fault is timed by the proxy
+    /// rather than by whoever noticed.
+    #[must_use]
+    pub fn froze_at_ns(&self) -> Option<u128> {
+        self.index
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .froze_at_ns()
     }
 
     /// Wall-clock nanoseconds of the most recent event the observer has

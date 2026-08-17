@@ -293,6 +293,10 @@ impl Orchestrator<Ready> {
 
             let (scenario_end_tx, mut scenario_end_rx) = tokio::sync::oneshot::channel::<()>();
             let scenario_start = Instant::now();
+            // The proxy timestamps the freeze on its own clock, so the fault is
+            // timed against a wall-clock origin rather than against when this
+            // side noticed.
+            let scenario_start_ns = now_ns();
             let scenario_fut = async {
                 let result = run_actions(
                     deployment.as_ref(),
@@ -328,8 +332,8 @@ impl Orchestrator<Ready> {
                         // recovery time is part of the fault (ops in the outage window
                         // fail; ops once it is back succeed) rather than the world
                         // stopping while we heal.
-                        let actual = scenario_start.elapsed().as_nanos();
-                        Ok(place(fault, placement, deployment.substrate(), schedule_id, actual).await?)
+                        let placed = placed_at(&session_observer, scenario_start_ns);
+                        Ok(place(fault, placement, deployment.substrate(), schedule_id, placed).await?)
                     }
                     _ = &mut scenario_end_rx => {
                         // The scenario finished before a freeze was seen. The freeze
@@ -338,8 +342,8 @@ impl Orchestrator<Ready> {
                         // not be visible yet. Give it a short grace window before
                         // concluding the anchor was missed.
                         if session_observer.wait_for_freeze(FREEZE_GRACE).await {
-                            let actual = scenario_start.elapsed().as_nanos();
-                            Ok(place(fault, placement, deployment.substrate(), schedule_id, actual).await?)
+                            let placed = placed_at(&session_observer, scenario_start_ns);
+                            Ok(place(fault, placement, deployment.substrate(), schedule_id, placed).await?)
                         } else {
                             // Genuinely no freeze; release it in case one is
                             // mid-flight and record the miss.
@@ -509,6 +513,22 @@ async fn run_actions(
     Ok(observations)
 }
 
+/// When the fault landed and where that sits in the scenario, both by the
+/// proxy's clock. Falling back to the observer's own reading only matters if the
+/// proxy froze without saying when, which it does not do.
+struct Placed {
+    at_ns: u128,
+    offset_ns: u128,
+}
+
+fn placed_at(session_observer: &SessionObserver, scenario_start_ns: u128) -> Placed {
+    let at_ns = session_observer.froze_at_ns().unwrap_or_else(now_ns);
+    Placed {
+        at_ns,
+        offset_ns: at_ns.saturating_sub(scenario_start_ns),
+    }
+}
+
 /// How this schedule's fault gets placed, resolved before the scenario starts so
 /// nothing needed mid-run can turn out to be missing.
 enum Placement<'a> {
@@ -547,11 +567,11 @@ async fn place(
     placement: Placement<'_>,
     substrate: &dyn Substrate,
     id: u32,
-    actual_offset_ns: u128,
+    placed: Placed,
 ) -> Result<FaultReport, crucible_plugin::Error> {
     let anchor = fault.anchor();
     let placed_at_ns = match placement {
-        Placement::Cut => now_ns(),
+        Placement::Cut => placed.at_ns,
         Placement::Kill(kills) => match kills.kill(&anchor.service).await {
             Ok(placed_at_ns) => {
                 substrate.proceed().await?;
@@ -573,7 +593,7 @@ async fn place(
             by: fault.primitive(),
             requested_direction: anchor.direction,
             requested_packet_index: anchor.k,
-            actual_offset_ns,
+            actual_offset_ns: placed.offset_ns,
             placed_at_ns,
         },
     })
@@ -664,9 +684,18 @@ mod tests {
     #[tokio::test]
     async fn a_fault_reports_fired_when_recovery_succeeds() {
         let deployment = FakeDeployment::default();
-        let report = place(&fault(), Placement::Kill(&deployment), &deployment, 1, 0)
-            .await
-            .expect("recovery succeeded, so a report comes back");
+        let report = place(
+            &fault(),
+            Placement::Kill(&deployment),
+            &deployment,
+            1,
+            Placed {
+                at_ns: 42,
+                offset_ns: 0,
+            },
+        )
+        .await
+        .expect("recovery succeeded, so a report comes back");
         assert!(matches!(report.result, FaultResult::Fired { .. }));
     }
 
@@ -678,7 +707,17 @@ mod tests {
             restart_fails: true,
             ..Default::default()
         };
-        let result = place(&fault(), Placement::Kill(&deployment), &deployment, 1, 0).await;
+        let result = place(
+            &fault(),
+            Placement::Kill(&deployment),
+            &deployment,
+            1,
+            Placed {
+                at_ns: 42,
+                offset_ns: 0,
+            },
+        )
+        .await;
         assert!(result.is_err());
     }
 
@@ -690,7 +729,17 @@ mod tests {
             resume_fails: true,
             ..Default::default()
         };
-        let result = place(&fault(), Placement::Kill(&deployment), &deployment, 1, 0).await;
+        let result = place(
+            &fault(),
+            Placement::Kill(&deployment),
+            &deployment,
+            1,
+            Placed {
+                at_ns: 42,
+                offset_ns: 0,
+            },
+        )
+        .await;
         assert!(result.is_err());
     }
 
@@ -701,9 +750,18 @@ mod tests {
             kill_fails: true,
             ..Default::default()
         };
-        let report = place(&fault(), Placement::Kill(&deployment), &deployment, 1, 0)
-            .await
-            .expect("kill-failure is a miss, not an error");
+        let report = place(
+            &fault(),
+            Placement::Kill(&deployment),
+            &deployment,
+            1,
+            Placed {
+                at_ns: 42,
+                offset_ns: 0,
+            },
+        )
+        .await
+        .expect("kill-failure is a miss, not an error");
         assert!(matches!(
             report.result,
             FaultResult::Missed(FaultMissReason::Failed(_))
