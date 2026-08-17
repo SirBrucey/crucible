@@ -15,6 +15,7 @@
     serde::Serialize,
     strum::EnumIter,
     strum::Display,
+    strum::EnumString,
 )]
 #[strum(serialize_all = "snake_case")]
 pub enum Primitive {
@@ -26,4 +27,26 @@ pub enum Primitive {
     Redeliver,
     /// Hold a message back until a later one has passed it.
     Reorder,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::str::FromStr;
+
+    use strum::IntoEnumIterator;
+
+    use super::*;
+
+    /// Anything that writes a primitive down and anything that reads one back
+    /// must agree, and they are in different processes.
+    #[test]
+    fn every_primitive_survives_being_written_down() {
+        for primitive in Primitive::iter() {
+            assert_eq!(
+                Primitive::from_str(&primitive.to_string()),
+                Ok(primitive),
+                "{primitive:?}"
+            );
+        }
+    }
 }

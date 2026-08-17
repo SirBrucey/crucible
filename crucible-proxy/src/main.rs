@@ -4,7 +4,7 @@ mod proxy;
 use std::{io::Write, net::SocketAddr};
 
 use clap::Parser;
-use crucible_protocol::Direction;
+use crucible_protocol::{Direction, Primitive};
 use tokio::{
     signal::unix::{SignalKind, signal},
     sync::watch,
@@ -37,13 +37,17 @@ struct Cli {
     /// for the service to be killed and brought back from outside; `cut` severs
     /// the connection between the proxy and the two services.
     #[arg(long = "fault", default_value = "kill")]
-    fault: Fault,
+    fault: Primitive,
 }
 
 /// What the proxy does to the fleet once the anchored packet is reached. The
 /// network is frozen before the fault is placed and released immediately after,
 /// to ensure the fault is placed deterministically.
-#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+///
+/// Narrower than [`Primitive`], because this holds connections and nothing else.
+/// A primitive it cannot place is refused as the proxy starts rather than when
+/// the packet arrives.
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Fault {
     /// Wait to be told the service has been killed and brought back. That
     /// happens outside the proxy, so the freeze is what holds the fleet for it.
@@ -51,6 +55,18 @@ enum Fault {
     /// Sever the connection between the proxy and the two services, so both see
     /// the edge go away mid-request while their processes and state survive.
     Cut,
+}
+
+impl TryFrom<Primitive> for Fault {
+    type Error = Error;
+
+    fn try_from(primitive: Primitive) -> Result<Self> {
+        match primitive {
+            Primitive::Kill => Ok(Self::Kill),
+            Primitive::Cut => Ok(Self::Cut),
+            Primitive::Redeliver | Primitive::Reorder => Err(Error::UnplaceableFault { primitive }),
+        }
+    }
 }
 
 /// A parsed `--fault-at` anchor: place the fault once `service` forwards `k`
@@ -99,6 +115,7 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+    let fault = Fault::try_from(cli.fault)?;
 
     // The network every pair in this sidecar forwards on, frozen while a fault
     // is placed. SIGUSR1 arms the anchor at scenario start, so it counts only
@@ -168,7 +185,7 @@ async fn main() -> Result<()> {
         });
     }
 
-    spawn_fault_control(cli.fault, anchor, trip_rx, pause_tx, sever_tx);
+    spawn_fault_control(fault, anchor, trip_rx, pause_tx, sever_tx);
 
     for spec in cli.control {
         let Pair {

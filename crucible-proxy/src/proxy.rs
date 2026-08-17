@@ -370,13 +370,15 @@ async fn forward_bytes(
             Ok(n) => n,
             Err(e) => break Err(format!("{read_label}: {e}")),
         };
-        emit(&events, ConnEvent::wrote(id, direction, n as u64));
         if !gate.passable().await {
             break Ok(bytes_total);
         }
         if let Err(e) = write.write_all(&buf[..n]).await {
             break Err(format!("{write_label}: {e}"));
         }
+        // Only once it is through: a packet the gate held back and then severed
+        // was never forwarded, and the learn pass counts these as traffic.
+        emit(&events, ConnEvent::wrote(id, direction, n as u64));
         bytes_total += n as u64;
         if let Some(anchor) = &anchor
             && anchor.record()
