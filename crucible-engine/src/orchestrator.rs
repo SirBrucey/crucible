@@ -10,7 +10,7 @@ use crucible_protocol::{FaultMissReason, FaultReport, FaultResult, now_ns};
 
 use crucible_core::{
     HEAL_BUDGET,
-    fault::{Anchor, Fault, Primitive},
+    fault::{Anchor, Fault, Losing, Primitive},
     ipc::Verdict,
     learned::Learned,
     observer::SessionObserver,
@@ -524,20 +524,23 @@ impl<'a> Placement<'a> {
         fault: &Fault,
         deployment: &'a dyn DeploymentRuntime,
     ) -> Result<Self, crucible_plugin::Error> {
-        match fault.primitive() {
-            Primitive::Kill => deployment
+        match fault {
+            Fault::Durable {
+                by: Losing::Kill, ..
+            } => deployment
                 .kills()
                 .map(Placement::Kill)
                 .ok_or_else(|| unreachable_fault(fault)),
             // The substrate does this one on its own, so what it offers is all
             // there is to check.
-            Primitive::Cut => deployment
+            Fault::Durable {
+                by: Losing::Cut, ..
+            } => deployment
                 .substrate()
                 .primitives()
                 .contains(&Primitive::Cut)
                 .then_some(Placement::Cut)
                 .ok_or_else(|| unreachable_fault(fault)),
-            Primitive::Redeliver | Primitive::Reorder => Err(unreachable_fault(fault)),
         }
     }
 }
@@ -663,7 +666,7 @@ mod tests {
                 direction: Direction::ClientToUpstream,
                 k: 3,
             },
-            by: Primitive::Kill,
+            by: Losing::Kill,
         }
     }
 

@@ -149,7 +149,7 @@ mod tests {
                     direction: Direction::ClientToUpstream,
                     k: 3,
                 },
-                by: crate::fault::Primitive::Kill,
+                by: crate::fault::Losing::Kill,
             },
             vec![
                 vec![Some(crate::plan::Value::Int(0))],

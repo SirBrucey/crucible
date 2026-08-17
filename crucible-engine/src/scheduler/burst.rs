@@ -9,7 +9,7 @@
 use crucible_protocol::Direction;
 
 use crucible_core::{
-    fault::{Anchor, Fault, Primitive},
+    fault::{Anchor, Fault, Losing, Primitive},
     learned::Learned,
     plan,
     schedule::Schedule,
@@ -103,7 +103,7 @@ fn faults(invariant: Invariant, by: Primitive, anchor: &Anchor) -> Option<Fault>
     match invariant {
         Invariant::Durable => Some(Fault::Durable {
             anchor: anchor.clone(),
-            by,
+            by: Losing::try_from(by).ok()?,
         }),
         Invariant::Recovers | Invariant::Idempotent | Invariant::Converges => None,
     }
@@ -119,7 +119,6 @@ impl Scheduler for BurstScheduler {
 mod tests {
     use std::collections::BTreeSet;
 
-    use crucible_core::fault::Primitive;
     use crucible_protocol::ServiceProfile;
 
     use super::*;

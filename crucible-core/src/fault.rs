@@ -10,8 +10,42 @@ use crate::verdict::Invariant;
 pub enum Fault {
     /// Break the fleet at the anchor and read what survived. Killing the service
     /// takes its process and everything it held; cutting the edge leaves both
-    /// sides running with the caller none the wiser.
-    Durable { anchor: Anchor, by: Primitive },
+    /// sides running and only the caller the wiser.
+    Durable { anchor: Anchor, by: Losing },
+}
+
+/// A way of making the fleet lose something in flight. Narrower than
+/// [`Primitive`], so nothing downstream has to answer for a fault that could
+/// never have been built.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize, strum::EnumIter,
+)]
+pub enum Losing {
+    Kill,
+    Cut,
+}
+
+impl From<Losing> for Primitive {
+    fn from(losing: Losing) -> Self {
+        match losing {
+            Losing::Kill => Primitive::Kill,
+            Losing::Cut => Primitive::Cut,
+        }
+    }
+}
+
+impl TryFrom<Primitive> for Losing {
+    type Error = Primitive;
+
+    /// `Err` for a primitive that changes what the fleet does rather than
+    /// costing it something, which is a different invariant's business.
+    fn try_from(primitive: Primitive) -> Result<Self, Primitive> {
+        match primitive {
+            Primitive::Kill => Ok(Self::Kill),
+            Primitive::Cut => Ok(Self::Cut),
+            Primitive::Redeliver | Primitive::Reorder => Err(primitive),
+        }
+    }
 }
 
 impl Fault {
@@ -36,7 +70,7 @@ impl Fault {
     #[must_use]
     pub fn primitive(&self) -> Primitive {
         match self {
-            Fault::Durable { by, .. } => *by,
+            Fault::Durable { by, .. } => (*by).into(),
         }
     }
 }
