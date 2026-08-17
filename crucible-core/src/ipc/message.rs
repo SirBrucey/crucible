@@ -1,4 +1,4 @@
-pub use crucible_protocol::{KillReport, ServiceProfile, Session};
+pub use crucible_protocol::{FaultReport, ServiceProfile, Session};
 
 use crate::{learned::Learned, schedule::Schedule};
 
@@ -35,8 +35,8 @@ pub enum WorkerToRunner {
 pub enum WorkerEvent {
     /// Free-form log line from the worker.
     Log(String),
-    /// Kill primitive outcome for a schedule.
-    Kill(KillReport),
+    /// What a schedule's fault did to the fleet.
+    Fault(FaultReport),
 }
 
 /// Outcome of running a schedule. Non-`Pass` verdicts carry the reason the

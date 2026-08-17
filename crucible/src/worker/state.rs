@@ -7,7 +7,7 @@
 //! The fleet is brought up only after the worker knows its work, so a schedule
 //! can arm the proxy's fault anchor on its command line at startup.
 
-use std::sync::Arc;
+use std::{collections::BTreeSet, sync::Arc};
 
 use crucible_core::{
     fault::Fault,
@@ -152,8 +152,7 @@ async fn bring_up(
     worker_id: u32,
     schedule: &Schedule,
 ) -> Result<Orchestrator<Ready>> {
-    let anchor = schedule.fault.as_ref().map(|fault| fault.anchor().clone());
-    let deployment = registry.deployment_for(&schedule.fleet, worker_id, anchor)?;
+    let deployment = registry.deployment_for(&schedule.fleet, worker_id, schedule.fault.clone())?;
     let actions = registry.actions_for(&schedule.steps)?;
     let orchestrator = Orchestrator::new(deployment, actions).setup().await?;
     Ok(orchestrator)
@@ -255,10 +254,15 @@ impl Worker<Learning> {
                 return Err(e.into());
             }
         };
-        // FIXME: this should be the union across every plugin driving the
-        // scenario, not the deployment's alone. Kind plugins are built per
-        // action and per check rather than held, so there is nothing to ask yet.
-        let primitives = orchestrator.deployment().primitives();
+        // FIXME: kind plugins join this union once they can offer a primitive.
+        // They are built per action and per check rather than held, so there is
+        // nothing to ask yet.
+        let deployment = orchestrator.deployment();
+        let primitives: BTreeSet<_> = deployment
+            .primitives()
+            .union(&deployment.substrate().primitives())
+            .copied()
+            .collect();
         let (learned, orchestrator) = orchestrator
             .learn(&queries, primitives)
             .await
@@ -297,7 +301,7 @@ impl Worker<Executing> {
             }
         };
 
-        let ((verdict, kill_report), orchestrator) = orchestrator
+        let ((verdict, fault_report), orchestrator) = orchestrator
             .execute(
                 schedule_id,
                 &self.state.fault,
@@ -310,15 +314,15 @@ impl Worker<Executing> {
             )?;
         drop(heartbeat);
         self.conn
-            .send(&WorkerToRunner::Event(WorkerEvent::Kill(
-                kill_report.clone(),
+            .send(&WorkerToRunner::Event(WorkerEvent::Fault(
+                fault_report.clone(),
             )))
             .await?;
         tracing::info!(
             worker_id = self.id,
             schedule_id,
-            ?kill_report,
-            "sent kill event"
+            ?fault_report,
+            "sent fault event"
         );
         self.conn
             .send(&WorkerToRunner::RunResult {

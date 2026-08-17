@@ -40,15 +40,17 @@ pub trait Deployment {
     fn bind(service: &plan::Service) -> Result<Self::Config, Self::Error>;
 }
 
-/// Hold the fleet still at the anchored moment and let it go again. Every
-/// deployment provides this: it is how a fault is placed precisely, not a fault
-/// in itself.
-pub trait Freeze: Send + Sync {
-    /// Arm the fault anchor at scenario start, so the replica freezes once the
-    /// target reaches the anchored point.
+/// What a deployment places in front of its fleet; it carries every edge's
+/// traffic.
+pub trait Substrate: Faults {
+    /// Arm the fault anchor at scenario start, so the replica holds still once
+    /// the target reaches the anchored point.
     fn arm_anchor(&self) -> BoxFuture<'_, Result<(), Error>>;
-    /// Release the freeze.
-    fn resume(&self) -> BoxFuture<'_, Result<(), Error>>;
+    /// The half of the fault that happens outside here is done, so let the fleet
+    /// go.
+    fn proceed(&self) -> BoxFuture<'_, Result<(), Error>>;
+    /// Nothing was placed. Disarm and let the fleet go, wherever it had got to.
+    fn abandon(&self) -> BoxFuture<'_, Result<(), Error>>;
 }
 
 /// What a plugin can do to a fleet beyond driving it. Each accessor answers with
@@ -60,7 +62,8 @@ pub trait Faults: Send + Sync {
     }
 
     /// Everything this can do, so a campaign can report what it was able to
-    /// reach. Read off the accessors, so it says exactly what is there.
+    /// reach. Read off the accessors where there is something to call, so those
+    /// say exactly what is there.
     fn primitives(&self) -> BTreeSet<Primitive> {
         [self.kills().map(|_| Primitive::Kill)]
             .into_iter()
@@ -79,7 +82,11 @@ pub trait Kill: Send + Sync {
 }
 
 /// A live fleet replica: bring it up, probe it, fault it, and remove it.
-pub trait DeploymentRuntime: Freeze + Faults {
+pub trait DeploymentRuntime: Faults {
+    /// What this runs in front of the fleet. It carries the traffic, so it is
+    /// asked for anything done to an edge rather than to a service.
+    fn substrate(&self) -> &dyn Substrate;
+
     fn setup(&mut self) -> BoxFuture<'_, Result<(), Error>>;
     fn wait_ready(&self) -> BoxFuture<'_, Result<(), Error>>;
     fn teardown(&mut self) -> BoxFuture<'_, Result<(), Error>>;

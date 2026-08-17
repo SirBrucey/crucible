@@ -2,7 +2,7 @@
 //! binds a service to that, and runs the replica.
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     time::Duration,
 };
@@ -23,7 +23,7 @@ use futures_util::{StreamExt, TryStreamExt};
 use tokio::time::sleep;
 
 use crucible_core::{
-    fault::Anchor,
+    fault::{Fault, Primitive},
     observer::SessionObserver,
     plan,
     schema::{AttrDecl, AttrSchema, ValueType},
@@ -31,7 +31,7 @@ use crucible_core::{
 
 use crate::{
     error::Error as PluginError,
-    role::{BoxFuture, Deployment, DeploymentRuntime, Faults, Freeze, Kill},
+    role::{BoxFuture, Deployment, DeploymentRuntime, Faults, Kill, Substrate},
 };
 
 const READINESS_TIMEOUT: Duration = Duration::from_mins(1);
@@ -154,7 +154,8 @@ pub struct Docker {
     network: String,
     services: Vec<ServiceConfig>,
     endpoints: Endpoints,
-    anchor: Option<Anchor>,
+    fault: Option<Fault>,
+    proxy: Proxy,
 }
 
 /// Where each service answers, keyed by service and kind. The proxy fronts every
@@ -183,18 +184,21 @@ impl Docker {
     ///
     /// # Errors
     /// Errors if connecting to the Docker daemon socket fails.
-    pub fn new(
-        worker_id: u32,
-        services: Vec<ServiceConfig>,
-        anchor: Option<Anchor>,
-    ) -> Result<Self> {
+    pub fn new(worker_id: u32, services: Vec<ServiceConfig>, fault: Option<Fault>) -> Result<Self> {
         let client = DockerClient::connect_with_socket_defaults()?;
+        let network = format!("crucible-{worker_id}");
         Ok(Self {
+            // Both act on the daemon, and the handle is shared rather than a
+            // second connection.
+            proxy: Proxy {
+                client: client.clone(),
+                container: format!("{network}-{PROXY_SUFFIX}"),
+            },
             client,
-            network: format!("crucible-{worker_id}"),
+            network,
             services,
             endpoints: Endpoints::default(),
-            anchor,
+            fault,
         })
     }
 
@@ -203,16 +207,6 @@ impl Docker {
             .iter()
             .find(|service| service.name == name)
             .ok_or_else(|| Error::UnknownService(name.to_string()))
-    }
-
-    async fn signal_proxy(&self, signal: &str) -> Result<()> {
-        let options = KillContainerOptionsBuilder::default()
-            .signal(signal)
-            .build();
-        self.client
-            .kill_container(&self.proxy_container_name(), Some(options))
-            .await?;
-        Ok(())
     }
 
     /// Network-scoped name of a service's backing container: its in-network
@@ -342,13 +336,16 @@ impl Docker {
                 ));
             }
         }
-        if let Some(anchor) = &self.anchor {
+        if let Some(fault) = &self.fault {
+            let anchor = fault.anchor();
             let direction = match anchor.direction {
                 Direction::ClientToUpstream => "c2u",
                 Direction::UpstreamToClient => "u2c",
             };
-            cmd.push("--freeze-at".to_string());
+            cmd.push("--fault-at".to_string());
             cmd.push(format!("{}={}={}", anchor.service, direction, anchor.k));
+            cmd.push("--fault".to_string());
+            cmd.push(fault.primitive().to_string());
         }
 
         let exposed_ports: Vec<String> = self
@@ -754,30 +751,56 @@ fn owned_idents(service: &plan::Service, attr: &'static str) -> Result<Vec<Strin
         .collect()
 }
 
-impl Freeze for Docker {
+/// The container Docker runs in front of the fleet.
+pub struct Proxy {
+    client: DockerClient,
+    container: String,
+}
+
+impl Substrate for Proxy {
     /// SIGUSR1 the proxy: it resets its packet counter and begins counting, so
     /// the anchor lands relative to scenario traffic rather than the fleet's
-    /// bring-up. When it reaches the scheduled packet the proxy freezes the
-    /// fleet itself.
+    /// bring-up. When it reaches the scheduled packet the proxy holds the fleet
+    /// itself.
     fn arm_anchor(&self) -> BoxFuture<'_, Result<(), PluginError>> {
-        Box::pin(async move {
-            self.signal_proxy("SIGUSR1")
-                .await
-                .map_err(PluginError::from)
-        })
+        Box::pin(async move { self.signal("SIGUSR1").await.map_err(PluginError::from) })
     }
 
-    /// SIGUSR2 the proxy to release the freeze, letting the held bytes flow again.
-    fn resume(&self) -> BoxFuture<'_, Result<(), PluginError>> {
-        Box::pin(async move {
-            self.signal_proxy("SIGUSR2")
-                .await
-                .map_err(PluginError::from)
-        })
+    /// SIGUSR2 the proxy: the kill has landed, so the held bytes flow again.
+    fn proceed(&self) -> BoxFuture<'_, Result<(), PluginError>> {
+        Box::pin(async move { self.signal("SIGUSR2").await.map_err(PluginError::from) })
+    }
+
+    /// SIGHUP the proxy: nothing was placed, so disarm and let the fleet go.
+    /// Separate from [`Self::proceed`] because a proxy waiting for a kill it
+    /// will never be told about would take one for the other.
+    fn abandon(&self) -> BoxFuture<'_, Result<(), PluginError>> {
+        Box::pin(async move { self.signal("SIGHUP").await.map_err(PluginError::from) })
     }
 }
 
-/// Docker owns the containers behind the fleet, so it is what can take one away.
+/// The proxy holds both sides of every edge, so it can let one go. There is
+/// nothing to call: it severs at the anchored packet, having been told which
+/// fault to place when the replica was built.
+impl Faults for Proxy {
+    fn primitives(&self) -> BTreeSet<Primitive> {
+        [Primitive::Cut].into()
+    }
+}
+
+impl Proxy {
+    async fn signal(&self, signal: &str) -> Result<()> {
+        let options = KillContainerOptionsBuilder::default()
+            .signal(signal)
+            .build();
+        self.client
+            .kill_container(&self.container, Some(options))
+            .await?;
+        Ok(())
+    }
+}
+
+/// Docker owns the containers behind the fleet, so it can take one away.
 impl Faults for Docker {
     fn kills(&self) -> Option<&dyn Kill> {
         Some(self)
@@ -801,6 +824,10 @@ impl Kill for Docker {
 }
 
 impl DeploymentRuntime for Docker {
+    fn substrate(&self) -> &dyn Substrate {
+        &self.proxy
+    }
+
     fn setup(&mut self) -> BoxFuture<'_, Result<(), PluginError>> {
         Box::pin(async move { self.create_replica().await.map_err(PluginError::from) })
     }

@@ -6,10 +6,14 @@ pub enum Error {
     Io(#[from] io::Error),
     #[error("pair `{pair}` must be in the form SERVICE=LISTEN=UPSTREAM")]
     MalformedPair { pair: String },
-    #[error("freeze-at `{spec}` must be in the form SERVICE=DIRECTION=K (DIRECTION is c2u or u2c)")]
-    MalformedFreezeAt { spec: String },
-    #[error("freeze-at names service `{service}`, which no --pair fronts")]
-    UnknownFreezeService { service: String },
+    #[error("fault-at `{spec}` must be in the form SERVICE=DIRECTION=K (DIRECTION is c2u or u2c)")]
+    MalformedFaultAt { spec: String },
+    #[error("this proxy holds connections, so it cannot {primitive}")]
+    UnplaceableFault {
+        primitive: crucible_protocol::Primitive,
+    },
+    #[error("fault-at names service `{service}`, which no --pair fronts")]
+    UnknownFaultService { service: String },
     #[error("parse listen `{addr}`: {source}")]
     ParseListen {
         addr: String,

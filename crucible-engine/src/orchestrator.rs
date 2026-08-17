@@ -6,18 +6,20 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crucible_protocol::{KillMissReason, KillReport, KillResult, now_ns};
+use crucible_protocol::{FaultMissReason, FaultReport, FaultResult, now_ns};
 
 use crucible_core::{
     HEAL_BUDGET,
-    fault::{Anchor, Fault, Primitive},
+    fault::{Anchor, Fault, Losing, Primitive},
     ipc::Verdict,
     learned::Learned,
     observer::SessionObserver,
     proxy_log::service_profiles_from_sessions,
     verdict::{Checkpoint, Observations, Observed, StepWindow, driver_for},
 };
-use crucible_plugin::{Action, DeploymentRuntime, Freeze, Kill, Targeted, registry::PreparedCheck};
+use crucible_plugin::{
+    Action, DeploymentRuntime, Kill, Substrate, Targeted, registry::PreparedCheck,
+};
 
 /// After a restart, wait this long before judging the fleet quiescent, so
 /// recovery traffic has a chance to start.
@@ -263,7 +265,7 @@ impl Orchestrator<Ready> {
         fault: &Fault,
         queries: Vec<PreparedCheck>,
         fault_free: Vec<Checkpoint>,
-    ) -> Result<((Verdict, KillReport), Orchestrator<Done>), crucible_plugin::Error> {
+    ) -> Result<((Verdict, FaultReport), Orchestrator<Done>), crucible_plugin::Error> {
         let Orchestrator {
             deployment,
             state: Ready {
@@ -272,25 +274,29 @@ impl Orchestrator<Ready> {
             },
         } = self;
         let anchor = fault.anchor();
-        // The scheduler only emits a schedule whose fault it can drive and whose
+        // The scheduler only emits a schedule whose fault it can place and whose
         // verdict it can read, so both of these resolve for anything it produced.
-        let killer = deployment.kills().ok_or_else(|| unreachable_fault(fault))?;
+        let placement = Placement::of(fault, deployment.as_ref())?;
         let mut driver = driver_for(fault.invariant()).ok_or_else(|| unreachable_fault(fault))?;
 
         // Run the fault sequence borrowing the replica handles, so whatever the
         // outcome we still own them afterwards: on success they move into `Done`
         // for the caller to tear down, on error we tear down here rather than
         // dropping the only handle to the replica and its observer tasks.
-        let outcome: Result<(Verdict, KillReport), crucible_plugin::Error> = async {
+        let outcome: Result<(Verdict, FaultReport), crucible_plugin::Error> = async {
             // Arm the anchor as the scenario starts: the proxy resets and counts
             // scenario packets from here, and wait_for_freeze captures its observer
             // baseline at the same moment, so both share the scenario-start origin.
             // A failed arm means the proxy never freezes, so the whole run would be
             // meaningless; surface it rather than pressing on.
-            deployment.arm_anchor().await?;
+            deployment.substrate().arm_anchor().await?;
 
             let (scenario_end_tx, mut scenario_end_rx) = tokio::sync::oneshot::channel::<()>();
             let scenario_start = Instant::now();
+            // The proxy timestamps the freeze on its own clock, so the fault is
+            // timed against a wall-clock origin rather than against when this
+            // side noticed.
+            let scenario_start_ns = now_ns();
             let scenario_fut = async {
                 let result = run_actions(
                     deployment.as_ref(),
@@ -304,56 +310,35 @@ impl Orchestrator<Ready> {
                 result
             };
 
-            let kill_fut = async {
-                tokio::select! {
+            let fault_fut = async {
+                let frozen = tokio::select! {
                     biased;
-                    frozen = session_observer.wait_for_freeze(ANCHOR_TIMEOUT) => {
-                        if !frozen {
-                            // The proxy never reported freezing (the target did not
-                            // reach its Kth packet); release the freeze in case it is
-                            // mid-flight and record a miss.
-                            deployment.resume().await?;
-                            return Ok::<_, crucible_plugin::Error>(missed(
-                                schedule_id,
-                                anchor,
-                                KillMissReason::ScenarioEndedBeforeAnchor,
-                            ));
-                        }
-                        // The proxy froze the fleet to place the kill precisely on the
-                        // anchored packet. Kill the target, then release the flow and
-                        // bring the target back concurrently: the scenario runs against
-                        // the dead-then-recovering service in real time. Its real
-                        // recovery time is part of the fault (ops in the outage window
-                        // fail; ops once it is back succeed) rather than the world
-                        // stopping while we heal.
-                        let actual = scenario_start.elapsed().as_nanos();
-                        Ok(fire_kill(deployment.as_ref(), killer, schedule_id, anchor, actual).await?)
-                    }
-                    _ = &mut scenario_end_rx => {
-                        // The scenario finished before a freeze was seen. The freeze
-                        // is observed through the docker log stream, which lags real
-                        // traffic, so a freeze triggered by a post-ack edge may just
-                        // not be visible yet. Give it a short grace window before
-                        // concluding the anchor was missed.
-                        if session_observer.wait_for_freeze(FREEZE_GRACE).await {
-                            let actual = scenario_start.elapsed().as_nanos();
-                            Ok(fire_kill(deployment.as_ref(), killer, schedule_id, anchor, actual).await?)
-                        } else {
-                            // Genuinely no freeze; release it in case one is
-                            // mid-flight and record the miss.
-                            deployment.resume().await?;
-                            Ok(missed(schedule_id, anchor, KillMissReason::ScenarioEndedBeforeAnchor))
-                        }
-                    }
+                    frozen = session_observer.wait_for_freeze(ANCHOR_TIMEOUT) => frozen,
+                    // The scenario finished before a freeze was seen. The freeze is
+                    // observed through the docker log stream, which lags real traffic,
+                    // so one triggered by a post-ack edge may just not be visible yet.
+                    _ = &mut scenario_end_rx => session_observer.wait_for_freeze(FREEZE_GRACE).await,
+                };
+                if !frozen {
+                    // The target never reached its Kth packet. Let the fleet go in
+                    // case a freeze is mid-flight, and record the miss.
+                    deployment.substrate().abandon().await?;
+                    return Ok::<_, crucible_plugin::Error>(missed(
+                        schedule_id,
+                        anchor,
+                        FaultMissReason::ScenarioEndedBeforeAnchor,
+                    ));
                 }
+                let placed = placed_at(&session_observer, scenario_start_ns);
+                place(fault, placement, deployment.substrate(), schedule_id, placed).await
             };
 
-            let (scenario_result, kill_result) = tokio::join!(scenario_fut, kill_fut);
-            let kill_report = kill_result?;
+            let (scenario_result, fault_result) = tokio::join!(scenario_fut, fault_fut);
+            let fault_report = fault_result?;
             let mut observations = scenario_result?;
-            observations.kill = Some(kill_report.clone());
+            observations.fault = Some(fault_report.clone());
 
-            if matches!(kill_report.result, KillResult::Fired { .. }) {
+            if matches!(fault_report.result, FaultResult::Fired { .. }) {
                 // The target was restarted concurrently with the scenario; just wait
                 // for the fleet to settle (giving any outbox redelivery its chance)
                 // before reading the durability state.
@@ -366,17 +351,17 @@ impl Orchestrator<Ready> {
             observations.fault_free = fault_free;
             session_observer.observe(&mut observations);
             let verdict = driver.drive(&observations);
-            Ok((verdict, kill_report))
+            Ok((verdict, fault_report))
         }
         .await;
 
         match outcome {
-            Ok((verdict, kill_report)) => {
+            Ok((verdict, fault_report)) => {
                 let done = Orchestrator {
                     deployment,
                     state: Done { session_observer },
                 };
-                Ok(((verdict, kill_report), done))
+                Ok(((verdict, fault_report), done))
             }
             Err(e) => {
                 let _ = teardown_replica(deployment, session_observer).await;
@@ -413,12 +398,12 @@ async fn teardown_replica(
     deployment.teardown().await
 }
 
-/// A [`KillReport`] for a fault that did not fire, for the given reason.
-fn missed(id: u32, fault: &Anchor, reason: KillMissReason) -> KillReport {
-    KillReport {
+/// A [`FaultReport`] for a fault that did not fire, for the given reason.
+fn missed(id: u32, fault: &Anchor, reason: FaultMissReason) -> FaultReport {
+    FaultReport {
         schedule_id: id,
         service: fault.service.clone(),
-        result: KillResult::Missed(reason),
+        result: FaultResult::Missed(reason),
     }
 }
 
@@ -507,42 +492,98 @@ async fn run_actions(
     Ok(observations)
 }
 
-/// Apply the kill against the already-frozen fleet and produce its report. Kill
-/// the target, then release the freeze and bring the target back so the scenario
-/// runs against the dead-then-recovering service.
-///
-/// Releasing the freeze and restarting the target must both succeed: otherwise
-/// the fleet is left wedged or the target permanently dead, and the durability
-/// verdict read afterwards would be meaningless. Those failures propagate as an
-/// error rather than being reported as a successful kill. A failed kill, by
-/// contrast, is a miss (nothing fired), not an error.
-async fn fire_kill(
-    deployment: &dyn Freeze,
-    killer: &dyn Kill,
-    id: u32,
-    fault: &Anchor,
-    actual_offset_ns: u128,
-) -> Result<KillReport, crucible_plugin::Error> {
-    let killed_at_ns = match killer.kill(&fault.service).await {
-        Ok(killed_at_ns) => killed_at_ns,
-        Err(e) => {
-            // The kill never landed, so nothing is dead; release the freeze the
-            // proxy is holding and report the miss. A resume failure here still
-            // leaves the fleet wedged, so it is fatal.
-            deployment.resume().await?;
-            return Ok(missed(id, fault, KillMissReason::KillFailed(e.to_string())));
+/// When the fault landed and where that sits in the scenario, both by the
+/// proxy's clock. Falling back to the observer's own reading only matters if the
+/// proxy froze without saying when, which it does not do.
+struct Placed {
+    at_ns: u128,
+    offset_ns: u128,
+}
+
+fn placed_at(session_observer: &SessionObserver, scenario_start_ns: u128) -> Placed {
+    let at_ns = session_observer.froze_at_ns().unwrap_or_else(now_ns);
+    Placed {
+        at_ns,
+        offset_ns: at_ns.saturating_sub(scenario_start_ns),
+    }
+}
+
+/// How this schedule's fault gets placed, resolved before the scenario starts so
+/// nothing needed mid-run can turn out to be missing.
+enum Placement<'a> {
+    /// The proxy holds the fleet while this side kills the service and brings it
+    /// back.
+    Kill(&'a dyn Kill),
+    /// The proxy severs the edge itself and releases the fleet.
+    Cut,
+}
+
+impl<'a> Placement<'a> {
+    /// What the deployment must offer to place `fault`.
+    fn of(
+        fault: &Fault,
+        deployment: &'a dyn DeploymentRuntime,
+    ) -> Result<Self, crucible_plugin::Error> {
+        match fault {
+            Fault::Durable {
+                by: Losing::Kill, ..
+            } => deployment
+                .kills()
+                .map(Placement::Kill)
+                .ok_or_else(|| unreachable_fault(fault)),
+            // The substrate does this one on its own, so what it offers is all
+            // there is to check.
+            Fault::Durable {
+                by: Losing::Cut, ..
+            } => deployment
+                .substrate()
+                .primitives()
+                .contains(&Primitive::Cut)
+                .then_some(Placement::Cut)
+                .ok_or_else(|| unreachable_fault(fault)),
         }
+    }
+}
+
+/// Place the fault against the already-frozen fleet and report it.
+///
+/// The kill releases the flow and restarts concurrently, so the scenario meets
+/// the dead-then-recovering service in real time. Both must succeed or the fleet
+/// is left wedged and the verdict would be meaningless, so they error. A failed
+/// kill is a miss, not an error.
+async fn place(
+    fault: &Fault,
+    placement: Placement<'_>,
+    substrate: &dyn Substrate,
+    id: u32,
+    placed: Placed,
+) -> Result<FaultReport, crucible_plugin::Error> {
+    let anchor = fault.anchor();
+    let placed_at_ns = match placement {
+        Placement::Cut => placed.at_ns,
+        Placement::Kill(kills) => match kills.kill(&anchor.service).await {
+            Ok(placed_at_ns) => {
+                substrate.proceed().await?;
+                kills.restart(&anchor.service).await?;
+                placed_at_ns
+            }
+            Err(e) => {
+                // Nothing is dead, so let the fleet go and report the miss. A
+                // failure here still leaves it wedged, so it is fatal.
+                substrate.abandon().await?;
+                return Ok(missed(id, anchor, FaultMissReason::Failed(e.to_string())));
+            }
+        },
     };
-    deployment.resume().await?;
-    killer.restart(&fault.service).await?;
-    Ok(KillReport {
+    Ok(FaultReport {
         schedule_id: id,
-        service: fault.service.clone(),
-        result: KillResult::Fired {
-            requested_direction: fault.direction,
-            requested_packet_index: fault.k,
-            actual_offset_ns,
-            killed_at_ns,
+        service: anchor.service.clone(),
+        result: FaultResult::Fired {
+            by: fault.primitive(),
+            requested_direction: anchor.direction,
+            requested_packet_index: anchor.k,
+            actual_offset_ns: placed.offset_ns,
+            placed_at_ns,
         },
     })
 }
@@ -554,8 +595,8 @@ mod tests {
 
     use super::*;
 
-    /// A deployment whose fault primitives can be told to fail, so `fire_kill`'s
-    /// error handling can be exercised without a real fleet.
+    /// A deployment whose kill can be told to fail, so placement's error handling
+    /// can be exercised without a real fleet.
     #[derive(Default)]
     struct FakeDeployment {
         kill_fails: bool,
@@ -563,15 +604,27 @@ mod tests {
         restart_fails: bool,
     }
 
-    impl Freeze for FakeDeployment {
+    impl crucible_plugin::Faults for FakeDeployment {}
+
+    impl Substrate for FakeDeployment {
         fn arm_anchor(&self) -> BoxFuture<'_, Result<(), crucible_plugin::Error>> {
             Box::pin(async { Ok(()) })
         }
 
-        fn resume(&self) -> BoxFuture<'_, Result<(), crucible_plugin::Error>> {
+        fn proceed(&self) -> BoxFuture<'_, Result<(), crucible_plugin::Error>> {
             Box::pin(async move {
                 if self.resume_fails {
                     Err(fake("resume failed"))
+                } else {
+                    Ok(())
+                }
+            })
+        }
+
+        fn abandon(&self) -> BoxFuture<'_, Result<(), crucible_plugin::Error>> {
+            Box::pin(async move {
+                if self.resume_fails {
+                    Err(fake("abandon failed"))
                 } else {
                     Ok(())
                 }
@@ -605,60 +658,102 @@ mod tests {
         crucible_plugin::Error::new("fake", message)
     }
 
-    fn fault() -> Anchor {
-        Anchor {
-            service: "db".into(),
-            direction: Direction::ClientToUpstream,
-            k: 3,
+    /// A kill of `db`.
+    fn fault() -> Fault {
+        Fault::Durable {
+            anchor: Anchor {
+                service: "db".into(),
+                direction: Direction::ClientToUpstream,
+                k: 3,
+            },
+            by: Losing::Kill,
         }
     }
 
     #[tokio::test]
-    async fn fire_kill_reports_fired_when_recovery_succeeds() {
+    async fn a_fault_reports_fired_when_recovery_succeeds() {
         let deployment = FakeDeployment::default();
-        let report = fire_kill(&deployment, &deployment, 1, &fault(), 0)
-            .await
-            .expect("recovery succeeded, so fire_kill returns a report");
-        assert!(matches!(report.result, KillResult::Fired { .. }));
+        let report = place(
+            &fault(),
+            Placement::Kill(&deployment),
+            &deployment,
+            1,
+            Placed {
+                at_ns: 42,
+                offset_ns: 0,
+            },
+        )
+        .await
+        .expect("recovery succeeded, so a report comes back");
+        assert!(matches!(report.result, FaultResult::Fired { .. }));
     }
 
     #[tokio::test]
-    async fn fire_kill_errors_when_restart_fails() {
+    async fn a_kill_errors_when_restart_fails() {
         // A failed restart leaves the target dead; reporting Fired would compute a
         // durability verdict against a dead fleet, so it must surface as an error.
         let deployment = FakeDeployment {
             restart_fails: true,
             ..Default::default()
         };
-        let result = fire_kill(&deployment, &deployment, 1, &fault(), 0).await;
+        let result = place(
+            &fault(),
+            Placement::Kill(&deployment),
+            &deployment,
+            1,
+            Placed {
+                at_ns: 42,
+                offset_ns: 0,
+            },
+        )
+        .await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
-    async fn fire_kill_errors_when_resume_fails() {
+    async fn a_kill_errors_when_resume_fails() {
         // A failed resume leaves the fleet frozen; the verdict would be read
         // against a wedged fleet, so it must surface as an error.
         let deployment = FakeDeployment {
             resume_fails: true,
             ..Default::default()
         };
-        let result = fire_kill(&deployment, &deployment, 1, &fault(), 0).await;
+        let result = place(
+            &fault(),
+            Placement::Kill(&deployment),
+            &deployment,
+            1,
+            Placed {
+                at_ns: 42,
+                offset_ns: 0,
+            },
+        )
+        .await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
-    async fn fire_kill_reports_miss_when_kill_fails() {
+    async fn a_fault_reports_miss_when_it_fails() {
         // A failed kill fired nothing; that is a miss, not an infra error.
         let deployment = FakeDeployment {
             kill_fails: true,
             ..Default::default()
         };
-        let report = fire_kill(&deployment, &deployment, 1, &fault(), 0)
-            .await
-            .expect("kill-failure is a miss, not an error");
+        let report = place(
+            &fault(),
+            Placement::Kill(&deployment),
+            &deployment,
+            1,
+            Placed {
+                at_ns: 42,
+                offset_ns: 0,
+            },
+        )
+        .await
+        .expect("kill-failure is a miss, not an error");
         assert!(matches!(
             report.result,
-            KillResult::Missed(KillMissReason::KillFailed(_))
+            FaultResult::Missed(FaultMissReason::Failed(_))
         ));
     }
 }
