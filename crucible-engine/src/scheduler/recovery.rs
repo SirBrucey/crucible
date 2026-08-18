@@ -18,9 +18,9 @@ pub struct RecoveryScheduler {
 }
 
 impl RecoveryScheduler {
-    /// Degrade each service the fault-free run saw traffic for, one schedule per
-    /// way of degrading it. Nothing is anchored to a packet: the fault is in
-    /// place before the scenario starts.
+    /// Degrade each of the fleet's services, one schedule per way of degrading
+    /// it. Nothing is anchored to a packet: the fault is in place before the
+    /// scenario starts.
     #[must_use]
     pub fn new(
         fleet: &plan::Fleet,
@@ -31,7 +31,7 @@ impl RecoveryScheduler {
     ) -> Self {
         let mut schedules = Vec::new();
         let mut next_id = first_id;
-        for profile in &learned.profiles {
+        for service in &fleet.services {
             for by in ways {
                 schedules.push(Schedule::faulted(
                     next_id,
@@ -39,7 +39,7 @@ impl RecoveryScheduler {
                     scenario.steps.clone(),
                     scenario.checks.clone(),
                     Fault::Recovers {
-                        service: profile.service.clone(),
+                        service: service.name.clone(),
                         by: *by,
                     },
                     learned.trajectory.clone(),
@@ -86,9 +86,10 @@ mod tests {
 
     use super::*;
 
-    fn learned(services: &[&str]) -> Learned {
+    /// A fault-free run that observed traffic for `seen` and nothing else.
+    fn learned(seen: &[&str]) -> Learned {
         Learned {
-            profiles: services
+            profiles: seen
                 .iter()
                 .map(|service| ServiceProfile {
                     service: (*service).to_string(),
@@ -101,31 +102,45 @@ mod tests {
         }
     }
 
+    fn schedules(ways: &[Losing], seen: &[&str]) -> Vec<Schedule> {
+        let plan = plan::example();
+        let mut s =
+            RecoveryScheduler::new(&plan.fleet, &plan.scenarios[0], &learned(seen), ways, 1);
+        std::iter::from_fn(move || s.next()).collect()
+    }
+
     #[test]
     fn one_schedule_per_service_per_way_of_degrading_it() {
-        let plan = plan::example();
-        let s = RecoveryScheduler::new(
-            &plan.fleet,
-            &plan.scenarios[0],
-            &learned(&["api", "db"]),
-            &[Losing::Kill, Losing::Cut],
-            1,
+        let fleet = plan::example().fleet.services.len();
+        assert_eq!(schedules(&[Losing::Kill], &[]).len(), fleet);
+        assert_eq!(
+            schedules(&[Losing::Kill, Losing::Cut], &[]).len(),
+            fleet * 2
         );
-        assert_eq!(s.total(), 4);
+    }
+
+    #[test]
+    fn a_service_the_run_saw_no_traffic_for_is_still_degraded() {
+        let degraded: Vec<String> = schedules(&[Losing::Kill], &[])
+            .iter()
+            .map(|schedule| {
+                schedule
+                    .fault
+                    .as_ref()
+                    .expect("a recovery run faults")
+                    .service()
+                    .to_owned()
+            })
+            .collect();
+        for service in &plan::example().fleet.services {
+            assert!(degraded.contains(&service.name), "{}", service.name);
+        }
     }
 
     #[test]
     fn a_recovery_schedule_is_not_anchored_to_a_packet() {
-        let plan = plan::example();
-        let mut s = RecoveryScheduler::new(
-            &plan.fleet,
-            &plan.scenarios[0],
-            &learned(&["db"]),
-            &[Losing::Kill],
-            1,
-        );
-        let fault = s.next().unwrap().fault.expect("a recovery run faults");
+        let schedules = schedules(&[Losing::Kill], &[]);
+        let fault = schedules[0].fault.as_ref().expect("a recovery run faults");
         assert_eq!(fault.anchor(), None);
-        assert_eq!(fault.service(), "db");
     }
 }

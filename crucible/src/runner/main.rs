@@ -648,7 +648,7 @@ async fn drive(bus: &EventBus, plan: &plan::Plan) -> Result<CampaignOutcome> {
         u32::try_from(bursts.total()).unwrap_or(u32::MAX) + 1,
     );
     let total = bursts.total() + degraded.total();
-    let mut scheduler = Chain(bursts, degraded);
+    let mut scheduler = Chain(degraded, bursts);
     let mut pool = Pool::new(
         bus,
         &plan.fleet,
