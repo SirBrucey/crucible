@@ -65,6 +65,9 @@ fn lookup<'a>(entries: &'a [(String, Value)], name: &str) -> Option<&'a Value> {
 #[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Deserialize, serde::Serialize)]
 pub struct Scenario {
     pub name: String,
+    /// How long the campaign may run. `None` is unbounded, so every schedule is
+    /// run.
+    pub budget: Option<Duration>,
     pub consistent_within: Duration,
     pub steps: Vec<Step>,
     pub checks: Vec<Check>,

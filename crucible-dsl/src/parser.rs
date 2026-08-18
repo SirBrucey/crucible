@@ -229,12 +229,17 @@ impl Parser {
         self.consume_kw("scenario");
         let name = self.expect_str("a scenario name")?;
         self.expect(&TokenKind::LBrace, "`{`");
+        let mut budget = None;
         let mut consistent_within = None;
         let mut steps = Vec::new();
         let mut expect = Vec::new();
         while !self.at_eof() && !self.at(&TokenKind::RBrace) {
-            if self.at_kw("consistent_within") {
-                if let Some(deadline) = self.consistent_within_stmt() {
+            if self.at_kw("budget") {
+                if let Some(bound) = self.duration_stmt("budget") {
+                    budget = Some(bound);
+                }
+            } else if self.at_kw("consistent_within") {
+                if let Some(deadline) = self.duration_stmt("consistent_within") {
                     consistent_within = Some(deadline);
                 }
             } else if self.at_kw("do") {
@@ -247,7 +252,7 @@ impl Parser {
             } else if self.at_kw("expect") {
                 expect.append(&mut self.expect_block());
             } else {
-                self.error_here("expected `consistent_within`, `do`, or `expect`");
+                self.error_here("expected `budget`, `consistent_within`, `do`, or `expect`");
                 self.recover_to(&TokenKind::Semi);
                 self.consume(&TokenKind::Semi);
             }
@@ -261,6 +266,7 @@ impl Parser {
         Some(Spanned::new(
             Scenario {
                 name,
+                budget,
                 consistent_within,
                 steps,
                 expect,
@@ -269,9 +275,9 @@ impl Parser {
         ))
     }
 
-    /// Parse `consistent_within: <duration>;`, the scenario's heal-phase deadline.
-    fn consistent_within_stmt(&mut self) -> Option<Spanned<std::time::Duration>> {
-        self.consume_kw("consistent_within");
+    /// A `<keyword>: <duration>;` statement of a scenario.
+    fn duration_stmt(&mut self, keyword: &str) -> Option<Spanned<std::time::Duration>> {
+        self.consume_kw(keyword);
         self.expect(&TokenKind::Colon, "`:`");
         let value = self.value()?;
         self.consume(&TokenKind::Semi);
@@ -280,7 +286,7 @@ impl Parser {
         } else {
             self.error(
                 value.span,
-                "`consistent_within` expects a duration like `30s`",
+                format!("`{keyword}` expects a duration like `30s`"),
             );
             None
         }

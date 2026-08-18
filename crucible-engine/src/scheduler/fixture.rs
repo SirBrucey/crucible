@@ -23,6 +23,7 @@ pub(super) fn fleet() -> plan::Fleet {
 pub(super) fn scenario() -> plan::Scenario {
     plan::Scenario {
         name: "s".into(),
+        budget: None,
         consistent_within: Duration::from_secs(15),
         steps: vec![plan::Step {
             driver: "http".into(),

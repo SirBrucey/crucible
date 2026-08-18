@@ -226,6 +226,7 @@ impl<'a> Lowerer<'a> {
         }
         plan::Scenario {
             name: scenario.name.node.clone(),
+            budget: scenario.budget.as_ref().map(|budget| budget.node),
             consistent_within: scenario.consistent_within.node,
             steps,
             checks,
@@ -713,6 +714,7 @@ mod tests {
         assert_eq!(plan.fleet.services.len(), 2);
 
         let scenario = &plan.scenarios[0];
+        assert_eq!(scenario.budget, None, "a scenario that states no budget");
         assert_eq!(scenario.consistent_within, Duration::from_secs(10));
 
         let step = &scenario.steps[0];
@@ -733,9 +735,8 @@ mod tests {
 
     #[test]
     fn lowering_fails_on_a_semantic_error() {
-        let src = r#"fleet "f" { deployment: docker; service api { kinds: [http], image: "x", ports: { http: 80 } } }
-                     scenario "s" { consistent_within: 1s; expect { db.orders.count == 1; } }"#;
-        let error = lower(&parse_file(src), &Registry::builtins()).unwrap_err();
+        let src = fleet_running("consistent_within: 1s; expect { db.orders.count == 1; }");
+        let error = lower(&parse_file(&src), &Registry::builtins()).unwrap_err();
         assert!(
             error
                 .iter()
@@ -743,11 +744,28 @@ mod tests {
         );
     }
 
+    /// One http service, and a scenario whose body is `body`.
+    fn fleet_running(body: &str) -> String {
+        format!(
+            r#"fleet "f" {{ deployment: docker; service api {{ kinds: [http], image: "x", ports: {{ http: 80 }} }} }}
+               scenario "s" {{ {body} }}"#
+        )
+    }
+
+    #[test]
+    fn a_stated_budget_bounds_the_campaign() {
+        let bounded = fleet_running("budget: 90s; consistent_within: 1s;");
+        assert_eq!(
+            lower_ok(&bounded).scenarios[0].budget,
+            Some(Duration::from_secs(90))
+        );
+        let unbounded = fleet_running("consistent_within: 1s;");
+        assert_eq!(lower_ok(&unbounded).scenarios[0].budget, None);
+    }
+
     #[test]
     fn consistent_within_must_be_within_bound() {
-        let src = r#"fleet "f" { deployment: docker; service api { kinds: [http], image: "x", ports: { http: 80 } } }
-                     scenario "s" { consistent_within: 10m; }"#;
-        let diags = diagnose(src);
+        let diags = diagnose(&fleet_running("consistent_within: 10m;"));
         find(&diags, "may be given at most");
     }
 
@@ -795,9 +813,8 @@ mod tests {
 
     #[test]
     fn an_unknown_service_lists_the_defined_ones() {
-        let src = r#"fleet "f" { deployment: docker; service api { kinds: [http], image: "x", ports: { http: 80 } } }
-                     scenario "s" { consistent_within: 1s; do { http POST gateway "/x" }; }"#;
-        let diags = diagnose(src);
+        let src = fleet_running(r#"consistent_within: 1s; do { http POST gateway "/x" };"#);
+        let diags = diagnose(&src);
         let diag = find(&diags, "unknown service `gateway`");
         assert_eq!(diag.help.as_ref().unwrap().suggestions, ["api"]);
     }

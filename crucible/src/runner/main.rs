@@ -43,9 +43,6 @@ const WORKER_BIN: &str = "crucible-worker";
 const LIBEXEC_DIR: &str = "/usr/lib/crucible";
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
-/// How long a campaign may run before it stops dispatching and reports what it
-/// has.
-const TOTAL_BUDGET: Duration = Duration::from_mins(5);
 const SCHEDULE_MARGIN: Duration = Duration::from_secs(30);
 const LEARN_MARGIN: Duration = Duration::from_secs(30);
 /// Bound for one learn attempt. A healthy learn brings the fleet up (bounded by
@@ -379,7 +376,6 @@ impl Outcomes {
                 errored = self.errored,
                 total,
                 elapsed_s,
-                budget_s = TOTAL_BUDGET.as_secs(),
                 "{stopped}, so the remaining schedules were skipped"
             );
         } else {
@@ -459,6 +455,8 @@ struct Pool<'a> {
     outcomes: Outcomes,
     recovery: Recovery,
     worker_id: u32,
+    /// How long the whole campaign may dispatch for.
+    campaign_budget: Option<Duration>,
     schedule_budget: Duration,
     campaign_start: Instant,
     max_inflight: usize,
@@ -471,6 +469,7 @@ impl<'a> Pool<'a> {
         bus: &'a EventBus,
         fleet: &'a plan::Fleet,
         worker_id: u32,
+        campaign_budget: Option<Duration>,
         schedule_budget: Duration,
         campaign_start: Instant,
         max_inflight: usize,
@@ -482,6 +481,7 @@ impl<'a> Pool<'a> {
             outcomes: Outcomes::default(),
             recovery: Recovery::default(),
             worker_id,
+            campaign_budget,
             schedule_budget,
             campaign_start,
             max_inflight,
@@ -490,9 +490,11 @@ impl<'a> Pool<'a> {
         }
     }
 
-    /// Whether the campaign's wall-clock budget still allows dispatching.
+    /// Whether the campaign's wall-clock budget still allows dispatching. An
+    /// unbounded campaign always does.
     fn within_budget(&self) -> bool {
-        self.campaign_start.elapsed() < TOTAL_BUDGET
+        self.campaign_budget
+            .is_none_or(|budget| self.campaign_start.elapsed() < budget)
     }
 
     /// Spawn one schedule attempt on the next worker id and its own replica.
@@ -653,6 +655,7 @@ async fn drive(bus: &EventBus, plan: &plan::Plan) -> Result<CampaignOutcome> {
         bus,
         &plan.fleet,
         worker_id,
+        scenario.budget,
         run_cost + scenario.consistent_within + SCHEDULE_MARGIN,
         campaign_start,
         concurrency(),
