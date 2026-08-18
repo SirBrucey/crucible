@@ -3,6 +3,9 @@
 pub mod burst;
 pub mod recovery;
 
+#[cfg(test)]
+mod fixture;
+
 pub use burst::BurstScheduler;
 pub use recovery::RecoveryScheduler;
 

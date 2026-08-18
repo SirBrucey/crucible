@@ -410,6 +410,49 @@ fn bind_services<D: Deployment>(planned: &plan::Fleet) -> Result<Vec<D::Config>,
 mod tests {
     use super::Registry;
 
+    use crucible_core::plan;
+
+    fn service(name: &str, kind: &str) -> plan::Service {
+        plan::Service {
+            name: name.to_owned(),
+            kinds: vec![kind.to_owned()],
+            attrs: Vec::new(),
+        }
+    }
+
+    fn fleet() -> plan::Fleet {
+        plan::Fleet {
+            name: "f".into(),
+            deployment: "docker".into(),
+            services: vec![service("api", "http"), service("db", "mariadb")],
+        }
+    }
+
+    fn steps() -> Vec<plan::Step> {
+        vec![plan::Step {
+            driver: "http".into(),
+            operation: "POST".into(),
+            args: vec![
+                plan::Value::Ident("api".into()),
+                plan::Value::Str("/orders".into()),
+            ],
+            body: None,
+            expect: None,
+        }]
+    }
+
+    fn checks() -> Vec<plan::Check> {
+        vec![plan::Check {
+            service: "db".into(),
+            observer: "mariadb".into(),
+            observable: vec!["orders".into(), "count".into()],
+            args: Vec::new(),
+            filter: None,
+            op: crucible_core::schema::CmpOp::Eq,
+            value: plan::Value::Int(3),
+        }]
+    }
+
     #[test]
     fn builtins_resolve_each_role_by_name() {
         let registry = Registry::builtins();
@@ -427,38 +470,31 @@ mod tests {
     }
 
     #[test]
-    fn every_step_of_the_example_scenario_prepares() {
-        let plan = crucible_core::plan::example();
+    fn a_step_prepares_against_the_service_it_names() {
         let actions = Registry::builtins()
-            .actions_for(&plan.scenarios[0].steps)
+            .actions_for(&steps())
             .expect("every step binds to its driver");
         let targets: Vec<&str> = actions.iter().map(|action| action.target()).collect();
-        assert_eq!(targets, ["api", "api", "api"]);
+        assert_eq!(targets, ["api"]);
     }
 
     #[tokio::test]
-    async fn every_check_of_the_example_scenario_prepares() {
-        let plan = crucible_core::plan::example();
+    async fn a_check_prepares_against_the_service_it_names() {
         let queries = Registry::builtins()
-            .queries_for(&plan.fleet, &plan.scenarios[0].checks)
+            .queries_for(&fleet(), &checks())
             .await
             .expect("every check binds to its observer");
         let targets: Vec<&str> = queries.iter().map(|(_, query)| query.target()).collect();
-        let named: Vec<&str> = plan.scenarios[0]
-            .checks
-            .iter()
-            .map(|check| check.service.as_str())
-            .collect();
-        assert_eq!(targets, named);
+        assert_eq!(targets, ["db"]);
     }
 
     #[tokio::test]
     async fn a_check_naming_a_service_the_fleet_lacks_is_rejected() {
-        let mut plan = crucible_core::plan::example();
-        plan.scenarios[0].checks[0].service = "ledger".into();
+        let mut checks = checks();
+        checks[0].service = "ledger".into();
         assert!(
             Registry::builtins()
-                .queries_for(&plan.fleet, &plan.scenarios[0].checks)
+                .queries_for(&fleet(), &checks)
                 .await
                 .is_err()
         );
@@ -466,9 +502,9 @@ mod tests {
 
     #[test]
     fn a_step_naming_an_unregistered_driver_is_rejected() {
-        let mut scenario = crucible_core::plan::example().scenarios.remove(0);
-        scenario.steps[0].driver = "grpc".into();
-        assert!(Registry::builtins().actions_for(&scenario.steps).is_err());
+        let mut steps = steps();
+        steps[0].driver = "grpc".into();
+        assert!(Registry::builtins().actions_for(&steps).is_err());
     }
 
     #[test]
@@ -477,10 +513,6 @@ mod tests {
         // that reports a plugin absent must not then hand one out.
         let registry = Registry::default();
         assert!(registry.deployment("docker").is_none());
-        assert!(
-            registry
-                .deployment_for(&crucible_core::plan::example().fleet, 0, None)
-                .is_err()
-        );
+        assert!(registry.deployment_for(&fleet(), 0, None).is_err());
     }
 }

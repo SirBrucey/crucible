@@ -135,14 +135,50 @@ mod tests {
         .await;
     }
 
+    fn fleet() -> crate::plan::Fleet {
+        crate::plan::Fleet {
+            name: "orders".into(),
+            deployment: "docker".into(),
+            services: vec![crate::plan::Service {
+                name: "db".into(),
+                kinds: vec!["mariadb".into()],
+                attrs: vec![("image".into(), crate::plan::Value::Str("mariadb:11".into()))],
+            }],
+        }
+    }
+
+    fn step() -> crate::plan::Step {
+        crate::plan::Step {
+            driver: "http".into(),
+            operation: "POST".into(),
+            args: vec![
+                crate::plan::Value::Ident("api".into()),
+                crate::plan::Value::Str("/orders".into()),
+            ],
+            body: None,
+            expect: None,
+        }
+    }
+
+    fn check() -> crate::plan::Check {
+        crate::plan::Check {
+            service: "db".into(),
+            observer: "mariadb".into(),
+            observable: vec!["orders".into(), "count".into()],
+            args: Vec::new(),
+            filter: None,
+            op: crate::schema::CmpOp::Eq,
+            value: crate::plan::Value::Int(3),
+        }
+    }
+
     #[tokio::test]
     async fn roundtrips_a_schedule_carrying_its_work() {
-        let plan = crate::plan::example();
         roundtrip(RunnerToWorker::Run(crate::schedule::Schedule::faulted(
             7,
-            plan.fleet,
-            plan.scenarios[0].steps.clone(),
-            plan.scenarios[0].checks.clone(),
+            fleet(),
+            vec![step()],
+            vec![check()],
             crate::fault::Fault::Durable {
                 anchor: crate::fault::Anchor {
                     service: "db".into(),
