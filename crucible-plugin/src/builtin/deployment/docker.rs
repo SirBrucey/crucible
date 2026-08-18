@@ -168,6 +168,27 @@ struct Endpoints {
     control: HashMap<(String, String), SocketAddr>,
 }
 
+/// What the proxy needs told about `fault`, which is nothing unless the proxy is
+/// the one placing it. A kill is done to the container either way.
+fn proxy_fault_args(fault: &Fault) -> Vec<String> {
+    match (fault.anchor(), fault.primitive()) {
+        (Some(anchor), by) => {
+            let direction = match anchor.direction {
+                Direction::ClientToUpstream => "c2u",
+                Direction::UpstreamToClient => "u2c",
+            };
+            vec![
+                "--fault-at".to_owned(),
+                format!("{}={}={}", anchor.service, direction, anchor.k),
+                "--fault".to_owned(),
+                by.to_string(),
+            ]
+        }
+        (None, Primitive::Cut) => vec!["--degrade".to_owned(), fault.service().to_owned()],
+        (None, _) => Vec::new(),
+    }
+}
+
 /// Where a service's control plane listens inside the proxy. Far enough above
 /// the fleet's own ports that it cannot land on one of them.
 fn control_port(port: u16) -> u16 {
@@ -337,15 +358,7 @@ impl Docker {
             }
         }
         if let Some(fault) = &self.fault {
-            let anchor = fault.anchor();
-            let direction = match anchor.direction {
-                Direction::ClientToUpstream => "c2u",
-                Direction::UpstreamToClient => "u2c",
-            };
-            cmd.push("--fault-at".to_string());
-            cmd.push(format!("{}={}={}", anchor.service, direction, anchor.k));
-            cmd.push("--fault".to_string());
-            cmd.push(fault.primitive().to_string());
+            cmd.extend(proxy_fault_args(fault));
         }
 
         let exposed_ports: Vec<String> = self

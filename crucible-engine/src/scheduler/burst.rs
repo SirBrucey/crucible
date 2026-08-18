@@ -78,6 +78,7 @@ impl BurstScheduler {
                         scenario.checks.clone(),
                         fault,
                         learned.trajectory.clone(),
+                        scenario.consistent_within,
                     ));
                     next_id += 1;
                 }
@@ -160,6 +161,7 @@ mod tests {
             .as_ref()
             .expect("a burst schedule always faults")
             .anchor()
+            .expect("a burst schedule always anchors")
     }
 
     /// A fleet whose loaded plugins cannot break anything cannot schedule any

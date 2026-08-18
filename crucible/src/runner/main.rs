@@ -10,7 +10,6 @@ use std::{
 
 use clap::{Parser, Subcommand};
 use crucible_core::{
-    HEAL_BUDGET,
     fault::Primitive,
     ipc::Verdict,
     learned::Learned,
@@ -21,7 +20,7 @@ use crucible_core::{
 use crucible_engine::{
     event_bus::EventBus,
     journal,
-    scheduler::{BurstScheduler, Scheduler},
+    scheduler::{BurstScheduler, Chain, RecoveryScheduler, Scheduler, recovery},
 };
 use strum::IntoEnumIterator;
 use tokio::{
@@ -510,7 +509,7 @@ impl<'a> Pool<'a> {
 
     /// Fill the in-flight set up to the concurrency cap, until the scheduler
     /// drains, the campaign gives up, or the wall-clock budget runs out.
-    fn fill(&mut self, scheduler: &mut BurstScheduler) {
+    fn fill(&mut self, scheduler: &mut dyn Scheduler) {
         while self.inflight.len() < self.max_inflight
             && !self.exhausted
             && !self.gave_up
@@ -640,13 +639,21 @@ async fn drive(bus: &EventBus, plan: &plan::Plan) -> Result<CampaignOutcome> {
     }
 
     let testable = report_reach(&learned.primitives);
-    let mut scheduler = BurstScheduler::new(&plan.fleet, scenario, &learned, &testable);
-    let total = scheduler.total();
+    let bursts = BurstScheduler::new(&plan.fleet, scenario, &learned, &testable);
+    let degraded = RecoveryScheduler::new(
+        &plan.fleet,
+        scenario,
+        &learned,
+        &recovery::ways(&testable),
+        u32::try_from(bursts.total()).unwrap_or(u32::MAX) + 1,
+    );
+    let total = bursts.total() + degraded.total();
+    let mut scheduler = Chain(degraded, bursts);
     let mut pool = Pool::new(
         bus,
         &plan.fleet,
         worker_id,
-        run_cost + HEAL_BUDGET + SCHEDULE_MARGIN,
+        run_cost + scenario.consistent_within + SCHEDULE_MARGIN,
         campaign_start,
         concurrency(),
     );
@@ -708,6 +715,7 @@ async fn run_learn(
             fleet.clone(),
             scenario.steps.clone(),
             scenario.checks.clone(),
+            scenario.consistent_within,
         );
         let outcome = execute_learn(bus, id, schedule).await;
         reclaim_fleet(id, fleet).await;

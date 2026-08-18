@@ -38,6 +38,10 @@ struct Cli {
     /// the connection between the proxy and the two services.
     #[arg(long = "fault", default_value = "kill")]
     fault: Primitive,
+    /// Hold `SERVICE`'s pairs down from scenario start until released, so the
+    /// fleet runs degraded rather than meeting one instantaneous fault.
+    #[arg(long = "degrade")]
+    degrade: Option<String>,
 }
 
 /// What the proxy does to the fleet once the anchored packet is reached. The
@@ -141,9 +145,29 @@ async fn main() -> Result<()> {
     // Bumped to sever the anchored pairs. A service may be fronted on several
     // ports, and the anchor counts across all of them.
     let (sever_tx, sever_rx) = watch::channel(0u64);
-    let anchor = at
-        .as_ref()
-        .map(|at| Anchor::new(at.direction, at.k, pause_tx.clone(), trip_tx));
+    // Held down for the whole scenario, rather than severed on one packet.
+    let (down_tx, down_rx) = watch::channel(false);
+    if let Some(service) = &cli.degrade
+        && !is_fronted(service, &cli.pairs)
+    {
+        return Err(Error::UnknownFaultService {
+            service: service.clone(),
+        });
+    }
+    let job = match &at {
+        Some(at) => Job::Anchored {
+            anchor: Anchor::new(at.direction, at.k, pause_tx.clone(), trip_tx),
+            fault,
+        },
+        None if cli.degrade.is_some() => Job::Degrade {
+            down: down_tx.clone(),
+        },
+        None => Job::Observe,
+    };
+    let anchor = match &job {
+        Job::Anchored { anchor, .. } => Some(anchor.clone()),
+        Job::Observe | Job::Degrade { .. } => None,
+    };
 
     for spec in cli.pairs {
         let Pair {
@@ -159,7 +183,13 @@ async fn main() -> Result<()> {
         } else {
             watch::channel(0u64).1
         };
-        let gate = Gate::new(pause_rx.clone(), severings);
+        let degraded = cli.degrade.as_deref() == Some(service.as_str());
+        let down = if degraded {
+            down_rx.clone()
+        } else {
+            watch::channel(false).1
+        };
+        let gate = Gate::new(pause_rx.clone(), severings, down);
         let pair_anchor = anchored.then(|| anchor.clone()).flatten();
         let (proxy, _local_addr, mut events) =
             Proxy::bind(listen, upstream.clone(), gate, pair_anchor).await?;
@@ -185,7 +215,7 @@ async fn main() -> Result<()> {
         });
     }
 
-    spawn_fault_control(fault, anchor, trip_rx, pause_tx, sever_tx);
+    spawn_fault_control(job, trip_rx, pause_tx, sever_tx);
 
     for spec in cli.control {
         let Pair {
@@ -234,14 +264,13 @@ impl Pair {
     }
 }
 
-/// Drive the fault for the lifetime of the process: arm the anchor when the
-/// scenario starts (SIGUSR1), and once the anchored packet passes, freeze the
-/// network, place the fault, and release it.
+/// Do this proxy's job for the lifetime of the process: impose it when the
+/// scenario starts (SIGUSR1), and lift it when told the run is over (SIGUSR2)
+/// or that nothing was placed (SIGHUP).
 ///
 /// Holds a `watch::Sender`, so it must outlive the proxies; it never returns.
 fn spawn_fault_control(
-    fault: Fault,
-    anchor: Option<Anchor>,
+    job: Job,
     mut trip: watch::Receiver<bool>,
     pause: watch::Sender<bool>,
     sever: watch::Sender<u64>,
@@ -260,56 +289,88 @@ fn spawn_fault_control(
         };
         loop {
             tokio::select! {
-                _ = arm.recv() => if let Some(anchor) = &anchor {
-                    anchor.arm();
-                    tracing::info!("anchor armed at scenario start (SIGUSR1)");
-                } else {
-                    tracing::debug!("SIGUSR1 with no anchor; ignored");
-                },
+                _ = arm.recv() => job.arm(),
                 Ok(()) = trip.changed() => {
                     if !*trip.borrow() {
                         continue;
                     }
-                    match fault {
-                        // The service is killed and brought back from outside,
-                        // which says so by signalling; until then the fleet
-                        // waits, so nothing runs against a half-dead service.
-                        // Abandoning says the kill never landed, and releases
-                        // just the same.
-                        Fault::Kill => tokio::select! {
-                            _ = proceed.recv() => tracing::info!("the kill has landed (SIGUSR2)"),
-                            _ = abandon.recv() => tracing::info!("the kill was abandoned (SIGHUP)"),
-                        },
-                        Fault::Cut => {
-                            // FIXME: propagate once this loop can report
-                            // failure. Every connection on the pair holds a
-                            // receiver, so this cannot fail.
-                            sever
-                                .send(*sever.borrow() + 1)
-                                .expect("the sever watch has live receivers");
-                            tracing::info!("severed the anchored pairs");
+                    if let Job::Anchored { fault, .. } = &job {
+                        match fault {
+                            // The service is killed and brought back from
+                            // outside, which says so by signalling; until then
+                            // the fleet waits, so nothing runs against a
+                            // half-dead service. Abandoning says the kill never
+                            // landed, and releases just the same.
+                            Fault::Kill => tokio::select! {
+                                _ = proceed.recv() => tracing::info!("the kill has landed (SIGUSR2)"),
+                                _ = abandon.recv() => tracing::info!("the kill was abandoned (SIGHUP)"),
+                            },
+                            Fault::Cut => {
+                                // FIXME: propagate once this loop can report
+                                // failure. Every connection on the pair holds a
+                                // receiver, so this cannot fail.
+                                sever
+                                    .send(*sever.borrow() + 1)
+                                    .expect("the sever watch has live receivers");
+                                tracing::info!("severed the anchored pairs");
+                            }
                         }
                     }
-                    release(anchor.as_ref(), &pause);
+                    job.release(&pause);
                 }
-                // Nothing was placed: the scenario ended before the anchored
-                // packet, or the wait for it timed out.
-                _ = abandon.recv() => release(anchor.as_ref(), &pause),
-                _ = proceed.recv() => tracing::debug!("SIGUSR2 with nothing held; ignored"),
+                // The run is over: either the scenario ended before the anchored
+                // packet, or it was degraded throughout and is done.
+                _ = abandon.recv() => job.release(&pause),
+                _ = proceed.recv() => job.release(&pause),
             }
         }
     });
 }
 
-/// Let the fleet go, and stop the anchor placing a second fault behind this one.
-// FIXME: propagate once the fault-control loop can report failure. main holds a
-// pause receiver for the process lifetime, so this cannot fail; a silent failure
-// would leave the fleet frozen with nothing left to release it.
-fn release(anchor: Option<&Anchor>, pause: &watch::Sender<bool>) {
-    if let Some(anchor) = anchor {
-        anchor.disarm();
+/// What this proxy was launched to do.
+enum Job {
+    /// Watch the fleet and interfere with nothing.
+    Observe,
+    /// Place `fault` on the anchored packet.
+    Anchored { anchor: Anchor, fault: Fault },
+    /// Hold a service's pairs down from scenario start until released.
+    Degrade { down: watch::Sender<bool> },
+}
+
+impl Job {
+    /// The scenario is starting.
+    fn arm(&self) {
+        match self {
+            Job::Observe => {}
+            Job::Anchored { anchor, .. } => {
+                anchor.arm();
+                tracing::info!("anchor armed at scenario start (SIGUSR1)");
+            }
+            // A degraded pair is down for the whole scenario, so it goes down
+            // here rather than at any packet.
+            Job::Degrade { down } => {
+                send(down, true);
+                tracing::info!("held the degraded pairs down (SIGUSR1)");
+            }
+        }
     }
-    pause.send(false).expect("pause watch has a live receiver");
+
+    /// Leave the fleet able to carry traffic, and unable to be faulted again.
+    fn release(&self, pause: &watch::Sender<bool>) {
+        match self {
+            Job::Observe => {}
+            Job::Anchored { anchor, .. } => anchor.disarm(),
+            Job::Degrade { down } => send(down, false),
+        }
+        send(pause, false);
+    }
+}
+
+// FIXME: propagate once the fault-control loop can report failure. main holds a
+// receiver for the process lifetime, so this cannot fail; a silent failure would
+// leave the fleet frozen with nothing left to release it.
+fn send(watch: &watch::Sender<bool>, value: bool) {
+    watch.send(value).expect("the watch has a live receiver");
 }
 
 #[cfg(test)]

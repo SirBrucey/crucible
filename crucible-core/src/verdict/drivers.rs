@@ -1,12 +1,17 @@
 //! Verdict drivers: what a run's observations mean for the invariant it tested.
 
-use crucible_protocol::{FaultReport, FaultResult};
+use crucible_protocol::{At, FaultReport, FaultResult};
 
 use super::{Ack, Checkpoint, Driver, Observations, StepWindow};
 use crate::fault::Primitive;
 use crate::ipc::Verdict;
 
 pub struct Durable;
+
+/// Recovery asks the same question of the settled state as durability: the fleet
+/// owes what it accepted, however it was degraded while accepting it. What
+/// differs is the fault, not the reading.
+pub struct Recovers;
 
 impl Driver for Durable {
     fn drive(&mut self, observations: &Observations) -> Verdict {
@@ -27,17 +32,12 @@ impl Driver for Durable {
             }
             Some(FaultReport {
                 service,
-                result:
-                    FaultResult::Fired {
-                        by,
-                        actual_offset_ns,
-                        ..
-                    },
+                result: FaultResult::Fired { by, at, .. },
                 ..
             }) => Placed {
                 service,
                 by: *by,
-                at_ns: *actual_offset_ns,
+                at,
             },
         };
 
@@ -92,6 +92,12 @@ impl Driver for Durable {
     }
 }
 
+impl Driver for Recovers {
+    fn drive(&mut self, observations: &Observations) -> Verdict {
+        Durable.drive(observations)
+    }
+}
+
 /// How many steps the fleet took responsibility for. Counts from the first, and
 /// refuses a run that skipped one and carried on, since no checkpoint says where
 /// that leaves the fleet.
@@ -129,8 +135,7 @@ fn differing(reached: &Checkpoint, expected: &Checkpoint) -> Result<Option<usize
 struct Placed<'a> {
     service: &'a str,
     by: Primitive,
-    /// Nanoseconds from scenario start when the fault was placed.
-    at_ns: u128,
+    at: &'a At,
 }
 
 impl Placed<'_> {
@@ -141,6 +146,14 @@ impl Placed<'_> {
             Primitive::Cut => "was cut off",
             Primitive::Redeliver => "was redelivered to",
             Primitive::Reorder => "was reordered around",
+        }
+    }
+
+    /// When it was done, against the steps the scenario drove.
+    fn when(self, windows: &[StepWindow]) -> String {
+        match self.at {
+            At::Packet { offset_ns, .. } => placement(windows, *offset_ns),
+            At::Throughout => "for the whole run".into(),
         }
     }
 }
@@ -175,7 +188,7 @@ fn failure(
         "`{}` {} {}. {reason}{diverged}",
         fault.service,
         fault.done(),
-        placement(&observations.windows, fault.at_ns)
+        fault.when(&observations.windows)
     )
 }
 
@@ -227,7 +240,7 @@ fn observable(observations: &Observations, i: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crucible_protocol::{FaultReport, FaultResult};
+    use crucible_protocol::{At, FaultReport, FaultResult};
 
     use super::*;
     use crate::{
@@ -241,17 +254,22 @@ mod tests {
 
     /// A kill of `db` placed `at_ns` nanoseconds into the scenario.
     fn fired_fault_at(at_ns: u128) -> FaultReport {
-        FaultReport {
-            schedule_id: 0,
-            service: "db".into(),
-            result: FaultResult::Fired {
-                by: Primitive::Kill,
-                requested_direction: crucible_protocol::Direction::ClientToUpstream,
-                requested_packet_index: 1,
-                actual_offset_ns: at_ns,
-                placed_at_ns: 0,
+        FaultReport::fired(
+            0,
+            "db",
+            Primitive::Kill,
+            At::Packet {
+                direction: crucible_protocol::Direction::ClientToUpstream,
+                k: 1,
+                offset_ns: at_ns,
             },
-        }
+            0,
+        )
+    }
+
+    /// A kill of `db` that stood for the whole run.
+    fn fired_throughout() -> FaultReport {
+        FaultReport::fired(0, "db", Primitive::Kill, At::Throughout, 0)
     }
 
     fn outcome(ack: Ack) -> Outcome {
@@ -433,6 +451,23 @@ mod tests {
             panic!("holding 2 where 1 step landed is a failure");
         };
         assert!(!reason.contains("first differed"), "reason: {reason}");
+    }
+
+    #[test]
+    fn a_verdict_on_a_degraded_run_says_it_stood_throughout() {
+        let mut obs = Observations::empty();
+        obs.fault = Some(fired_throughout());
+        obs.outcomes = vec![outcome(Ack::Acked), outcome(Ack::Acked)];
+        obs.checks = vec![reading(1)];
+        obs.fault_free = vec![checkpoint(0), checkpoint(1), checkpoint(2)];
+        obs.windows = vec![window(0, 100), window(120, 200)];
+        let Verdict::Fail { reason } = Durable.drive(&obs) else {
+            panic!("settling short of the fault-free run is a failure");
+        };
+        assert!(
+            reason.starts_with("`db` was killed for the whole run."),
+            "{reason}"
+        );
     }
 
     #[test]

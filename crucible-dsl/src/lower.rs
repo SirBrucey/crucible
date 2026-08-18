@@ -213,6 +213,17 @@ impl<'a> Lowerer<'a> {
                 checks.push(check);
             }
         }
+        // Every schedule waits this out, so a scenario that asks for longer than
+        // a campaign can afford is refused rather than silently shortened.
+        if scenario.consistent_within.node > crucible_core::MAX_CONSISTENT_WITHIN {
+            self.error(
+                scenario.consistent_within.span,
+                format!(
+                    "a fleet may be given at most {:?} to settle",
+                    crucible_core::MAX_CONSISTENT_WITHIN
+                ),
+            );
+        }
         plan::Scenario {
             name: scenario.name.node.clone(),
             consistent_within: scenario.consistent_within.node,
@@ -730,6 +741,14 @@ mod tests {
                 .iter()
                 .any(|diag| diag.message.contains("unknown service"))
         );
+    }
+
+    #[test]
+    fn consistent_within_must_be_within_bound() {
+        let src = r#"fleet "f" { deployment: docker; service api { kinds: [http], image: "x", ports: { http: 80 } } }
+                     scenario "s" { consistent_within: 10m; }"#;
+        let diags = diagnose(src);
+        find(&diags, "may be given at most");
     }
 
     #[test]

@@ -218,7 +218,7 @@ impl Worker<Idle> {
                     tracing::info!(
                         worker_id = self.id,
                         schedule_id = schedule.id,
-                        service = fault.anchor().service,
+                        service = fault.service(),
                         invariant = ?fault.invariant(),
                         "received schedule"
                     );
@@ -264,7 +264,7 @@ impl Worker<Learning> {
             .copied()
             .collect();
         let (learned, orchestrator) = orchestrator
-            .learn(&queries, primitives)
+            .learn(&queries, primitives, schedule.consistent_within)
             .await
             .inspect_err(|e| tracing::error!(worker_id = self.id, error = %e, "learn failed"))?;
         drop(heartbeat);
@@ -307,6 +307,7 @@ impl Worker<Executing> {
                 &self.state.fault,
                 queries,
                 schedule.trajectory.clone(),
+                schedule.consistent_within,
             )
             .await
             .inspect_err(

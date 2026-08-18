@@ -14,5 +14,6 @@ pub mod verdict;
 
 use std::time::Duration;
 
-/// How long a fleet is given to settle after a fault before its state is read.
-pub const HEAL_BUDGET: Duration = Duration::from_secs(15);
+/// The longest a scenario may give its fleet to settle. Every schedule waits it
+/// out, so it bounds what a campaign costs.
+pub const MAX_CONSISTENT_WITHIN: Duration = Duration::from_secs(30);
