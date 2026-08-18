@@ -32,6 +32,8 @@ pub struct Service {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Scenario {
     pub name: Spanned<String>,
+    /// How long the campaign may run. Absent is unbounded: every schedule runs.
+    pub budget: Option<Spanned<Duration>>,
     pub consistent_within: Spanned<Duration>,
     pub steps: Vec<Spanned<Step>>,
     pub expect: Vec<Spanned<Predicate>>,

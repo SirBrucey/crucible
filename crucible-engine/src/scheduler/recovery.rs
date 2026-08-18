@@ -54,6 +54,13 @@ impl RecoveryScheduler {
         }
     }
 
+    /// How many schedules degrading this fleet takes, before building any. The
+    /// campaign needs it to reserve their cost against its budget.
+    #[must_use]
+    pub fn count(fleet: &plan::Fleet, ways: &[Losing]) -> usize {
+        fleet.services.len() * ways.len()
+    }
+
     #[must_use]
     pub fn total(&self) -> usize {
         self.total
@@ -87,6 +94,15 @@ mod tests {
     use super::*;
     use crate::scheduler::fixture;
 
+    fn carrying(packets: u32) -> crucible_protocol::Burst {
+        crucible_protocol::Burst {
+            start: 0,
+            mid: packets.div_ceil(2),
+            end: packets,
+            packets,
+        }
+    }
+
     /// A fault-free run that observed traffic for `seen` and nothing else.
     fn learned(seen: &[&str]) -> Learned {
         Learned {
@@ -94,8 +110,8 @@ mod tests {
                 .iter()
                 .map(|service| ServiceProfile {
                     service: (*service).to_string(),
-                    client_to_upstream: vec![1],
-                    upstream_to_client: vec![1],
+                    client_to_upstream: vec![carrying(1)],
+                    upstream_to_client: vec![carrying(1)],
                 })
                 .collect(),
             trajectory: Vec::new(),

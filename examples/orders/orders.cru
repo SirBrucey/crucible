@@ -58,6 +58,8 @@ fleet "orders" {
 }
 
 scenario "orders_durability" {
+  // Drop this line to run every schedule the scheduler produces.
+  budget: 5m;
   consistent_within: 15s;
 
   do { http POST api "/orders" body { item: "book", quantity: 4 } };

@@ -1,11 +1,10 @@
 //! Reconstruct `Session` records from sidecar proxy log lines.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 
 use crucible_protocol::{
-    ConnEvent, ConnEventKind, ConnId, Direction, ServiceProfile, Session, WriteRecord,
+    Burst, ConnEvent, ConnEventKind, ConnId, Direction, ServiceProfile, Session, WriteRecord,
 };
-use rand::seq::SliceRandom;
 
 struct Pending {
     opened_ns: u128,
@@ -73,16 +72,14 @@ impl Sessions {
 /// Consecutive packets more than this far apart start a new burst.
 const BURST_GAP_NS: u128 = 20_000_000; // 20 ms
 
-/// Cap on the total anchors in one catalogue so it always fits the IPC frame. A
-/// learn run with more anchors than this is randomly sampled down (seeded
-/// sampling for cross-run reproducibility is a future refinement).
-const MAX_TOTAL_ANCHORS: usize = 400;
+/// Cap on the total bursts in one catalogue so it always fits the IPC frame. A
+/// learn run with more bursts than this keeps the busiest.
+const MAX_TOTAL_BURSTS: usize = 100;
 
-/// Derive per-service fault anchors from a session catalogue, split by direction
-/// and made scenario-relative to `scenario_start_ns` (writes before scenario
-/// start are ignored). Each direction's packets are clustered into bursts and
-/// reduced to their before/during/after anchor packet-counts, then the whole
-/// catalogue is sampled down if it would not fit the IPC frame.
+/// Derive per-service bursts from a session catalogue, split by direction and
+/// made scenario-relative to `scenario_start_ns` (writes before scenario start
+/// are ignored). Each direction's packets are clustered into bursts, then the
+/// whole catalogue is trimmed if it would not fit the IPC frame.
 #[must_use]
 pub fn service_profiles_from_sessions(
     sessions: &[Session],
@@ -113,8 +110,8 @@ pub fn service_profiles_from_sessions(
             u2c.sort_unstable_by_key(|packet| packet.at);
             ServiceProfile {
                 service,
-                client_to_upstream: burst_anchors(&c2u),
-                upstream_to_client: burst_anchors(&u2c),
+                client_to_upstream: bursts(&c2u),
+                upstream_to_client: bursts(&u2c),
             }
         })
         .collect();
@@ -129,79 +126,74 @@ struct Packet {
     at: u128,
 }
 
-/// Cluster `packets` (sorted timestamps) into bursts by inter-packet gap and
-/// return the before / during / after anchor packet-counts, sorted and deduped.
-/// A count `K` means "freeze once `K` packets have crossed": `K = first - 1`
-/// lands just before a burst, `K = last` just after it.
-///
-/// `K = 0` (before the very first packet on the edge) is dropped. The anchor is
-/// now armed at scenario start rather than at boot, so freezing there is
-/// achievable, but it kills the target before the scenario has driven any
-/// traffic across the edge, so it probes no point within that edge's traffic the
-/// way the `K >= 1` anchors do. "Kill before first contact" would be a deliberate
-/// fault to add, not a by-product of this enumeration.
-fn burst_anchors(packets: &[Packet]) -> Vec<u32> {
-    let n = packets.len();
-    if n == 0 {
-        return Vec::new();
-    }
-    let mut anchors: BTreeSet<u32> = BTreeSet::new();
+/// Cluster `packets` (sorted timestamps) into bursts by inter-packet gap, each
+/// given as the three points a fault can be placed against. A count `K` means
+/// "freeze once `K` packets have crossed", so `start` is `first - 1` and `end` is
+/// `last`.
+fn bursts(packets: &[Packet]) -> Vec<Burst> {
+    let mut bursts = Vec::new();
     let mut start = 0usize; // 0-based index of the current burst's first packet
-    for j in 0..n {
-        let ends_burst = j + 1 == n || packets[j + 1].at - packets[j].at > BURST_GAP_NS;
+    for j in 0..packets.len() {
+        let ends_burst = j + 1 == packets.len() || packets[j + 1].at - packets[j].at > BURST_GAP_NS;
         if ends_burst {
             // 1-based packet counts; a single learn run should never approach u32.
-            let first_count = u32::try_from(start + 1).expect("packet count fits in u32");
-            let last_count = u32::try_from(j + 1).expect("packet count fits in u32");
-            anchors.insert(first_count - 1); // before
-            anchors.insert(u32::midpoint(first_count, last_count)); // during
-            anchors.insert(last_count); // after
+            let first = u32::try_from(start + 1).expect("packet count fits in u32");
+            let last = u32::try_from(j + 1).expect("packet count fits in u32");
+            bursts.push(Burst {
+                start: first - 1,
+                mid: u32::midpoint(first, last),
+                end: last,
+                packets: last - first + 1,
+            });
             start = j + 1;
         }
     }
-    anchors.into_iter().filter(|&k| k > 0).collect()
+    bursts
 }
 
-/// Randomly sample the catalogue's anchors down to `MAX_TOTAL_ANCHORS` if it has
-/// more, so the serialized catalogue always fits the IPC frame. A no-op for a
-/// normal-sized run; only a pathologically busy learn (very many bursts) is
-/// trimmed, and the drop is logged.
+/// Trim the catalogue to `MAX_TOTAL_BURSTS` if it holds more, so the serialized
+/// catalogue always fits the IPC frame. A no-op for a normal-sized run; only a
+/// pathologically busy learn is trimmed, and the drop is logged.
+///
+/// The busiest bursts are kept, which is the same preference the scheduler
+/// applies when it cannot afford them all.
 fn sample_to_frame(profiles: &mut [ServiceProfile]) {
     let total: usize = profiles
         .iter()
         .map(|p| p.client_to_upstream.len() + p.upstream_to_client.len())
         .sum();
-    if total <= MAX_TOTAL_ANCHORS {
+    if total <= MAX_TOTAL_BURSTS {
         return;
     }
-    // Flatten to (profile index, is-client-to-upstream, K), keep a random subset,
-    // then rebuild each profile's per-direction vectors.
-    let mut flat: Vec<(usize, bool, u32)> = Vec::with_capacity(total);
+    let mut flat: Vec<(usize, bool, Burst)> = Vec::with_capacity(total);
     for (i, profile) in profiles.iter().enumerate() {
-        flat.extend(profile.client_to_upstream.iter().map(|&k| (i, true, k)));
-        flat.extend(profile.upstream_to_client.iter().map(|&k| (i, false, k)));
+        flat.extend(profile.client_to_upstream.iter().map(|&b| (i, true, b)));
+        flat.extend(profile.upstream_to_client.iter().map(|&b| (i, false, b)));
     }
-    flat.shuffle(&mut rand::rng());
-    flat.truncate(MAX_TOTAL_ANCHORS);
+    flat.sort_unstable_by_key(|(_, _, burst)| std::cmp::Reverse(burst.packets));
+    flat.truncate(MAX_TOTAL_BURSTS);
     for profile in profiles.iter_mut() {
         profile.client_to_upstream.clear();
         profile.upstream_to_client.clear();
     }
-    for (i, is_c2u, k) in flat {
+    for (i, is_c2u, burst) in flat {
         if is_c2u {
-            profiles[i].client_to_upstream.push(k);
+            profiles[i].client_to_upstream.push(burst);
         } else {
-            profiles[i].upstream_to_client.push(k);
+            profiles[i].upstream_to_client.push(burst);
         }
     }
+    // Picking the busiest left each edge in size order, and a burst's position on
+    // its edge is what makes it the first or the third. `mid` rises across an
+    // edge's bursts, so it puts them back in the order they happened.
     for profile in profiles.iter_mut() {
-        profile.client_to_upstream.sort_unstable();
-        profile.upstream_to_client.sort_unstable();
+        profile.client_to_upstream.sort_unstable_by_key(|b| b.mid);
+        profile.upstream_to_client.sort_unstable_by_key(|b| b.mid);
     }
     tracing::warn!(
         total,
-        cap = MAX_TOTAL_ANCHORS,
-        "learn produced more anchors than fit the catalogue; sampled down"
+        cap = MAX_TOTAL_BURSTS,
+        "learn produced more bursts than fit the catalogue; kept the busiest"
     );
 }
 
@@ -305,33 +297,27 @@ mod tests {
     }
 
     #[test]
-    fn single_packet_yields_only_the_after_anchor() {
-        // before is K=0 (dropped); during and after both collapse to K=1.
-        assert_eq!(burst_anchors(&driven(&[1_000])), vec![1]);
-    }
-
-    #[test]
-    fn k_zero_is_never_an_anchor() {
-        assert!(!burst_anchors(&driven(&[1_000])).contains(&0));
-        assert!(!burst_anchors(&driven(&[1_000, 2_000, 3_000])).contains(&0));
+    fn a_single_packet_collapses_to_one_placeable_point() {
+        let [burst] = bursts(&driven(&[1_000])).try_into().expect("one burst");
+        assert_eq!((burst.start, burst.mid, burst.end), (0, 1, 1));
+        assert_eq!(burst.packets, 1);
     }
 
     #[test]
     fn contiguous_packets_are_one_burst() {
-        // Four packets inside the gap: one burst, during=midpoint(1,4)=2, after=4.
-        assert_eq!(
-            burst_anchors(&driven(&[1_000, 2_000, 3_000, 4_000])),
-            vec![2, 4]
-        );
+        let [burst] = bursts(&driven(&[1_000, 2_000, 3_000, 4_000]))
+            .try_into()
+            .expect("one burst");
+        assert_eq!((burst.start, burst.mid, burst.end), (0, 2, 4));
+        assert_eq!(burst.packets, 4);
     }
 
     #[test]
-    fn a_gap_splits_bursts_and_shares_the_boundary_anchor() {
-        // Packets 1-2 form the first burst, 3-4 the second (gap > BURST_GAP_NS).
-        // Burst 1 -> {during 1, after 2}; burst 2 -> {before 2, during 3, after 4}.
-        // The shared boundary count 2 is deduped away by the anchor set.
+    fn a_gap_splits_bursts() {
         let packets = driven(&[1_000, 2_000, 100_000_000, 101_000_000]);
-        assert_eq!(burst_anchors(&packets), vec![1, 2, 3, 4]);
+        let [first, second] = bursts(&packets).try_into().expect("two bursts");
+        assert_eq!((first.start, first.mid, first.end), (0, 1, 2));
+        assert_eq!((second.start, second.mid, second.end), (2, 3, 4));
     }
 
     #[test]
@@ -366,9 +352,11 @@ mod tests {
         let profiles = service_profiles_from_sessions(&[session], 50);
         assert_eq!(profiles.len(), 1);
         assert_eq!(profiles[0].service, "db");
-        // A single post-start packet each direction -> the after anchor (K=1).
-        assert_eq!(profiles[0].client_to_upstream, vec![1]);
-        assert_eq!(profiles[0].upstream_to_client, vec![1]);
+        // One post-start packet each direction, so one burst carrying it.
+        assert_eq!(profiles[0].client_to_upstream.len(), 1);
+        assert_eq!(profiles[0].client_to_upstream[0].packets, 1);
+        assert_eq!(profiles[0].upstream_to_client.len(), 1);
+        assert_eq!(profiles[0].upstream_to_client[0].packets, 1);
     }
 
     #[test]
