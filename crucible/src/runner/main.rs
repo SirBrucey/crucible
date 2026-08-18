@@ -20,7 +20,7 @@ use crucible_core::{
 use crucible_engine::{
     event_bus::EventBus,
     journal,
-    scheduler::{BurstScheduler, Chain, RecoveryScheduler, Scheduler, recovery},
+    scheduler::{self, Budget, BurstScheduler, Chain, RecoveryScheduler, Scheduler, recovery},
 };
 use strum::IntoEnumIterator;
 use tokio::{
@@ -623,14 +623,14 @@ async fn drive(bus: &EventBus, plan: &plan::Plan) -> Result<CampaignOutcome> {
         .expect("the grammar requires a scenario, so a lowered plan states one");
 
     // Learn is a barrier: schedules derive from its observed traffic profiles.
-    let (learned, run_cost) = run_learn(bus, &mut worker_id, &plan.fleet, scenario).await?;
+    let (learned, cycle_cost) = run_learn(bus, &mut worker_id, &plan.fleet, scenario).await?;
     let readings = learned.trajectory.iter().flatten();
     tracing::info!(
         services = learned.profiles.len(),
         checkpoints = learned.trajectory.len(),
         read = readings.clone().filter(|r| r.is_some()).count(),
         unread = readings.filter(|r| r.is_none()).count(),
-        run_cost_ms = run_cost.as_millis(),
+        cycle_cost_ms = cycle_cost.as_millis(),
         "session catalogue received"
     );
 
@@ -641,24 +641,54 @@ async fn drive(bus: &EventBus, plan: &plan::Plan) -> Result<CampaignOutcome> {
     }
 
     let testable = report_reach(&learned.primitives);
-    let bursts = BurstScheduler::new(&plan.fleet, scenario, &learned, &testable);
+    let concurrency = concurrency();
+    let cost = cycle_cost + scenario.consistent_within;
+
+    let ways = recovery::ways(&testable);
+    let budget = scenario.budget.map(|budget| Budget {
+        left: budget.saturating_sub(campaign_start.elapsed()),
+        cost,
+        concurrency,
+    });
+
+    // Recovery is one schedule per service, therefore its cost is known before it
+    // is built and comes off the top. The bursts take what is left.
+    let bursts = BurstScheduler::new(
+        &plan.fleet,
+        scenario,
+        &learned,
+        &testable,
+        budget.map(|budget| budget.after(RecoveryScheduler::count(&plan.fleet, &ways))),
+    );
     let degraded = RecoveryScheduler::new(
         &plan.fleet,
         scenario,
         &learned,
-        &recovery::ways(&testable),
+        &ways,
         u32::try_from(bursts.total()).unwrap_or(u32::MAX) + 1,
     );
+
     let total = bursts.total() + degraded.total();
+    tracing::info!(
+        schedules = total,
+        recovery = degraded.total(),
+        budget_s = budget.map(|budget| budget.left.as_secs()),
+        cost_s = cost.as_secs(),
+        concurrency,
+        estimate_s = scheduler::runtime(total, cost, concurrency).as_secs(),
+        "campaign fitted to {}",
+        bursts.coverage()
+    );
+
     let mut scheduler = Chain(degraded, bursts);
     let mut pool = Pool::new(
         bus,
         &plan.fleet,
         worker_id,
         scenario.budget,
-        run_cost + scenario.consistent_within + SCHEDULE_MARGIN,
+        cost + SCHEDULE_MARGIN,
         campaign_start,
-        concurrency(),
+        concurrency,
     );
 
     // Interrupting a run must not orphan its in-flight replicas or sockets, so
@@ -720,10 +750,13 @@ async fn run_learn(
             scenario.checks.clone(),
             scenario.consistent_within,
         );
+        // Timed around the reclaim as well as the run: every schedule brings a
+        // replica up and takes it down again, so that is what one costs.
+        let cycle = Instant::now();
         let outcome = execute_learn(bus, id, schedule).await;
         reclaim_fleet(id, fleet).await;
         match outcome {
-            Ok(result) => return Ok(result),
+            Ok((learned, _)) => return Ok((learned, cycle.elapsed())),
             Err(e) if e.is_transient() && attempt < LEARN_MAX_ATTEMPTS => {
                 tracing::warn!(attempt, error = %e, "learn failed; retrying on a fresh replica");
                 attempt += 1;
