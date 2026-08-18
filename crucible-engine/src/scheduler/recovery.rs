@@ -85,6 +85,7 @@ mod tests {
     use crucible_protocol::ServiceProfile;
 
     use super::*;
+    use crate::scheduler::fixture;
 
     /// A fault-free run that observed traffic for `seen` and nothing else.
     fn learned(seen: &[&str]) -> Learned {
@@ -103,15 +104,19 @@ mod tests {
     }
 
     fn schedules(ways: &[Losing], seen: &[&str]) -> Vec<Schedule> {
-        let plan = plan::example();
-        let mut s =
-            RecoveryScheduler::new(&plan.fleet, &plan.scenarios[0], &learned(seen), ways, 1);
+        let mut s = RecoveryScheduler::new(
+            &fixture::fleet(),
+            &fixture::scenario(),
+            &learned(seen),
+            ways,
+            1,
+        );
         std::iter::from_fn(move || s.next()).collect()
     }
 
     #[test]
     fn one_schedule_per_service_per_way_of_degrading_it() {
-        let fleet = plan::example().fleet.services.len();
+        let fleet = fixture::fleet().services.len();
         assert_eq!(schedules(&[Losing::Kill], &[]).len(), fleet);
         assert_eq!(
             schedules(&[Losing::Kill, Losing::Cut], &[]).len(),
@@ -132,7 +137,7 @@ mod tests {
                     .to_owned()
             })
             .collect();
-        for service in &plan::example().fleet.services {
+        for service in &fixture::fleet().services {
             assert!(degraded.contains(&service.name), "{}", service.name);
         }
     }

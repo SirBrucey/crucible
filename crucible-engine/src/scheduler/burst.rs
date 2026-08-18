@@ -123,6 +123,7 @@ mod tests {
     use crucible_protocol::ServiceProfile;
 
     use super::*;
+    use crate::scheduler::fixture;
 
     fn profile(service: &str, c2u: Vec<u32>, u2c: Vec<u32>) -> ServiceProfile {
         ServiceProfile {
@@ -140,15 +141,14 @@ mod tests {
     /// A campaign testing durability by every way of breaking the fleet in
     /// `ways`.
     fn driven(profiles: &[ServiceProfile], ways: Vec<Primitive>) -> BurstScheduler {
-        let plan = plan::example();
         let learned = Learned {
             profiles: profiles.to_vec(),
             trajectory: Vec::new(),
             primitives: ways.iter().copied().collect(),
         };
         BurstScheduler::new(
-            &plan.fleet,
-            &plan.scenarios[0],
+            &fixture::fleet(),
+            &fixture::scenario(),
             &learned,
             &[(Invariant::Durable, ways)],
         )
@@ -168,13 +168,12 @@ mod tests {
     /// faults, so the campaign is a fault-free run only.
     #[test]
     fn nothing_testable_yields_nothing() {
-        let plan = plan::example();
         let learned = Learned {
             profiles: vec![profile("db", vec![1, 2], vec![3])],
             trajectory: Vec::new(),
             primitives: BTreeSet::new(),
         };
-        let mut s = BurstScheduler::new(&plan.fleet, &plan.scenarios[0], &learned, &[]);
+        let mut s = BurstScheduler::new(&fixture::fleet(), &fixture::scenario(), &learned, &[]);
         assert_eq!(s.total(), 0);
         assert!(s.next().is_none());
     }
