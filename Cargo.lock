@@ -510,7 +510,6 @@ dependencies = [
  "futures-util",
  "postcard",
  "proptest",
- "rand 0.10.2",
  "serde",
  "serde_json",
  "strum",
