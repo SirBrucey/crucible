@@ -243,7 +243,13 @@ impl Anchor {
     /// for a connection that is not the anchored edge. Returns whether this call
     /// fired, so the caller can announce it.
     fn record(&self, peer: IpAddr) -> bool {
-        if !self.active.load(Ordering::SeqCst) || !on_edge(&self.edge, peer) {
+        if !self.active.load(Ordering::SeqCst) {
+            return false;
+        }
+        if !on_edge(&self.edge, peer) {
+            // Whose traffic is being passed over, which is what separates an
+            // edge that carried nothing from one we failed to recognise.
+            tracing::debug!(%peer, direction = ?self.direction, "not the anchored edge");
             return false;
         }
         let crossed = self.count.fetch_add(1, Ordering::SeqCst) + 1;
@@ -259,6 +265,15 @@ impl Anchor {
     /// been let go with no one left to let it go again.
     pub fn disarm(&self) {
         self.active.store(false, Ordering::SeqCst);
+        // How far the anchor got, which is what tells a run that reported no
+        // fault whether its packet never came or was never noticed.
+        tracing::debug!(
+            k = self.k,
+            counted = self.count.load(Ordering::SeqCst),
+            direction = ?self.direction,
+            resolved = self.edge.get().is_some(),
+            "anchor disarmed"
+        );
     }
 }
 
