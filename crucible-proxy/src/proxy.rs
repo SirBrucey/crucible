@@ -1,10 +1,11 @@
 //! Bytes-through TCP forwarder that emits connection events.
 
 use std::{
+    collections::HashSet,
     io,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     },
 };
@@ -43,6 +44,63 @@ pub struct Anchor {
     pause: watch::Sender<bool>,
     /// Says the anchored packet has passed.
     trip: watch::Sender<bool>,
+    /// The edge whose packets `k` counts. The learn run measured the burst on
+    /// one edge, so counting another client's traffic to the same upstream
+    /// would fire on a packet the schedule never named.
+    edge: Arc<OnceLock<OnEdge>>,
+}
+
+/// Which connections a fault applies to: those carrying the edge it names.
+///
+/// The proxy fronts an upstream, so its pair carries every client that dials
+/// that upstream. A fault named for one edge must not count or sever another
+/// client's traffic to the same service.
+///
+/// Resolved once, when the anchor is armed: the fleet is up by then, so its
+/// names answer, and nothing is looked up while bytes are moving.
+pub struct OnEdge {
+    /// Addresses the client that dialled holds.
+    client: HashSet<IpAddr>,
+    /// Every address the fleet holds, so a caller from outside it is one that
+    /// is none of these.
+    fleet: HashSet<IpAddr>,
+    /// Whether the edge was dialled from outside the fleet.
+    outside: bool,
+}
+
+impl OnEdge {
+    #[must_use]
+    pub fn new(client: HashSet<IpAddr>, fleet: HashSet<IpAddr>, outside: bool) -> Self {
+        Self {
+            client,
+            fleet,
+            outside,
+        }
+    }
+
+    /// Whether a connection from `peer` is the edge this was built for.
+    #[must_use]
+    fn holds(&self, peer: IpAddr) -> bool {
+        if self.outside {
+            !self.fleet.contains(&peer)
+        } else {
+            self.client.contains(&peer)
+        }
+    }
+}
+
+/// Whether `peer` is on the edge, once it is known. An unresolved edge holds
+/// nothing: it is resolved as the scenario starts, and nothing is counted or
+/// severed before that.
+fn on_edge(edge: &OnceLock<OnEdge>, peer: IpAddr) -> bool {
+    edge.get().is_some_and(|edge| edge.holds(peer))
+}
+
+/// One connection the proxy carries, and who dialled it.
+#[derive(Clone, Copy)]
+struct Conn {
+    id: ConnId,
+    peer: IpAddr,
 }
 
 /// What a connection is subject to while the fleet runs.
@@ -61,6 +119,10 @@ pub struct Gate {
     /// While `true` the pair carries nothing, so the peer meets a partition
     /// rather than a blip.
     down: watch::Receiver<bool>,
+    /// The edge being cut, which only some of this pair's connections carry.
+    edge: Arc<OnceLock<OnEdge>>,
+    /// Who dialled, so this connection can tell whether it is that edge.
+    peer: Option<IpAddr>,
 }
 
 impl Gate {
@@ -69,6 +131,7 @@ impl Gate {
         pause: watch::Receiver<bool>,
         severings: watch::Receiver<u64>,
         down: watch::Receiver<bool>,
+        edge: Arc<OnceLock<OnEdge>>,
     ) -> Self {
         let opened_at = *severings.borrow();
         Self {
@@ -76,16 +139,21 @@ impl Gate {
             severings,
             opened_at,
             down,
+            edge,
+            peer: None,
         }
     }
 
-    /// The gate a connection accepted now is subject to.
-    fn accept(&self) -> Self {
-        Self::new(
-            self.pause.clone(),
-            self.severings.clone(),
-            self.down.clone(),
-        )
+    /// The gate a connection from `peer` is subject to.
+    fn accept(&self, peer: IpAddr) -> Self {
+        Self {
+            opened_at: *self.severings.borrow(),
+            peer: Some(peer),
+            pause: self.pause.clone(),
+            severings: self.severings.clone(),
+            down: self.down.clone(),
+            edge: Arc::clone(&self.edge),
+        }
     }
 
     /// Hold here while the network is frozen. Returns whether the connection
@@ -101,7 +169,8 @@ impl Gate {
     }
 
     fn severed(&self) -> bool {
-        *self.severings.borrow() != self.opened_at || *self.down.borrow()
+        let cut = *self.severings.borrow() != self.opened_at || *self.down.borrow();
+        cut && self.peer.is_some_and(|peer| on_edge(&self.edge, peer))
     }
 
     /// Resolves once this connection is severed, so it can race something that
@@ -130,6 +199,7 @@ impl Anchor {
         k: u32,
         pause: watch::Sender<bool>,
         trip: watch::Sender<bool>,
+        edge: Arc<OnceLock<OnEdge>>,
     ) -> Self {
         Self {
             direction,
@@ -138,6 +208,7 @@ impl Anchor {
             active: Arc::new(AtomicBool::new(false)),
             pause,
             trip,
+            edge,
         }
     }
 
@@ -167,11 +238,12 @@ impl Anchor {
         }
     }
 
-    /// Count one forwarded packet, firing on the one that reaches `k`. A no-op
-    /// until armed, so bring-up traffic is not counted. Returns whether this
-    /// call fired, so the caller can announce it.
-    fn record(&self) -> bool {
-        if !self.active.load(Ordering::SeqCst) {
+    /// Count one forwarded packet from `peer`, firing on the one that reaches
+    /// `k`. A no-op until armed, so bring-up traffic is not counted, and a no-op
+    /// for a connection that is not the anchored edge. Returns whether this call
+    /// fired, so the caller can announce it.
+    fn record(&self, peer: IpAddr) -> bool {
+        if !self.active.load(Ordering::SeqCst) || !on_edge(&self.edge, peer) {
             return false;
         }
         let crossed = self.count.fetch_add(1, Ordering::SeqCst) + 1;
@@ -238,7 +310,7 @@ impl Proxy {
                 peer,
                 self.upstream.clone(),
                 self.events_tx.clone(),
-                self.gate.accept(),
+                self.gate.accept(peer.ip()),
                 self.anchor.clone(),
             ));
         }
@@ -329,8 +401,12 @@ async fn forward(
         .filter(|a| a.direction == Direction::ClientToUpstream);
     let anchor_u2c = anchor.filter(|a| a.direction == Direction::UpstreamToClient);
 
-    let c2u = tokio::spawn(forward_bytes(
+    let conn = Conn {
         id,
+        peer: peer.ip(),
+    };
+    let c2u = tokio::spawn(forward_bytes(
+        conn,
         client_r,
         upstream_w,
         Direction::ClientToUpstream,
@@ -339,7 +415,7 @@ async fn forward(
         anchor_c2u,
     ));
     let u2c = tokio::spawn(forward_bytes(
-        id,
+        conn,
         upstream_r,
         client_w,
         Direction::UpstreamToClient,
@@ -364,7 +440,7 @@ async fn forward(
 /// count each chunk against `anchor`. Returns the total bytes forwarded, or the
 /// error that ended it.
 async fn forward_bytes(
-    id: ConnId,
+    conn: Conn,
     mut read: OwnedReadHalf,
     mut write: OwnedWriteHalf,
     direction: Direction,
@@ -398,12 +474,12 @@ async fn forward_bytes(
         }
         // Only once it is through: a packet the gate held back and then severed
         // was never forwarded, and the learn pass counts these as traffic.
-        emit(&events, ConnEvent::wrote(id, direction, n as u64));
+        emit(&events, ConnEvent::wrote(conn.id, direction, n as u64));
         bytes_total += n as u64;
         if let Some(anchor) = &anchor
-            && anchor.record()
+            && anchor.record(conn.peer)
         {
-            emit(&events, ConnEvent::froze(id, anchor.k));
+            emit(&events, ConnEvent::froze(conn.id, anchor.k));
         }
     }
 }
@@ -421,18 +497,37 @@ mod tests {
 
     use super::*;
 
+    /// Who the connections under test come from.
+    const PEER: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 2));
+
+    /// An edge that everything is on, so a test says what it is about rather
+    /// than which end dialled.
+    fn every_peer() -> Arc<OnceLock<OnEdge>> {
+        let edge = OnceLock::new();
+        // An edge dialled from outside an empty fleet, which every peer is.
+        let held = edge.set(OnEdge::new(HashSet::new(), HashSet::new(), true));
+        assert!(held.is_ok(), "a fresh cell is empty");
+        Arc::new(edge)
+    }
+
     /// A gate that never closes.
     fn open() -> Gate {
         Gate::new(
             watch::channel(false).1,
             watch::channel(0).1,
             watch::channel(false).1,
+            every_peer(),
         )
     }
 
     /// A gate held by `pause`.
     fn held(pause: watch::Receiver<bool>) -> Gate {
-        Gate::new(pause, watch::channel(0).1, watch::channel(false).1)
+        Gate::new(
+            pause,
+            watch::channel(0).1,
+            watch::channel(false).1,
+            every_peer(),
+        )
     }
 
     /// An anchor of `k` packets, with the watches it fires.
@@ -440,7 +535,13 @@ mod tests {
         let (pause_tx, pause_rx) = watch::channel(false);
         let (trip_tx, trip_rx) = watch::channel(false);
         (
-            Anchor::new(Direction::ClientToUpstream, k, pause_tx, trip_tx),
+            Anchor::new(
+                Direction::ClientToUpstream,
+                k,
+                pause_tx,
+                trip_tx,
+                every_peer(),
+            ),
             pause_rx,
             trip_rx,
         )
@@ -599,7 +700,12 @@ mod tests {
         let (proxy, proxy_addr, _events) = Proxy::bind(
             (Ipv4Addr::LOCALHOST, 0).into(),
             echo.to_string(),
-            Gate::new(watch::channel(false).1, watch::channel(0).1, down_rx),
+            Gate::new(
+                watch::channel(false).1,
+                watch::channel(0).1,
+                down_rx,
+                every_peer(),
+            ),
             None,
         )
         .await
@@ -633,7 +739,12 @@ mod tests {
         let (proxy, proxy_addr, _events) = Proxy::bind(
             (Ipv4Addr::LOCALHOST, 0).into(),
             echo.to_string(),
-            Gate::new(watch::channel(false).1, sever_rx, watch::channel(false).1),
+            Gate::new(
+                watch::channel(false).1,
+                sever_rx,
+                watch::channel(false).1,
+                every_peer(),
+            ),
             None,
         )
         .await
@@ -672,11 +783,11 @@ mod tests {
         // Before arm, record is a no-op, so the fleet's bring-up traffic never
         // moves the counter or trips the gate.
         let (anchor, _pause, rx) = anchor(1);
-        assert!(!anchor.record(), "an unarmed record must not trip");
+        assert!(!anchor.record(PEER), "an unarmed record must not trip");
         assert!(!*rx.borrow(), "gate stays open while dormant");
         anchor.arm();
         assert!(
-            anchor.record(),
+            anchor.record(PEER),
             "the first armed packet reaches k=1 and trips"
         );
         assert!(*rx.borrow(), "gate tripped once armed");
@@ -699,11 +810,11 @@ mod tests {
         // would be no one left to resume). Disarming makes each arm a one-shot.
         let (anchor, _pause, rx) = anchor(2);
         anchor.arm();
-        anchor.record(); // count 1, below k
+        anchor.record(PEER); // count 1, below k
         assert!(!*rx.borrow(), "must not trip below k");
         anchor.disarm();
-        anchor.record(); // would be count 2 == k, but disarmed
-        anchor.record();
+        anchor.record(PEER); // would be count 2 == k, but disarmed
+        anchor.record(PEER);
         assert!(!*rx.borrow(), "a disarmed anchor must not re-trip the gate");
     }
 

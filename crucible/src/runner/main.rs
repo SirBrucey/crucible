@@ -658,7 +658,7 @@ async fn drive(bus: &EventBus, plan: &plan::Plan) -> Result<CampaignOutcome> {
         scenario,
         &learned,
         &testable,
-        budget.map(|budget| budget.after(RecoveryScheduler::count(&plan.fleet, &ways))),
+        budget.map(|budget| budget.after(RecoveryScheduler::count(&plan.fleet, &learned, &ways))),
     );
     let degraded = RecoveryScheduler::new(
         &plan.fleet,

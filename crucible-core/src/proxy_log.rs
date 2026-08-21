@@ -1,9 +1,12 @@
 //! Reconstruct `Session` records from sidecar proxy log lines.
 
-use std::collections::{BTreeMap, HashMap};
+use std::{
+    collections::{BTreeMap, HashMap},
+    net::{IpAddr, SocketAddr},
+};
 
 use crucible_protocol::{
-    Burst, ConnEvent, ConnEventKind, ConnId, Direction, ServiceProfile, Session, WriteRecord,
+    Burst, ConnEvent, ConnEventKind, ConnId, Direction, Edge, EdgeProfile, Session, WriteRecord,
 };
 
 struct Pending {
@@ -76,18 +79,27 @@ const BURST_GAP_NS: u128 = 20_000_000; // 20 ms
 /// learn run with more bursts than this keeps the busiest.
 const MAX_TOTAL_BURSTS: usize = 100;
 
-/// Derive per-service bursts from a session catalogue, split by direction and
-/// made scenario-relative to `scenario_start_ns` (writes before scenario start
-/// are ignored). Each direction's packets are clustered into bursts, then the
-/// whole catalogue is trimmed if it would not fit the IPC frame.
+/// Derive per-edge bursts from a session catalogue, split by direction and made
+/// scenario-relative to `scenario_start_ns` (writes before scenario start are
+/// ignored). Each direction's packets are clustered into bursts, then the whole
+/// catalogue is trimmed if it would not fit the IPC frame.
+///
+/// `addresses` names the service behind a peer, so an edge carries both the
+/// service that dialled and the one it reached. A peer it does not name came
+/// from outside the fleet.
 #[must_use]
-pub fn service_profiles_from_sessions(
+pub fn edge_profiles_from_sessions<S: std::hash::BuildHasher>(
     sessions: &[Session],
     scenario_start_ns: u128,
-) -> Vec<ServiceProfile> {
-    // Per service: (client-to-upstream packets, upstream-to-client packets).
-    let mut by_service: BTreeMap<String, (Vec<Packet>, Vec<Packet>)> = BTreeMap::new();
+    addresses: &HashMap<IpAddr, String, S>,
+) -> Vec<EdgeProfile> {
+    // Per edge: (client-to-upstream packets, upstream-to-client packets).
+    let mut by_edge: BTreeMap<Edge, (Vec<Packet>, Vec<Packet>)> = BTreeMap::new();
     for session in sessions {
+        let edge = Edge {
+            client: client_of(session, addresses),
+            upstream: session.service.clone(),
+        };
         for write in &session.writes {
             if write.ts_ns < scenario_start_ns {
                 continue;
@@ -95,7 +107,7 @@ pub fn service_profiles_from_sessions(
             let packet = Packet {
                 at: write.ts_ns - scenario_start_ns,
             };
-            let entry = by_service.entry(session.service.clone()).or_default();
+            let entry = by_edge.entry(edge.clone()).or_default();
             match write.direction {
                 Direction::ClientToUpstream => entry.0.push(packet),
                 Direction::UpstreamToClient => entry.1.push(packet),
@@ -103,13 +115,13 @@ pub fn service_profiles_from_sessions(
         }
     }
 
-    let mut profiles: Vec<ServiceProfile> = by_service
+    let mut profiles: Vec<EdgeProfile> = by_edge
         .into_iter()
-        .map(|(service, (mut c2u, mut u2c))| {
+        .map(|(edge, (mut c2u, mut u2c))| {
             c2u.sort_unstable_by_key(|packet| packet.at);
             u2c.sort_unstable_by_key(|packet| packet.at);
-            ServiceProfile {
-                service,
+            EdgeProfile {
+                edge,
                 client_to_upstream: bursts(&c2u),
                 upstream_to_client: bursts(&u2c),
             }
@@ -117,6 +129,17 @@ pub fn service_profiles_from_sessions(
         .collect();
     sample_to_frame(&mut profiles);
     profiles
+}
+
+/// The service that dialled, or `None` for a caller from outside the fleet.
+fn client_of<S: std::hash::BuildHasher>(
+    session: &Session,
+    addresses: &HashMap<IpAddr, String, S>,
+) -> Option<String> {
+    // The peer is `address:port`; the port is the caller's ephemeral one, so
+    // only the address identifies it.
+    let address: SocketAddr = session.peer.parse().ok()?;
+    addresses.get(&address.ip()).cloned()
 }
 
 /// One packet the proxy forwarded, at its time relative to scenario start. The
@@ -157,7 +180,7 @@ fn bursts(packets: &[Packet]) -> Vec<Burst> {
 ///
 /// The busiest bursts are kept, which is the same preference the scheduler
 /// applies when it cannot afford them all.
-fn sample_to_frame(profiles: &mut [ServiceProfile]) {
+fn sample_to_frame(profiles: &mut [EdgeProfile]) {
     let total: usize = profiles
         .iter()
         .map(|p| p.client_to_upstream.len() + p.upstream_to_client.len())
@@ -274,7 +297,7 @@ mod tests {
         fn catalogue_always_fits_the_frame(
             sessions in prop::collection::vec(a_session(), 0..8),
         ) {
-            let profiles = service_profiles_from_sessions(&sessions, 0);
+            let profiles = edge_profiles_from_sessions(&sessions, 0, &HashMap::new());
             let catalogue = WorkerToRunner::SessionCatalogue(crate::learned::Learned {
                 profiles,
                 trajectory: Vec::new(),
@@ -321,7 +344,7 @@ mod tests {
     }
 
     #[test]
-    fn service_profiles_split_by_direction_and_skip_pre_scenario_writes() {
+    fn edge_profiles_split_by_direction_and_skip_pre_scenario_writes() {
         let session = Session {
             service: "db".into(),
             conn_id: 0,
@@ -349,14 +372,60 @@ mod tests {
                 },
             ],
         };
-        let profiles = service_profiles_from_sessions(&[session], 50);
+        let addresses = HashMap::from([("127.0.0.1".parse().unwrap(), "api".to_string())]);
+        let profiles = edge_profiles_from_sessions(&[session], 50, &addresses);
         assert_eq!(profiles.len(), 1);
-        assert_eq!(profiles[0].service, "db");
+        assert_eq!(profiles[0].edge.client.as_deref(), Some("api"));
+        assert_eq!(profiles[0].edge.upstream, "db");
         // One post-start packet each direction, so one burst carrying it.
         assert_eq!(profiles[0].client_to_upstream.len(), 1);
         assert_eq!(profiles[0].client_to_upstream[0].packets, 1);
         assert_eq!(profiles[0].upstream_to_client.len(), 1);
         assert_eq!(profiles[0].upstream_to_client[0].packets, 1);
+    }
+
+    /// One packet on `at`, from `peer`, to `service`.
+    fn dialled(service: &str, peer: &str, at: u128) -> Session {
+        Session {
+            service: service.into(),
+            conn_id: 0,
+            peer: format!("{peer}:1"),
+            opened_ns: 0,
+            closed_ns: None,
+            writes: vec![WriteRecord {
+                ts_ns: at,
+                direction: Direction::ClientToUpstream,
+                bytes: 1,
+            }],
+        }
+    }
+
+    /// Two services dialling one upstream are two edges. Sharing a profile
+    /// would make `k` count another client's packets, so a fault would land
+    /// where the schedule never named.
+    #[test]
+    fn one_upstream_dialled_by_two_services_is_two_edges() {
+        let addresses = HashMap::from([
+            ("10.0.0.1".parse().unwrap(), "api".to_string()),
+            ("10.0.0.2".parse().unwrap(), "inventory".to_string()),
+        ]);
+        let sessions = [
+            dialled("db", "10.0.0.1", 100),
+            dialled("db", "10.0.0.2", 200),
+        ];
+        let profiles = edge_profiles_from_sessions(&sessions, 0, &addresses);
+        let clients: Vec<Option<&str>> = profiles
+            .iter()
+            .map(|profile| profile.edge.client.as_deref())
+            .collect();
+        assert_eq!(clients, [Some("api"), Some("inventory")]);
+    }
+
+    #[test]
+    fn a_peer_the_fleet_does_not_hold_dialled_from_outside_it() {
+        let sessions = [dialled("api", "192.168.1.5", 100)];
+        let profiles = edge_profiles_from_sessions(&sessions, 0, &HashMap::new());
+        assert_eq!(profiles[0].edge.client, None);
     }
 
     #[test]

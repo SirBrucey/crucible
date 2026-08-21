@@ -114,7 +114,7 @@ impl Session<Dispatching> {
     pub async fn learn(mut self, bus: &EventBus, schedule: Schedule) -> Result<Learned> {
         self.read_ready(bus, "Learning").await?;
 
-        let outbound = RunnerToWorker::Run(schedule);
+        let outbound = RunnerToWorker::Run(Box::new(schedule));
         write_frame(&mut self.stream, &outbound).await?;
         journal_out(bus, self.state.worker_id, outbound).await;
 
@@ -145,7 +145,7 @@ impl Session<Dispatching> {
     ) -> Result<Session<AwaitingResult>> {
         self.read_ready(bus, "Dispatching").await?;
 
-        let outbound = RunnerToWorker::Run(schedule);
+        let outbound = RunnerToWorker::Run(Box::new(schedule));
         write_frame(&mut self.stream, &outbound).await?;
         journal_out(bus, self.state.worker_id, outbound).await;
 

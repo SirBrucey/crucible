@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 
-use crucible_protocol::ServiceProfile;
+use crucible_protocol::EdgeProfile;
 
 use crate::{fault::Primitive, verdict::Checkpoint};
 
@@ -10,8 +10,8 @@ use crate::{fault::Primitive, verdict::Checkpoint};
 /// information the scheduler has to go on.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct Learned {
-    /// Per-service traffic profiles, which the fault anchors come from.
-    pub profiles: Vec<ServiceProfile>,
+    /// Per-edge traffic profiles, which the fault anchors come from.
+    pub profiles: Vec<EdgeProfile>,
     /// The state each step left behind, which every faulted run is judged
     /// against.
     pub trajectory: Vec<Checkpoint>,

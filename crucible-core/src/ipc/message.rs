@@ -1,4 +1,4 @@
-pub use crucible_protocol::{FaultReport, ServiceProfile, Session};
+pub use crucible_protocol::{EdgeProfile, FaultReport, Session};
 
 use crate::{learned::Learned, schedule::Schedule};
 
@@ -63,5 +63,5 @@ pub enum RunnerToWorker {
     /// Runner sends a schedule for the worker to run. A schedule with no faults
     /// is the fault-free run, which answers with a `SessionCatalogue`; any other
     /// answers with a `RunResult`.
-    Run(Schedule),
+    Run(Box<Schedule>),
 }

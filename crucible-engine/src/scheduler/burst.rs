@@ -1,16 +1,16 @@
 //! Burst scheduler: faults placed against the bursts of traffic the learn pass
 //! saw (it does the clustering, see
-//! [`crucible_core::proxy_log::service_profiles_from_sessions`]).
+//! [`crucible_core::proxy_log::edge_profiles_from_sessions`]).
 //!
 //! Every burst on every edge is faulted before any burst is faulted at more than
 //! one point, so a short budget costs resolution within a burst rather than
 //! whole edges. Where it will not stretch to one point per burst, the busiest
 //! bursts take what there is.
 
-use crucible_protocol::{Burst, Direction};
+use crucible_protocol::{Burst, Direction, Edge};
 
 use crucible_core::{
-    fault::{Anchor, Fault, Losing, Primitive},
+    fault::{Anchor, Fault, Losing, Primitive, Taking},
     learned::Learned,
     plan,
     schedule::Schedule,
@@ -70,18 +70,18 @@ impl BurstScheduler {
         testable: &[(Invariant, Vec<Primitive>)],
         budget: Option<Budget>,
     ) -> Self {
-        let mut edges: Vec<(&str, Direction, &[Burst])> = learned
+        let mut edges: Vec<(&Edge, Direction, &[Burst])> = learned
             .profiles
             .iter()
             .flat_map(|p| {
                 [
                     (
-                        p.service.as_str(),
+                        &p.edge,
                         Direction::ClientToUpstream,
                         p.client_to_upstream.as_slice(),
                     ),
                     (
-                        p.service.as_str(),
+                        &p.edge,
                         Direction::UpstreamToClient,
                         p.upstream_to_client.as_slice(),
                     ),
@@ -89,60 +89,77 @@ impl BurstScheduler {
             })
             .filter(|(_, _, bursts)| !bursts.is_empty())
             .collect();
-        edges.sort_by_key(|(service, _, _)| *service);
+        edges.sort_by_key(|(edge, _, _)| *edge);
 
-        // A fault is one (invariant, primitive) pairing a burst can place, and
-        // covering those comes before resolution, so they multiply what a single
-        // point costs. A pairing no burst can place must not be costed.
+        // One point in one burst is faulted every way the fleet can be broken
+        // there, and covering those comes before resolution, so they multiply
+        // what a point costs. A way no burst can place must not be costed.
         let ways: Vec<(Invariant, Losing)> = testable
             .iter()
             .flat_map(|(invariant, ways)| ways.iter().map(|by| (*invariant, *by)))
             .filter_map(|(invariant, by)| Some((invariant, placeable(invariant, by)?)))
             .collect();
         let seen: usize = edges.iter().map(|(_, _, bursts)| bursts.len()).sum();
-        let fitted = Fitted::new(budget, seen, ways.len());
 
         // Interleaved, so an edge's second burst comes after every edge's first.
-        let mut probed: Vec<(&str, Direction, Burst)> = Vec::new();
+        let mut probed: Vec<(&Edge, Direction, Burst)> = Vec::new();
         for nth in 0..edges.iter().map(|(_, _, b)| b.len()).max().unwrap_or(0) {
-            for (service, direction, bursts) in &edges {
+            for (edge, direction, bursts) in &edges {
                 if let Some(&burst) = bursts.get(nth) {
-                    probed.push((service, *direction, burst));
+                    probed.push((edge, *direction, burst));
                 }
             }
         }
-        if let Fitted::Busiest { bursts } = fitted {
+
+        // What one point in one burst costs, which is not the same everywhere:
+        // an edge dialled from outside the fleet has only one end to kill.
+        let cost =
+            |edge: &Edge| -> usize { ways.iter().map(|(_, by)| targets(*by, edge).len()).sum() };
+        let at_one_point: usize = probed.iter().map(|(edge, ..)| cost(edge)).sum();
+        let fitted = Fitted::new(budget, at_one_point);
+        if let Fitted::Busiest(budget) = fitted {
+            // The busiest bursts take what there is. Costs differ per burst, so
+            // how many fit is only knowable in the order they will be kept.
             probed.sort_by_key(|(_, _, burst)| std::cmp::Reverse(burst.packets));
-            probed.truncate(bursts);
+            let mut spent = 0;
+            probed.retain(|(edge, ..)| {
+                let affordable = budget.fits(spent + cost(edge));
+                if affordable {
+                    spent += cost(edge);
+                }
+                affordable
+            });
         }
 
         let mut schedules: Vec<Schedule> = Vec::new();
         let mut next_id: u32 = Schedule::LEARN_ID + 1;
-        for (service, direction, burst) in &probed {
+        for (edge, direction, burst) in &probed {
             for k in fitted.points(*burst, *direction) {
                 for (invariant, by) in &ways {
-                    let anchor = Anchor {
-                        service: (*service).to_string(),
-                        direction: *direction,
-                        k,
-                    };
-                    let fault = match invariant {
-                        Invariant::Durable => Fault::Durable { anchor, by: *by },
-                        // `placeable` kept these out of `ways`.
-                        Invariant::Recovers | Invariant::Idempotent | Invariant::Converges => {
-                            continue;
-                        }
-                    };
-                    schedules.push(Schedule::faulted(
-                        next_id,
-                        fleet.clone(),
-                        scenario.steps.clone(),
-                        scenario.checks.clone(),
-                        fault,
-                        learned.trajectory.clone(),
-                        scenario.consistent_within,
-                    ));
-                    next_id += 1;
+                    for taking in targets(*by, edge) {
+                        let anchor = Anchor {
+                            edge: (*edge).clone(),
+                            direction: *direction,
+                            k,
+                        };
+                        let fault = match invariant {
+                            Invariant::Durable => Fault::Durable { anchor, by: taking },
+                            // `placeable` kept these out of `ways`.
+                            Invariant::Recovers | Invariant::Idempotent | Invariant::Converges => {
+                                continue;
+                            }
+                        };
+                        schedules.push(Schedule::faulted(
+                            next_id,
+                            fleet.clone(),
+                            scenario.steps.clone(),
+                            scenario.checks.clone(),
+                            fault,
+                            learned.trajectory.clone(),
+                            scenario.consistent_within,
+                        ));
+                        next_id += 1;
+                    }
                 }
             }
         }
@@ -172,36 +189,35 @@ impl BurstScheduler {
 }
 
 /// How much of each burst a budget affords.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug)]
 enum Fitted {
     /// Every burst, at this many points each.
     Every(usize),
-    /// One point each in this many bursts, the busiest first. What is left when
-    /// the budget does not stretch to every burst.
-    Busiest { bursts: usize },
+    /// One point each, in as many of the busiest bursts as this affords. What is
+    /// left when the budget does not stretch to every burst, so it carries the
+    /// budget that could not.
+    Busiest(Budget),
 }
 
 impl Fitted {
-    /// What `budget` buys over `bursts`, given that one point in one burst costs
-    /// a schedule for each way of breaking the fleet.
-    fn new(budget: Option<Budget>, bursts: usize, ways: usize) -> Self {
+    /// What `budget` buys, given that faulting every burst at one point costs
+    /// `at_one_point` schedules.
+    fn new(budget: Option<Budget>, at_one_point: usize) -> Self {
         let Some(budget) = budget else {
             return Fitted::Every(POINTS_PER_BURST);
         };
         for points in (1..=POINTS_PER_BURST).rev() {
-            if budget.fits(bursts * points * ways) {
+            if budget.fits(at_one_point * points) {
                 return Fitted::Every(points);
             }
         }
-        Fitted::Busiest {
-            bursts: budget.affords(bursts, ways),
-        }
+        Fitted::Busiest(budget)
     }
 
     fn points_per_burst(self) -> usize {
         match self {
             Fitted::Every(points) => points,
-            Fitted::Busiest { .. } => 1,
+            Fitted::Busiest(_) => 1,
         }
     }
 
@@ -227,6 +243,21 @@ impl Fitted {
     }
 }
 
+/// What breaking `edge` by `losing` can take: either end of it if the fleet is
+/// to lose a service, the edge itself if it is to lose the link. An edge dialled
+/// from outside the fleet has only the one end we can reach.
+fn targets(losing: Losing, edge: &Edge) -> Vec<Taking> {
+    match losing {
+        Losing::Kill => edge
+            .client
+            .iter()
+            .chain(std::iter::once(&edge.upstream))
+            .map(|service| Taking::Kill(service.clone()))
+            .collect(),
+        Losing::Cut => vec![Taking::Cut(edge.clone())],
+    }
+}
+
 /// How a burst breaks the fleet to test `invariant`, if it can. Recovery
 /// degrades the fleet from the start rather than part way through, so a burst
 /// cannot test it.
@@ -247,7 +278,7 @@ impl Scheduler for BurstScheduler {
 mod tests {
     use std::{collections::BTreeSet, time::Duration};
 
-    use crucible_protocol::ServiceProfile;
+    use crucible_protocol::EdgeProfile;
 
     use super::*;
     use crate::scheduler::fixture;
@@ -264,9 +295,18 @@ mod tests {
         }
     }
 
-    fn profile(service: &str, c2u: Vec<Burst>, u2c: Vec<Burst>) -> ServiceProfile {
-        ServiceProfile {
-            service: service.into(),
+    /// An edge to `upstream`, dialled from outside the fleet so it has one end
+    /// to kill and a test says how many schedules it expects.
+    fn profile(upstream: &str, c2u: Vec<Burst>, u2c: Vec<Burst>) -> EdgeProfile {
+        from(None, upstream, c2u, u2c)
+    }
+
+    fn from(client: Option<&str>, upstream: &str, c2u: Vec<Burst>, u2c: Vec<Burst>) -> EdgeProfile {
+        EdgeProfile {
+            edge: Edge {
+                client: client.map(ToOwned::to_owned),
+                upstream: upstream.into(),
+            },
             client_to_upstream: c2u,
             upstream_to_client: u2c,
         }
@@ -274,7 +314,7 @@ mod tests {
 
     /// An unbounded campaign against a fleet that can be killed, so durability
     /// is on.
-    fn scheduler(profiles: &[ServiceProfile]) -> BurstScheduler {
+    fn scheduler(profiles: &[EdgeProfile]) -> BurstScheduler {
         driven(profiles, vec![Primitive::Kill], None)
     }
 
@@ -290,7 +330,7 @@ mod tests {
     /// A campaign testing durability by every way of breaking the fleet in
     /// `ways`, fitted to a budget affording `capacity` schedules.
     fn driven(
-        profiles: &[ServiceProfile],
+        profiles: &[EdgeProfile],
         ways: Vec<Primitive>,
         capacity: Option<u32>,
     ) -> BurstScheduler {
@@ -385,20 +425,70 @@ mod tests {
     }
 
     #[test]
-    fn emission_is_round_robin_across_services() {
+    fn emission_is_round_robin_across_edges() {
         let scheduler = scheduler(&[
             profile("api", vec![burst(0, 1)], vec![]),
             profile("db", vec![burst(0, 1)], vec![]),
         ]);
-        let first_two: Vec<_> = std::iter::from_fn({
+        let first_two: Vec<String> = std::iter::from_fn({
             let mut s = scheduler;
             move || s.next()
         })
         .take(2)
-        .map(|s| fault(&s).service.clone())
+        .map(|s| fault(&s).edge.upstream.clone())
         .collect();
         assert!(first_two.contains(&"api".to_string()));
         assert!(first_two.contains(&"db".to_string()));
+    }
+
+    /// What each schedule takes away.
+    fn taken(s: BurstScheduler) -> Vec<String> {
+        std::iter::from_fn({
+            let mut s = s;
+            move || s.next()
+        })
+        .map(|s| {
+            s.fault
+                .as_ref()
+                .expect("a burst schedule always faults")
+                .taking()
+                .target()
+        })
+        .collect()
+    }
+
+    #[test]
+    fn a_kill_can_take_either_end_of_an_edge() {
+        let taken = taken(driven(
+            &[from(Some("inventory"), "broker", vec![burst(1, 4)], vec![])],
+            vec![Primitive::Kill],
+            None,
+        ));
+        assert!(taken.contains(&"inventory".to_string()));
+        assert!(taken.contains(&"broker".to_string()));
+    }
+
+    #[test]
+    fn an_edge_from_outside_the_fleet_offers_only_its_upstream() {
+        let taken = taken(driven(
+            &[profile("api", vec![burst(1, 4)], vec![])],
+            vec![Primitive::Kill],
+            None,
+        ));
+        assert!(taken.iter().all(|target| target == "api"), "{taken:?}");
+    }
+
+    #[test]
+    fn a_cut_takes_the_edge_itself() {
+        let taken = taken(driven(
+            &[from(Some("api"), "db", vec![burst(1, 4)], vec![])],
+            vec![Primitive::Cut],
+            None,
+        ));
+        assert!(
+            taken.iter().all(|target| target == "api -> db"),
+            "{taken:?}"
+        );
     }
 
     #[test]

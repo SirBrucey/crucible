@@ -14,13 +14,31 @@ pub use session::{Session, WriteRecord};
 
 use serde::{Deserialize, Serialize};
 
-/// The bursts of traffic the learn run saw a service carry, split by direction.
+/// A link the proxy carries.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
+pub struct Edge {
+    /// The service that dialled, or `None` when the traffic came from outside
+    /// the fleet, such as the framework driving a step.
+    pub client: Option<String>,
+    pub upstream: String,
+}
+
+impl std::fmt::Display for Edge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.client {
+            Some(client) => write!(f, "{client} -> {}", self.upstream),
+            None => write!(f, "-> {}", self.upstream),
+        }
+    }
+}
+
+/// The bursts of traffic the learn run saw one edge carry, split by direction.
 /// Faults land relative to observed traffic rather than a wall clock, so this is
 /// what the scheduler places them against. Bursts are bounded by sampling if a
 /// run is unusually busy, so the catalogue always fits the IPC frame.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-pub struct ServiceProfile {
-    pub service: String,
+pub struct EdgeProfile {
+    pub edge: Edge,
     /// Bursts on the client-to-upstream direction (requests in).
     pub client_to_upstream: Vec<Burst>,
     /// Bursts on the upstream-to-client direction (responses out).

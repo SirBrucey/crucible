@@ -9,11 +9,11 @@ use std::{
 use crucible_protocol::{At, FaultMissReason, FaultReport, FaultResult, now_ns};
 
 use crucible_core::{
-    fault::{Fault, Losing, Primitive},
+    fault::{Fault, Primitive, Taking},
     ipc::Verdict,
     learned::Learned,
     observer::SessionObserver,
-    proxy_log::service_profiles_from_sessions,
+    proxy_log::edge_profiles_from_sessions,
     verdict::{Checkpoint, Observations, Observed, StepWindow, driver_for},
 };
 use crucible_plugin::{
@@ -239,8 +239,15 @@ impl Orchestrator<Ready> {
             .wait_for_quiescence(LEARN_SETTLE, QUIESCENCE_IDLE, consistent_within)
             .await;
         session_observer.observe(&mut observations);
+        // Read before teardown, while every service is still up and holding the
+        // address its traffic came from.
+        let addresses = deployment.addresses().await?;
         let learned = Learned {
-            profiles: service_profiles_from_sessions(&observations.sessions, scenario_start_ns),
+            profiles: edge_profiles_from_sessions(
+                &observations.sessions,
+                scenario_start_ns,
+                &addresses,
+            ),
             trajectory: observations.trajectory,
             primitives,
         };
@@ -379,7 +386,7 @@ async fn teardown_replica(
 
 /// A [`FaultReport`] for a fault that did not fire, for the given reason.
 fn missed(id: u32, fault: &Fault, reason: FaultMissReason) -> FaultReport {
-    FaultReport::missed(id, fault.service(), reason)
+    FaultReport::missed(id, fault.taking().target(), reason)
 }
 
 /// Read what the fleet settled on, one reading per check the scenario states.
@@ -488,7 +495,10 @@ fn placed_at(session_observer: &SessionObserver, scenario_start_ns: u128) -> Pla
 enum Placement<'a> {
     /// The proxy holds the fleet while this side kills the service and brings it
     /// back.
-    Kill(&'a dyn Kill),
+    Kill {
+        kills: &'a dyn Kill,
+        service: &'a str,
+    },
     /// The proxy severs the edge itself and releases the fleet.
     Cut,
 }
@@ -496,17 +506,17 @@ enum Placement<'a> {
 impl<'a> Placement<'a> {
     /// What the deployment must offer to place `fault`.
     fn of(
-        fault: &Fault,
+        fault: &'a Fault,
         deployment: &'a dyn DeploymentRuntime,
     ) -> Result<Self, crucible_plugin::Error> {
-        match fault.losing() {
-            Losing::Kill => deployment
+        match fault.taking() {
+            Taking::Kill(service) => deployment
                 .kills()
-                .map(Placement::Kill)
+                .map(|kills| Placement::Kill { kills, service })
                 .ok_or_else(|| unreachable_fault(fault)),
             // The substrate does this one on its own, so what it offers is all
             // there is to check.
-            Losing::Cut => deployment
+            Taking::Cut(_) => deployment
                 .substrate()
                 .primitives()
                 .contains(&Primitive::Cut)
@@ -596,7 +606,7 @@ async fn degraded_run(
             deployment.substrate().arm_anchor().await?;
             now_ns()
         }
-        Placement::Kill(kills) => match kills.kill(fault.service()).await {
+        Placement::Kill { kills, service } => match kills.kill(service).await {
             Ok(placed_at_ns) => placed_at_ns,
             // Nothing is down, so the run would meet an undegraded fleet.
             Err(e) => {
@@ -626,8 +636,8 @@ async fn degraded_run(
 
     match placement {
         Placement::Cut => deployment.substrate().proceed().await?,
-        Placement::Kill(kills) => {
-            kills.restart(fault.service()).await?;
+        Placement::Kill { kills, service } => {
+            kills.restart(service).await?;
             deployment.substrate().proceed().await?;
         }
     }
@@ -635,7 +645,7 @@ async fn degraded_run(
         observations,
         FaultReport::fired(
             id,
-            fault.service(),
+            fault.taking().target(),
             fault.primitive(),
             At::Throughout,
             placed_at_ns,
@@ -658,10 +668,10 @@ async fn place(
 ) -> Result<FaultReport, crucible_plugin::Error> {
     let placed_at_ns = match placement {
         Placement::Cut => placed.at_ns,
-        Placement::Kill(kills) => match kills.kill(fault.service()).await {
+        Placement::Kill { kills, service } => match kills.kill(service).await {
             Ok(placed_at_ns) => {
                 substrate.proceed().await?;
-                kills.restart(fault.service()).await?;
+                kills.restart(service).await?;
                 placed_at_ns
             }
             Err(e) => {
@@ -677,7 +687,7 @@ async fn place(
         .expect("an anchored fault is placed on a packet");
     Ok(FaultReport::fired(
         id,
-        fault.service(),
+        fault.taking().target(),
         fault.primitive(),
         At::Packet {
             direction: anchor.direction,
@@ -758,15 +768,26 @@ mod tests {
         crucible_plugin::Error::new("fake", message)
     }
 
-    /// A kill of `db`.
+    /// A kill of `db`, anchored in what `api` was saying to it.
     fn fault() -> Fault {
         Fault::Durable {
             anchor: crucible_core::fault::Anchor {
-                service: "db".into(),
+                edge: crucible_protocol::Edge {
+                    client: Some("api".into()),
+                    upstream: "db".into(),
+                },
                 direction: Direction::ClientToUpstream,
                 k: 3,
             },
-            by: Losing::Kill,
+            by: Taking::Kill("db".into()),
+        }
+    }
+
+    /// The placement `fault` calls for, against a deployment that can kill.
+    fn killing(deployment: &FakeDeployment) -> Placement<'_> {
+        Placement::Kill {
+            kills: deployment,
+            service: "db",
         }
     }
 
@@ -775,7 +796,7 @@ mod tests {
         let deployment = FakeDeployment::default();
         let report = place(
             &fault(),
-            Placement::Kill(&deployment),
+            killing(&deployment),
             &deployment,
             1,
             Placed {
@@ -798,7 +819,7 @@ mod tests {
         };
         let result = place(
             &fault(),
-            Placement::Kill(&deployment),
+            killing(&deployment),
             &deployment,
             1,
             Placed {
@@ -820,7 +841,7 @@ mod tests {
         };
         let result = place(
             &fault(),
-            Placement::Kill(&deployment),
+            killing(&deployment),
             &deployment,
             1,
             Placed {
@@ -841,7 +862,7 @@ mod tests {
         };
         let report = place(
             &fault(),
-            Placement::Kill(&deployment),
+            killing(&deployment),
             &deployment,
             1,
             Placed {

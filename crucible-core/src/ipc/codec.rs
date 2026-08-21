@@ -9,9 +9,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 ///
 /// Kept small on purpose. The handshake is tens of bytes; the biggest current
 /// message is [`WorkerToRunner::SessionCatalogue`](crate::ipc::WorkerToRunner::SessionCatalogue),
-/// whose per-service anchor lists are sampled down to a fixed cap on the learn
-/// side so it always fits (see
-/// [`crate::proxy_log::service_profiles_from_sessions`]).
+/// whose per-edge burst lists are trimmed to a fixed cap on the learn side so it
+/// always fits (see [`crate::proxy_log::edge_profiles_from_sessions`]).
 pub(crate) const MAX_FRAME_SIZE: usize = 4096;
 
 // The frame header stores the payload length as a big-endian u32, so the cap
@@ -174,24 +173,29 @@ mod tests {
 
     #[tokio::test]
     async fn roundtrips_a_schedule_carrying_its_work() {
-        roundtrip(RunnerToWorker::Run(crate::schedule::Schedule::faulted(
-            7,
-            fleet(),
-            vec![step()],
-            vec![check()],
-            crate::fault::Fault::Durable {
-                anchor: crate::fault::Anchor {
-                    service: "db".into(),
-                    direction: Direction::ClientToUpstream,
-                    k: 3,
+        roundtrip(RunnerToWorker::Run(Box::new(
+            crate::schedule::Schedule::faulted(
+                7,
+                fleet(),
+                vec![step()],
+                vec![check()],
+                crate::fault::Fault::Durable {
+                    anchor: crate::fault::Anchor {
+                        edge: crucible_protocol::Edge {
+                            client: Some("api".into()),
+                            upstream: "db".into(),
+                        },
+                        direction: Direction::ClientToUpstream,
+                        k: 3,
+                    },
+                    by: crate::fault::Taking::Kill("db".into()),
                 },
-                by: crate::fault::Losing::Kill,
-            },
-            vec![
-                vec![Some(crate::plan::Value::Int(0))],
-                vec![Some(crate::plan::Value::Int(3))],
-            ],
-            std::time::Duration::from_secs(15),
+                vec![
+                    vec![Some(crate::plan::Value::Int(0))],
+                    vec![Some(crate::plan::Value::Int(3))],
+                ],
+                std::time::Duration::from_secs(15),
+            ),
         )))
         .await;
     }
