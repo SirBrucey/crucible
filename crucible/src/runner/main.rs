@@ -626,13 +626,21 @@ async fn drive(bus: &EventBus, plan: &plan::Plan) -> Result<CampaignOutcome> {
     let (learned, cycle_cost) = run_learn(bus, &mut worker_id, &plan.fleet, scenario).await?;
     let readings = learned.trajectory.iter().flatten();
     tracing::info!(
-        services = learned.profiles.len(),
+        edges = learned.profiles.len(),
         checkpoints = learned.trajectory.len(),
         read = readings.clone().filter(|r| r.is_some()).count(),
         unread = readings.filter(|r| r.is_none()).count(),
         cycle_cost_ms = cycle_cost.as_millis(),
         "session catalogue received"
     );
+    for profile in &learned.profiles {
+        tracing::debug!(
+            edge = %profile.edge,
+            requests = ?profile.client_to_upstream,
+            responses = ?profile.upstream_to_client,
+            "learned"
+        );
+    }
 
     let settled = learned.trajectory.last().map_or(&[][..], Vec::as_slice);
     if let Some(unmet) = verdict::unmet(&scenario.checks, settled) {

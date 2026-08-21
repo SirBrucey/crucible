@@ -9,6 +9,7 @@ use std::{
 
 use bollard::{
     Docker as DockerClient,
+    container::LogOutput,
     models::{
         ContainerCreateBody, EndpointSettings, HealthConfig, HealthStatusEnum, HostConfig,
         NetworkCreateRequest, NetworkingConfig,
@@ -39,6 +40,9 @@ const READINESS_POLL: Duration = Duration::from_millis(500);
 const HEALTHCHECK_INTERVAL: Duration = Duration::from_secs(1);
 const HEALTHCHECK_START_PERIOD: Duration = Duration::from_secs(30);
 const PROXY_IMAGE: &str = "crucible-proxy:0.1";
+/// Sets the log filter the proxy runs under, for when a run needs to know what
+/// its substrate was doing.
+const PROXY_LOG: &str = "CRUCIBLE_PROXY_LOG";
 /// Control-plane listeners start here, above anything a fleet would use.
 const CONTROL_BASE: u16 = 40000;
 const PROXY_SUFFIX: &str = "proxy";
@@ -396,6 +400,11 @@ impl Docker {
         let config = ContainerCreateBody {
             image: Some(PROXY_IMAGE.to_string()),
             cmd: Some(cmd),
+            // What the proxy says about itself is relayed to the run's log, so
+            // this is how to ask it for more.
+            env: std::env::var(PROXY_LOG)
+                .ok()
+                .map(|filter| vec![format!("RUST_LOG={filter}")]),
             exposed_ports: Some(exposed_ports),
             host_config: Some(HostConfig {
                 publish_all_ports: Some(true),
@@ -914,11 +923,13 @@ impl DeploymentRuntime for Docker {
 
     /// The proxy writes its event lines to its container's stdout, so following
     /// that container's log is how this deployment hands the observer its feed.
+    /// Its stderr is what it has to say about itself. Without this failures
+    /// happen silently.
     fn start_session_observer(&self) -> SessionObserver {
         let container = self.proxy_container_name();
         let options = LogsOptionsBuilder::default()
             .stdout(true)
-            .stderr(false)
+            .stderr(true)
             .follow(true)
             .tail("all")
             .build();
@@ -929,6 +940,12 @@ impl DeploymentRuntime for Docker {
                 // A stream that ends is how a failed read reaches the observer,
                 // which has no way to ask docker what went wrong.
                 std::future::ready(match chunk {
+                    Ok(LogOutput::StdErr { message }) => {
+                        for line in String::from_utf8_lossy(&message).lines() {
+                            tracing::debug!(target: "proxy", %container, "{line}");
+                        }
+                        Some(Vec::new())
+                    }
                     Ok(bytes) => Some(bytes.as_ref().to_vec()),
                     Err(e) => {
                         tracing::warn!(target: "session_observer", %container, error = %e, "log stream error");

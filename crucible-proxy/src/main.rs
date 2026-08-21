@@ -164,6 +164,14 @@ async fn resolve(hosts: &[(String, String)], client: Option<&str>) -> OnEdge {
             }
         }
     }
+    // What the proxy decided the edge is, which every later attribution rests
+    // on.
+    tracing::debug!(
+        client = client.unwrap_or("outside the fleet"),
+        theirs = ?theirs,
+        fleet = ?fleet,
+        "resolved the anchored edge"
+    );
     OnEdge::new(theirs, fleet, client.is_none())
 }
 

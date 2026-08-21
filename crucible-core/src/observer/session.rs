@@ -166,16 +166,18 @@ impl SessionObserver {
     }
 
     /// Block until the proxy reports the fleet has frozen (the fault anchor
-    /// tripped) since this call began, or until `timeout` elapses; returns
-    /// whether the freeze was observed. The baseline is captured at call time,
-    /// which the caller aligns with scenario start (the same moment it arms the
-    /// anchor).
+    /// tripped) since `baseline`, or until `timeout` elapses; returns whether
+    /// the freeze was observed.
+    ///
+    /// The caller takes `baseline` from [`Self::freeze_count`] when it arms the
+    /// anchor, and passes the same one to every wait. Taking a fresh one per
+    /// call would hide a freeze that had already arrived, and the run would go
+    /// looking for a second that is never coming.
     ///
     /// A freeze that the proxy itself releases may already be over by the time
     /// it is seen here, so this says the fault was placed, not that the fleet is
     /// still held. Use [`Self::froze_at_ns`] for when it landed.
-    pub async fn wait_for_freeze(&self, timeout: Duration) -> bool {
-        let baseline = self.freeze_count();
+    pub async fn wait_for_freeze(&self, baseline: u32, timeout: Duration) -> bool {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             if self.freeze_count() > baseline {
@@ -188,7 +190,9 @@ impl SessionObserver {
         }
     }
 
-    fn freeze_count(&self) -> u32 {
+    /// Freezes seen so far, which a caller takes as the baseline for its waits.
+    #[must_use]
+    pub fn freeze_count(&self) -> u32 {
         self.index
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -336,6 +340,29 @@ mod tests {
         assert_eq!(index.freeze_count(), 1);
         index.record("db".into(), ConnEvent::froze_at(0, 30, 5));
         assert_eq!(index.freeze_count(), 2);
+    }
+
+    /// We ask twice whether the fault fired, once while the scenario runs and
+    /// again once it ends. If the second ask started counting from scratch it
+    /// would miss a freeze that had already arrived, and we would report a fault
+    /// that fired as one that never did.
+    #[tokio::test]
+    async fn a_freeze_stays_seen_by_every_wait_that_shares_a_baseline() {
+        let line = format!(
+            "db\t{}\n",
+            serde_json::to_string(&ConnEvent::froze_at(0, 20, 3)).expect("an event serializes")
+        );
+        let observer = SessionObserver::start(
+            futures_util::stream::iter([line.into_bytes()])
+                .chain(futures_util::stream::pending::<Vec<u8>>()),
+        );
+        let baseline = 0;
+        let brief = Duration::from_secs(1);
+        assert!(observer.wait_for_freeze(baseline, brief).await);
+        assert!(
+            observer.wait_for_freeze(baseline, brief).await,
+            "the same freeze answers a later wait"
+        );
     }
 
     #[test]
