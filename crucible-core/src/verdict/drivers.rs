@@ -54,17 +54,24 @@ impl Driver for Durable {
 
         // A checkpoint says where the fleet stands once the first N steps have
         // landed. If every step landed we hold the run to the last one, in
-        // whatever order they got there. If a step in the middle did not land
-        // and a later one did, no checkpoint says where that leaves things.
-        let landed = match steps_landed(observations) {
-            Ok(landed) => landed,
-            Err(reason) => return Verdict::Inconclusive { reason },
-        };
-        let Some(expected) = observations.fault_free.get(landed) else {
+        // whatever order they got there. A step whose ack was lost leaves more
+        // than one count admissible, and the fleet answers to any of them.
+        let landed = steps_landed(observations);
+        if landed.is_empty() {
+            return Verdict::Inconclusive {
+                reason: refused_then_landed(observations),
+            };
+        }
+        let admissible: Vec<(usize, &Checkpoint)> = landed
+            .iter()
+            .filter_map(|n| observations.fault_free.get(*n).map(|at| (*n, at)))
+            .collect();
+        let Some(&(landed, expected)) = admissible.last() else {
             return Verdict::Inconclusive {
                 reason: format!(
-                    "the fault-free run left {} checkpoint(s), so it cannot say where {landed} step(s) leave the fleet",
-                    observations.fault_free.len()
+                    "the fault-free run left {} checkpoint(s), so it cannot say where {} step(s) leave the fleet",
+                    observations.fault_free.len(),
+                    counts(&landed),
                 ),
             };
         };
@@ -77,6 +84,16 @@ impl Driver for Durable {
             .iter()
             .map(|observed| Some(observed.value.clone()))
             .collect();
+        // Any outcome the run admits is enough: what is in doubt is what the
+        // fleet accepted, and it is not held to the strictest reading of that.
+        if admissible
+            .iter()
+            .any(|(_, expected)| matches!(differing(&settled, expected), Ok(None)))
+        {
+            return Verdict::Pass;
+        }
+        // Judged against the most it can have accepted, which is the most it can
+        // owe.
         match differing(&settled, expected) {
             Ok(None) => Verdict::Pass,
             Ok(Some(at)) => Verdict::Fail {
@@ -98,23 +115,27 @@ impl Driver for Recovers {
     }
 }
 
-/// How many steps the fleet took responsibility for. Counts from the first, and
-/// refuses a run that skipped one and carried on, since no checkpoint says where
-/// that leaves the fleet.
-fn steps_landed(observations: &Observations) -> Result<usize, String> {
-    let landed: Vec<bool> = observations
+/// How many steps the fleet may have taken responsibility for, fewest first.
+///
+/// A step whose ack was lost may have landed or not, so a run admits every count
+/// its unknowns allow. A count is admissible when nothing before it was refused
+/// and nothing after it was acknowledged, since a checkpoint describes a run that
+/// landed a prefix of the steps and nothing else.
+///
+/// Empty when a refusal precedes an acknowledgement, which no checkpoint
+/// describes however the unknowns fall.
+fn steps_landed(observations: &Observations) -> Vec<usize> {
+    let acks: Vec<Ack> = observations
         .outcomes
         .iter()
-        .map(|outcome| outcome.ack == Ack::Acked)
+        .map(|outcome| outcome.ack)
         .collect();
-    let counted = landed.iter().take_while(|landed| **landed).count();
-    if landed[counted..].iter().any(|landed| *landed) {
-        return Err(format!(
-            "step {} did not land and a later one did, which no checkpoint describes",
-            counted + 1
-        ));
-    }
-    Ok(counted)
+    (0..=acks.len())
+        .filter(|n| {
+            acks[..*n].iter().all(|ack| *ack != Ack::Rejected)
+                && acks[*n..].iter().all(|ack| *ack != Ack::Acked)
+        })
+        .collect()
 }
 
 /// The first observable the two readings disagree on, `None` if they agree, and
@@ -220,6 +241,27 @@ fn steps(n: usize) -> String {
     } else {
         format!("{n} steps")
     }
+}
+
+/// The counts a run admits, as a verdict says them.
+fn counts(landed: &[usize]) -> String {
+    let spelled: Vec<String> = landed.iter().map(ToString::to_string).collect();
+    spelled.join(" or ")
+}
+
+/// Why no count describes this run: a step was refused and a later one landed,
+/// so what the fleet accepted is not a prefix of what the scenario drove.
+fn refused_then_landed(observations: &Observations) -> String {
+    let acks: Vec<Ack> = observations
+        .outcomes
+        .iter()
+        .map(|outcome| outcome.ack)
+        .collect();
+    let refused = acks
+        .iter()
+        .position(|ack| *ack == Ack::Rejected)
+        .map_or(0, |at| at + 1);
+    format!("step {refused} was refused and a later one landed, which no checkpoint describes")
 }
 
 /// The step this run's state first parted from the fault-free run's.
@@ -390,10 +432,80 @@ mod tests {
         ));
     }
 
+    /// A lost ack leaves the fleet owing either what it would owe having taken
+    /// the step or what it would owe having refused it, so either is a pass.
+    #[test]
+    fn a_run_whose_ack_was_lost_answers_to_either_checkpoint() {
+        assert_eq!(
+            judged(&[Ack::Acked, Ack::Unknown], &[0, 1, 2], 1),
+            Verdict::Pass,
+        );
+        assert_eq!(
+            judged(&[Ack::Acked, Ack::Unknown], &[0, 1, 2], 2),
+            Verdict::Pass,
+        );
+    }
+
+    #[test]
+    fn a_run_whose_ack_was_lost_still_fails_where_neither_describes_it() {
+        assert!(matches!(
+            judged(&[Ack::Acked, Ack::Unknown], &[0, 1, 2], 7),
+            Verdict::Fail { .. },
+        ));
+    }
+
+    /// A step that landed after the one in doubt settles it: the doubt cannot be
+    /// resolved as "not landed" without leaving a gap no checkpoint describes.
+    #[test]
+    fn a_later_landed_step_settles_what_a_lost_ack_left_open() {
+        assert_eq!(
+            judged(&[Ack::Unknown, Ack::Acked], &[0, 1, 2], 2),
+            Verdict::Pass,
+        );
+        assert!(matches!(
+            judged(&[Ack::Unknown, Ack::Acked], &[0, 1, 2], 1),
+            Verdict::Fail { .. },
+        ));
+    }
+
+    /// Every step in doubt, so the fleet may have taken all of them or none.
+    #[test]
+    fn a_run_of_lost_acks_admits_every_checkpoint() {
+        for settled in [0, 1, 2] {
+            assert_eq!(
+                judged(&[Ack::Unknown, Ack::Unknown], &[0, 1, 2], settled),
+                Verdict::Pass,
+                "settling at {settled}",
+            );
+        }
+    }
+
+    /// A refusal bounds the doubt: nothing after it can have landed, so a lost
+    /// ack that follows one cannot be read as landed.
+    #[test]
+    fn a_refusal_bounds_what_a_later_lost_ack_admits() {
+        assert_eq!(
+            judged(&[Ack::Acked, Ack::Rejected, Ack::Unknown], &[0, 1, 2, 3], 1),
+            Verdict::Pass,
+        );
+        assert!(matches!(
+            judged(&[Ack::Acked, Ack::Rejected, Ack::Unknown], &[0, 1, 2, 3], 2),
+            Verdict::Fail { .. },
+        ));
+    }
+
     #[test]
     fn a_fault_free_run_too_short_to_say_is_inconclusive() {
         assert!(matches!(
             judged(&[Ack::Acked, Ack::Acked], &[0, 1], 2),
+            Verdict::Inconclusive { .. },
+        ));
+    }
+
+    #[test]
+    fn a_lost_ack_whose_outcomes_have_no_checkpoint_is_inconclusive() {
+        assert!(matches!(
+            judged(&[Ack::Acked, Ack::Unknown], &[0], 1),
             Verdict::Inconclusive { .. },
         ));
     }
