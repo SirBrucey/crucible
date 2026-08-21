@@ -41,11 +41,14 @@ const QUIESCENCE_IDLE: Duration = Duration::from_secs(1);
 /// stop waiting. In practice the scenario ending fires first (a shorter path to
 /// the same "missed" outcome); this only guards a pathological hang.
 const ANCHOR_TIMEOUT: Duration = Duration::from_mins(1);
-/// A freeze is observed through the docker log stream, which lags real traffic.
-/// If the scenario ends before a freeze has been seen, wait this long for a
-/// freeze triggered by a post-ack edge to become visible before concluding the
-/// anchor was missed. Comfortably larger than docker-log delivery latency.
-const FREEZE_GRACE: Duration = Duration::from_secs(1);
+/// A freeze is observed through the docker log stream, which batches, so it can
+/// arrive well after the traffic that caused it. Once the fleet is quiet, wait
+/// this long for one to appear before concluding the anchor was missed.
+///
+/// Only ever paid on the way to reporting a miss, so it costs a run that found
+/// its fault nothing. Reporting a fault that fired as one that never did is
+/// worth more than the seconds this spends.
+const FREEZE_GRACE: Duration = Duration::from_secs(5);
 
 /// Per-worker orchestrator that owns the replica lifecycle around one scenario,
 /// modelled as a typestate so a phase can only reach for what earlier phases
@@ -540,8 +543,9 @@ async fn anchored_run(
     fault: &Fault,
 ) -> Result<(Observations, FaultReport), crucible_plugin::Error> {
     // Arm as the scenario starts: the proxy counts scenario packets from here,
-    // and wait_for_freeze takes its baseline at the same moment, so both share
-    // the scenario-start origin. A failed arm means nothing will ever freeze.
+    // and the freeze baseline is taken at the same moment, so both share the
+    // scenario-start origin. A failed arm means nothing will ever freeze.
+    let baseline = session_observer.freeze_count();
     deployment.substrate().arm_anchor().await?;
 
     let (scenario_end_tx, mut scenario_end_rx) = tokio::sync::oneshot::channel::<()>();
@@ -564,11 +568,28 @@ async fn anchored_run(
     let fault_fut = async {
         let frozen = tokio::select! {
             biased;
-            frozen = session_observer.wait_for_freeze(ANCHOR_TIMEOUT) => frozen,
-            // The scenario finished before a freeze was seen. The freeze is
-            // observed through the docker log stream, which lags real traffic,
-            // so one triggered by a post-ack edge may just not be visible yet.
-            _ = &mut scenario_end_rx => session_observer.wait_for_freeze(FREEZE_GRACE).await,
+            frozen = session_observer.wait_for_freeze(baseline, ANCHOR_TIMEOUT) => frozen,
+            // The scenario finished before a freeze was seen, which does not
+            // mean the anchored packet is not coming: a consumer's edges carry
+            // traffic the scenario never waited for. Wait for the fleet to stop
+            // rather than for a fixed grace, so an anchor is missed only when
+            // its packet never crossed.
+            _ = &mut scenario_end_rx => {
+                tokio::select! {
+                    biased;
+                    frozen = session_observer.wait_for_freeze(baseline, ANCHOR_TIMEOUT) => frozen,
+                    () = session_observer.wait_for_quiescence(
+                        LEARN_SETTLE,
+                        QUIESCENCE_IDLE,
+                        ANCHOR_TIMEOUT,
+                    ) => {
+                        // Quiet, so nothing more is coming. The freeze is read
+                        // through the docker log stream, which lags the traffic
+                        // that caused it, so give a last one time to appear.
+                        session_observer.wait_for_freeze(baseline, FREEZE_GRACE).await
+                    }
+                }
+            }
         };
         if !frozen {
             // The target never reached its Kth packet. Let the fleet go in case
