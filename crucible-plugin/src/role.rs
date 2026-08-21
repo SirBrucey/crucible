@@ -6,7 +6,12 @@
 //! the plugin's own types. The runtime trait is object-safe, so the framework
 //! can hold plugins whose types it cannot name.
 
-use std::{collections::BTreeSet, future::Future, net::SocketAddr, pin::Pin};
+use std::{
+    collections::{BTreeSet, HashMap},
+    future::Future,
+    net::{IpAddr, SocketAddr},
+    pin::Pin,
+};
 
 use crucible_core::{
     fault::Primitive,
@@ -93,6 +98,10 @@ pub trait DeploymentRuntime: Faults {
 
     /// The data plane address for a service's kind, where the test traffic runs.
     fn endpoint(&self, service: &str, kind: &str) -> Option<SocketAddr>;
+
+    /// Which service answers at each address, so an observed peer can be named.
+    /// Read while the fleet is whole.
+    fn addresses(&self) -> BoxFuture<'_, Result<HashMap<IpAddr, String>, Error>>;
 
     /// The control plane address for a service's kind.
     fn control_endpoint(&self, service: &str, kind: &str) -> Option<SocketAddr>;

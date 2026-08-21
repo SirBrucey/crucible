@@ -1,25 +1,61 @@
 //! Where a fault lands, in terms of what the fleet has been observed to do.
 
-use crucible_protocol::Direction;
 pub use crucible_protocol::Primitive;
+use crucible_protocol::{Direction, Edge};
 
 use crate::verdict::Invariant;
 
 /// What to break and how to drive the operation.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub enum Fault {
-    /// Break the fleet at the anchor and read what survived. Killing the service
-    /// takes its process and everything it held; cutting the edge leaves both
-    /// sides running and only the caller the wiser.
-    Durable { anchor: Anchor, by: Losing },
-    /// Run the whole scenario with `service` degraded, then put it back and see
-    /// whether the fleet catches up on what it accepted while it was.
-    Recovers { service: String, by: Losing },
+    /// Break the fleet at the anchor and read what survived.
+    Durable { anchor: Anchor, by: Taking },
+    /// Run the whole scenario degraded, then put it back and see whether the
+    /// fleet catches up on what it accepted while it was.
+    Recovers { by: Taking },
 }
 
-/// A way of making the fleet lose something in flight. Narrower than
-/// [`Primitive`], so nothing downstream has to answer for a fault that could
-/// never have been built.
+/// What a fault takes away. Narrower than [`Primitive`], so nothing downstream
+/// has to answer for a fault that could never have been built.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub enum Taking {
+    /// A service, taken away and brought back. Every edge it holds goes with it;
+    /// an anchor only says when.
+    Kill(String),
+    /// One edge. The services on both ends keep running.
+    Cut(Edge),
+}
+
+impl Taking {
+    #[must_use]
+    pub fn primitive(&self) -> Primitive {
+        match self {
+            Taking::Kill(_) => Primitive::Kill,
+            Taking::Cut(_) => Primitive::Cut,
+        }
+    }
+
+    /// What is done to, spelled for a report to name.
+    #[must_use]
+    pub fn target(&self) -> String {
+        match self {
+            Taking::Kill(service) => service.clone(),
+            Taking::Cut(edge) => edge.to_string(),
+        }
+    }
+}
+
+impl std::fmt::Display for Taking {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Taking::Kill(service) => write!(f, "killing {service}"),
+            Taking::Cut(edge) => write!(f, "cutting {edge}"),
+        }
+    }
+}
+
+/// A way of making the fleet lose something in flight, before it is aimed at
+/// anything. Narrower than [`Primitive`] on the same grounds as [`Taking`].
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize, strum::EnumIter,
 )]
@@ -72,36 +108,30 @@ impl Fault {
         }
     }
 
-    /// The service the fault is done to.
+    /// What the fault takes away.
     #[must_use]
-    pub fn service(&self) -> &str {
+    pub fn taking(&self) -> &Taking {
         match self {
-            Fault::Durable { anchor, .. } => &anchor.service,
-            Fault::Recovers { service, .. } => service,
-        }
-    }
-
-    /// Which way the fleet is made to lose something.
-    #[must_use]
-    pub fn losing(&self) -> Losing {
-        match self {
-            Fault::Durable { by, .. } | Fault::Recovers { by, .. } => *by,
+            Fault::Durable { by, .. } | Fault::Recovers { by, .. } => by,
         }
     }
 
     /// What is done to the fleet.
     #[must_use]
     pub fn primitive(&self) -> Primitive {
-        self.losing().into()
+        self.taking().primitive()
     }
 }
 
-/// Where a fault lands: once `service` has forwarded `k` packets on
-/// `direction`. Anchoring to observed traffic rather than a wall clock is what
-/// makes a schedule reproducible across replicas.
+/// Where a fault lands: once `edge` has carried `k` packets on `direction`.
+/// Anchoring to observed traffic rather than a wall clock is what makes a
+/// schedule reproducible across replicas.
+///
+/// The edge supplies the moment, not the target. A kill on either of its ends
+/// takes that whole service, every other edge it holds included.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct Anchor {
-    pub service: String,
+    pub edge: Edge,
     pub direction: Direction,
     pub k: u32,
 }

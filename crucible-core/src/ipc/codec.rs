@@ -181,11 +181,14 @@ mod tests {
             vec![check()],
             crate::fault::Fault::Durable {
                 anchor: crate::fault::Anchor {
-                    service: "db".into(),
+                    edge: crucible_protocol::Edge {
+                        client: Some("api".into()),
+                        upstream: "db".into(),
+                    },
                     direction: Direction::ClientToUpstream,
                     k: 3,
                 },
-                by: crate::fault::Losing::Kill,
+                by: crate::fault::Taking::Kill("db".into()),
             },
             vec![
                 vec![Some(crate::plan::Value::Int(0))],

@@ -1,9 +1,12 @@
-//! Recovery scheduler: one schedule per `(service, way of degrading it)`. The
-//! fleet runs the whole scenario degraded and is put back afterwards, so what it
-//! accepted while down is what it has to have caught up on.
+//! Recovery scheduler: one schedule per way of degrading the fleet, held for the
+//! whole scenario and put back afterwards, so what it accepted while down is
+//! what it has to have caught up on.
+//!
+//! Losing a service degrades every edge it holds; losing one edge leaves both
+//! its ends running, so a service reachable another way carries on.
 
 use crucible_core::{
-    fault::{Fault, Losing},
+    fault::{Fault, Losing, Taking},
     learned::Learned,
     plan,
     schedule::Schedule,
@@ -18,9 +21,8 @@ pub struct RecoveryScheduler {
 }
 
 impl RecoveryScheduler {
-    /// Degrade each of the fleet's services, one schedule per way of degrading
-    /// it. Nothing is anchored to a packet: the fault is in place before the
-    /// scenario starts.
+    /// Degrade the fleet every way it can be degraded. Nothing is anchored to a
+    /// packet: the fault is in place before the scenario starts.
     #[must_use]
     pub fn new(
         fleet: &plan::Fleet,
@@ -29,25 +31,22 @@ impl RecoveryScheduler {
         ways: &[Losing],
         first_id: u32,
     ) -> Self {
-        let mut schedules = Vec::new();
         let mut next_id = first_id;
-        for service in &fleet.services {
-            for by in ways {
-                schedules.push(Schedule::faulted(
+        let schedules: Vec<Schedule> = degradations(fleet, learned, ways)
+            .map(|by| {
+                let schedule = Schedule::faulted(
                     next_id,
                     fleet.clone(),
                     scenario.steps.clone(),
                     scenario.checks.clone(),
-                    Fault::Recovers {
-                        service: service.name.clone(),
-                        by: *by,
-                    },
+                    Fault::Recovers { by },
                     learned.trajectory.clone(),
                     scenario.consistent_within,
-                ));
+                );
                 next_id += 1;
-            }
-        }
+                schedule
+            })
+            .collect();
         Self {
             total: schedules.len(),
             schedules: schedules.into_iter(),
@@ -57,8 +56,8 @@ impl RecoveryScheduler {
     /// How many schedules degrading this fleet takes, before building any. The
     /// campaign needs it to reserve their cost against its budget.
     #[must_use]
-    pub fn count(fleet: &plan::Fleet, ways: &[Losing]) -> usize {
-        fleet.services.len() * ways.len()
+    pub fn count(fleet: &plan::Fleet, learned: &Learned, ways: &[Losing]) -> usize {
+        degradations(fleet, learned, ways).count()
     }
 
     #[must_use]
@@ -71,6 +70,32 @@ impl Scheduler for RecoveryScheduler {
     fn next(&mut self) -> Option<Schedule> {
         self.schedules.next()
     }
+}
+
+/// Every way this fleet can be held degraded: each service the author declared,
+/// and each edge the fault-free run saw carry traffic.
+fn degradations<'a>(
+    fleet: &'a plan::Fleet,
+    learned: &'a Learned,
+    ways: &'a [Losing],
+) -> impl Iterator<Item = Taking> + 'a {
+    ways.iter()
+        .flat_map(move |by| -> Box<dyn Iterator<Item = Taking> + 'a> {
+            match by {
+                Losing::Kill => Box::new(
+                    fleet
+                        .services
+                        .iter()
+                        .map(|service| Taking::Kill(service.name.clone())),
+                ),
+                Losing::Cut => Box::new(
+                    learned
+                        .profiles
+                        .iter()
+                        .map(|profile| Taking::Cut(profile.edge.clone())),
+                ),
+            }
+        })
 }
 
 /// The ways this scheduler can degrade a fleet, out of what the campaign found
@@ -89,13 +114,13 @@ mod tests {
     use std::collections::BTreeSet;
 
     use crucible_core::fault::Primitive;
-    use crucible_protocol::ServiceProfile;
+    use crucible_protocol::{Burst, Edge, EdgeProfile};
 
     use super::*;
     use crate::scheduler::fixture;
 
-    fn carrying(packets: u32) -> crucible_protocol::Burst {
-        crucible_protocol::Burst {
+    fn carrying(packets: u32) -> Burst {
+        Burst {
             start: 0,
             mid: packets.div_ceil(2),
             end: packets,
@@ -103,13 +128,17 @@ mod tests {
         }
     }
 
-    /// A fault-free run that observed traffic for `seen` and nothing else.
+    /// A fault-free run that saw traffic on the edges into `seen` and nothing
+    /// else.
     fn learned(seen: &[&str]) -> Learned {
         Learned {
             profiles: seen
                 .iter()
-                .map(|service| ServiceProfile {
-                    service: (*service).to_string(),
+                .map(|upstream| EdgeProfile {
+                    edge: Edge {
+                        client: None,
+                        upstream: (*upstream).to_string(),
+                    },
                     client_to_upstream: vec![carrying(1)],
                     upstream_to_client: vec![carrying(1)],
                 })
@@ -130,29 +159,38 @@ mod tests {
         std::iter::from_fn(move || s.next()).collect()
     }
 
-    #[test]
-    fn one_schedule_per_service_per_way_of_degrading_it() {
-        let fleet = fixture::fleet().services.len();
-        assert_eq!(schedules(&[Losing::Kill], &[]).len(), fleet);
-        assert_eq!(
-            schedules(&[Losing::Kill, Losing::Cut], &[]).len(),
-            fleet * 2
-        );
-    }
-
-    #[test]
-    fn a_service_the_run_saw_no_traffic_for_is_still_degraded() {
-        let degraded: Vec<String> = schedules(&[Losing::Kill], &[])
+    /// What each schedule degrades.
+    fn degraded(ways: &[Losing], seen: &[&str]) -> Vec<String> {
+        schedules(ways, seen)
             .iter()
             .map(|schedule| {
                 schedule
                     .fault
                     .as_ref()
                     .expect("a recovery run faults")
-                    .service()
-                    .to_owned()
+                    .taking()
+                    .target()
             })
-            .collect();
+            .collect()
+    }
+
+    #[test]
+    fn one_schedule_per_service_to_kill() {
+        let fleet = fixture::fleet().services.len();
+        assert_eq!(schedules(&[Losing::Kill], &["db"]).len(), fleet);
+    }
+
+    /// A cut is per edge, and which edges exist is what the run observed, so a
+    /// fleet whose services never spoke offers nothing to cut.
+    #[test]
+    fn one_schedule_per_observed_edge_to_cut() {
+        assert_eq!(schedules(&[Losing::Cut], &["db", "api"]).len(), 2);
+        assert!(schedules(&[Losing::Cut], &[]).is_empty());
+    }
+
+    #[test]
+    fn a_service_the_run_saw_no_traffic_for_is_still_degraded() {
+        let degraded = degraded(&[Losing::Kill], &[]);
         for service in &fixture::fleet().services {
             assert!(degraded.contains(&service.name), "{}", service.name);
         }

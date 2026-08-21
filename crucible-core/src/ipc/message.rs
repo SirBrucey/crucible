@@ -1,4 +1,4 @@
-pub use crucible_protocol::{FaultReport, ServiceProfile, Session};
+pub use crucible_protocol::{EdgeProfile, FaultReport, Session};
 
 use crate::{learned::Learned, schedule::Schedule};
 

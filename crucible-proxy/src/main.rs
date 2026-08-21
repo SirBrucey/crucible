@@ -1,7 +1,12 @@
 mod error;
 mod proxy;
 
-use std::{io::Write, net::SocketAddr};
+use std::{
+    collections::HashSet,
+    io::Write,
+    net::SocketAddr,
+    sync::{Arc, OnceLock},
+};
 
 use clap::Parser;
 use crucible_protocol::{Direction, Primitive};
@@ -12,7 +17,7 @@ use tokio::{
 
 use crate::{
     error::{Error, Result},
-    proxy::{Anchor, Gate, Proxy, Relay},
+    proxy::{Anchor, Gate, OnEdge, Proxy, Relay},
 };
 
 #[derive(Parser)]
@@ -29,8 +34,10 @@ struct Cli {
     /// not infected by the framework's own.
     #[arg(long = "control")]
     control: Vec<String>,
-    /// Fault anchor `SERVICE=DIRECTION=K` (DIRECTION is `c2u` or `u2c`): place
-    /// the fault once `SERVICE` has forwarded `K` packets in that direction.
+    /// Fault anchor `CLIENT>UPSTREAM=DIRECTION=K` (DIRECTION is `c2u` or
+    /// `u2c`): place the fault once that edge has carried `K` packets in that
+    /// direction. An empty CLIENT (`>db=c2u=3`) is the edge dialled from
+    /// outside the fleet.
     #[arg(long = "fault-at")]
     fault_at: Option<String>,
     /// What to do to the fleet at the anchored packet. `kill` freezes and waits
@@ -38,8 +45,8 @@ struct Cli {
     /// the connection between the proxy and the two services.
     #[arg(long = "fault", default_value = "kill")]
     fault: Primitive,
-    /// Hold `SERVICE`'s pairs down from scenario start until released, so the
-    /// fleet runs degraded rather than meeting one instantaneous fault.
+    /// Hold the edge `CLIENT>UPSTREAM` down from scenario start until released,
+    /// so the fleet runs degraded rather than meeting one instantaneous fault.
     #[arg(long = "degrade")]
     degrade: Option<String>,
 }
@@ -73,10 +80,11 @@ impl TryFrom<Primitive> for Fault {
     }
 }
 
-/// A parsed `--fault-at` anchor: place the fault once `service` forwards `k`
-/// packets in `direction`.
+/// A parsed `--fault-at` anchor: place the fault once the edge from `client` to
+/// `upstream` has carried `k` packets in `direction`.
 struct FaultAt {
-    service: String,
+    client: Option<String>,
+    upstream: String,
     direction: Direction,
     k: u32,
 }
@@ -88,24 +96,75 @@ fn is_fronted(service: &str, pairs: &[String]) -> bool {
         .any(|spec| spec.split('=').next() == Some(service))
 }
 
+/// The service each pair fronts, and the host it forwards to, which is where
+/// that service answers.
+fn fronted(pairs: &[String]) -> Vec<(String, String)> {
+    pairs
+        .iter()
+        .filter_map(|spec| {
+            let mut parts = spec.splitn(3, '=');
+            let (service, _listen, upstream) = (parts.next()?, parts.next()?, parts.next()?);
+            // The upstream is `host:port`; only the host names the container.
+            let host = upstream.rsplit_once(':').map_or(upstream, |(host, _)| host);
+            Some((service.to_owned(), host.to_owned()))
+        })
+        .collect()
+}
+
+/// An edge as `CLIENT>UPSTREAM`, where an empty CLIENT was dialled from outside
+/// the fleet.
+fn parse_edge(spec: &str) -> Result<(Option<String>, String)> {
+    let (client, upstream) = spec
+        .split_once('>')
+        .ok_or_else(|| Error::MalformedFaultAt { spec: spec.into() })?;
+    Ok((
+        (!client.is_empty()).then(|| client.to_owned()),
+        upstream.to_owned(),
+    ))
+}
+
 fn parse_fault_at(spec: &str) -> Result<FaultAt> {
+    let malformed = || Error::MalformedFaultAt { spec: spec.into() };
     let mut parts = spec.splitn(3, '=');
-    let (Some(service), Some(dir), Some(k)) = (parts.next(), parts.next(), parts.next()) else {
-        return Err(Error::MalformedFaultAt { spec: spec.into() });
+    let (Some(edge), Some(dir), Some(k)) = (parts.next(), parts.next(), parts.next()) else {
+        return Err(malformed());
     };
+    let (client, upstream) = parse_edge(edge)?;
     let direction = match dir {
         "c2u" => Direction::ClientToUpstream,
         "u2c" => Direction::UpstreamToClient,
-        _ => return Err(Error::MalformedFaultAt { spec: spec.into() }),
+        _ => return Err(malformed()),
     };
-    let k = k
-        .parse()
-        .map_err(|_| Error::MalformedFaultAt { spec: spec.into() })?;
     Ok(FaultAt {
-        service: service.into(),
+        client,
+        upstream,
         direction,
-        k,
+        k: k.parse().map_err(|_| malformed())?,
     })
+}
+
+/// Every address the fleet's services answer at, and those of `client` alone.
+///
+/// Read as the scenario starts, when the fleet is up and its names resolve.
+/// Nothing is looked up while bytes are moving.
+async fn resolve(hosts: &[(String, String)], client: Option<&str>) -> OnEdge {
+    let mut fleet = HashSet::new();
+    let mut theirs = HashSet::new();
+    for (service, host) in hosts {
+        // A host with no port does not resolve, and which port it answers on
+        // does not change which container it is.
+        let Ok(addrs) = tokio::net::lookup_host((host.as_str(), 0)).await else {
+            tracing::warn!(%service, %host, "did not resolve, so its traffic is not recognised");
+            continue;
+        };
+        for addr in addrs {
+            fleet.insert(addr.ip());
+            if client == Some(service.as_str()) {
+                theirs.insert(addr.ip());
+            }
+        }
+    }
+    OnEdge::new(theirs, fleet, client.is_none())
 }
 
 #[tokio::main]
@@ -136,10 +195,10 @@ async fn main() -> Result<()> {
     // silently never count (k>0, no pair increments it) or, on arm, freeze the
     // whole fleet for a target that is not even fronted (k=0).
     if let Some(at) = &at
-        && !is_fronted(&at.service, &cli.pairs)
+        && !is_fronted(&at.upstream, &cli.pairs)
     {
         return Err(Error::UnknownFaultService {
-            service: at.service.clone(),
+            service: at.upstream.clone(),
         });
     }
     // Bumped to sever the anchored pairs. A service may be fronted on several
@@ -147,19 +206,32 @@ async fn main() -> Result<()> {
     let (sever_tx, sever_rx) = watch::channel(0u64);
     // Held down for the whole scenario, rather than severed on one packet.
     let (down_tx, down_rx) = watch::channel(false);
-    if let Some(service) = &cli.degrade
-        && !is_fronted(service, &cli.pairs)
+    let degrade = cli.degrade.as_deref().map(parse_edge).transpose()?;
+    if let Some((_, upstream)) = &degrade
+        && !is_fronted(upstream, &cli.pairs)
     {
         return Err(Error::UnknownFaultService {
-            service: service.clone(),
+            service: upstream.clone(),
         });
     }
+    // Where each service answers, which is what names the far end of a
+    // connection. Taken before the pairs are consumed below.
+    let hosts = fronted(&cli.pairs);
+    // Which connections the fault applies to. A pair carries every client that
+    // dials its upstream, and a fault is placed on one edge.
+    let edge: Arc<OnceLock<OnEdge>> = Arc::new(OnceLock::new());
     let job = match &at {
         Some(at) => Job::Anchored {
-            anchor: Anchor::new(at.direction, at.k, pause_tx.clone(), trip_tx),
+            anchor: Anchor::new(
+                at.direction,
+                at.k,
+                pause_tx.clone(),
+                trip_tx,
+                Arc::clone(&edge),
+            ),
             fault,
         },
-        None if cli.degrade.is_some() => Job::Degrade {
+        None if degrade.is_some() => Job::Degrade {
             down: down_tx.clone(),
         },
         None => Job::Observe,
@@ -169,53 +241,38 @@ async fn main() -> Result<()> {
         Job::Observe | Job::Degrade { .. } => None,
     };
 
-    for spec in cli.pairs {
-        let Pair {
-            service,
-            listen,
-            upstream,
-        } = Pair::parse(&spec)?;
+    for spec in &cli.pairs {
         // Only the pairs fronting the anchored service count toward the fault,
         // and only they can be severed by it.
-        let anchored = at.as_ref().is_some_and(|at| at.service == service);
-        let severings = if anchored {
-            sever_rx.clone()
-        } else {
-            watch::channel(0u64).1
-        };
-        let degraded = cli.degrade.as_deref() == Some(service.as_str());
-        let down = if degraded {
-            down_rx.clone()
-        } else {
-            watch::channel(false).1
-        };
-        let gate = Gate::new(pause_rx.clone(), severings, down);
-        let pair_anchor = anchored.then(|| anchor.clone()).flatten();
-        let (proxy, _local_addr, mut events) =
-            Proxy::bind(listen, upstream.clone(), gate, pair_anchor).await?;
-        tracing::info!(%service, %listen, %upstream, "proxy pair up");
-
-        tokio::spawn(async move {
-            if let Err(e) = proxy.run().await {
-                tracing::error!(?e, "proxy accept loop ended");
-            }
-        });
-        // One process fronts the whole fleet, so every pair tags its events with
-        // its service; the runner attributes the interleaved stream by that tag.
-        tokio::spawn(async move {
-            while let Some(event) = events.recv().await {
-                match serde_json::to_string(&event) {
-                    Ok(line) => {
-                        println!("{service}\t{line}");
-                        let _ = std::io::stdout().flush();
-                    }
-                    Err(e) => tracing::error!(?e, "serialize conn event"),
-                }
-            }
-        });
+        let pair = Pair::parse(spec)?;
+        let anchored = at.as_ref().is_some_and(|at| at.upstream == pair.service);
+        let degraded = degrade
+            .as_ref()
+            .is_some_and(|(_, upstream)| *upstream == pair.service);
+        let gate = Gate::new(
+            pause_rx.clone(),
+            if anchored {
+                sever_rx.clone()
+            } else {
+                watch::channel(0u64).1
+            },
+            if degraded {
+                down_rx.clone()
+            } else {
+                watch::channel(false).1
+            },
+            Arc::clone(&edge),
+        );
+        serve(pair, gate, anchored.then(|| anchor.clone()).flatten()).await?;
     }
 
-    spawn_fault_control(job, trip_rx, pause_tx, sever_tx);
+    // Whichever of the two placed a fault named the edge it applies to.
+    let client = at
+        .as_ref()
+        .map(|at| at.client.clone())
+        .or_else(|| degrade.as_ref().map(|(client, _)| client.clone()))
+        .flatten();
+    spawn_fault_control(job, trip_rx, pause_tx, sever_tx, edge, hosts, client);
 
     for spec in cli.control {
         let Pair {
@@ -264,6 +321,39 @@ impl Pair {
     }
 }
 
+/// Bring one pair up and report what crosses it, for the lifetime of the
+/// process.
+async fn serve(pair: Pair, gate: Gate, anchor: Option<Anchor>) -> Result<()> {
+    let Pair {
+        service,
+        listen,
+        upstream,
+    } = pair;
+    let (proxy, _local_addr, mut events) =
+        Proxy::bind(listen, upstream.clone(), gate, anchor).await?;
+    tracing::info!(%service, %listen, %upstream, "proxy pair up");
+
+    tokio::spawn(async move {
+        if let Err(e) = proxy.run().await {
+            tracing::error!(?e, "proxy accept loop ended");
+        }
+    });
+    // One process fronts the whole fleet, so every pair tags its events with
+    // its service; the runner attributes the interleaved stream by that tag.
+    tokio::spawn(async move {
+        while let Some(event) = events.recv().await {
+            match serde_json::to_string(&event) {
+                Ok(line) => {
+                    println!("{service}\t{line}");
+                    let _ = std::io::stdout().flush();
+                }
+                Err(e) => tracing::error!(?e, "serialize conn event"),
+            }
+        }
+    });
+    Ok(())
+}
+
 /// Do this proxy's job for the lifetime of the process: impose it when the
 /// scenario starts (SIGUSR1), and lift it when told the run is over (SIGUSR2)
 /// or that nothing was placed (SIGHUP).
@@ -274,6 +364,9 @@ fn spawn_fault_control(
     mut trip: watch::Receiver<bool>,
     pause: watch::Sender<bool>,
     sever: watch::Sender<u64>,
+    edge: Arc<OnceLock<OnEdge>>,
+    hosts: Vec<(String, String)>,
+    client: Option<String>,
 ) {
     tokio::spawn(async move {
         let (mut arm, mut proceed, mut abandon) = match (
@@ -289,7 +382,16 @@ fn spawn_fault_control(
         };
         loop {
             tokio::select! {
-                _ = arm.recv() => job.arm(),
+                _ = arm.recv() => {
+                    // The fleet answers to its names only once it is up, so the
+                    // edge is resolved here rather than at bind.
+                    if edge.get().is_none()
+                        && edge.set(resolve(&hosts, client.as_deref()).await).is_err()
+                    {
+                        tracing::warn!("the edge was resolved twice, so the first stands");
+                    }
+                    job.arm();
+                }
                 Ok(()) = trip.changed() => {
                     if !*trip.borrow() {
                         continue;
@@ -379,28 +481,44 @@ mod tests {
 
     #[test]
     fn parses_a_client_to_upstream_anchor() {
-        let at = parse_fault_at("db=c2u=3").expect("valid spec");
-        assert_eq!(at.service, "db");
+        let at = parse_fault_at("api>db=c2u=3").expect("valid spec");
+        assert_eq!(at.client.as_deref(), Some("api"));
+        assert_eq!(at.upstream, "db");
         assert_eq!(at.direction, Direction::ClientToUpstream);
         assert_eq!(at.k, 3);
     }
 
     #[test]
     fn parses_an_upstream_to_client_anchor() {
-        let at = parse_fault_at("api=u2c=0").expect("valid spec");
-        assert_eq!(at.service, "api");
+        let at = parse_fault_at("inventory>api=u2c=0").expect("valid spec");
+        assert_eq!(at.client.as_deref(), Some("inventory"));
+        assert_eq!(at.upstream, "api");
         assert_eq!(at.direction, Direction::UpstreamToClient);
         assert_eq!(at.k, 0);
     }
 
+    /// The framework driving a step is not one of the fleet's services, so the
+    /// edge it dials has no near end to name.
+    #[test]
+    fn parses_an_anchor_on_an_edge_from_outside_the_fleet() {
+        let at = parse_fault_at(">api=c2u=1").expect("valid spec");
+        assert_eq!(at.client, None);
+        assert_eq!(at.upstream, "api");
+    }
+
+    #[test]
+    fn rejects_an_anchor_naming_no_edge() {
+        assert!(parse_fault_at("db=c2u=3").is_err());
+    }
+
     #[test]
     fn rejects_an_unknown_direction() {
-        assert!(parse_fault_at("db=sideways=3").is_err());
+        assert!(parse_fault_at("api>db=sideways=3").is_err());
     }
 
     #[test]
     fn rejects_a_non_numeric_k() {
-        assert!(parse_fault_at("db=c2u=three").is_err());
+        assert!(parse_fault_at("api>db=c2u=three").is_err());
     }
 
     #[test]

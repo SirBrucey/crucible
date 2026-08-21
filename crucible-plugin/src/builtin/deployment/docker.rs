@@ -18,12 +18,12 @@ use bollard::{
         LogsOptionsBuilder, RemoveContainerOptionsBuilder, StartContainerOptions,
     },
 };
-use crucible_protocol::{Direction, now_ns};
+use crucible_protocol::{Direction, Edge, now_ns};
 use futures_util::{StreamExt, TryStreamExt};
 use tokio::time::sleep;
 
 use crucible_core::{
-    fault::{Fault, Primitive},
+    fault::{Fault, Primitive, Taking},
     observer::SessionObserver,
     plan,
     schema::{AttrDecl, AttrSchema, ValueType},
@@ -171,7 +171,7 @@ struct Endpoints {
 /// What the proxy needs told about `fault`, which is nothing unless the proxy is
 /// the one placing it. A kill is done to the container either way.
 fn proxy_fault_args(fault: &Fault) -> Vec<String> {
-    match (fault.anchor(), fault.primitive()) {
+    match (fault.anchor(), fault.taking()) {
         (Some(anchor), by) => {
             let direction = match anchor.direction {
                 Direction::ClientToUpstream => "c2u",
@@ -179,14 +179,24 @@ fn proxy_fault_args(fault: &Fault) -> Vec<String> {
             };
             vec![
                 "--fault-at".to_owned(),
-                format!("{}={}={}", anchor.service, direction, anchor.k),
+                format!("{}={}={}", edge_arg(&anchor.edge), direction, anchor.k),
                 "--fault".to_owned(),
-                by.to_string(),
+                by.primitive().to_string(),
             ]
         }
-        (None, Primitive::Cut) => vec!["--degrade".to_owned(), fault.service().to_owned()],
-        (None, _) => Vec::new(),
+        (None, Taking::Cut(edge)) => vec!["--degrade".to_owned(), edge_arg(edge)],
+        (None, Taking::Kill(_)) => Vec::new(),
     }
+}
+
+/// An edge as the proxy takes it: `CLIENT>UPSTREAM`, with CLIENT empty for one
+/// dialled from outside the fleet.
+fn edge_arg(edge: &Edge) -> String {
+    format!(
+        "{}>{}",
+        edge.client.as_deref().unwrap_or_default(),
+        edge.upstream
+    )
 }
 
 /// Where a service's control plane listens inside the proxy. Far enough above
@@ -452,6 +462,37 @@ impl Docker {
             .await?;
         wait_container_ready(&self.client, &container).await?;
         Ok(now_ns())
+    }
+
+    /// The address each service's container holds on the replica's network.
+    ///
+    /// A container that cannot be inspected, or that holds no address, is left
+    /// out rather than failing the read: a peer that goes unnamed costs one
+    /// edge's attribution, where an error costs the whole catalogue.
+    async fn container_addresses(&self) -> Result<HashMap<IpAddr, String>> {
+        let mut addresses = HashMap::new();
+        for service in &self.services {
+            let container = self.backing_container_name(service);
+            let Ok(inspect) = self.client.inspect_container(&container, None).await else {
+                tracing::warn!(%container, "could not inspect, so its traffic goes unattributed");
+                continue;
+            };
+            let networks = inspect
+                .network_settings
+                .and_then(|settings| settings.networks)
+                .unwrap_or_default();
+            let held = networks.into_values().flat_map(|endpoint| {
+                [endpoint.ip_address, endpoint.global_ipv6_address]
+                    .into_iter()
+                    .flatten()
+            });
+            for address in held {
+                if let Ok(address) = address.parse::<IpAddr>() {
+                    addresses.insert(address, service.name.clone());
+                }
+            }
+        }
+        Ok(addresses)
     }
 
     async fn create_replica(&mut self) -> Result<()> {
@@ -865,6 +906,10 @@ impl DeploymentRuntime for Docker {
             .control
             .get(&(service.to_owned(), kind.to_owned()))
             .copied()
+    }
+
+    fn addresses(&self) -> BoxFuture<'_, Result<HashMap<IpAddr, String>, PluginError>> {
+        Box::pin(async move { self.container_addresses().await.map_err(PluginError::from) })
     }
 
     /// The proxy writes its event lines to its container's stdout, so following

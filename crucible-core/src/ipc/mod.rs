@@ -3,7 +3,7 @@ mod message;
 
 use std::time::Duration;
 
-pub use message::{RunnerToWorker, ServiceProfile, Session, Verdict, WorkerEvent, WorkerToRunner};
+pub use message::{EdgeProfile, RunnerToWorker, Session, Verdict, WorkerEvent, WorkerToRunner};
 
 /// How often a busy worker emits a [`WorkerToRunner::Heartbeat`], so the runner
 /// can tell a slow-but-alive worker from a hung or dead one.
