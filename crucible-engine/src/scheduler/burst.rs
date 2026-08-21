@@ -1,6 +1,6 @@
 //! Burst scheduler: faults placed against the bursts of traffic the learn pass
 //! saw (it does the clustering, see
-//! [`crucible_core::proxy_log::service_profiles_from_sessions`]).
+//! [`crucible_core::proxy_log::edge_profiles_from_sessions`]).
 //!
 //! Every burst on every edge is faulted before any burst is faulted at more than
 //! one point, so a short budget costs resolution within a burst rather than

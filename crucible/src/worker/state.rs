@@ -212,7 +212,9 @@ impl Worker<Idle> {
                         schedule_id = schedule.id,
                         "received learn"
                     );
-                    Ok(IdleNext::Learn(self.transition(Learning { schedule })))
+                    Ok(IdleNext::Learn(self.transition(Learning {
+                        schedule: *schedule,
+                    })))
                 }
                 Some(fault) => {
                     tracing::info!(
@@ -222,9 +224,10 @@ impl Worker<Idle> {
                         invariant = ?fault.invariant(),
                         "received schedule"
                     );
-                    Ok(IdleNext::Work(
-                        self.transition(Executing { schedule, fault }),
-                    ))
+                    Ok(IdleNext::Work(self.transition(Executing {
+                        schedule: *schedule,
+                        fault,
+                    })))
                 }
             },
             other @ RunnerToWorker::HelloAck { .. } => Err(Error::UnexpectedMessage {

@@ -386,7 +386,7 @@ async fn teardown_replica(
 
 /// A [`FaultReport`] for a fault that did not fire, for the given reason.
 fn missed(id: u32, fault: &Fault, reason: FaultMissReason) -> FaultReport {
-    FaultReport::missed(id, &fault.taking().target(), reason)
+    FaultReport::missed(id, fault.taking().target(), reason)
 }
 
 /// Read what the fleet settled on, one reading per check the scenario states.
@@ -645,7 +645,7 @@ async fn degraded_run(
         observations,
         FaultReport::fired(
             id,
-            &fault.taking().target(),
+            fault.taking().target(),
             fault.primitive(),
             At::Throughout,
             placed_at_ns,
@@ -687,7 +687,7 @@ async fn place(
         .expect("an anchored fault is placed on a packet");
     Ok(FaultReport::fired(
         id,
-        &fault.taking().target(),
+        fault.taking().target(),
         fault.primitive(),
         At::Packet {
             direction: anchor.direction,
