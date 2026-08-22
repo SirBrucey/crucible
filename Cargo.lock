@@ -541,6 +541,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "crucible-kind-amqp"
+version = "0.1.0"
+
+[[package]]
 name = "crucible-plugin"
 version = "0.1.0"
 dependencies = [
