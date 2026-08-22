@@ -126,6 +126,48 @@ fn body_ends(frames: &[Frame], at: usize) -> Option<usize> {
     Some(last)
 }
 
+/// Reads one direction of one connection, across as many reads as it takes.
+///
+/// A frame can arrive split over several reads and a message over several
+/// frames, so what is not yet whole is held here until the rest of it turns up.
+#[derive(Debug, Default)]
+pub struct Reader {
+    /// Bytes belonging to an operation that has not finished arriving.
+    pending: Vec<u8>,
+}
+
+impl crucible_protocol::Operations for Reader {
+    fn read(&mut self, bytes: &[u8]) -> usize {
+        Reader::read(self, bytes).len()
+    }
+}
+
+impl Reader {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Take the next `bytes` off the wire and return the operations they
+    /// completed, in the order they were sent.
+    ///
+    /// Each one's `at` indexes what this reader had buffered, which is its own
+    /// bytes and not the caller's.
+    pub fn read(&mut self, bytes: &[u8]) -> Vec<Message> {
+        self.pending.extend_from_slice(bytes);
+        let decoded = crate::frame::decode(&self.pending);
+        let (messages, whole) = read(&decoded.frames);
+        // Frames belonging to an operation still arriving stay pending, along
+        // with the bytes behind them.
+        let consumed = match whole {
+            0 => 0,
+            whole => decoded.frames[whole - 1].at.end,
+        };
+        self.pending.drain(..consumed);
+        messages
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,6 +204,68 @@ mod tests {
         let mut header = frame(Kind::Header, 14, at);
         header.body_size = Some(size);
         header
+    }
+
+    /// The bytes of a frame of `ty` on channel 1 carrying `payload`.
+    fn wire(ty: u8, payload: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![ty, 0, 1];
+        bytes.extend_from_slice(
+            &u32::try_from(payload.len())
+                .expect("a test payload")
+                .to_be_bytes(),
+        );
+        bytes.extend_from_slice(payload);
+        bytes.push(0xCE);
+        bytes
+    }
+
+    /// The bytes of a publish carrying `body`.
+    fn publish(body: &[u8]) -> Vec<u8> {
+        let mut method = 60u16.to_be_bytes().to_vec();
+        method.extend_from_slice(&basic::PUBLISH.to_be_bytes());
+        let mut header = vec![0, 60, 0, 0];
+        header.extend_from_slice(&(body.len() as u64).to_be_bytes());
+        header.extend_from_slice(&[0, 0]);
+
+        let mut bytes = wire(1, &method);
+        bytes.extend(wire(2, &header));
+        if !body.is_empty() {
+            bytes.extend(wire(3, body));
+        }
+        bytes
+    }
+
+    /// A message split anywhere still arrives once, whole. This is what the
+    /// reader is for: the wire hands over bytes, not messages.
+    #[test]
+    fn a_publish_split_across_reads_is_read_once_it_is_whole() {
+        let bytes = publish(b"an order");
+        for split in 1..bytes.len() {
+            let mut reader = Reader::new();
+            let first = reader.read(&bytes[..split]);
+            let second = reader.read(&bytes[split..]);
+            assert_eq!(
+                first.len() + second.len(),
+                1,
+                "split at {split} read it {} times",
+                first.len() + second.len()
+            );
+        }
+    }
+
+    #[test]
+    fn a_reader_counts_across_reads_rather_than_within_one() {
+        let mut reader = Reader::new();
+        let mut bytes = publish(b"one");
+        bytes.extend(publish(b"two"));
+        assert_eq!(reader.read(&bytes).len(), 2, "both in one read");
+
+        let mut reader = Reader::new();
+        let mut seen = 0;
+        for byte in bytes.chunks(1) {
+            seen += reader.read(byte).len();
+        }
+        assert_eq!(seen, 2, "the same two, a byte at a time");
     }
 
     #[test]

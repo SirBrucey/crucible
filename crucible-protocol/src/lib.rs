@@ -14,6 +14,20 @@ pub use session::{Session, WriteRecord};
 
 use serde::{Deserialize, Serialize};
 
+/// Reads one direction of one connection as the operations it carries.
+///
+/// What a fault is placed against is an operation the fleet performs, not a
+/// chunk the kernel happened to hand over: those vary run to run, and a schedule
+/// that named the second one would land somewhere else next time. Telling one
+/// from the next is the protocol's business, so it is a plugin's.
+///
+/// One is made per direction, and holds whatever has not finished arriving.
+pub trait Operations: Send {
+    /// Take the next `bytes` off the wire and return how many operations they
+    /// completed.
+    fn read(&mut self, bytes: &[u8]) -> usize;
+}
+
 /// A link the proxy carries.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
 pub struct Edge {
