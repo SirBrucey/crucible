@@ -17,16 +17,17 @@ use tokio::{
 
 use crate::{
     error::{Error, Result},
-    proxy::{Anchor, Gate, OnEdge, Proxy, Relay},
+    proxy::{Anchor, Gate, OnEdge, Proxy, Relay, Upstream},
 };
 
 #[derive(Parser)]
 #[command(about = "Multi-listener bytes-through proxy for a crucible fleet")]
 struct Cli {
-    /// Listen and upstream pair in the form `SERVICE=LISTEN=UPSTREAM`
-    /// (e.g. `db=0.0.0.0:3306=db-actual:3306`). A pair connects a service to
-    /// the proxy, and a service-to-service edge is two of them. Test traffic is
-    /// driven and monitored here.
+    /// Listen and upstream pair in the form `SERVICE=KIND=LISTEN=UPSTREAM`
+    /// (e.g. `db=mariadb=0.0.0.0:3306=db-actual:3306`). A pair connects a
+    /// service to the proxy, and a service-to-service edge is two of them. Test
+    /// traffic is driven and monitored here. KIND is what the service speaks,
+    /// which decides what the proxy can make of the bytes crossing it.
     #[arg(long = "pair", required = true)]
     pairs: Vec<String>,
     /// A side channel to the same services, in the same form, for faulting and
@@ -102,11 +103,13 @@ fn fronted(pairs: &[String]) -> Vec<(String, String)> {
     pairs
         .iter()
         .filter_map(|spec| {
-            let mut parts = spec.splitn(3, '=');
-            let (service, _listen, upstream) = (parts.next()?, parts.next()?, parts.next()?);
+            let pair = Pair::parse(spec).ok()?;
             // The upstream is `host:port`; only the host names the container.
-            let host = upstream.rsplit_once(':').map_or(upstream, |(host, _)| host);
-            Some((service.to_owned(), host.to_owned()))
+            let host = pair
+                .upstream
+                .rsplit_once(':')
+                .map_or(pair.upstream.as_str(), |(host, _)| host);
+            Some((pair.service.clone(), host.to_owned()))
         })
         .collect()
 }
@@ -283,10 +286,13 @@ async fn main() -> Result<()> {
     spawn_fault_control(job, trip_rx, pause_tx, sever_tx, edge, hosts, client);
 
     for spec in cli.control {
+        // A control pair carries the framework's own traffic, which is not
+        // reported and so is not read as anything.
         let Pair {
             service,
             listen,
             upstream,
+            ..
         } = Pair::parse(&spec)?;
         let relay = Relay::bind(listen, upstream.clone()).await?;
         tracing::info!(%service, %listen, %upstream, "control pair up");
@@ -304,15 +310,18 @@ async fn main() -> Result<()> {
 /// One listener and where it forwards to, as `SERVICE=LISTEN=UPSTREAM`.
 struct Pair {
     service: String,
+    /// What the service speaks here, which decides what the proxy can make of
+    /// the bytes crossing it.
+    kind: String,
     listen: SocketAddr,
     upstream: String,
 }
 
 impl Pair {
     fn parse(spec: &str) -> Result<Self> {
-        let mut parts = spec.splitn(3, '=');
-        let (Some(service), Some(listen), Some(upstream)) =
-            (parts.next(), parts.next(), parts.next())
+        let mut parts = spec.splitn(4, '=');
+        let (Some(service), Some(kind), Some(listen), Some(upstream)) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
         else {
             return Err(Error::MalformedPair {
                 pair: spec.to_string(),
@@ -320,6 +329,7 @@ impl Pair {
         };
         Ok(Self {
             service: service.to_string(),
+            kind: kind.to_string(),
             listen: listen.parse().map_err(|source| Error::ParseListen {
                 addr: listen.to_string(),
                 source,
@@ -334,12 +344,26 @@ impl Pair {
 async fn serve(pair: Pair, gate: Gate, anchor: Option<Anchor>) -> Result<()> {
     let Pair {
         service,
+        kind,
         listen,
         upstream,
     } = pair;
-    let (proxy, _local_addr, mut events) =
-        Proxy::bind(listen, upstream.clone(), gate, anchor).await?;
-    tracing::info!(%service, %listen, %upstream, "proxy pair up");
+    let (proxy, _local_addr, mut events) = Proxy::bind(
+        listen,
+        Upstream {
+            host: upstream.clone(),
+            kind: kind.clone(),
+        },
+        gate,
+        anchor,
+    )
+    .await?;
+    tracing::info!(
+        %service, %kind, %listen, %upstream,
+        // Whether a fault here lands on an operation or on a read off the wire.
+        read = crucible_kind::is_read(&kind),
+        "proxy pair up"
+    );
 
     tokio::spawn(async move {
         if let Err(e) = proxy.run().await {

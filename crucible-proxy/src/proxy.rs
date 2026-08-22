@@ -10,7 +10,7 @@ use std::{
     },
 };
 
-use crucible_protocol::{ConnEvent, ConnId, Direction};
+use crucible_protocol::{ConnEvent, ConnId, Direction, Operations};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{
@@ -101,6 +101,25 @@ fn on_edge(edge: &OnceLock<OnEdge>, peer: IpAddr) -> bool {
 struct Conn {
     id: ConnId,
     peer: IpAddr,
+}
+
+/// Where a pair forwards to, and what its bytes are.
+#[derive(Clone)]
+pub struct Upstream {
+    /// The host it dials, resolved per connection rather than once: it is a
+    /// container that may not exist when the pair binds, and may be a different
+    /// one after a kill and restart.
+    pub host: String,
+    /// What the service speaks here, which decides what its traffic is read as.
+    pub kind: String,
+}
+
+/// One direction of one connection: where its bytes come from, where they go,
+/// and which way that is.
+struct Half {
+    read: OwnedReadHalf,
+    write: OwnedWriteHalf,
+    direction: Direction,
 }
 
 /// What a connection is subject to while the fleet runs.
@@ -279,10 +298,7 @@ impl Anchor {
 
 pub struct Proxy {
     listener: TcpListener,
-    /// Resolved per connection rather than once: the upstream is a container
-    /// that may not exist when this binds, and may be a different one after a
-    /// kill and restart.
-    upstream: String,
+    upstream: Upstream,
     events_tx: mpsc::UnboundedSender<ConnEvent>,
     next_id: Arc<AtomicU64>,
     gate: Gate,
@@ -291,12 +307,13 @@ pub struct Proxy {
 
 impl Proxy {
     /// Bind to `listen` and prepare to forward every accepted connection to
-    /// `upstream`, subject to `gate`. `anchor`, if set, trips once this pair has
-    /// forwarded `k` packets on its direction. Returns the proxy, its bound
-    /// local address, and the receiver for connection events.
+    /// `upstream`, subject to `gate`, reading what crosses it as `kind`.
+    /// `anchor`, if set, trips once this pair has carried `k` operations on its
+    /// direction. Returns the proxy, its bound local address, and the receiver
+    /// for connection events.
     pub async fn bind(
         listen: SocketAddr,
-        upstream: String,
+        upstream: Upstream,
         gate: Gate,
         anchor: Option<Anchor>,
     ) -> io::Result<(Self, SocketAddr, mpsc::UnboundedReceiver<ConnEvent>)> {
@@ -390,17 +407,17 @@ async fn forward(
     id: ConnId,
     client: TcpStream,
     peer: SocketAddr,
-    upstream: String,
+    upstream: Upstream,
     events_tx: mpsc::UnboundedSender<ConnEvent>,
     gate: Gate,
     anchor: Option<Anchor>,
 ) {
-    let upstream_conn = match TcpStream::connect(&upstream).await {
+    let upstream_conn = match TcpStream::connect(&upstream.host).await {
         Ok(s) => s,
         Err(e) => {
             emit(
                 &events_tx,
-                ConnEvent::failed(id, format!("dial upstream {upstream}: {e}")),
+                ConnEvent::failed(id, format!("dial upstream {}: {e}", upstream.host)),
             );
             return;
         }
@@ -420,20 +437,28 @@ async fn forward(
         id,
         peer: peer.ip(),
     };
+    // A reader each way: what a client sends and what it gets back are two
+    // streams, and neither says anything about where the other has got to.
     let c2u = tokio::spawn(forward_bytes(
         conn,
-        client_r,
-        upstream_w,
-        Direction::ClientToUpstream,
+        Half {
+            read: client_r,
+            write: upstream_w,
+            direction: Direction::ClientToUpstream,
+        },
+        crucible_kind::reader_for(&upstream.kind),
         events_tx.clone(),
         gate.clone(),
         anchor_c2u,
     ));
     let u2c = tokio::spawn(forward_bytes(
         conn,
-        upstream_r,
-        client_w,
-        Direction::UpstreamToClient,
+        Half {
+            read: upstream_r,
+            write: client_w,
+            direction: Direction::UpstreamToClient,
+        },
+        crucible_kind::reader_for(&upstream.kind),
         events_tx.clone(),
         gate,
         anchor_u2c,
@@ -456,13 +481,17 @@ async fn forward(
 /// error that ended it.
 async fn forward_bytes(
     conn: Conn,
-    mut read: OwnedReadHalf,
-    mut write: OwnedWriteHalf,
-    direction: Direction,
+    half: Half,
+    mut operations: Box<dyn Operations>,
     events: mpsc::UnboundedSender<ConnEvent>,
     mut gate: Gate,
     anchor: Option<Anchor>,
 ) -> Result<u64, String> {
+    let Half {
+        mut read,
+        mut write,
+        direction,
+    } = half;
     let (read_label, write_label) = match direction {
         Direction::ClientToUpstream => ("client_read", "upstream_write"),
         Direction::UpstreamToClient => ("upstream_read", "client_write"),
@@ -487,15 +516,21 @@ async fn forward_bytes(
         if let Err(e) = write.write_all(&buf[..n]).await {
             break Err(format!("{write_label}: {e}"));
         }
-        // Only once it is through: a packet the gate held back and then severed
-        // was never forwarded, and the learn pass counts these as traffic.
-        emit(&events, ConnEvent::wrote(conn.id, direction, n as u64));
-        bytes_total += n as u64;
-        if let Some(anchor) = &anchor
-            && anchor.record(conn.peer)
-        {
-            emit(&events, ConnEvent::froze(conn.id, anchor.k));
+        // Only once it is through: bytes the gate held back and then severed
+        // were never forwarded, and the learn pass counts these as traffic.
+        // Once per operation they completed, so what a fault is placed against
+        // is what the fleet did rather than how the kernel broke it up.
+        let completed = operations.read(&buf[..n]);
+        tracing::debug!(?direction, bytes = n, operations = completed, "forwarded");
+        for _ in 0..completed {
+            emit(&events, ConnEvent::wrote(conn.id, direction, n as u64));
+            if let Some(anchor) = &anchor
+                && anchor.record(conn.peer)
+            {
+                emit(&events, ConnEvent::froze(conn.id, anchor.k));
+            }
         }
+        bytes_total += n as u64;
     }
 }
 
@@ -523,6 +558,15 @@ mod tests {
         let held = edge.set(OnEdge::new(HashSet::new(), HashSet::new(), true));
         assert!(held.is_ok(), "a fresh cell is empty");
         Arc::new(edge)
+    }
+
+    /// `host` spoken as a kind with no plugin to read it, so a read off the
+    /// wire is one operation and these tests count what they send.
+    fn unread(host: SocketAddr) -> Upstream {
+        Upstream {
+            host: host.to_string(),
+            kind: "bytes".to_string(),
+        }
     }
 
     /// A gate that never closes.
@@ -593,14 +637,10 @@ mod tests {
     #[tokio::test]
     async fn two_concurrent_connections_round_trip_and_emit_distinct_events() {
         let echo = spawn_echo().await;
-        let (proxy, proxy_addr, mut events) = Proxy::bind(
-            (Ipv4Addr::LOCALHOST, 0).into(),
-            echo.to_string(),
-            open(),
-            None,
-        )
-        .await
-        .unwrap();
+        let (proxy, proxy_addr, mut events) =
+            Proxy::bind((Ipv4Addr::LOCALHOST, 0).into(), unread(echo), open(), None)
+                .await
+                .unwrap();
         tokio::spawn(proxy.run());
 
         let mut a = TcpStream::connect(proxy_addr).await.unwrap();
@@ -661,7 +701,7 @@ mod tests {
         };
         let (proxy, proxy_addr, mut events) = Proxy::bind(
             (Ipv4Addr::LOCALHOST, 0).into(),
-            unused.to_string(),
+            unread(unused),
             open(),
             None,
         )
@@ -681,7 +721,7 @@ mod tests {
         let (pause_tx, pause_rx) = watch::channel(false);
         let (proxy, proxy_addr, _events) = Proxy::bind(
             (Ipv4Addr::LOCALHOST, 0).into(),
-            echo.to_string(),
+            unread(echo),
             held(pause_rx),
             None,
         )
@@ -714,7 +754,7 @@ mod tests {
         let (down_tx, down_rx) = watch::channel(false);
         let (proxy, proxy_addr, _events) = Proxy::bind(
             (Ipv4Addr::LOCALHOST, 0).into(),
-            echo.to_string(),
+            unread(echo),
             Gate::new(
                 watch::channel(false).1,
                 watch::channel(0).1,
@@ -753,7 +793,7 @@ mod tests {
         let (sever_tx, sever_rx) = watch::channel(0);
         let (proxy, proxy_addr, _events) = Proxy::bind(
             (Ipv4Addr::LOCALHOST, 0).into(),
-            echo.to_string(),
+            unread(echo),
             Gate::new(
                 watch::channel(false).1,
                 sever_rx,
@@ -839,7 +879,7 @@ mod tests {
         let (anchor, pause_rx, _trip) = anchor(2);
         let (proxy, proxy_addr, mut events) = Proxy::bind(
             (Ipv4Addr::LOCALHOST, 0).into(),
-            echo.to_string(),
+            unread(echo),
             held(pause_rx),
             Some(anchor.clone()),
         )
@@ -872,7 +912,7 @@ mod tests {
         let (anchor, mut pause_rx, _trip) = anchor(2);
         let (proxy, proxy_addr, _events) = Proxy::bind(
             (Ipv4Addr::LOCALHOST, 0).into(),
-            echo.to_string(),
+            unread(echo),
             held(pause_rx.clone()),
             Some(anchor.clone()),
         )

@@ -352,19 +352,19 @@ impl Docker {
 
         let mut cmd = Vec::new();
         for service in &self.services {
-            // A pair per port, each tagged with the service rather than the
-            // kind: what a fault is anchored to is the service, however many
-            // ports its traffic arrives on.
-            for port in service.ports.values() {
+            // A pair per port. A fault is anchored to the service however many
+            // ports its traffic arrives on, but each carries the kind it speaks,
+            // which is what the proxy reads the bytes as.
+            for (kind, port) in &service.ports {
                 cmd.push("--pair".to_string());
                 cmd.push(format!(
-                    "{name}=0.0.0.0:{port}={upstream}:{port}",
+                    "{name}={kind}=0.0.0.0:{port}={upstream}:{port}",
                     name = service.name,
                     upstream = Self::backing_alias(service),
                 ));
                 cmd.push("--control".to_string());
                 cmd.push(format!(
-                    "{name}=0.0.0.0:{listen}={upstream}:{port}",
+                    "{name}={kind}=0.0.0.0:{listen}={upstream}:{port}",
                     name = service.name,
                     listen = control_port(*port),
                     upstream = Self::backing_alias(service),

@@ -541,8 +541,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "crucible-kind"
+version = "0.1.0"
+dependencies = [
+ "crucible-kind-amqp",
+ "crucible-protocol",
+]
+
+[[package]]
 name = "crucible-kind-amqp"
 version = "0.1.0"
+dependencies = [
+ "crucible-protocol",
+]
 
 [[package]]
 name = "crucible-plugin"
@@ -574,6 +585,7 @@ name = "crucible-proxy"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "crucible-kind",
  "crucible-protocol",
  "serde_json",
  "thiserror",
