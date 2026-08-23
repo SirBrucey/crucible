@@ -942,7 +942,14 @@ impl DeploymentRuntime for Docker {
                 std::future::ready(match chunk {
                     Ok(LogOutput::StdErr { message }) => {
                         for line in String::from_utf8_lossy(&message).lines() {
-                            tracing::debug!(target: "proxy", %container, "{line}");
+                            // At the level the proxy gave it, so what it has to
+                            // complain about is seen without having to ask for
+                            // it, and the rest stays out of the way.
+                            if line.contains("ERROR") || line.contains("WARN") {
+                                tracing::warn!(target: "proxy", %container, "{line}");
+                            } else {
+                                tracing::debug!(target: "proxy", %container, "{line}");
+                            }
                         }
                         Some(Vec::new())
                     }

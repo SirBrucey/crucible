@@ -186,6 +186,9 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .with_writer(std::io::stderr)
+        // Nothing reads this but the run's log, which relays it. Colour codes
+        // would arrive as escape sequences in the middle of it.
+        .with_ansi(false)
         .init();
 
     let cli = Cli::parse();
