@@ -256,6 +256,7 @@ impl Anchor {
         self.trip
             .send(true)
             .expect("the trip watch has a live receiver");
+        tracing::info!(mark = %self.mark, "held the fleet on the moment its mark names");
     }
 
     /// Arm at scenario start, so what the fleet does from here can place the

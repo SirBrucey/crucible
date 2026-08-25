@@ -515,6 +515,7 @@ impl Job {
             Job::Degrade { down } => send(down, false),
         }
         send(pause, false);
+        tracing::info!("let the fleet go");
     }
 }
 
