@@ -19,7 +19,7 @@ pedantic = { level = "deny", priority = -1 }
 undocumented_unsafe_blocks = "warn"
 
 [workspace.dependencies]
-amq-protocol = "10"
+amq-protocol = { version = "10", default-features = false }
 ariadne = "0.6"
 bollard = "0.21"
 clap = { version = "4", features = ["derive", "env"] }
