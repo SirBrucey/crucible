@@ -89,6 +89,16 @@ struct Framed {
     at: Range<usize>,
 }
 
+/// One whole frame on its way back to the wire, and where it sat in the stream.
+///
+/// Its bytes are the ones that arrived, so nothing the parser does not
+/// understand can be lost by writing it out again. Only a frame put back
+/// together across reads, or one a fault replaced, is owned.
+struct Wire<'a> {
+    at: Range<usize>,
+    bytes: Cow<'a, [u8]>,
+}
+
 /// Every whole frame at the front of `bytes`.
 ///
 /// One still arriving is left where it is: the parser says so rather than
@@ -186,6 +196,22 @@ enum Side {
     After,
 }
 
+impl Side {
+    /// How many of `wire` go out before the fleet is held on `message`.
+    ///
+    /// A message that began in an earlier read has already had those frames go,
+    /// so the most this side can still hold back is everything in this one.
+    fn holds(self, wire: &[Wire<'_>], message: &Message) -> usize {
+        let boundary = match self {
+            Side::Before => message.at.start,
+            Side::After => message.at.end,
+        };
+        wire.iter()
+            .position(|frame| frame.at.end > boundary)
+            .unwrap_or(wire.len())
+    }
+}
+
 impl std::fmt::Display for Side {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -250,25 +276,19 @@ impl Seen {
 
 impl crucible_protocol::Kind for Reader {
     fn carry<'a>(&mut self, bytes: &'a [u8]) -> Carried<'a> {
-        // Where these bytes start in the stream, so an extent can be given back
-        // as an offset into what the caller just handed over.
-        let head = self.head();
+        let (wire, messages) = self.read(bytes);
         let mut freeze_after = None;
         let mut found = Vec::new();
-        for message in self.read(bytes) {
+        for message in messages {
             for (side, placement) in self.seen.count(message.operation, self.direction) {
                 if self.watching.as_deref() == Some(placement.mark.as_str()) {
-                    let at = match side {
-                        Side::Before => message.at.start,
-                        Side::After => message.at.end,
-                    };
-                    freeze_after = Some(at.saturating_sub(head));
+                    freeze_after = Some(side.holds(&wire, &message));
                 }
                 found.push(placement);
             }
         }
         Carried {
-            forward: Cow::Borrowed(bytes),
+            forward: wire.into_iter().map(|frame| frame.bytes).collect(),
             freeze_after,
             found,
             did: None,
@@ -299,22 +319,34 @@ impl Reader {
         }
     }
 
-    /// Where in the stream the next bytes handed over will start.
-    fn head(&self) -> usize {
-        self.taken + self.pending.len()
-    }
-
-    /// Take the next `bytes` off the wire and return the operations they
-    /// completed, in the order they were sent.
+    /// Take the next `bytes` off the wire and return every whole frame in them
+    /// along with the operations those completed, in the order they were sent.
     ///
-    /// Each one's `at` counts from the first byte this reader ever saw, so a
-    /// message that arrived over several reads still says where it began.
-    pub fn read(&mut self, bytes: &[u8]) -> Vec<Message> {
+    /// A frame that has not finished arriving is held back until the rest of it
+    /// turns up, so what comes out is always something the protocol recognises.
+    /// Extents count from the first byte this reader ever saw, so a message
+    /// that arrived over several reads still says where it began.
+    fn read<'a>(&mut self, bytes: &'a [u8]) -> (Vec<Wire<'a>>, Vec<Message>) {
+        // What was already held, so a frame that arrived whole can be given
+        // back as a slice of what the caller just handed over.
+        let held = self.pending.len();
         self.pending.extend_from_slice(bytes);
         // A frame is parsed once. Only the tail of one still arriving is ever
         // looked at again, so a long message costs what it is long.
         let decoded = decode(&self.pending);
         let consumed = decoded.last().map_or(0, |framed| framed.at.end);
+
+        let wire = decoded
+            .iter()
+            .map(|framed| Wire {
+                at: self.taken + framed.at.start..self.taken + framed.at.end,
+                bytes: match framed.at.start.checked_sub(held) {
+                    Some(start) => Cow::Borrowed(&bytes[start..framed.at.end - held]),
+                    None => Cow::Owned(self.pending[framed.at.clone()].to_vec()),
+                },
+            })
+            .collect();
+
         self.frames.extend(decoded.into_iter().map(|framed| Framed {
             frame: framed.frame,
             at: self.taken + framed.at.start..self.taken + framed.at.end,
@@ -326,7 +358,7 @@ impl Reader {
         // of it to turn up.
         let (messages, whole) = read(&self.frames);
         self.frames.drain(..whole);
-        messages
+        (wire, messages)
     }
 }
 
@@ -456,14 +488,13 @@ mod tests {
         );
     }
 
+    /// An ack is one frame, so a fault before it lets nothing of it go and a
+    /// fault after it lets the whole of it go.
     #[test]
     fn the_fleet_is_held_where_the_watched_mark_falls() {
         let bytes = ack();
         assert_eq!(freeze(&bytes, &format!("ack:{TAG}:before")), Some(0));
-        assert_eq!(
-            freeze(&bytes, &format!("ack:{TAG}:after")),
-            Some(bytes.len())
-        );
+        assert_eq!(freeze(&bytes, &format!("ack:{TAG}:after")), Some(1));
     }
 
     #[test]
@@ -524,7 +555,33 @@ mod tests {
             None,
             "still arriving"
         );
-        assert_eq!(reader.carry(&bytes[split..]).freeze_after, Some(4));
+        assert_eq!(
+            reader.carry(&bytes[split..]).freeze_after,
+            Some(1),
+            "the frame that finished it"
+        );
+    }
+
+    /// What comes back is what arrived, so nothing the parser does not
+    /// understand can be lost by writing it out again.
+    #[test]
+    fn what_is_carried_is_what_arrived() {
+        let bytes = [publish(b"an order"), ack()].concat();
+        assert_eq!(Reader::new(WAY).carry(&bytes).forward.concat(), bytes);
+    }
+
+    /// A read can end mid-frame. Half a frame is not something the fleet can
+    /// act on, so it waits for the rest and goes out whole.
+    #[test]
+    fn a_frame_split_across_reads_goes_out_whole() {
+        let bytes = ack();
+        let split = bytes.len() - 4;
+        let mut reader = Reader::new(WAY);
+        assert!(
+            reader.carry(&bytes[..split]).forward.is_empty(),
+            "none of it is whole yet"
+        );
+        assert_eq!(reader.carry(&bytes[split..]).forward.concat(), bytes);
     }
 
     /// A fault that goes before an operation which began in an earlier read

@@ -42,10 +42,9 @@ pub struct Placement {
 
 /// What a plugin made of some bytes.
 pub struct Carried<'a> {
-    /// What goes on the wire. Borrowed unless the plugin needs to mutate the
-    /// wire.
-    pub forward: std::borrow::Cow<'a, [u8]>,
-    /// How far into `forward` the fleet is held.
+    /// Ordered buffer of bytes from the wire.
+    pub forward: Vec<std::borrow::Cow<'a, [u8]>>,
+    /// How many of them go before the fleet is held.
     pub freeze_after: Option<usize>,
     /// Where a fault could go, found in these bytes.
     pub found: Vec<Placement>,

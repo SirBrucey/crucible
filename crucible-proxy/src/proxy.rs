@@ -529,36 +529,45 @@ async fn forward_bytes(
             break Ok(bytes_total);
         }
         // What goes on the wire, which is what arrived unless the plugin had
-        // reason to change it.
+        // reason to change it. Anything still arriving stays with the plugin
+        // until the rest of it turns up.
         let carried = operations.carry(&buf[..n]);
-        let forward = carried.forward.as_ref();
         for placement in carried.found {
             emit(&events, ConnEvent::placeable(conn.id, placement));
         }
-        // The plugin says where in these bytes the moment falls, so what comes
+        // The plugin says which of these the moment falls after, so what comes
         // before it goes out first and the fleet is held on the moment itself.
-        let held_at = carried.freeze_after.unwrap_or(forward.len());
-        if let Err(e) = write.write_all(&forward[..held_at]).await {
-            break Err(format!("{write_label}: {e}"));
-        }
-        if carried.freeze_after.is_some()
-            && let Some(anchor) = &anchor
-            && anchor.reached(conn.peer)
-        {
-            emit(&events, ConnEvent::froze(conn.id, anchor.mark.clone()));
-            // Hold here, in the task carrying the moment, so nothing else
-            // crosses while the fault is placed.
-            if !gate.passable().await {
-                break Ok(bytes_total);
+        let held_after = carried.freeze_after.unwrap_or(carried.forward.len());
+        let mut written: u64 = 0;
+        let mut severed = false;
+        for (sent, frame) in carried.forward.iter().enumerate() {
+            if let Err(e) = write.write_all(frame).await {
+                return Err(format!("{write_label}: {e}"));
+            }
+            written += frame.len() as u64;
+            if sent + 1 != held_after {
+                continue;
+            }
+            if carried.freeze_after.is_some()
+                && let Some(anchor) = &anchor
+                && anchor.reached(conn.peer)
+            {
+                emit(&events, ConnEvent::froze(conn.id, anchor.mark.clone()));
+                // Hold here, in the task carrying the moment, so nothing else
+                // crosses while the fault is placed.
+                if !gate.passable().await {
+                    severed = true;
+                    break;
+                }
             }
         }
-        if let Err(e) = write.write_all(&forward[held_at..]).await {
-            break Err(format!("{write_label}: {e}"));
+        // Only once it is through: what the gate held back and then severed was
+        // never forwarded, and the learn pass counts these as traffic.
+        emit(&events, ConnEvent::wrote(conn.id, direction, written));
+        bytes_total += written;
+        if severed {
+            break Ok(bytes_total);
         }
-        // Only once it is through: bytes the gate held back and then severed
-        // were never forwarded, and the learn pass counts these as traffic.
-        emit(&events, ConnEvent::wrote(conn.id, direction, n as u64));
-        bytes_total += n as u64;
     }
 }
 

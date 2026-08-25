@@ -90,8 +90,10 @@ struct Unread {
 impl Kind for Unread {
     fn carry<'a>(&mut self, bytes: &'a [u8]) -> Carried<'a> {
         Carried {
-            forward: Cow::Borrowed(bytes),
-            freeze_after: self.watching.then_some(bytes.len()),
+            // One read, which it has to take whole because it cannot see
+            // anything smaller.
+            forward: vec![Cow::Borrowed(bytes)],
+            freeze_after: self.watching.then_some(1),
             // It cannot say where a fault should go.
             found: Vec::new(),
             did: None,
@@ -120,7 +122,7 @@ mod tests {
         assert!(!is_read("http"));
         let mut reader = Kinds::new("http", None).reader(Direction::ClientToUpstream);
         let carried = reader.carry(b"anything at all");
-        assert_eq!(carried.forward.as_ref(), b"anything at all");
+        assert_eq!(carried.forward.concat(), b"anything at all");
         assert_eq!(carried.freeze_after, None);
         assert!(carried.found.is_empty());
     }
@@ -130,8 +132,8 @@ mod tests {
     #[test]
     fn a_kind_with_no_plugin_offers_every_read() {
         let mut reader = watching().reader(Direction::ClientToUpstream);
-        assert_eq!(reader.carry(b"one").freeze_after, Some(3));
-        assert_eq!(reader.carry(b"two").freeze_after, Some(3));
+        assert_eq!(reader.carry(b"one").freeze_after, Some(1));
+        assert_eq!(reader.carry(b"two").freeze_after, Some(1));
     }
 
     /// Only the direction a schedule named offers moments; the other way is
