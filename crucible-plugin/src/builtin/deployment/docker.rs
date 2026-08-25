@@ -183,7 +183,7 @@ fn proxy_fault_args(fault: &Fault) -> Vec<String> {
             };
             vec![
                 "--fault-at".to_owned(),
-                format!("{}={}={}", edge_arg(&anchor.edge), direction, anchor.k),
+                format!("{}={}={}", edge_arg(&anchor.edge), direction, anchor.mark),
                 "--fault".to_owned(),
                 by.primitive().to_string(),
             ]

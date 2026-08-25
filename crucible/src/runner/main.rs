@@ -612,6 +612,56 @@ fn report_reach(available: &BTreeSet<Primitive>) -> Vec<(Invariant, Vec<Primitiv
     testable
 }
 
+/// Every schedule the campaign will run, in the order it will run them.
+///
+/// Recovery is one schedule per service, so its cost is known before it is
+/// built and comes off the top. The bursts take what is left.
+fn fit(
+    plan: &plan::Plan,
+    scenario: &plan::Scenario,
+    learned: &Learned,
+    campaign_start: Instant,
+    cost: Duration,
+    concurrency: usize,
+) -> Chain<RecoveryScheduler, BurstScheduler> {
+    let testable = report_reach(&learned.primitives);
+    let ways = recovery::ways(&testable);
+    let budget = scenario.budget.map(|budget| Budget {
+        left: budget.saturating_sub(campaign_start.elapsed()),
+        cost,
+        concurrency,
+    });
+
+    let bursts = BurstScheduler::new(
+        &plan.fleet,
+        scenario,
+        learned,
+        &testable,
+        budget.map(|budget| budget.after(RecoveryScheduler::count(&plan.fleet, learned, &ways))),
+    );
+    let degraded = RecoveryScheduler::new(
+        &plan.fleet,
+        scenario,
+        learned,
+        &ways,
+        u32::try_from(bursts.total()).unwrap_or(u32::MAX) + 1,
+    );
+
+    let total = bursts.total() + degraded.total();
+    tracing::info!(
+        schedules = total,
+        recovery = degraded.total(),
+        budget_s = budget.map(|budget| budget.left.as_secs()),
+        cost_s = cost.as_secs(),
+        concurrency,
+        estimate_s = scheduler::runtime(total, cost, concurrency).as_secs(),
+        "campaign fitted to {}",
+        bursts.coverage()
+    );
+
+    Chain(degraded, bursts)
+}
+
 async fn drive(bus: &EventBus, plan: &plan::Plan) -> Result<CampaignOutcome> {
     let campaign_start = Instant::now();
     let mut worker_id: u32 = 0;
@@ -648,47 +698,10 @@ async fn drive(bus: &EventBus, plan: &plan::Plan) -> Result<CampaignOutcome> {
         return Ok(CampaignOutcome::Indecisive);
     }
 
-    let testable = report_reach(&learned.primitives);
     let concurrency = concurrency();
     let cost = cycle_cost + scenario.consistent_within;
 
-    let ways = recovery::ways(&testable);
-    let budget = scenario.budget.map(|budget| Budget {
-        left: budget.saturating_sub(campaign_start.elapsed()),
-        cost,
-        concurrency,
-    });
-
-    // Recovery is one schedule per service, therefore its cost is known before it
-    // is built and comes off the top. The bursts take what is left.
-    let bursts = BurstScheduler::new(
-        &plan.fleet,
-        scenario,
-        &learned,
-        &testable,
-        budget.map(|budget| budget.after(RecoveryScheduler::count(&plan.fleet, &learned, &ways))),
-    );
-    let degraded = RecoveryScheduler::new(
-        &plan.fleet,
-        scenario,
-        &learned,
-        &ways,
-        u32::try_from(bursts.total()).unwrap_or(u32::MAX) + 1,
-    );
-
-    let total = bursts.total() + degraded.total();
-    tracing::info!(
-        schedules = total,
-        recovery = degraded.total(),
-        budget_s = budget.map(|budget| budget.left.as_secs()),
-        cost_s = cost.as_secs(),
-        concurrency,
-        estimate_s = scheduler::runtime(total, cost, concurrency).as_secs(),
-        "campaign fitted to {}",
-        bursts.coverage()
-    );
-
-    let mut scheduler = Chain(degraded, bursts);
+    let mut scheduler = fit(plan, scenario, &learned, campaign_start, cost, concurrency);
     let mut pool = Pool::new(
         bus,
         &plan.fleet,
@@ -732,8 +745,11 @@ async fn drive(bus: &EventBus, plan: &plan::Plan) -> Result<CampaignOutcome> {
     } else {
         Stopped::Budget
     };
-    pool.outcomes
-        .report(total, campaign_start.elapsed().as_secs(), stopped);
+    pool.outcomes.report(
+        scheduler.total(),
+        campaign_start.elapsed().as_secs(),
+        stopped,
+    );
     Ok(pool.outcomes.outcome())
 }
 

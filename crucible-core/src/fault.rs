@@ -123,7 +123,7 @@ impl Fault {
     }
 }
 
-/// Where a fault lands: once `edge` has carried `k` packets on `direction`.
+/// Where a fault lands: at the moment `mark` names, on `direction` of `edge`.
 /// Anchoring to observed traffic rather than a wall clock is what makes a
 /// schedule reproducible across replicas.
 ///
@@ -133,5 +133,9 @@ impl Fault {
 pub struct Anchor {
     pub edge: Edge,
     pub direction: Direction,
-    pub k: u32,
+    /// The moment to place it at, in the terms of whatever reads this edge. A
+    /// plugin names what the moment is; an edge nothing can read counts reads.
+    pub mark: String,
+    /// What faulting here catches, for a report to say why it was worth doing.
+    pub why: String,
 }

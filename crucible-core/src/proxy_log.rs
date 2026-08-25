@@ -6,13 +6,15 @@ use std::{
 };
 
 use crucible_protocol::{
-    Burst, ConnEvent, ConnEventKind, ConnId, Direction, Edge, EdgeProfile, Session, WriteRecord,
+    Burst, ConnEvent, ConnEventKind, ConnId, Direction, Edge, EdgeProfile, Placement, Session,
+    WriteRecord,
 };
 
 struct Pending {
     opened_ns: u128,
     peer: String,
     writes: Vec<WriteRecord>,
+    placements: Vec<Placement>,
 }
 
 /// Sessions observed across a Learn run.
@@ -38,6 +40,7 @@ impl Sessions {
                         opened_ns: ts_ns,
                         peer: peer.to_string(),
                         writes: Vec::new(),
+                        placements: Vec::new(),
                     },
                 );
             }
@@ -59,11 +62,17 @@ impl Sessions {
                         opened_ns: pending.opened_ns,
                         closed_ns: Some(ts_ns),
                         writes: pending.writes,
+                        placements: pending.placements,
                     });
                 }
             }
             ConnEventKind::Failed { .. } => {
                 self.opened.remove(&(service.to_string(), id));
+            }
+            ConnEventKind::Placeable { placement } => {
+                if let Some(pending) = self.opened.get_mut(&(service.to_string(), id)) {
+                    pending.placements.push(placement);
+                }
             }
             // A control signal about the fault anchor, not part of a session's
             // byte accounting; the freeze waiter consumes it elsewhere.
@@ -95,11 +104,19 @@ pub fn edge_profiles_from_sessions<S: std::hash::BuildHasher>(
 ) -> Vec<EdgeProfile> {
     // Per edge: (client-to-upstream packets, upstream-to-client packets).
     let mut by_edge: BTreeMap<Edge, (Vec<Packet>, Vec<Packet>)> = BTreeMap::new();
+    // Where the plugins reading each edge said a fault could go.
+    let mut placeable: BTreeMap<Edge, Vec<Placement>> = BTreeMap::new();
     for session in sessions {
         let edge = Edge {
             client: client_of(session, addresses),
             upstream: session.service.clone(),
         };
+        if !session.placements.is_empty() {
+            placeable
+                .entry(edge.clone())
+                .or_default()
+                .extend(session.placements.iter().cloned());
+        }
         for write in &session.writes {
             if write.ts_ns < scenario_start_ns {
                 continue;
@@ -121,9 +138,10 @@ pub fn edge_profiles_from_sessions<S: std::hash::BuildHasher>(
             c2u.sort_unstable_by_key(|packet| packet.at);
             u2c.sort_unstable_by_key(|packet| packet.at);
             EdgeProfile {
-                edge,
                 client_to_upstream: bursts(&c2u),
                 upstream_to_client: bursts(&u2c),
+                placements: placeable.remove(&edge).unwrap_or_default(),
+                edge,
             }
         })
         .collect();
@@ -249,6 +267,7 @@ impl IntoIterator for Sessions {
                 opened_ns: pending.opened_ns,
                 closed_ns: None,
                 writes: pending.writes,
+                placements: pending.placements,
             });
         }
         self.finished
@@ -286,6 +305,7 @@ mod tests {
                 opened_ns: 0,
                 closed_ns: None,
                 writes,
+                placements: Vec::new(),
             }
         })
     }
@@ -351,6 +371,7 @@ mod tests {
             peer: "127.0.0.1:1".to_string(),
             opened_ns: 0,
             closed_ns: None,
+            placements: Vec::new(),
             writes: vec![
                 // Before scenario start (50): ignored.
                 WriteRecord {
@@ -392,6 +413,7 @@ mod tests {
             peer: format!("{peer}:1"),
             opened_ns: 0,
             closed_ns: None,
+            placements: Vec::new(),
             writes: vec![WriteRecord {
                 ts_ns: at,
                 direction: Direction::ClientToUpstream,

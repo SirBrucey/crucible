@@ -336,9 +336,15 @@ mod tests {
             ConnEvent::wrote_at(0, 10, Direction::ClientToUpstream, 1),
         );
         assert_eq!(index.freeze_count(), 0);
-        index.record("db".into(), ConnEvent::froze_at(0, 20, 3));
+        index.record(
+            "db".into(),
+            ConnEvent::froze_at(0, 20, "publish:1:after".to_owned()),
+        );
         assert_eq!(index.freeze_count(), 1);
-        index.record("db".into(), ConnEvent::froze_at(0, 30, 5));
+        index.record(
+            "db".into(),
+            ConnEvent::froze_at(0, 30, "publish:2:after".to_owned()),
+        );
         assert_eq!(index.freeze_count(), 2);
     }
 
@@ -350,7 +356,8 @@ mod tests {
     async fn a_freeze_stays_seen_by_every_wait_that_shares_a_baseline() {
         let line = format!(
             "db\t{}\n",
-            serde_json::to_string(&ConnEvent::froze_at(0, 20, 3)).expect("an event serializes")
+            serde_json::to_string(&ConnEvent::froze_at(0, 20, "publish:1:after".to_owned()))
+                .expect("an event serializes")
         );
         let observer = SessionObserver::start(
             futures_util::stream::iter([line.into_bytes()])

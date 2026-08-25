@@ -170,10 +170,13 @@ impl Placed<'_> {
         }
     }
 
-    /// When it was done, against the steps the scenario drove.
+    /// When it was done, against the steps the scenario drove, and what it
+    /// caught there.
     fn when(self, windows: &[StepWindow]) -> String {
         match self.at {
-            At::Packet { offset_ns, .. } => placement(windows, *offset_ns),
+            At::Moment { offset_ns, why, .. } => {
+                format!("{}, on {why}", placement(windows, *offset_ns))
+            }
             At::Throughout => "for the whole run".into(),
         }
     }
@@ -300,9 +303,10 @@ mod tests {
             0,
             "db",
             Primitive::Kill,
-            At::Packet {
+            At::Moment {
                 direction: crucible_protocol::Direction::ClientToUpstream,
-                k: 1,
+                mark: "publish:1:after".to_owned(),
+                why: "a publish the broker has not confirmed".to_owned(),
                 offset_ns: at_ns,
             },
             0,
@@ -616,7 +620,9 @@ mod tests {
             panic!("settling short of the fault-free run is a failure");
         };
         assert!(
-            reason.starts_with("`db` was killed during step 2."),
+            reason.starts_with(
+                "`db` was killed during step 2, on a publish the broker has not confirmed."
+            ),
             "{reason}"
         );
     }

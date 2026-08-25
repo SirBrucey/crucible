@@ -13,6 +13,8 @@ pub struct Session {
     pub opened_ns: u128,
     pub closed_ns: Option<u128>,
     pub writes: Vec<WriteRecord>,
+    /// Where the plugin reading this said a fault could go.
+    pub placements: Vec<crate::Placement>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]

@@ -14,18 +14,63 @@ pub use session::{Session, WriteRecord};
 
 use serde::{Deserialize, Serialize};
 
-/// Reads one direction of one connection as the operations it carries.
+/// What the framework is exercising.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+pub enum Property {
+    /// What is accepted, is kept.
+    Durable,
+    /// Doing the same thing twice leaves what doing it once would.
+    Idempotent,
+    /// Regardless of order, the fleet settles the same way.
+    Converges,
+    /// A degraded fleet catches up on what it accepted while it was down.
+    Recovers,
+}
+
+/// Where a fault can go.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct Placement {
+    /// Which way the traffic it watches for runs.
+    pub direction: Direction,
+    /// What the plugin is waiting for.
+    pub mark: String,
+    /// What faulting here would catch.
+    pub why: String,
+    /// Which property this is exercising.
+    pub exercises: Property,
+}
+
+/// What a plugin made of some bytes.
+pub struct Carried<'a> {
+    /// What goes on the wire. Borrowed unless the plugin needs to mutate the
+    /// wire.
+    pub forward: std::borrow::Cow<'a, [u8]>,
+    /// How far into `forward` the fleet is held.
+    pub freeze_after: Option<usize>,
+    /// Where a fault could go, found in these bytes.
+    pub found: Vec<Placement>,
+    /// What the plugin did.
+    pub did: Option<Did>,
+}
+
+/// A plugin's report, in terms the framework can act on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Did {
+    /// What it was asked to do landed.
+    Placed(String),
+    /// It cannot be done here, so the run proves nothing.
+    Unplaceable(String),
+}
+
+/// One direction of one connection, read by whatever understands it.
 ///
-/// What a fault is placed against is an operation the fleet performs, not a
-/// chunk the kernel happened to hand over: those vary run to run, and a schedule
-/// that named the second one would land somewhere else next time. Telling one
-/// from the next is the protocol's business, so it is a plugin's.
+/// The framework knows edges, bytes, and the property under test. What those
+/// bytes mean is the protocol's business, so it is delegated to the plugin.
 ///
 /// One is made per direction, and holds whatever has not finished arriving.
-pub trait Operations: Send {
-    /// Take the next `bytes` off the wire and return how many operations they
-    /// completed.
-    fn read(&mut self, bytes: &[u8]) -> usize;
+pub trait Kind: Send {
+    /// Take the next bytes off the wire and say what goes on it in their place.
+    fn carry<'a>(&mut self, bytes: &'a [u8]) -> Carried<'a>;
 }
 
 /// A link the proxy carries.
@@ -57,6 +102,9 @@ pub struct EdgeProfile {
     pub client_to_upstream: Vec<Burst>,
     /// Bursts on the upstream-to-client direction (responses out).
     pub upstream_to_client: Vec<Burst>,
+    /// Where the plugin reading this edge said a fault could go. Empty for an
+    /// edge nothing can read, which is what the bursts are for.
+    pub placements: Vec<Placement>,
 }
 
 /// One run of packets with no long gap in it, given as the three points a fault

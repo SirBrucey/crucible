@@ -10,7 +10,7 @@ use std::{
     },
 };
 
-use crucible_protocol::{ConnEvent, ConnId, Direction, Operations};
+use crucible_protocol::{ConnEvent, ConnId, Direction, Kind};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{
@@ -20,33 +20,31 @@ use tokio::{
     sync::{mpsc, watch},
 };
 
-/// Where a fault lands on a pair: once `k` packets have been forwarded on
-/// `direction`, counted across all this pair's connections.
+/// Where a fault lands on a pair: at the moment `mark` names, which the kind
+/// plugin recognises on `direction`.
 ///
-/// Dormant until [`arm`](Self::arm), so it counts only scenario traffic, not the
-/// fleet's own bring-up handshakes. The runner arms it once the scenario starts,
-/// which resets the count to zero; that shared origin is what makes the count
-/// match the scenario-relative one the learn pass measured.
-///
-/// The count is shared across the pair's connections. With a single connection
-/// on `direction` (the common case) the fault lands exactly on the k-th packet.
-/// With several connections forwarding at once, one that has already passed the
-/// gate can write a packet or two past `k` before it next observes it, so under
-/// contention the fault lands slightly late, never early.
+/// Dormant until [`arm`](Self::arm), so a fault cannot be placed in the fleet's
+/// own bring-up. A run that never reaches the moment says so, rather than
+/// faulting whatever happened to be in that position.
 #[derive(Clone)]
 pub struct Anchor {
     direction: Direction,
-    k: u32,
-    count: Arc<AtomicU32>,
+    mark: String,
+    /// How many of the moments offered to let pass before the one the mark
+    /// names, which is one unless the count is the framework's own.
+    nth: u32,
+    /// Moments that have passed on this edge since the scenario started. The
+    /// pair carries every client that dials its upstream, and a count taken
+    /// from one edge means nothing on another.
+    seen: Arc<AtomicU32>,
     active: Arc<AtomicBool>,
     /// Held the moment the anchored packet passes, inside the task that carried
     /// it, so nothing slips through while the fault is being decided.
     pause: watch::Sender<bool>,
     /// Says the anchored packet has passed.
     trip: watch::Sender<bool>,
-    /// The edge whose packets `k` counts. The learn run measured the burst on
-    /// one edge, so counting another client's traffic to the same upstream
-    /// would fire on a packet the schedule never named.
+    /// The edge the mark is watched on, so another client's traffic to the same
+    /// upstream cannot fire a fault the schedule never named.
     edge: Arc<OnceLock<OnEdge>>,
 }
 
@@ -103,15 +101,15 @@ struct Conn {
     peer: IpAddr,
 }
 
-/// Where a pair forwards to, and what its bytes are.
+/// Where a pair forwards to, and what reads what crosses it.
 #[derive(Clone)]
 pub struct Upstream {
     /// The host it dials, resolved per connection rather than once: it is a
     /// container that may not exist when the pair binds, and may be a different
     /// one after a kill and restart.
     pub host: String,
-    /// What the service speaks here, which decides what its traffic is read as.
-    pub kind: String,
+    /// Makes a reader per connection, holding whatever they share.
+    pub kinds: crucible_kind::Kinds,
 }
 
 /// One direction of one connection: where its bytes come from, where they go,
@@ -215,15 +213,17 @@ async fn changed<T>(watch: &mut watch::Receiver<T>) {
 impl Anchor {
     pub fn new(
         direction: Direction,
-        k: u32,
+        mark: String,
+        nth: u32,
         pause: watch::Sender<bool>,
         trip: watch::Sender<bool>,
         edge: Arc<OnceLock<OnEdge>>,
     ) -> Self {
         Self {
             direction,
-            k,
-            count: Arc::new(AtomicU32::new(0)),
+            mark,
+            nth,
+            seen: Arc::new(AtomicU32::new(0)),
             active: Arc::new(AtomicBool::new(false)),
             pause,
             trip,
@@ -231,8 +231,20 @@ impl Anchor {
         }
     }
 
+    /// Which way the traffic carrying its moment runs.
+    #[must_use]
+    pub fn direction(&self) -> Direction {
+        self.direction
+    }
+
+    /// The moment it waits for.
+    #[must_use]
+    pub fn mark(&self) -> &str {
+        &self.mark
+    }
+
     /// Hold the fleet. Holding it here rather than leaving it to whoever reads
-    /// the trip keeps the fault on the k-th packet.
+    /// the trip keeps the fault on the moment the mark named.
     fn fire(&self) {
         // FIXME: propagate once arm and record can report failure. Both watches
         // keep a receiver for the whole process, so this cannot fail; dropping
@@ -246,22 +258,19 @@ impl Anchor {
             .expect("the trip watch has a live receiver");
     }
 
-    /// Arm at scenario start: reset the count and begin counting. `k == 0`
-    /// (place the fault before the first scenario packet) fires right away, now
-    /// that the fleet is up rather than mid-bring-up.
+    /// Arm at scenario start, so what the fleet does from here can place the
+    /// fault.
     pub fn arm(&self) {
-        self.count.store(0, Ordering::SeqCst);
+        self.seen.store(0, Ordering::SeqCst);
         self.active.store(true, Ordering::SeqCst);
-        if self.k == 0 {
-            self.fire();
-        }
     }
 
-    /// Count one forwarded packet from `peer`, firing on the one that reaches
-    /// `k`. A no-op until armed, so bring-up traffic is not counted, and a no-op
-    /// for a connection that is not the anchored edge. Returns whether this call
-    /// fired, so the caller can announce it.
-    fn record(&self, peer: IpAddr) -> bool {
+    /// Whether a moment offered on this connection is the one the schedule
+    /// named, and if it is, hold the fleet.
+    ///
+    /// A no-op until armed, so bring-up traffic cannot place a fault, and a
+    /// no-op for a connection that is not the anchored edge.
+    fn reached(&self, peer: IpAddr) -> bool {
         if !self.active.load(Ordering::SeqCst) {
             return false;
         }
@@ -271,12 +280,11 @@ impl Anchor {
             tracing::debug!(%peer, direction = ?self.direction, "not the anchored edge");
             return false;
         }
-        let crossed = self.count.fetch_add(1, Ordering::SeqCst) + 1;
-        if crossed == self.k {
-            self.fire();
-            return true;
+        if self.seen.fetch_add(1, Ordering::SeqCst) + 1 != self.nth {
+            return false;
         }
-        false
+        self.fire();
+        true
     }
 
     /// Disarm: stop counting so the anchor cannot fire again. Paired with every
@@ -287,8 +295,8 @@ impl Anchor {
         // How far the anchor got, which is what tells a run that reported no
         // fault whether its packet never came or was never noticed.
         tracing::debug!(
-            k = self.k,
-            counted = self.count.load(Ordering::SeqCst),
+            mark = %self.mark,
+            reached = self.seen.load(Ordering::SeqCst),
             direction = ?self.direction,
             resolved = self.edge.get().is_some(),
             "anchor disarmed"
@@ -446,7 +454,9 @@ async fn forward(
             write: upstream_w,
             direction: Direction::ClientToUpstream,
         },
-        crucible_kind::reader_for(&upstream.kind),
+        // Only the anchored direction watches for the moment; the other way
+        // reads its traffic and forwards it.
+        upstream.kinds.reader(Direction::ClientToUpstream),
         events_tx.clone(),
         gate.clone(),
         anchor_c2u,
@@ -458,7 +468,7 @@ async fn forward(
             write: client_w,
             direction: Direction::UpstreamToClient,
         },
-        crucible_kind::reader_for(&upstream.kind),
+        upstream.kinds.reader(Direction::UpstreamToClient),
         events_tx.clone(),
         gate,
         anchor_u2c,
@@ -482,7 +492,7 @@ async fn forward(
 async fn forward_bytes(
     conn: Conn,
     half: Half,
-    mut operations: Box<dyn Operations>,
+    mut operations: Box<dyn Kind>,
     events: mpsc::UnboundedSender<ConnEvent>,
     mut gate: Gate,
     anchor: Option<Anchor>,
@@ -513,23 +523,36 @@ async fn forward_bytes(
         if !gate.passable().await {
             break Ok(bytes_total);
         }
-        if let Err(e) = write.write_all(&buf[..n]).await {
+        // What goes on the wire, which is what arrived unless the plugin had
+        // reason to change it.
+        let carried = operations.carry(&buf[..n]);
+        let forward = carried.forward.as_ref();
+        for placement in carried.found {
+            emit(&events, ConnEvent::placeable(conn.id, placement));
+        }
+        // The plugin says where in these bytes the moment falls, so what comes
+        // before it goes out first and the fleet is held on the moment itself.
+        let held_at = carried.freeze_after.unwrap_or(forward.len());
+        if let Err(e) = write.write_all(&forward[..held_at]).await {
+            break Err(format!("{write_label}: {e}"));
+        }
+        if carried.freeze_after.is_some()
+            && let Some(anchor) = &anchor
+            && anchor.reached(conn.peer)
+        {
+            emit(&events, ConnEvent::froze(conn.id, anchor.mark.clone()));
+            // Hold here, in the task carrying the moment, so nothing else
+            // crosses while the fault is placed.
+            if !gate.passable().await {
+                break Ok(bytes_total);
+            }
+        }
+        if let Err(e) = write.write_all(&forward[held_at..]).await {
             break Err(format!("{write_label}: {e}"));
         }
         // Only once it is through: bytes the gate held back and then severed
         // were never forwarded, and the learn pass counts these as traffic.
-        // Once per operation they completed, so what a fault is placed against
-        // is what the fleet did rather than how the kernel broke it up.
-        let completed = operations.read(&buf[..n]);
-        tracing::debug!(?direction, bytes = n, operations = completed, "forwarded");
-        for _ in 0..completed {
-            emit(&events, ConnEvent::wrote(conn.id, direction, n as u64));
-            if let Some(anchor) = &anchor
-                && anchor.record(conn.peer)
-            {
-                emit(&events, ConnEvent::froze(conn.id, anchor.k));
-            }
-        }
+        emit(&events, ConnEvent::wrote(conn.id, direction, n as u64));
         bytes_total += n as u64;
     }
 }
@@ -565,7 +588,18 @@ mod tests {
     fn unread(host: SocketAddr) -> Upstream {
         Upstream {
             host: host.to_string(),
-            kind: "bytes".to_string(),
+            kinds: crucible_kind::Kinds::new("bytes", None),
+        }
+    }
+
+    /// The same, offering the moments `anchor` counts, so a fault can land.
+    fn watching(host: SocketAddr, anchor: &Anchor) -> Upstream {
+        Upstream {
+            host: host.to_string(),
+            kinds: crucible_kind::Kinds::new(
+                "bytes",
+                Some((anchor.direction(), anchor.mark().to_owned())),
+            ),
         }
     }
 
@@ -589,14 +623,19 @@ mod tests {
         )
     }
 
-    /// An anchor of `k` packets, with the watches it fires.
-    fn anchor(k: u32) -> (Anchor, watch::Receiver<bool>, watch::Receiver<bool>) {
+    /// A moment for an anchor to watch for.
+    const MARK: &str = "publish:1:after";
+
+    /// An anchor watching for `mark`, with the watches it fires. The kind is
+    /// unread, so the mark counts the moments offered.
+    fn anchor(mark: &str) -> (Anchor, watch::Receiver<bool>, watch::Receiver<bool>) {
         let (pause_tx, pause_rx) = watch::channel(false);
         let (trip_tx, trip_rx) = watch::channel(false);
         (
             Anchor::new(
                 Direction::ClientToUpstream,
-                k,
+                mark.to_owned(),
+                crucible_kind::nth("bytes", mark),
                 pause_tx,
                 trip_tx,
                 every_peer(),
@@ -673,6 +712,11 @@ mod tests {
                 ConnEventKind::Wrote { bytes, .. } => {
                     *wrote_counts.entry(event.id).or_default() += bytes;
                 }
+                // Nothing reads these bytes, so it can say nothing about where
+                // a fault would go.
+                ConnEventKind::Placeable { placement } => {
+                    panic!("unexpected placement from an unread kind: {placement:?}")
+                }
                 ConnEventKind::Closed {
                     bytes_client_to_upstream,
                     bytes_upstream_to_client,
@@ -683,7 +727,9 @@ mod tests {
                     );
                 }
                 ConnEventKind::Failed { reason } => panic!("unexpected Failed: {reason}"),
-                ConnEventKind::Froze { k } => panic!("unexpected Froze without an anchor: k={k}"),
+                ConnEventKind::Froze { mark } => {
+                    panic!("unexpected Froze without an anchor: {mark}")
+                }
             }
         }
 
@@ -834,52 +880,36 @@ mod tests {
     }
 
     #[test]
-    fn a_dormant_anchor_does_not_count() {
-        // Before arm, record is a no-op, so the fleet's bring-up traffic never
-        // moves the counter or trips the gate.
-        let (anchor, _pause, rx) = anchor(1);
-        assert!(!anchor.record(PEER), "an unarmed record must not trip");
+    fn a_dormant_anchor_does_not_fire() {
+        // Before arm the moment cannot be reached, so the fleet's own bring-up
+        // never places a fault.
+        let (anchor, _pause, rx) = anchor(MARK);
+        assert!(!anchor.reached(PEER), "an unarmed anchor must not fire");
         assert!(!*rx.borrow(), "gate stays open while dormant");
         anchor.arm();
-        assert!(
-            anchor.record(PEER),
-            "the first armed packet reaches k=1 and trips"
-        );
+        assert!(anchor.reached(PEER), "an armed anchor fires at the moment");
         assert!(*rx.borrow(), "gate tripped once armed");
-    }
-
-    #[test]
-    fn a_zero_k_anchor_trips_on_arm() {
-        // k=0 means freeze before the first scenario packet, so arming (after
-        // bring-up) trips the gate immediately.
-        let (anchor, _pause, rx) = anchor(0);
-        assert!(!*rx.borrow(), "not tripped before arm");
-        anchor.arm();
-        assert!(*rx.borrow(), "k=0 trips the gate on arm");
     }
 
     #[test]
     fn a_disarmed_anchor_does_not_refreeze() {
         // On a give-up path the runner releases the gate but the anchor stays
-        // armed; a trailing packet that reaches k must not trip it again (there
-        // would be no one left to resume). Disarming makes each arm a one-shot.
-        let (anchor, _pause, rx) = anchor(2);
+        // armed; a moment reached afterwards must not trip it again, since
+        // there would be no one left to resume. Disarming makes arm a one-shot.
+        let (anchor, _pause, rx) = anchor(MARK);
         anchor.arm();
-        anchor.record(PEER); // count 1, below k
-        assert!(!*rx.borrow(), "must not trip below k");
         anchor.disarm();
-        anchor.record(PEER); // would be count 2 == k, but disarmed
-        anchor.record(PEER);
+        assert!(!anchor.reached(PEER), "a disarmed anchor must not fire");
         assert!(!*rx.borrow(), "a disarmed anchor must not re-trip the gate");
     }
 
     #[tokio::test]
-    async fn anchor_emits_a_froze_event_when_it_trips() {
+    async fn an_anchor_announces_the_moment_it_stopped_on() {
         let echo = spawn_echo().await;
-        let (anchor, pause_rx, _trip) = anchor(2);
+        let (anchor, pause_rx, _trip) = anchor("2");
         let (proxy, proxy_addr, mut events) = Proxy::bind(
             (Ipv4Addr::LOCALHOST, 0).into(),
-            unread(echo),
+            watching(echo, &anchor),
             held(pause_rx),
             Some(anchor.clone()),
         )
@@ -889,30 +919,30 @@ mod tests {
         anchor.arm();
 
         let mut client = TcpStream::connect(proxy_addr).await.unwrap();
-        // First packet is below K; forwarded and echoed normally.
+        // The first read is before the moment; forwarded and echoed normally.
         client.write_all(b"a").await.unwrap();
         let mut buf = [0u8; 1];
         client.read_exact(&mut buf).await.unwrap();
-        // Second packet reaches K=2 and trips the anchor.
+        // The second is the moment the mark named.
         client.write_all(b"b").await.unwrap();
 
-        // The proxy must announce the freeze with a Froze event carrying k.
-        let k = loop {
+        // The proxy must announce the freeze, naming what it stopped on.
+        let stopped_on = loop {
             let event = recv(&mut events).await;
-            if let ConnEventKind::Froze { k } = event.kind {
-                break k;
+            if let ConnEventKind::Froze { mark } = event.kind {
+                break mark;
             }
         };
-        assert_eq!(k, 2);
+        assert_eq!(stopped_on, "2");
     }
 
     #[tokio::test]
-    async fn anchor_trips_the_gate_after_k_packets() {
+    async fn an_anchor_holds_the_fleet_at_the_moment_it_names() {
         let echo = spawn_echo().await;
-        let (anchor, mut pause_rx, _trip) = anchor(2);
+        let (anchor, mut pause_rx, _trip) = anchor("2");
         let (proxy, proxy_addr, _events) = Proxy::bind(
             (Ipv4Addr::LOCALHOST, 0).into(),
-            unread(echo),
+            watching(echo, &anchor),
             held(pause_rx.clone()),
             Some(anchor.clone()),
         )
