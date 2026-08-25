@@ -83,6 +83,7 @@ pub struct Message {
 }
 
 /// One frame, and where it sat in the stream it was parsed from.
+#[derive(Debug)]
 struct Framed {
     frame: AMQPFrame,
     at: Range<usize>,
@@ -162,8 +163,13 @@ fn body_ends(frames: &[Framed], at: usize) -> Option<usize> {
 /// frames, so what is not yet whole is held here until the rest of it turns up.
 #[derive(Debug)]
 pub struct Reader {
-    /// Bytes belonging to an operation that has not finished arriving.
+    /// Bytes of a frame that has not finished arriving.
     pending: Vec<u8>,
+    /// Whole frames of an operation that has not finished arriving.
+    frames: Vec<Framed>,
+    /// Bytes parsed into `frames`, which is what makes every extent count from
+    /// the same place however the stream was broken up.
+    taken: usize,
     /// Operations of each kind this has seen, which is what a mark counts.
     seen: Seen,
     /// The moment a schedule named, watched for as the run goes.
@@ -244,9 +250,9 @@ impl Seen {
 
 impl crucible_protocol::Kind for Reader {
     fn carry<'a>(&mut self, bytes: &'a [u8]) -> Carried<'a> {
-        // What was already held, so an offset into the buffer can be given back
-        // as one into what the caller just handed over.
-        let held = self.pending.len();
+        // Where these bytes start in the stream, so an extent can be given back
+        // as an offset into what the caller just handed over.
+        let head = self.head();
         let mut freeze_after = None;
         let mut found = Vec::new();
         for message in self.read(bytes) {
@@ -256,7 +262,7 @@ impl crucible_protocol::Kind for Reader {
                         Side::Before => message.at.start,
                         Side::After => message.at.end,
                     };
-                    freeze_after = Some(at.saturating_sub(held));
+                    freeze_after = Some(at.saturating_sub(head));
                 }
                 found.push(placement);
             }
@@ -277,6 +283,8 @@ impl Reader {
         Self {
             direction,
             pending: Vec::new(),
+            frames: Vec::new(),
+            taken: 0,
             seen: Seen::default(),
             watching: None,
         }
@@ -291,22 +299,33 @@ impl Reader {
         }
     }
 
+    /// Where in the stream the next bytes handed over will start.
+    fn head(&self) -> usize {
+        self.taken + self.pending.len()
+    }
+
     /// Take the next `bytes` off the wire and return the operations they
     /// completed, in the order they were sent.
     ///
-    /// Each one's `at` indexes what this reader had buffered, which is its own
-    /// bytes and not the caller's.
+    /// Each one's `at` counts from the first byte this reader ever saw, so a
+    /// message that arrived over several reads still says where it began.
     pub fn read(&mut self, bytes: &[u8]) -> Vec<Message> {
         self.pending.extend_from_slice(bytes);
-        let frames = decode(&self.pending);
-        let (messages, whole) = read(&frames);
-        // Frames belonging to an operation still arriving stay pending, along
-        // with the bytes behind them.
-        let consumed = match whole {
-            0 => 0,
-            whole => frames[whole - 1].at.end,
-        };
+        // A frame is parsed once. Only the tail of one still arriving is ever
+        // looked at again, so a long message costs what it is long.
+        let decoded = decode(&self.pending);
+        let consumed = decoded.last().map_or(0, |framed| framed.at.end);
+        self.frames.extend(decoded.into_iter().map(|framed| Framed {
+            frame: framed.frame,
+            at: self.taken + framed.at.start..self.taken + framed.at.end,
+        }));
         self.pending.drain(..consumed);
+        self.taken += consumed;
+
+        // Frames belonging to an operation still arriving are left for the rest
+        // of it to turn up.
+        let (messages, whole) = read(&self.frames);
+        self.frames.drain(..whole);
         messages
     }
 }
@@ -490,5 +509,32 @@ mod tests {
         assert_eq!(taken, 3);
         assert_eq!(messages[0].operation, Operation::Publish);
         assert_eq!(messages[0].at, 0..bytes.len(), "the whole of it");
+    }
+
+    /// A message arrives over as many reads as the kernel gives it. The one
+    /// that completes it is where the fleet is held, and the offset is into
+    /// that read rather than into everything the reader has seen.
+    #[test]
+    fn a_message_split_across_reads_is_held_on_the_read_that_finishes_it() {
+        let bytes = publish(b"an order");
+        let split = bytes.len() - 4;
+        let mut reader = Reader::watching(WAY, "publish:1:after".to_owned());
+        assert_eq!(
+            reader.carry(&bytes[..split]).freeze_after,
+            None,
+            "still arriving"
+        );
+        assert_eq!(reader.carry(&bytes[split..]).freeze_after, Some(4));
+    }
+
+    /// A fault that goes before an operation which began in an earlier read
+    /// holds everything in this one, since what it was to precede has gone.
+    #[test]
+    fn a_message_split_before_the_mark_holds_the_whole_read() {
+        let bytes = publish(b"an order");
+        let split = bytes.len() - 4;
+        let mut reader = Reader::watching(WAY, "publish:1:before".to_owned());
+        assert_eq!(reader.carry(&bytes[..split]).freeze_after, None);
+        assert_eq!(reader.carry(&bytes[split..]).freeze_after, Some(0));
     }
 }
