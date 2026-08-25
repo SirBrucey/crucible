@@ -458,12 +458,7 @@ fn spawn_fault_control(
                                 _ = abandon.recv() => tracing::info!("the kill was abandoned (SIGHUP)"),
                             },
                             Fault::Cut => {
-                                // FIXME: propagate once this loop can report
-                                // failure. Every connection on the pair holds a
-                                // receiver, so this cannot fail.
-                                sever
-                                    .send(*sever.borrow() + 1)
-                                    .expect("the sever watch has live receivers");
+                                sever_once(&sever);
                                 tracing::info!("severed the anchored pairs");
                             }
                         }
@@ -515,6 +510,7 @@ impl Job {
             Job::Degrade { down } => send(down, false),
         }
         send(pause, false);
+        tracing::info!("let the fleet go");
     }
 }
 
@@ -523,6 +519,14 @@ impl Job {
 // leave the fleet frozen with nothing left to release it.
 fn send(watch: &watch::Sender<bool>, value: bool) {
     watch.send(value).expect("the watch has a live receiver");
+}
+
+/// Sever the anchored pairs once more.
+///
+/// The count is advanced in place. Reading it to send one more would hold the
+/// watch open while asking to write it, and the sever would wait on itself.
+fn sever_once(severings: &watch::Sender<u64>) {
+    severings.send_modify(|count| *count += 1);
 }
 
 #[cfg(test)]
@@ -579,6 +583,18 @@ mod tests {
     #[test]
     fn rejects_a_missing_field() {
         assert!(parse_fault_at("db=c2u").is_err());
+    }
+
+    /// Every cut tells the pairs to let go of what they hold, so a second one
+    /// has to say something a connection accepted after the first can tell
+    /// apart from it.
+    #[test]
+    fn severing_advances_what_the_pairs_are_holding() {
+        let (severings, holding) = watch::channel(0u64);
+        sever_once(&severings);
+        let first = *holding.borrow();
+        sever_once(&severings);
+        assert_ne!(*holding.borrow(), first);
     }
 
     #[test]

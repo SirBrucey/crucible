@@ -176,8 +176,8 @@ impl BurstScheduler {
             points.extend(taken);
         }
 
-        // What one point costs, which is not the same everywhere: an edge
-        // dialled from outside the fleet has only one end to kill.
+        // What one point costs, which is not the same everywhere: what an edge
+        // has to break depends on the edge.
         let cost =
             |edge: &Edge| -> usize { ways.iter().map(|(_, by)| targets(*by, edge).len()).sum() };
         if let Some(budget) = budget {
@@ -240,9 +240,8 @@ impl BurstScheduler {
     }
 }
 
-/// What breaking `edge` by `losing` can take: either end of it if the fleet is
-/// to lose a service, the edge itself if it is to lose the link. An edge dialled
-/// from outside the fleet has only the one end we can reach.
+/// What breaking `edge` by `losing` takes from the fleet: the services at its
+/// ends, or the link between them.
 fn targets(losing: Losing, edge: &Edge) -> Vec<Taking> {
     match losing {
         Losing::Kill => edge
@@ -251,7 +250,11 @@ fn targets(losing: Losing, edge: &Edge) -> Vec<Taking> {
             .chain(std::iter::once(&edge.upstream))
             .map(|service| Taking::Kill(service.clone()))
             .collect(),
-        Losing::Cut => vec![Taking::Cut(edge.clone())],
+        Losing::Cut => edge
+            .within_fleet()
+            .then(|| Taking::Cut(edge.clone()))
+            .into_iter()
+            .collect(),
     }
 }
 
@@ -397,14 +400,15 @@ mod tests {
         assert_eq!(s.total(), 2);
     }
 
+    /// Both ends and the link between them, at each of the burst's points.
     #[test]
     fn every_way_of_breaking_the_fleet_gets_its_own_schedule() {
         let s = driven(
-            &[profile("db", vec![burst(1, 4)], vec![])],
+            &[from(Some("api"), "db", vec![burst(1, 4)], vec![])],
             vec![Primitive::Kill, Primitive::Cut],
             None,
         );
-        assert_eq!(s.total(), 6);
+        assert_eq!(s.total(), 9);
     }
 
     #[test]
@@ -477,6 +481,19 @@ mod tests {
             None,
         ));
         assert!(taken.iter().all(|target| target == "api"), "{taken:?}");
+    }
+
+    /// The framework reaches in over an edge of its own to drive the scenario.
+    /// Cutting that stops the steps rather than the fleet, so there is no link
+    /// there to take.
+    #[test]
+    fn the_edge_the_scenario_is_driven_over_is_not_cut() {
+        let s = driven(
+            &[profile("api", vec![burst(1, 4)], vec![])],
+            vec![Primitive::Cut],
+            None,
+        );
+        assert_eq!(s.total(), 0);
     }
 
     #[test]
@@ -570,11 +587,11 @@ mod tests {
     #[test]
     fn covering_both_ways_of_breaking_the_fleet_comes_before_more_points() {
         let s = driven(
-            &[profile("db", vec![burst(0, 4)], vec![])],
+            &[from(Some("api"), "db", vec![burst(0, 4)], vec![])],
             vec![Primitive::Kill, Primitive::Cut],
-            Some(2),
+            Some(3),
         );
-        assert_eq!(s.coverage().taken, 1, "one point, broken both ways");
-        assert_eq!(s.total(), 2);
+        assert_eq!(s.coverage().taken, 1, "one point, broken every way");
+        assert_eq!(s.total(), 3);
     }
 }

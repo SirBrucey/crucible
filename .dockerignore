@@ -1,0 +1,5 @@
+# Build output, which is the bulk of a working tree and none of what an image
+# is built from. Sending it costs more than the build itself.
+target/
+**/target/
+.git/

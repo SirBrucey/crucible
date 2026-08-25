@@ -269,6 +269,9 @@ impl Orchestrator<Ready> {
     /// # Errors
     /// Errors if arming, resuming, killing, or restarting the fleet fails, if the
     /// scenario fails to run, or if a check cannot be read.
+    // Every worker's log goes to the one place, so what a line is about is only
+    // clear if it says which run it came from.
+    #[tracing::instrument(skip_all, fields(schedule = schedule_id))]
     pub async fn execute(
         self,
         schedule_id: u32,
@@ -457,9 +460,13 @@ async fn run_actions(
     observations
         .trajectory
         .push(read_checkpoint(deployment, queries).await);
-    for (action, endpoint) in actions {
+    for (step, (action, endpoint)) in actions.iter().enumerate() {
         let start_ns = scenario_start.elapsed().as_nanos();
-        observations.outcomes.push(action.run(*endpoint).await?);
+        // How far a run got, which is what says where one that stopped stopped.
+        tracing::debug!(step, kind = action.kind(), %endpoint, "driving");
+        let outcome = action.run(*endpoint).await?;
+        tracing::debug!(step, ack = ?outcome.ack, "answered; settling");
+        observations.outcomes.push(outcome);
         session_observer
             .wait_for_quiescence(STEP_SETTLE, QUIESCENCE_IDLE, STEP_BUDGET)
             .await;
@@ -470,6 +477,7 @@ async fn run_actions(
             start_ns,
             end_ns: scenario_start.elapsed().as_nanos(),
         });
+        tracing::debug!(step, "settled; reading state");
         observations
             .trajectory
             .push(read_checkpoint(deployment, queries).await);

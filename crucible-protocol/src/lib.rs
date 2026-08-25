@@ -82,6 +82,17 @@ pub struct Edge {
     pub upstream: String,
 }
 
+impl Edge {
+    /// Whether the fleet holds both ends of this.
+    ///
+    /// The other kind is the framework reaching in to drive a step. Breaking
+    /// that stops the scenario, not the fleet.
+    #[must_use]
+    pub fn within_fleet(&self) -> bool {
+        self.client.is_some()
+    }
+}
+
 impl std::fmt::Display for Edge {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.client {

@@ -72,7 +72,7 @@ impl Scheduler for RecoveryScheduler {
 }
 
 /// Every way this fleet can be held degraded: each service the author declared,
-/// and each edge the fault-free run saw carry traffic.
+/// and each link the fault-free run saw carry traffic.
 fn degradations<'a>(
     fleet: &'a plan::Fleet,
     learned: &'a Learned,
@@ -91,6 +91,7 @@ fn degradations<'a>(
                     learned
                         .profiles
                         .iter()
+                        .filter(|profile| profile.edge.within_fleet())
                         .map(|profile| Taking::Cut(profile.edge.clone())),
                 ),
             }
@@ -128,23 +129,32 @@ mod tests {
     }
 
     /// A fault-free run that saw traffic on the edges into `seen` and nothing
-    /// else.
+    /// else, each dialled by the fleet's own `api`.
     fn learned(seen: &[&str]) -> Learned {
         Learned {
             profiles: seen
                 .iter()
-                .map(|upstream| EdgeProfile {
-                    placements: Vec::new(),
-                    edge: Edge {
-                        client: None,
-                        upstream: (*upstream).to_string(),
-                    },
-                    client_to_upstream: vec![carrying(1)],
-                    upstream_to_client: vec![carrying(1)],
-                })
+                .map(|upstream| profile(dialled(upstream)))
                 .collect(),
             trajectory: Vec::new(),
             primitives: BTreeSet::from([Primitive::Kill, Primitive::Cut]),
+        }
+    }
+
+    /// The edge `api` holds to `upstream`.
+    fn dialled(upstream: &str) -> Edge {
+        Edge {
+            client: Some("api".to_string()),
+            upstream: upstream.to_string(),
+        }
+    }
+
+    fn profile(edge: Edge) -> EdgeProfile {
+        EdgeProfile {
+            placements: Vec::new(),
+            edge,
+            client_to_upstream: vec![carrying(1)],
+            upstream_to_client: vec![carrying(1)],
         }
     }
 
@@ -186,6 +196,34 @@ mod tests {
     fn one_schedule_per_observed_edge_to_cut() {
         assert_eq!(schedules(&[Losing::Cut], &["db", "api"]).len(), 2);
         assert!(schedules(&[Losing::Cut], &[]).is_empty());
+    }
+
+    /// The framework reaches in over an edge of its own to drive the scenario.
+    /// Holding that down runs the fleet against no traffic at all.
+    #[test]
+    fn the_edge_the_scenario_is_driven_over_is_not_degraded() {
+        let mut learned = learned(&["db"]);
+        learned.profiles.push(profile(Edge {
+            client: None,
+            upstream: "api".to_string(),
+        }));
+        let mut s = RecoveryScheduler::new(
+            &fixture::fleet(),
+            &fixture::scenario(),
+            &learned,
+            &[Losing::Cut],
+            1,
+        );
+        let cut: Vec<String> = std::iter::from_fn(move || s.next())
+            .map(|schedule| {
+                schedule
+                    .fault
+                    .expect("a recovery run faults")
+                    .taking()
+                    .target()
+            })
+            .collect();
+        assert_eq!(cut, ["api -> db"]);
     }
 
     #[test]
