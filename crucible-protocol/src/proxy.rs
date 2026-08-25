@@ -91,16 +91,25 @@ impl ConnEvent {
     }
 
     #[must_use]
-    pub fn froze(id: ConnId, k: u32) -> Self {
-        Self::froze_at(id, now_ns(), k)
+    pub fn placeable(id: ConnId, placement: crate::Placement) -> Self {
+        Self {
+            id,
+            ts_ns: now_ns(),
+            kind: ConnEventKind::Placeable { placement },
+        }
     }
 
     #[must_use]
-    pub fn froze_at(id: ConnId, ts_ns: u128, k: u32) -> Self {
+    pub fn froze(id: ConnId, mark: String) -> Self {
+        Self::froze_at(id, now_ns(), mark)
+    }
+
+    #[must_use]
+    pub fn froze_at(id: ConnId, ts_ns: u128, mark: String) -> Self {
         Self {
             id,
             ts_ns,
-            kind: ConnEventKind::Froze { k },
+            kind: ConnEventKind::Froze { mark },
         }
     }
 }
@@ -127,8 +136,13 @@ pub enum ConnEventKind {
     /// direction and the proxy has frozen the fleet. Emitted once per arm, at the
     /// trip, so a consumer can gate an action on the freeze actually being in
     /// place rather than on its own independent packet count.
+    /// The moment a schedule named has come, and the fleet is held on it.
     Froze {
-        k: u32,
+        mark: String,
+    },
+    /// Somewhere the plugin reading this connection says a fault could go.
+    Placeable {
+        placement: crate::Placement,
     },
 }
 

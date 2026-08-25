@@ -66,6 +66,10 @@ pub fn runtime(n: usize, cost: Duration, concurrency: usize) -> Duration {
 pub trait Scheduler: Send + Sync {
     /// Return the next schedule, or `None` when the scheduler is exhausted.
     fn next(&mut self) -> Option<Schedule>;
+
+    /// How many schedules this will hand out, settled when it is built so the
+    /// campaign can say what it is about to run.
+    fn total(&self) -> usize;
 }
 
 /// Every schedule of the first, then every schedule of the second, so a campaign
@@ -75,6 +79,10 @@ pub struct Chain<A, B>(pub A, pub B);
 impl<A: Scheduler, B: Scheduler> Scheduler for Chain<A, B> {
     fn next(&mut self) -> Option<Schedule> {
         self.0.next().or_else(|| self.1.next())
+    }
+
+    fn total(&self) -> usize {
+        self.0.total() + self.1.total()
     }
 }
 

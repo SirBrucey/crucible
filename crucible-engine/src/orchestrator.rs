@@ -710,9 +710,10 @@ async fn place(
         id,
         fault.taking().target(),
         fault.primitive(),
-        At::Packet {
+        At::Moment {
             direction: anchor.direction,
-            k: anchor.k,
+            mark: anchor.mark.clone(),
+            why: anchor.why.clone(),
             offset_ns: placed.offset_ns,
         },
         placed_at_ns,
@@ -798,7 +799,8 @@ mod tests {
                     upstream: "db".into(),
                 },
                 direction: Direction::ClientToUpstream,
-                k: 3,
+                mark: "ack:7:before".into(),
+                why: "an ack the consumer has sent and the broker has not seen".into(),
             },
             by: Taking::Kill("db".into()),
         }

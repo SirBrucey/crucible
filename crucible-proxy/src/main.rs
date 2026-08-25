@@ -35,10 +35,10 @@ struct Cli {
     /// not infected by the framework's own.
     #[arg(long = "control")]
     control: Vec<String>,
-    /// Fault anchor `CLIENT>UPSTREAM=DIRECTION=K` (DIRECTION is `c2u` or
-    /// `u2c`): place the fault once that edge has carried `K` packets in that
-    /// direction. An empty CLIENT (`>db=c2u=3`) is the edge dialled from
-    /// outside the fleet.
+    /// Fault anchor `CLIENT>UPSTREAM=DIRECTION=MARK` (DIRECTION is `c2u` or
+    /// `u2c`): place the fault when the kind plugin reading that direction sees
+    /// the moment MARK names. An empty CLIENT (`>db=c2u=publish:1:after`) is the
+    /// edge dialled from outside the fleet.
     #[arg(long = "fault-at")]
     fault_at: Option<String>,
     /// What to do to the fleet at the anchored packet. `kill` freezes and waits
@@ -81,35 +81,47 @@ impl TryFrom<Primitive> for Fault {
     }
 }
 
-/// A parsed `--fault-at` anchor: place the fault once the edge from `client` to
-/// `upstream` has carried `k` packets in `direction`.
+/// A parsed `--fault-at` anchor: place the fault when the edge from `client` to
+/// `upstream` reaches the moment `mark` names, on `direction`.
 struct FaultAt {
     client: Option<String>,
     upstream: String,
     direction: Direction,
-    k: u32,
+    mark: String,
 }
 
-/// Whether some pair spec fronts `service` (the part before its first `=`).
-fn is_fronted(service: &str, pairs: &[String]) -> bool {
-    pairs
-        .iter()
-        .any(|spec| spec.split('=').next() == Some(service))
+/// How many of the moments an edge offers must pass before the one `at` names.
+///
+/// A fault-at must name a service some pair fronts, or it would silently never
+/// reach its moment, or freeze the whole fleet for a target that is not even
+/// fronted. What that pair speaks is what its mark means.
+fn nth_named(at: Option<&FaultAt>, pairs: &[Pair]) -> Result<u32> {
+    let Some(at) = at else {
+        return Ok(1);
+    };
+    let pair = fronting(&at.upstream, pairs).ok_or_else(|| Error::UnknownFaultService {
+        service: at.upstream.clone(),
+    })?;
+    Ok(crucible_kind::nth(&pair.kind, &at.mark))
+}
+
+/// The pair fronting `service`, if any pair does.
+fn fronting<'a>(service: &str, pairs: &'a [Pair]) -> Option<&'a Pair> {
+    pairs.iter().find(|pair| pair.service == service)
 }
 
 /// The service each pair fronts, and the host it forwards to, which is where
 /// that service answers.
-fn fronted(pairs: &[String]) -> Vec<(String, String)> {
+fn fronted(pairs: &[Pair]) -> Vec<(String, String)> {
     pairs
         .iter()
-        .filter_map(|spec| {
-            let pair = Pair::parse(spec).ok()?;
+        .map(|pair| {
             // The upstream is `host:port`; only the host names the container.
             let host = pair
                 .upstream
                 .rsplit_once(':')
                 .map_or(pair.upstream.as_str(), |(host, _)| host);
-            Some((pair.service.clone(), host.to_owned()))
+            (pair.service.clone(), host.to_owned())
         })
         .collect()
 }
@@ -129,7 +141,7 @@ fn parse_edge(spec: &str) -> Result<(Option<String>, String)> {
 fn parse_fault_at(spec: &str) -> Result<FaultAt> {
     let malformed = || Error::MalformedFaultAt { spec: spec.into() };
     let mut parts = spec.splitn(3, '=');
-    let (Some(edge), Some(dir), Some(k)) = (parts.next(), parts.next(), parts.next()) else {
+    let (Some(edge), Some(dir), Some(mark)) = (parts.next(), parts.next(), parts.next()) else {
         return Err(malformed());
     };
     let (client, upstream) = parse_edge(edge)?;
@@ -142,7 +154,7 @@ fn parse_fault_at(spec: &str) -> Result<FaultAt> {
         client,
         upstream,
         direction,
-        k: k.parse().map_err(|_| malformed())?,
+        mark: mark.to_owned(),
     })
 }
 
@@ -202,19 +214,18 @@ async fn main() -> Result<()> {
     // named rather than wherever the fleet has got to since.
     let (trip_tx, trip_rx) = watch::channel(false);
 
+    // Everything the proxy fronts, read before anything binds so a malformed
+    // pair is refused rather than met halfway through bring-up.
+    let pairs = cli
+        .pairs
+        .iter()
+        .map(|spec| Pair::parse(spec))
+        .collect::<Result<Vec<_>>>()?;
+
     // Build the fault anchor (if any) once, so the same handle both counts on the
     // matching pair and is armed by the SIGUSR1 handler.
     let at = cli.fault_at.as_deref().map(parse_fault_at).transpose()?;
-    // A fault-at must name a service some pair fronts. Otherwise it would
-    // silently never count (k>0, no pair increments it) or, on arm, freeze the
-    // whole fleet for a target that is not even fronted (k=0).
-    if let Some(at) = &at
-        && !is_fronted(&at.upstream, &cli.pairs)
-    {
-        return Err(Error::UnknownFaultService {
-            service: at.upstream.clone(),
-        });
-    }
+    let nth = nth_named(at.as_ref(), &pairs)?;
     // Bumped to sever the anchored pairs. A service may be fronted on several
     // ports, and the anchor counts across all of them.
     let (sever_tx, sever_rx) = watch::channel(0u64);
@@ -222,7 +233,7 @@ async fn main() -> Result<()> {
     let (down_tx, down_rx) = watch::channel(false);
     let degrade = cli.degrade.as_deref().map(parse_edge).transpose()?;
     if let Some((_, upstream)) = &degrade
-        && !is_fronted(upstream, &cli.pairs)
+        && fronting(upstream, &pairs).is_none()
     {
         return Err(Error::UnknownFaultService {
             service: upstream.clone(),
@@ -230,7 +241,7 @@ async fn main() -> Result<()> {
     }
     // Where each service answers, which is what names the far end of a
     // connection. Taken before the pairs are consumed below.
-    let hosts = fronted(&cli.pairs);
+    let hosts = fronted(&pairs);
     // Which connections the fault applies to. A pair carries every client that
     // dials its upstream, and a fault is placed on one edge.
     let edge: Arc<OnceLock<OnEdge>> = Arc::new(OnceLock::new());
@@ -238,7 +249,8 @@ async fn main() -> Result<()> {
         Some(at) => Job::Anchored {
             anchor: Anchor::new(
                 at.direction,
-                at.k,
+                at.mark.clone(),
+                nth,
                 pause_tx.clone(),
                 trip_tx,
                 Arc::clone(&edge),
@@ -255,10 +267,9 @@ async fn main() -> Result<()> {
         Job::Observe | Job::Degrade { .. } => None,
     };
 
-    for spec in &cli.pairs {
+    for pair in pairs {
         // Only the pairs fronting the anchored service count toward the fault,
         // and only they can be severed by it.
-        let pair = Pair::parse(spec)?;
         let anchored = at.as_ref().is_some_and(|at| at.upstream == pair.service);
         let degraded = degrade
             .as_ref()
@@ -351,11 +362,15 @@ async fn serve(pair: Pair, gate: Gate, anchor: Option<Anchor>) -> Result<()> {
         listen,
         upstream,
     } = pair;
+    // Only the direction a schedule named watches for its moment.
+    let watching = anchor
+        .as_ref()
+        .map(|anchor| (anchor.direction(), anchor.mark().to_owned()));
     let (proxy, _local_addr, mut events) = Proxy::bind(
         listen,
         Upstream {
             host: upstream.clone(),
-            kind: kind.clone(),
+            kinds: crucible_kind::Kinds::new(&kind, watching),
         },
         gate,
         anchor,
@@ -516,20 +531,20 @@ mod tests {
 
     #[test]
     fn parses_a_client_to_upstream_anchor() {
-        let at = parse_fault_at("api>db=c2u=3").expect("valid spec");
+        let at = parse_fault_at("api>db=c2u=ack:7:before").expect("valid spec");
         assert_eq!(at.client.as_deref(), Some("api"));
         assert_eq!(at.upstream, "db");
         assert_eq!(at.direction, Direction::ClientToUpstream);
-        assert_eq!(at.k, 3);
+        assert_eq!(at.mark, "ack:7:before");
     }
 
     #[test]
     fn parses_an_upstream_to_client_anchor() {
-        let at = parse_fault_at("inventory>api=u2c=0").expect("valid spec");
+        let at = parse_fault_at("inventory>api=u2c=publish:1:after").expect("valid spec");
         assert_eq!(at.client.as_deref(), Some("inventory"));
         assert_eq!(at.upstream, "api");
         assert_eq!(at.direction, Direction::UpstreamToClient);
-        assert_eq!(at.k, 0);
+        assert_eq!(at.mark, "publish:1:after");
     }
 
     /// The framework driving a step is not one of the fleet's services, so the
@@ -551,9 +566,14 @@ mod tests {
         assert!(parse_fault_at("api>db=sideways=3").is_err());
     }
 
+    /// Only the plugin reading the edge knows what its marks mean, so the proxy
+    /// carries whatever it is given rather than judging it.
     #[test]
-    fn rejects_a_non_numeric_k() {
-        assert!(parse_fault_at("api>db=c2u=three").is_err());
+    fn a_mark_is_whatever_the_plugin_reading_it_says() {
+        for mark in ["three", "ack:7:before", "publish:1:after"] {
+            let at = parse_fault_at(&format!("api>db=c2u={mark}")).expect("valid spec");
+            assert_eq!(at.mark, mark);
+        }
     }
 
     #[test]
@@ -563,8 +583,16 @@ mod tests {
 
     #[test]
     fn a_fault_service_must_front_a_pair() {
-        let pairs = vec!["db=0.0.0.0:3306=db-actual:3306".to_string()];
-        assert!(is_fronted("db", &pairs));
-        assert!(!is_fronted("api", &pairs));
+        let pairs = vec![Pair::parse("db=mariadb=0.0.0.0:3306=db-actual:3306").unwrap()];
+        assert!(fronting("db", &pairs).is_some());
+        assert!(fronting("api", &pairs).is_none());
+    }
+
+    /// What a mark means is the fronted pair's business: a kind with a plugin
+    /// names its own moment, and one without counts the moments offered.
+    #[test]
+    fn what_a_mark_means_comes_from_the_kind_fronting_it() {
+        assert_eq!(crucible_kind::nth("mariadb", "3"), 3);
+        assert_eq!(crucible_kind::nth("amqp", "ack:7:before"), 1);
     }
 }

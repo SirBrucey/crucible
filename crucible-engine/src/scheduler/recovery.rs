@@ -59,16 +59,15 @@ impl RecoveryScheduler {
     pub fn count(fleet: &plan::Fleet, learned: &Learned, ways: &[Losing]) -> usize {
         degradations(fleet, learned, ways).count()
     }
-
-    #[must_use]
-    pub fn total(&self) -> usize {
-        self.total
-    }
 }
 
 impl Scheduler for RecoveryScheduler {
     fn next(&mut self) -> Option<Schedule> {
         self.schedules.next()
+    }
+
+    fn total(&self) -> usize {
+        self.total
     }
 }
 
@@ -135,6 +134,7 @@ mod tests {
             profiles: seen
                 .iter()
                 .map(|upstream| EdgeProfile {
+                    placements: Vec::new(),
                     edge: Edge {
                         client: None,
                         upstream: (*upstream).to_string(),

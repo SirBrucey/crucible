@@ -58,12 +58,14 @@ pub enum FaultResult {
 /// Where in the run a fault was placed.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub enum At {
-    /// On one anchored packet, so it caught whatever was in flight.
-    Packet {
-        /// Direction whose packets the anchor counted.
+    /// On one moment in the traffic, so it caught whatever was in flight.
+    Moment {
+        /// Which way the traffic it was placed on runs.
         direction: Direction,
-        /// The packet count on that direction it was anchored to.
-        k: u32,
+        /// What the moment was, in the terms of whatever read that edge.
+        mark: String,
+        /// What faulting there catches.
+        why: String,
         /// Nanoseconds from scenario start when it was placed.
         offset_ns: u128,
     },
