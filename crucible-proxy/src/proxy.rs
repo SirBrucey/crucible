@@ -513,7 +513,10 @@ async fn forward_bytes(
         // waiting for a packet that is never coming.
         let read = tokio::select! {
             read = read.read(&mut buf) => read,
-            () = gate.severing() => break Ok(bytes_total),
+            () = gate.severing() => {
+                tracing::debug!(%conn.peer, ?direction, "severed while waiting for traffic");
+                break Ok(bytes_total);
+            }
         };
         let n = match read {
             Ok(0) => break Ok(bytes_total),
@@ -521,6 +524,7 @@ async fn forward_bytes(
             Err(e) => break Err(format!("{read_label}: {e}")),
         };
         if !gate.passable().await {
+            tracing::debug!(%conn.peer, ?direction, "severed with traffic in hand");
             break Ok(bytes_total);
         }
         // What goes on the wire, which is what arrived unless the plugin had
@@ -979,5 +983,68 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
+    }
+
+    /// A cut takes the connection it lands on, not the service. What the caller
+    /// dials next has to be answered, or every step after the fault reports a
+    /// fleet that stopped talking rather than the one write that was lost.
+    #[tokio::test]
+    async fn a_severed_connection_leaves_the_next_one_working() {
+        let echo = spawn_echo().await;
+        let (pause_tx, pause_rx) = watch::channel(false);
+        let (trip_tx, mut trip_rx) = watch::channel(false);
+        let (sever_tx, sever_rx) = watch::channel(0u64);
+        let edge = every_peer();
+        let anchor = Anchor::new(
+            Direction::ClientToUpstream,
+            "1".to_owned(),
+            1,
+            pause_tx.clone(),
+            trip_tx,
+            Arc::clone(&edge),
+        );
+        let (proxy, proxy_addr, _events) = Proxy::bind(
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            watching(echo, &anchor),
+            Gate::new(pause_rx, sever_rx, watch::channel(false).1, edge),
+            Some(anchor.clone()),
+        )
+        .await
+        .unwrap();
+        tokio::spawn(proxy.run());
+        anchor.arm();
+
+        // What the fault control does for a cut: sever the pair, then let the
+        // fleet go, leaving it to carry on with one connection lost.
+        let severing = anchor.clone();
+        tokio::spawn(async move {
+            while !*trip_rx.borrow_and_update() {
+                if trip_rx.changed().await.is_err() {
+                    return;
+                }
+            }
+            sever_tx.send(1).expect("the sever watch has receivers");
+            severing.disarm();
+            pause_tx.send(false).expect("the pause watch has receivers");
+        });
+
+        // The connection the fault lands on: it goes, one way or another.
+        let mut cut = TcpStream::connect(proxy_addr).await.unwrap();
+        cut.write_all(b"a").await.unwrap();
+        let mut buf = [0u8; 1];
+        let read = timeout(Duration::from_secs(2), cut.read(&mut buf)).await;
+        assert!(
+            matches!(read, Ok(Ok(0) | Err(_))),
+            "the severed connection ends rather than hanging: {read:?}"
+        );
+
+        // The one dialled after it is a working edge.
+        let mut next = TcpStream::connect(proxy_addr).await.unwrap();
+        next.write_all(b"b").await.unwrap();
+        timeout(Duration::from_secs(2), next.read_exact(&mut buf))
+            .await
+            .expect("the next connection is answered")
+            .expect("read succeeds");
+        assert_eq!(&buf, b"b");
     }
 }
