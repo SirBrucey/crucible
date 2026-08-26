@@ -31,6 +31,9 @@ struct Point<'a> {
     direction: Direction,
     mark: String,
     why: String,
+    /// What faulting here is good for. A moment a plugin named is only a moment
+    /// for the property it named it for.
+    exercises: Invariant,
     /// How much traffic was around it, so a short budget keeps the busiest.
     weight: u32,
 }
@@ -50,6 +53,7 @@ fn points_on(profile: &EdgeProfile) -> Vec<Point<'_>> {
                 direction: placement.direction,
                 mark: placement.mark.clone(),
                 why: placement.why.clone(),
+                exercises: placement.exercises.into(),
                 weight: 1,
             })
             .collect();
@@ -72,6 +76,9 @@ fn points_on(profile: &EdgeProfile) -> Vec<Point<'_>> {
                     direction,
                     mark: k.to_string(),
                     why: format!("{k} reads into what this edge carried"),
+                    // Nothing read this edge, so all a moment on it can say is
+                    // that the fleet was part way through something.
+                    exercises: Invariant::Durable,
                     weight: burst.packets,
                 });
             }
@@ -177,15 +184,22 @@ impl BurstScheduler {
         }
 
         // What one point costs, which is not the same everywhere: what an edge
-        // has to break depends on the edge.
-        let cost =
-            |edge: &Edge| -> usize { ways.iter().map(|(_, by)| targets(*by, edge).len()).sum() };
+        // has to break depends on the edge, and a moment is only spent on what
+        // it is good for.
+        let cost = |point: &Point<'_>| -> usize {
+            ways.iter()
+                .filter(|(invariant, _)| *invariant == point.exercises)
+                .map(|(_, by)| targets(*by, point.edge).len())
+                .sum()
+        };
+        // A moment nothing can be placed on is not a moment this campaign has.
+        points.retain(|point| cost(point) > 0);
         if let Some(budget) = budget {
             let mut spent = 0;
             points.retain(|point| {
-                let affordable = budget.fits(spent + cost(point.edge));
+                let affordable = budget.fits(spent + cost(point));
                 if affordable {
-                    spent += cost(point.edge);
+                    spent += cost(point);
                 }
                 affordable
             });
@@ -194,7 +208,7 @@ impl BurstScheduler {
         let mut schedules: Vec<Schedule> = Vec::new();
         let mut next_id: u32 = Schedule::LEARN_ID + 1;
         for point in &points {
-            for (invariant, by) in &ways {
+            for (invariant, by) in ways.iter().filter(|(it, _)| *it == point.exercises) {
                 for taking in targets(*by, point.edge) {
                     let anchor = Anchor {
                         edge: point.edge.clone(),
@@ -314,6 +328,22 @@ mod tests {
             },
             client_to_upstream: c2u,
             upstream_to_client: u2c,
+        }
+    }
+
+    /// An edge a plugin read, which named `moments` on it.
+    fn named(moments: Vec<(&str, crucible_protocol::Property)>) -> EdgeProfile {
+        EdgeProfile {
+            placements: moments
+                .into_iter()
+                .map(|(mark, exercises)| crucible_protocol::Placement {
+                    direction: Direction::ClientToUpstream,
+                    mark: mark.to_owned(),
+                    why: format!("what {mark} catches"),
+                    exercises,
+                })
+                .collect(),
+            ..from(Some("api"), "broker", vec![], vec![])
         }
     }
 
@@ -494,6 +524,28 @@ mod tests {
             None,
         );
         assert_eq!(s.total(), 0);
+    }
+
+    /// A plugin names a moment for one property. Faulting there for another
+    /// asks it to hold the fleet somewhere it was never watching, and the run
+    /// comes back having tested nothing.
+    #[test]
+    fn a_moment_is_only_spent_on_what_it_was_named_for() {
+        let s = driven(
+            &[named(vec![
+                ("ack:1:before", crucible_protocol::Property::Durable),
+                ("redeliver:1", crucible_protocol::Property::Idempotent),
+            ])],
+            vec![Primitive::Kill],
+            None,
+        );
+        let marks: Vec<String> = std::iter::from_fn({
+            let mut s = s;
+            move || s.next()
+        })
+        .filter_map(|schedule| schedule.fault?.anchor().map(|at| at.mark.clone()))
+        .collect();
+        assert!(marks.iter().all(|mark| mark == "ack:1:before"), "{marks:?}");
     }
 
     #[test]

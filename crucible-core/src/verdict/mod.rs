@@ -19,6 +19,17 @@ pub enum Invariant {
     Recovers,
 }
 
+impl From<crucible_protocol::Property> for Invariant {
+    fn from(property: crucible_protocol::Property) -> Self {
+        match property {
+            crucible_protocol::Property::Durable => Invariant::Durable,
+            crucible_protocol::Property::Idempotent => Invariant::Idempotent,
+            crucible_protocol::Property::Converges => Invariant::Converges,
+            crucible_protocol::Property::Recovers => Invariant::Recovers,
+        }
+    }
+}
+
 impl Invariant {
     /// Anything that can put this invariant under pressure. Losing a write is
     /// losing a write, so durability and recovery do not mind whether the
