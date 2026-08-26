@@ -572,7 +572,7 @@ async fn forward_bytes(
         // out first and the fleet is held on the moment itself. None of them
         // going first is a moment before anything in this read.
         let mut written: u64 = 0;
-        let mut severed = false;
+        let mut cut_off = false;
         for sent in 0..=carried.forward.len() {
             if carried.freeze_after == Some(sent)
                 && let Some(anchor) = &anchor
@@ -580,9 +580,12 @@ async fn forward_bytes(
             {
                 emit(&events, ConnEvent::froze(conn.id, anchor.mark.clone()));
                 // Hold here, in the task carrying the moment, so nothing else
-                // crosses while the fault is placed.
+                // crosses while the fault is placed. This is the connection a
+                // cut is most likely to take, so it is the one that has to say
+                // the cut landed.
                 if !gate.passable().await {
-                    severed = true;
+                    severed(&events, conn, direction, "on the moment it was held");
+                    cut_off = true;
                     break;
                 }
             }
@@ -598,7 +601,7 @@ async fn forward_bytes(
         // never forwarded, and the learn pass counts these as traffic.
         emit(&events, ConnEvent::wrote(conn.id, direction, written));
         bytes_total += written;
-        if severed {
+        if cut_off {
             break Ok(bytes_total);
         }
     }
