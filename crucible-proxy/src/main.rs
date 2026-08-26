@@ -52,13 +52,16 @@ struct Cli {
     degrade: Option<String>,
 }
 
-/// What the proxy does to the fleet once the anchored packet is reached. The
-/// network is frozen before the fault is placed and released immediately after,
-/// to ensure the fault is placed deterministically.
+/// What the proxy does to the fleet at the moment a schedule names.
 ///
-/// Narrower than [`Primitive`], because this holds connections and nothing else.
-/// A primitive it cannot place is refused as the proxy starts rather than when
-/// the packet arrives.
+/// Two sorts, and the difference is where the fault happens. Taking something
+/// away happens outside the byte stream, so the network is frozen first and
+/// released after, and the fault lands on the moment however long it takes.
+/// Changing what crosses happens in the stream itself, as the bytes pass, so
+/// there is nothing to hold.
+///
+/// Narrower than [`Primitive`]: one it cannot place is refused as the proxy
+/// starts rather than when the traffic arrives.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Fault {
     /// Wait to be told the service has been killed and brought back. That
@@ -67,6 +70,9 @@ enum Fault {
     /// Sever the connection between the proxy and the two services, so both see
     /// the edge go away mid-request while their processes and state survive.
     Cut,
+    /// Leave it to the plugin reading the edge, which changes what crosses as
+    /// it passes.
+    Rewritten,
 }
 
 impl TryFrom<Primitive> for Fault {
@@ -76,7 +82,8 @@ impl TryFrom<Primitive> for Fault {
         match primitive {
             Primitive::Kill => Ok(Self::Kill),
             Primitive::Cut => Ok(Self::Cut),
-            Primitive::Redeliver | Primitive::Reorder => Err(Error::UnplaceableFault { primitive }),
+            Primitive::Redeliver => Ok(Self::Rewritten),
+            Primitive::Reorder => Err(Error::UnplaceableFault { primitive }),
         }
     }
 }
@@ -461,6 +468,10 @@ fn spawn_fault_control(
                                 sever_once(&sever);
                                 tracing::info!("severed the anchored pairs");
                             }
+                            // The plugin changed what crossed as it passed, so
+                            // the fleet was never held and there is nothing
+                            // here to put back.
+                            Fault::Rewritten => {}
                         }
                     }
                     job.release(&pause);

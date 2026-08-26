@@ -278,14 +278,14 @@ impl Seen {
 }
 
 impl crucible_protocol::Kind for Reader {
-    fn carry<'a>(&mut self, bytes: &'a [u8]) -> Carried<'a> {
+    fn carry<'a>(&mut self, bytes: &'a [u8], placing: bool) -> Carried<'a> {
         let (mut wire, messages) = self.read(bytes);
         let mut freeze_after = None;
         let mut found = Vec::new();
         let mut did = None;
         for message in messages {
             if let Some(placement) = redelivery(&message, self.direction) {
-                if self.watches(&placement) {
+                if placing && self.watches(&placement) {
                     // The schedule names one moment, so once this is done there
                     // is nothing left to watch for.
                     self.watching = None;
@@ -537,19 +537,19 @@ mod tests {
 
     /// Placements a fault-free run of `bytes` offers.
     fn placements(bytes: &[u8]) -> Vec<Placement> {
-        Reader::new(WAY).carry(bytes).found
+        Reader::new(WAY).carry(bytes, false).found
     }
 
     /// Where a run watching `mark` holds the fleet.
     fn freeze(bytes: &[u8], mark: &str) -> Option<usize> {
         Reader::watching(WAY, mark.to_owned())
-            .carry(bytes)
+            .carry(bytes, true)
             .freeze_after
     }
 
     /// What a run watching `mark` puts on the wire, and what it says it did.
     fn faulted(bytes: &[u8], mark: &str) -> (Vec<u8>, Option<Did>) {
-        let carried = Reader::watching(WAY, mark.to_owned()).carry(bytes);
+        let carried = Reader::watching(WAY, mark.to_owned()).carry(bytes, true);
         (carried.forward.concat(), carried.did)
     }
 
@@ -689,12 +689,12 @@ mod tests {
         let split = bytes.len() - 4;
         let mut reader = Reader::watching(WAY, "publish:1:after".to_owned());
         assert_eq!(
-            reader.carry(&bytes[..split]).freeze_after,
+            reader.carry(&bytes[..split], true).freeze_after,
             None,
             "still arriving"
         );
         assert_eq!(
-            reader.carry(&bytes[split..]).freeze_after,
+            reader.carry(&bytes[split..], true).freeze_after,
             Some(1),
             "the frame that finished it"
         );
@@ -705,7 +705,10 @@ mod tests {
     #[test]
     fn what_is_carried_is_what_arrived() {
         let bytes = [publish(b"an order"), ack()].concat();
-        assert_eq!(Reader::new(WAY).carry(&bytes).forward.concat(), bytes);
+        assert_eq!(
+            Reader::new(WAY).carry(&bytes, false).forward.concat(),
+            bytes
+        );
     }
 
     /// A read can end mid-frame. Half a frame is not something the fleet can
@@ -716,10 +719,10 @@ mod tests {
         let split = bytes.len() - 4;
         let mut reader = Reader::new(WAY);
         assert!(
-            reader.carry(&bytes[..split]).forward.is_empty(),
+            reader.carry(&bytes[..split], false).forward.is_empty(),
             "none of it is whole yet"
         );
-        assert_eq!(reader.carry(&bytes[split..]).forward.concat(), bytes);
+        assert_eq!(reader.carry(&bytes[split..], false).forward.concat(), bytes);
     }
 
     /// A fault that goes before an operation which began in an earlier read
@@ -729,7 +732,7 @@ mod tests {
         let bytes = publish(b"an order");
         let split = bytes.len() - 4;
         let mut reader = Reader::watching(WAY, "publish:1:before".to_owned());
-        assert_eq!(reader.carry(&bytes[..split]).freeze_after, None);
-        assert_eq!(reader.carry(&bytes[split..]).freeze_after, Some(0));
+        assert_eq!(reader.carry(&bytes[..split], true).freeze_after, None);
+        assert_eq!(reader.carry(&bytes[split..], true).freeze_after, Some(0));
     }
 }

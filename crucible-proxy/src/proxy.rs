@@ -266,6 +266,13 @@ impl Anchor {
         self.active.store(true, Ordering::SeqCst);
     }
 
+    /// Whether a fault may be placed on this connection now: the scenario has
+    /// started and this is the edge the schedule named.
+    #[must_use]
+    pub fn placing(&self, peer: IpAddr) -> bool {
+        self.active.load(Ordering::SeqCst) && on_edge(&self.edge, peer)
+    }
+
     /// Whether a moment offered on this connection is the one the schedule
     /// named, and if it is, hold the fleet.
     ///
@@ -531,9 +538,16 @@ async fn forward_bytes(
         // What goes on the wire, which is what arrived unless the plugin had
         // reason to change it. Anything still arriving stays with the plugin
         // until the rest of it turns up.
-        let carried = operations.carry(&buf[..n]);
+        let placing = anchor
+            .as_ref()
+            .is_some_and(|anchor| anchor.placing(conn.peer));
+        let carried = operations.carry(&buf[..n], placing);
         for placement in carried.found {
             emit(&events, ConnEvent::placeable(conn.id, placement));
+        }
+        if let Some(did) = carried.did {
+            tracing::info!(%conn.peer, ?direction, ?did, "the plugin changed what crossed");
+            emit(&events, ConnEvent::did(conn.id, did));
         }
         // The plugin says which of these the moment falls after, so what comes
         // before it goes out first and the fleet is held on the moment itself.
@@ -726,10 +740,13 @@ mod tests {
                 ConnEventKind::Wrote { bytes, .. } => {
                     *wrote_counts.entry(event.id).or_default() += bytes;
                 }
-                // Nothing reads these bytes, so it can say nothing about where
-                // a fault would go.
+                // Nothing reads these bytes, so it can neither say where a
+                // fault would go nor change what crosses.
                 ConnEventKind::Placeable { placement } => {
                     panic!("unexpected placement from an unread kind: {placement:?}")
+                }
+                ConnEventKind::Did { did } => {
+                    panic!("an unread kind changed nothing: {did:?}")
                 }
                 ConnEventKind::Closed {
                     bytes_client_to_upstream,

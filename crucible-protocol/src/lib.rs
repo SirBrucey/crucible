@@ -53,7 +53,7 @@ pub struct Carried<'a> {
 }
 
 /// A plugin's report, in terms the framework can act on.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub enum Did {
     /// What it was asked to do landed.
     Placed(String),
@@ -69,7 +69,11 @@ pub enum Did {
 /// One is made per direction, and holds whatever has not finished arriving.
 pub trait Kind: Send {
     /// Take the next bytes off the wire and say what goes on it in their place.
-    fn carry<'a>(&mut self, bytes: &'a [u8]) -> Carried<'a>;
+    ///
+    /// `placing` says whether a fault may be placed on this connection now:
+    /// the scenario has started, and this is the edge the schedule named.
+    /// Neither is anything the bytes can say, so the framework says it.
+    fn carry<'a>(&mut self, bytes: &'a [u8], placing: bool) -> Carried<'a>;
 }
 
 /// A link the proxy carries.
