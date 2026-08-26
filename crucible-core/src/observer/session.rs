@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use crucible_protocol::{ConnEvent, ConnEventKind, Direction, Session, now_ns};
+use crucible_protocol::{ConnEvent, ConnEventKind, Did, Direction, Session, now_ns};
 use futures_util::{Stream, StreamExt};
 use tokio::{sync::mpsc, task::JoinHandle};
 
@@ -52,7 +52,17 @@ pub struct EventIndex {
     freezes: u32,
     /// When the proxy last held the fleet, which is also when the fault landed.
     froze_at: Option<u128>,
+    /// What the fault has said of itself, since a fault nothing can be seen to
+    /// have met is one the run cannot be judged on.
+    placed: Vec<Reported>,
     last_ts: Option<u128>,
+}
+
+/// Something the fault said of itself, and when.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reported {
+    pub did: Did,
+    pub at_ns: u128,
 }
 
 impl EventIndex {
@@ -74,7 +84,19 @@ impl EventIndex {
             self.freezes += 1;
             self.froze_at = Some(event.ts_ns);
         }
+        if let ConnEventKind::Did { did } = &event.kind {
+            self.placed.push(Reported {
+                did: did.clone(),
+                at_ns: event.ts_ns,
+            });
+        }
         self.events.push((service, event));
+    }
+
+    /// What the fault said of itself, in the order it said it.
+    #[must_use]
+    pub fn placed(&self) -> &[Reported] {
+        &self.placed
     }
 
     /// How many packets `service` has written on `direction` so far. O(1).
@@ -188,6 +210,41 @@ impl SessionObserver {
             }
             tokio::time::sleep(ANCHOR_POLL).await;
         }
+    }
+
+    /// Block until the fault is seen to have been placed, or until `timeout`
+    /// elapses. Returns what it last said of itself, which is `None` if it said
+    /// nothing at all.
+    ///
+    /// A fault that asks the fleet for something cannot be known to have landed
+    /// when it is asked, only when the fleet does it. Waiting for that is what
+    /// separates a run the fleet met from one it never did.
+    pub async fn wait_for_placed(&self, timeout: Duration) -> Option<Reported> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let last = self.placed().pop();
+            if matches!(
+                &last,
+                Some(Reported {
+                    did: Did::Placed(_),
+                    ..
+                })
+            ) || tokio::time::Instant::now() >= deadline
+            {
+                return last;
+            }
+            tokio::time::sleep(ANCHOR_POLL).await;
+        }
+    }
+
+    /// What the fault has said of itself so far.
+    #[must_use]
+    pub fn placed(&self) -> Vec<Reported> {
+        self.index
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .placed()
+            .to_vec()
     }
 
     /// Freezes seen so far, which a caller takes as the baseline for its waits.

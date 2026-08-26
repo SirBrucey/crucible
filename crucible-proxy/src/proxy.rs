@@ -408,6 +408,25 @@ impl Relay {
     }
 }
 
+/// Say that this connection has been cut off, which is the fault being placed:
+/// nothing else can see a cut land, and a run that reports one it never made is
+/// a run that judged a fleet it never broke.
+fn severed(
+    events: &mpsc::UnboundedSender<ConnEvent>,
+    conn: Conn,
+    direction: Direction,
+    when: &str,
+) {
+    tracing::debug!(%conn.peer, ?direction, "severed {when}");
+    emit(
+        events,
+        ConnEvent::did(
+            conn.id,
+            crucible_protocol::Did::Placed(format!("the edge was cut off {when}")),
+        ),
+    );
+}
+
 /// Send a connection event to the drain task in `main`, which holds the receiver
 /// for as long as any forward task (or the accept loop) holds a sender.
 // FIXME: propagate this for real recovery once the forward tasks report failures
@@ -522,7 +541,7 @@ async fn forward_bytes(
         let read = tokio::select! {
             read = read.read(&mut buf) => read,
             () = gate.severing() => {
-                tracing::debug!(%conn.peer, ?direction, "severed while waiting for traffic");
+                severed(&events, conn, direction, "waiting for traffic");
                 break Ok(bytes_total);
             }
         };
@@ -532,7 +551,7 @@ async fn forward_bytes(
             Err(e) => break Err(format!("{read_label}: {e}")),
         };
         if !gate.passable().await {
-            tracing::debug!(%conn.peer, ?direction, "severed with traffic in hand");
+            severed(&events, conn, direction, "with traffic in hand");
             break Ok(bytes_total);
         }
         // What goes on the wire, which is what arrived unless the plugin had

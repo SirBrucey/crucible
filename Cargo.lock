@@ -612,6 +612,7 @@ dependencies = [
  "crucible-core",
  "crucible-plugin",
  "crucible-protocol",
+ "futures-util",
  "serde",
  "serde_json",
  "tokio",

@@ -2,4 +2,4 @@
 
 pub mod session;
 
-pub use session::{EventIndex, SessionObserver};
+pub use session::{EventIndex, Reported, SessionObserver};
