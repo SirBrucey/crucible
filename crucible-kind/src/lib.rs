@@ -21,6 +21,8 @@ pub struct Kinds {
     kind: String,
     /// The moment to watch for, and which way the traffic carrying it runs.
     watching: Option<(Direction, String)>,
+    /// What a pair's two directions agree on, for a kind whose readers need to.
+    consuming: crucible_kind_amqp::message::Consuming,
 }
 
 impl Kinds {
@@ -29,6 +31,7 @@ impl Kinds {
         Self {
             kind: kind.to_owned(),
             watching,
+            consuming: crucible_kind_amqp::message::Consuming::default(),
         }
     }
 
@@ -41,12 +44,17 @@ impl Kinds {
             .filter(|(way, _)| *way == direction)
             .map(|(_, mark)| mark.clone());
         match (self.kind.as_str(), mark) {
-            (crucible_kind_amqp::NAME, Some(mark)) => Box::new(
-                crucible_kind_amqp::message::Reader::watching(direction, mark),
-            ),
-            (crucible_kind_amqp::NAME, None) => {
-                Box::new(crucible_kind_amqp::message::Reader::new(direction))
+            (crucible_kind_amqp::NAME, Some(mark)) => {
+                Box::new(crucible_kind_amqp::message::Reader::watching(
+                    direction,
+                    self.consuming.clone(),
+                    mark,
+                ))
             }
+            (crucible_kind_amqp::NAME, None) => Box::new(crucible_kind_amqp::message::Reader::new(
+                direction,
+                self.consuming.clone(),
+            )),
             // A mark on an unread kind is a count of reads, so every read is a
             // candidate and whoever holds the count picks between them.
             (_, mark) => Box::new(Unread {

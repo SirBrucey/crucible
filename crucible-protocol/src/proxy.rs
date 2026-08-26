@@ -151,8 +151,8 @@ pub enum ConnEventKind {
     Placeable {
         placement: crate::Placement,
     },
-    /// What the plugin reading this connection made of the moment it was asked
-    /// to change.
+    /// What the plugin reading this connection made of the fault it was asked
+    /// to place.
     Did {
         did: crate::Did,
     },

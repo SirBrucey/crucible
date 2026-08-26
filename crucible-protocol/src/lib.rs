@@ -52,12 +52,18 @@ pub struct Carried<'a> {
     pub did: Option<Did>,
 }
 
-/// A plugin's report, in terms the framework can act on.
+/// What a plugin made of the fault it was asked to place.
+///
+/// Only [`Did::Placed`] is a fault the run met. The rest are reasons it did
+/// not, and a run that did not meet its fault has tested nothing.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub enum Did {
-    /// What it was asked to do landed.
+    /// Set in motion. Whether it happens is the fleet's to say, so this alone
+    /// proves nothing.
+    Asked,
+    /// Seen to happen, so the fleet met it.
     Placed(String),
-    /// It cannot be done here, so the run proves nothing.
+    /// Cannot be done here.
     Unplaceable(String),
 }
 
