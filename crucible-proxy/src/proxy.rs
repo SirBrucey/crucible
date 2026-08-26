@@ -568,20 +568,13 @@ async fn forward_bytes(
             tracing::info!(%conn.peer, ?direction, ?did, "the plugin changed what crossed");
             emit(&events, ConnEvent::did(conn.id, did));
         }
-        // The plugin says which of these the moment falls after, so what comes
-        // before it goes out first and the fleet is held on the moment itself.
-        let held_after = carried.freeze_after.unwrap_or(carried.forward.len());
+        // The plugin says how many of these go before the moment, so those go
+        // out first and the fleet is held on the moment itself. None of them
+        // going first is a moment before anything in this read.
         let mut written: u64 = 0;
         let mut severed = false;
-        for (sent, frame) in carried.forward.iter().enumerate() {
-            if let Err(e) = write.write_all(frame).await {
-                return Err(format!("{write_label}: {e}"));
-            }
-            written += frame.len() as u64;
-            if sent + 1 != held_after {
-                continue;
-            }
-            if carried.freeze_after.is_some()
+        for sent in 0..=carried.forward.len() {
+            if carried.freeze_after == Some(sent)
                 && let Some(anchor) = &anchor
                 && anchor.reached(conn.peer)
             {
@@ -593,6 +586,13 @@ async fn forward_bytes(
                     break;
                 }
             }
+            let Some(frame) = carried.forward.get(sent) else {
+                break;
+            };
+            if let Err(e) = write.write_all(frame).await {
+                return Err(format!("{write_label}: {e}"));
+            }
+            written += frame.len() as u64;
         }
         // Only once it is through: what the gate held back and then severed was
         // never forwarded, and the learn pass counts these as traffic.
@@ -658,6 +658,21 @@ mod tests {
             watch::channel(false).1,
             every_peer(),
         )
+    }
+
+    /// A kind that holds the fleet before anything it is handed goes out, which
+    /// is what a fault placed before an operation asks for.
+    struct Before;
+
+    impl Kind for Before {
+        fn carry<'a>(&mut self, bytes: &'a [u8], _placing: bool) -> crucible_protocol::Carried<'a> {
+            crucible_protocol::Carried {
+                forward: vec![std::borrow::Cow::Borrowed(bytes)],
+                freeze_after: Some(0),
+                found: Vec::new(),
+                did: None,
+            }
+        }
     }
 
     /// A gate held by `pause`.
@@ -1029,6 +1044,46 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
+    }
+
+    /// A moment before the first of them is still a moment, and the fleet has
+    /// to be held on it rather than after whatever it was to come before.
+    #[tokio::test]
+    async fn a_moment_before_anything_in_a_read_holds_the_fleet() {
+        let echo = spawn_echo().await;
+        let (anchor, mut pause_rx, _trip) = anchor("1");
+        anchor.arm();
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let fronted = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(fronted).await.unwrap();
+        let (inbound, peer) = listener.accept().await.unwrap();
+        let (client_r, _client_w) = inbound.into_split();
+        let (_upstream_r, upstream_w) = TcpStream::connect(echo).await.unwrap().into_split();
+        let (events, _drain) = mpsc::unbounded_channel();
+
+        tokio::spawn(forward_bytes(
+            Conn {
+                id: 0,
+                peer: peer.ip(),
+            },
+            Half {
+                read: client_r,
+                write: upstream_w,
+                direction: Direction::ClientToUpstream,
+            },
+            Box::new(Before),
+            events,
+            held(pause_rx.clone()),
+            Some(anchor),
+        ));
+
+        client.write_all(b"a").await.unwrap();
+        timeout(Duration::from_secs(2), pause_rx.changed())
+            .await
+            .expect("the fleet is held on a moment before anything")
+            .expect("the pause watch is live");
+        assert!(*pause_rx.borrow());
     }
 
     /// A cut takes the connection it lands on, not the service. What the caller
