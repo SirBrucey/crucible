@@ -11,7 +11,7 @@
 use crucible_protocol::{Burst, Direction, Edge, EdgeProfile};
 
 use crucible_core::{
-    fault::{Anchor, Fault, Losing, Primitive, Taking},
+    fault::{Anchor, By, Drive, Fault, Primitive},
     learned::Learned,
     plan,
     schedule::Schedule,
@@ -160,7 +160,7 @@ impl BurstScheduler {
         // One point is faulted every way the fleet can be broken there, and
         // covering those comes before covering more points, so they multiply
         // what a point costs. A way no point can place must not be costed.
-        let ways: Vec<(Invariant, Losing)> = testable
+        let ways: Vec<(Invariant, Drive)> = testable
             .iter()
             .flat_map(|(invariant, ways)| ways.iter().map(|by| (*invariant, *by)))
             .filter_map(|(invariant, by)| Some((invariant, placeable(invariant, by)?)))
@@ -218,10 +218,9 @@ impl BurstScheduler {
                     };
                     let fault = match invariant {
                         Invariant::Durable => Fault::Durable { anchor, by: taking },
+                        Invariant::Idempotent => Fault::Idempotent { anchor, by: taking },
                         // `placeable` kept these out of `ways`.
-                        Invariant::Recovers | Invariant::Idempotent | Invariant::Converges => {
-                            continue;
-                        }
+                        Invariant::Recovers | Invariant::Converges => continue,
                     };
                     schedules.push(Schedule::faulted(
                         next_id,
@@ -256,29 +255,30 @@ impl BurstScheduler {
 
 /// What breaking `edge` by `losing` takes from the fleet: the services at its
 /// ends, or the link between them.
-fn targets(losing: Losing, edge: &Edge) -> Vec<Taking> {
+fn targets(losing: Drive, edge: &Edge) -> Vec<By> {
     match losing {
-        Losing::Kill => edge
+        Drive::Kill => edge
             .client
             .iter()
             .chain(std::iter::once(&edge.upstream))
-            .map(|service| Taking::Kill(service.clone()))
+            .map(|service| By::Kill(service.clone()))
             .collect(),
-        Losing::Cut => edge
+        Drive::Cut => edge
             .within_fleet()
-            .then(|| Taking::Cut(edge.clone()))
+            .then(|| By::Cut(edge.clone()))
             .into_iter()
             .collect(),
+        Drive::Repeat => vec![By::Repeat(edge.clone())],
     }
 }
 
 /// How a burst breaks the fleet to test `invariant`, if it can. Recovery
 /// degrades the fleet from the start rather than part way through, so a burst
 /// cannot test it.
-fn placeable(invariant: Invariant, by: Primitive) -> Option<Losing> {
+fn placeable(invariant: Invariant, by: Primitive) -> Option<Drive> {
     match invariant {
-        Invariant::Durable => Losing::try_from(by).ok(),
-        Invariant::Recovers | Invariant::Idempotent | Invariant::Converges => None,
+        Invariant::Durable | Invariant::Idempotent => Drive::try_from(by).ok(),
+        Invariant::Recovers | Invariant::Converges => None,
     }
 }
 

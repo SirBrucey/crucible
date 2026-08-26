@@ -13,6 +13,11 @@ pub struct Durable;
 /// differs is the fault, not the reading.
 pub struct Recovers;
 
+/// Idempotency asks it too. Every step was answered, so the fleet owes all of
+/// them and no more: doing one of them twice has to leave what doing it once
+/// would. What differs is again the fault, not the reading.
+pub struct Idempotent;
+
 impl Driver for Durable {
     fn drive(&mut self, observations: &Observations) -> Verdict {
         // No fault fired => nothing to test.
@@ -110,6 +115,12 @@ impl Driver for Durable {
 }
 
 impl Driver for Recovers {
+    fn drive(&mut self, observations: &Observations) -> Verdict {
+        Durable.drive(observations)
+    }
+}
+
+impl Driver for Idempotent {
     fn drive(&mut self, observations: &Observations) -> Verdict {
         Durable.drive(observations)
     }

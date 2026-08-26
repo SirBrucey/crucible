@@ -24,7 +24,7 @@ use futures_util::{StreamExt, TryStreamExt};
 use tokio::time::sleep;
 
 use crucible_core::{
-    fault::{Fault, Primitive, Taking},
+    fault::{By, Fault, Primitive},
     observer::SessionObserver,
     plan,
     schema::{AttrDecl, AttrSchema, ValueType},
@@ -188,8 +188,10 @@ fn proxy_fault_args(fault: &Fault) -> Vec<String> {
                 by.primitive().to_string(),
             ]
         }
-        (None, Taking::Cut(edge)) => vec!["--degrade".to_owned(), edge_arg(edge)],
-        (None, Taking::Kill(_)) => Vec::new(),
+        (None, By::Cut(edge)) => vec!["--degrade".to_owned(), edge_arg(edge)],
+        // A kill is done to the container, and repeating a message needs a
+        // moment to repeat, so an unanchored one is nothing the proxy can do.
+        (None, By::Kill(_) | By::Repeat(_)) => Vec::new(),
     }
 }
 
@@ -842,12 +844,13 @@ impl Substrate for Proxy {
     }
 }
 
-/// The proxy holds both sides of every edge, so it can let one go. There is
-/// nothing to call: it severs at the anchored packet, having been told which
-/// fault to place when the replica was built.
+/// The proxy holds both sides of every edge, so it can let one go, and it reads
+/// what crosses, so it can change one. There is nothing to call: it does either
+/// at the moment a schedule named, having been told which when the replica was
+/// built.
 impl Faults for Proxy {
     fn primitives(&self) -> BTreeSet<Primitive> {
-        [Primitive::Cut].into()
+        [Primitive::Cut, Primitive::Redeliver].into()
     }
 }
 

@@ -189,7 +189,7 @@ mod tests {
                         mark: "ack:7:before".into(),
                         why: "an ack the consumer has sent and the broker has not seen".into(),
                     },
-                    by: crate::fault::Taking::Kill("db".into()),
+                    by: crate::fault::By::Kill("db".into()),
                 },
                 vec![
                     vec![Some(crate::plan::Value::Int(0))],

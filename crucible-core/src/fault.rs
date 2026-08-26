@@ -9,29 +9,37 @@ use crate::verdict::Invariant;
 #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub enum Fault {
     /// Break the fleet at the anchor and read what survived.
-    Durable { anchor: Anchor, by: Taking },
+    Durable { anchor: Anchor, by: By },
+    /// Have the fleet do the same work twice at the anchor, and read whether
+    /// doing it twice left what doing it once would.
+    Idempotent { anchor: Anchor, by: By },
     /// Run the whole scenario degraded, then put it back and see whether the
     /// fleet catches up on what it accepted while it was.
-    Recovers { by: Taking },
+    Recovers { by: By },
 }
 
-/// What a fault takes away. Narrower than [`Primitive`], so nothing downstream
-/// has to answer for a fault that could never have been built.
+/// How a fault drives the fleet, and what it drives. Narrower than
+/// [`Primitive`], so nothing downstream has to answer for a fault that could
+/// never have been built.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
-pub enum Taking {
+pub enum By {
     /// A service, taken away and brought back. Every edge it holds goes with it;
     /// an anchor only says when.
     Kill(String),
     /// One edge. The services on both ends keep running.
     Cut(Edge),
+    /// One edge, carrying a message it already carried, so whoever reads it is
+    /// asked to do the same work twice.
+    Repeat(Edge),
 }
 
-impl Taking {
+impl By {
     #[must_use]
     pub fn primitive(&self) -> Primitive {
         match self {
-            Taking::Kill(_) => Primitive::Kill,
-            Taking::Cut(_) => Primitive::Cut,
+            By::Kill(_) => Primitive::Kill,
+            By::Cut(_) => Primitive::Cut,
+            By::Repeat(_) => Primitive::Redeliver,
         }
     }
 
@@ -39,50 +47,53 @@ impl Taking {
     #[must_use]
     pub fn target(&self) -> String {
         match self {
-            Taking::Kill(service) => service.clone(),
-            Taking::Cut(edge) => edge.to_string(),
+            By::Kill(service) => service.clone(),
+            By::Cut(edge) | By::Repeat(edge) => edge.to_string(),
         }
     }
 }
 
-impl std::fmt::Display for Taking {
+impl std::fmt::Display for By {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Taking::Kill(service) => write!(f, "killing {service}"),
-            Taking::Cut(edge) => write!(f, "cutting {edge}"),
+            By::Kill(service) => write!(f, "killing {service}"),
+            By::Cut(edge) => write!(f, "cutting {edge}"),
+            By::Repeat(edge) => write!(f, "repeating a message on {edge}"),
         }
     }
 }
 
-/// A way of making the fleet lose something in flight, before it is aimed at
-/// anything. Narrower than [`Primitive`] on the same grounds as [`Taking`].
+/// A way of driving the fleet, before it is aimed at anything. Narrower than
+/// [`Primitive`] on the same grounds as [`By`].
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize, strum::EnumIter,
 )]
-pub enum Losing {
+pub enum Drive {
     Kill,
     Cut,
+    Repeat,
 }
 
-impl From<Losing> for Primitive {
-    fn from(losing: Losing) -> Self {
+impl From<Drive> for Primitive {
+    fn from(losing: Drive) -> Self {
         match losing {
-            Losing::Kill => Primitive::Kill,
-            Losing::Cut => Primitive::Cut,
+            Drive::Kill => Primitive::Kill,
+            Drive::Cut => Primitive::Cut,
+            Drive::Repeat => Primitive::Redeliver,
         }
     }
 }
 
-impl TryFrom<Primitive> for Losing {
+impl TryFrom<Primitive> for Drive {
     type Error = Primitive;
 
-    /// `Err` for a primitive that changes what the fleet does rather than
-    /// costing it something, which is a different invariant's business.
+    /// `Err` for a primitive nothing can yet aim at an edge.
     fn try_from(primitive: Primitive) -> Result<Self, Primitive> {
         match primitive {
             Primitive::Kill => Ok(Self::Kill),
             Primitive::Cut => Ok(Self::Cut),
-            Primitive::Redeliver | Primitive::Reorder => Err(primitive),
+            Primitive::Redeliver => Ok(Self::Repeat),
+            Primitive::Reorder => Err(primitive),
         }
     }
 }
@@ -94,6 +105,7 @@ impl Fault {
     pub fn invariant(&self) -> Invariant {
         match self {
             Fault::Durable { .. } => Invariant::Durable,
+            Fault::Idempotent { .. } => Invariant::Idempotent,
             Fault::Recovers { .. } => Invariant::Recovers,
         }
     }
@@ -102,7 +114,7 @@ impl Fault {
     #[must_use]
     pub fn anchor(&self) -> Option<&Anchor> {
         match self {
-            Fault::Durable { anchor, .. } => Some(anchor),
+            Fault::Durable { anchor, .. } | Fault::Idempotent { anchor, .. } => Some(anchor),
             // Imposed before there is any traffic to land in.
             Fault::Recovers { .. } => None,
         }
@@ -110,9 +122,11 @@ impl Fault {
 
     /// What the fault takes away.
     #[must_use]
-    pub fn taking(&self) -> &Taking {
+    pub fn taking(&self) -> &By {
         match self {
-            Fault::Durable { by, .. } | Fault::Recovers { by, .. } => by,
+            Fault::Durable { by, .. }
+            | Fault::Idempotent { by, .. }
+            | Fault::Recovers { by, .. } => by,
         }
     }
 

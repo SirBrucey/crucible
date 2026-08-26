@@ -4,7 +4,7 @@ pub mod drivers;
 
 use std::{cmp::Ordering, collections::BTreeSet};
 
-pub use drivers::{Durable, Recovers};
+pub use drivers::{Durable, Idempotent, Recovers};
 use serde::{Deserialize, Serialize};
 use strum::EnumIter;
 
@@ -238,8 +238,9 @@ pub trait Driver {
 pub fn driver_for(invariant: Invariant) -> Option<Box<dyn Driver>> {
     match invariant {
         Invariant::Durable => Some(Box::new(Durable)),
+        Invariant::Idempotent => Some(Box::new(Idempotent)),
         Invariant::Recovers => Some(Box::new(Recovers)),
-        Invariant::Idempotent | Invariant::Converges => None,
+        Invariant::Converges => None,
     }
 }
 
