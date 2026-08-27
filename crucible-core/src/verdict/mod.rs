@@ -4,7 +4,7 @@ pub mod drivers;
 
 use std::{cmp::Ordering, collections::BTreeSet};
 
-pub use drivers::{Durable, Recovers};
+pub use drivers::{Durable, Idempotent, Recovers};
 use serde::{Deserialize, Serialize};
 use strum::EnumIter;
 
@@ -17,6 +17,17 @@ pub enum Invariant {
     Converges,
     Durable,
     Recovers,
+}
+
+impl From<crucible_protocol::Property> for Invariant {
+    fn from(property: crucible_protocol::Property) -> Self {
+        match property {
+            crucible_protocol::Property::Durable => Invariant::Durable,
+            crucible_protocol::Property::Idempotent => Invariant::Idempotent,
+            crucible_protocol::Property::Converges => Invariant::Converges,
+            crucible_protocol::Property::Recovers => Invariant::Recovers,
+        }
+    }
 }
 
 impl Invariant {
@@ -227,8 +238,9 @@ pub trait Driver {
 pub fn driver_for(invariant: Invariant) -> Option<Box<dyn Driver>> {
     match invariant {
         Invariant::Durable => Some(Box::new(Durable)),
+        Invariant::Idempotent => Some(Box::new(Idempotent)),
         Invariant::Recovers => Some(Box::new(Recovers)),
-        Invariant::Idempotent | Invariant::Converges => None,
+        Invariant::Converges => None,
     }
 }
 

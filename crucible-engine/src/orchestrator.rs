@@ -6,13 +6,13 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crucible_protocol::{At, FaultMissReason, FaultReport, FaultResult, now_ns};
+use crucible_protocol::{At, Did, FaultMissReason, FaultReport, FaultResult, now_ns};
 
 use crucible_core::{
-    fault::{Fault, Primitive, Taking},
+    fault::{By, Fault, Primitive},
     ipc::Verdict,
     learned::Learned,
-    observer::SessionObserver,
+    observer::{Reported, SessionObserver},
     proxy_log::edge_profiles_from_sessions,
     verdict::{Checkpoint, Observations, Observed, StepWindow, driver_for},
 };
@@ -49,6 +49,10 @@ const ANCHOR_TIMEOUT: Duration = Duration::from_mins(1);
 /// its fault nothing. Reporting a fault that fired as one that never did is
 /// worth more than the seconds this spends.
 const FREEZE_GRACE: Duration = Duration::from_secs(5);
+/// A fault the proxy places itself is reported over the same stream, so what it
+/// says arrives after it happened. Wait this long for it before concluding
+/// nothing was placed.
+const PLACED_GRACE: Duration = Duration::from_secs(5);
 
 /// Per-worker orchestrator that owns the replica lifecycle around one scenario,
 /// modelled as a typestate so a phase can only reach for what earlier phases
@@ -298,9 +302,9 @@ impl Orchestrator<Ready> {
         // dropping the only handle to the replica and its observer tasks.
         let outcome: Result<(Verdict, FaultReport), crucible_plugin::Error> = async {
             let (mut observations, fault_report) = match fault {
-                // Placed on one packet, so the scenario is in flight when it
+                // Placed on one moment, so the scenario is in flight when it
                 // lands and the two run together.
-                Fault::Durable { .. } => {
+                Fault::Durable { .. } | Fault::Idempotent { .. } => {
                     anchored_run(
                         deployment.as_ref(),
                         placement,
@@ -485,22 +489,6 @@ async fn run_actions(
     Ok(observations)
 }
 
-/// When the fault landed and where that sits in the scenario, both by the
-/// proxy's clock. Falling back to the observer's own reading only matters if the
-/// proxy froze without saying when, which it does not do.
-struct Placed {
-    at_ns: u128,
-    offset_ns: u128,
-}
-
-fn placed_at(session_observer: &SessionObserver, scenario_start_ns: u128) -> Placed {
-    let at_ns = session_observer.froze_at_ns().unwrap_or_else(now_ns);
-    Placed {
-        at_ns,
-        offset_ns: at_ns.saturating_sub(scenario_start_ns),
-    }
-}
-
 /// How this schedule's fault gets placed, resolved before the scenario starts so
 /// nothing needed mid-run can turn out to be missing.
 enum Placement<'a> {
@@ -512,6 +500,10 @@ enum Placement<'a> {
     },
     /// The proxy severs the edge itself and releases the fleet.
     Cut,
+    /// The plugin reading the edge changes what crosses it as it passes, so the
+    /// fleet is never held and there is nothing for this side to do but hear
+    /// what came of it.
+    Rewritten,
 }
 
 impl<'a> Placement<'a> {
@@ -521,17 +513,23 @@ impl<'a> Placement<'a> {
         deployment: &'a dyn DeploymentRuntime,
     ) -> Result<Self, crucible_plugin::Error> {
         match fault.taking() {
-            Taking::Kill(service) => deployment
+            By::Kill(service) => deployment
                 .kills()
                 .map(|kills| Placement::Kill { kills, service })
                 .ok_or_else(|| unreachable_fault(fault)),
-            // The substrate does this one on its own, so what it offers is all
+            // The substrate does these on its own, so what it offers is all
             // there is to check.
-            Taking::Cut(_) => deployment
+            By::Cut(_) => deployment
                 .substrate()
                 .primitives()
                 .contains(&Primitive::Cut)
                 .then_some(Placement::Cut)
+                .ok_or_else(|| unreachable_fault(fault)),
+            By::Repeat(_) => deployment
+                .substrate()
+                .primitives()
+                .contains(&Primitive::Redeliver)
+                .then_some(Placement::Rewritten)
                 .ok_or_else(|| unreachable_fault(fault)),
         }
     }
@@ -574,6 +572,24 @@ async fn anchored_run(
     };
 
     let fault_fut = async {
+        // A fault the fleet is held for says so by freezing. One that changes
+        // what crosses holds nothing, so there is no freeze to wait for and
+        // what the plugin did is all there is to go on.
+        if matches!(placement, Placement::Rewritten) {
+            let _ = (&mut scenario_end_rx).await;
+            session_observer
+                .wait_for_quiescence(LEARN_SETTLE, QUIESCENCE_IDLE, ANCHOR_TIMEOUT)
+                .await;
+            return place(
+                fault,
+                placement,
+                deployment.substrate(),
+                session_observer,
+                id,
+                scenario_start_ns,
+            )
+            .await;
+        }
         let frozen = tokio::select! {
             biased;
             frozen = session_observer.wait_for_freeze(baseline, ANCHOR_TIMEOUT) => frozen,
@@ -609,8 +625,15 @@ async fn anchored_run(
                 FaultMissReason::ScenarioEndedBeforeAnchor,
             ));
         }
-        let placed = placed_at(session_observer, scenario_start_ns);
-        place(fault, placement, deployment.substrate(), id, placed).await
+        place(
+            fault,
+            placement,
+            deployment.substrate(),
+            session_observer,
+            id,
+            scenario_start_ns,
+        )
+        .await
     };
 
     let (scenario, report) = tokio::join!(scenario_fut, fault_fut);
@@ -631,7 +654,7 @@ async fn degraded_run(
 ) -> Result<(Observations, FaultReport), crucible_plugin::Error> {
     let placed_at_ns = match placement {
         // Arming is what puts the substrate's held degradation in place.
-        Placement::Cut => {
+        Placement::Cut | Placement::Rewritten => {
             deployment.substrate().arm_anchor().await?;
             now_ns()
         }
@@ -664,7 +687,7 @@ async fn degraded_run(
     .await?;
 
     match placement {
-        Placement::Cut => deployment.substrate().proceed().await?,
+        Placement::Cut | Placement::Rewritten => deployment.substrate().proceed().await?,
         Placement::Kill { kills, service } => {
             kills.restart(service).await?;
             deployment.substrate().proceed().await?;
@@ -682,6 +705,21 @@ async fn degraded_run(
     ))
 }
 
+/// What a fault the proxy places itself says of itself, said in the terms a
+/// miss is reported in.
+fn unplaced(said: Option<Reported>) -> String {
+    match said {
+        Some(Reported {
+            did: Did::Unplaceable(why),
+            ..
+        }) => why,
+        Some(Reported {
+            did: Did::Asked, ..
+        }) => "the fleet was asked and was not seen to do it".to_owned(),
+        _ => "the proxy did not say it placed anything".to_owned(),
+    }
+}
+
 /// Place the fault against the already-frozen fleet and report it.
 ///
 /// The kill releases the flow and restarts concurrently, so the scenario meets
@@ -692,11 +730,25 @@ async fn place(
     fault: &Fault,
     placement: Placement<'_>,
     substrate: &dyn Substrate,
+    session_observer: &SessionObserver,
     id: u32,
-    placed: Placed,
+    scenario_start_ns: u128,
 ) -> Result<FaultReport, crucible_plugin::Error> {
     let placed_at_ns = match placement {
-        Placement::Cut => placed.at_ns,
+        // The proxy places these itself, so what says one landed is the proxy
+        // saying so. Taking the freeze as proof would report a fleet that was
+        // held and then let go as one that met a fault.
+        Placement::Cut | Placement::Rewritten => {
+            match session_observer.wait_for_placed(PLACED_GRACE).await {
+                Some(Reported {
+                    did: Did::Placed(_),
+                    at_ns,
+                }) => at_ns,
+                said => {
+                    return Ok(missed(id, fault, FaultMissReason::Failed(unplaced(said))));
+                }
+            }
+        }
         Placement::Kill { kills, service } => match kills.kill(service).await {
             Ok(placed_at_ns) => {
                 substrate.proceed().await?;
@@ -713,7 +765,7 @@ async fn place(
     };
     let anchor = fault
         .anchor()
-        .expect("an anchored fault is placed on a packet");
+        .expect("an anchored fault is placed on a moment");
     Ok(FaultReport::fired(
         id,
         fault.taking().target(),
@@ -722,7 +774,7 @@ async fn place(
             direction: anchor.direction,
             mark: anchor.mark.clone(),
             why: anchor.why.clone(),
-            offset_ns: placed.offset_ns,
+            offset_ns: placed_at_ns.saturating_sub(scenario_start_ns),
         },
         placed_at_ns,
     ))
@@ -810,8 +862,14 @@ mod tests {
                 mark: "ack:7:before".into(),
                 why: "an ack the consumer has sent and the broker has not seen".into(),
             },
-            by: Taking::Kill("db".into()),
+            by: By::Kill("db".into()),
         }
+    }
+
+    /// A fleet that says nothing of itself, for a fault that is not placed by
+    /// the proxy and so has nothing to hear back.
+    fn silent() -> SessionObserver {
+        SessionObserver::start(futures_util::stream::empty())
     }
 
     /// The placement `fault` calls for, against a deployment that can kill.
@@ -822,21 +880,27 @@ mod tests {
         }
     }
 
+    /// A cut is placed by the proxy, so what says it happened is the proxy
+    /// saying so. Without that the run reports a fleet it never broke.
+    #[tokio::test]
+    async fn a_cut_nothing_was_seen_to_make_is_missed() {
+        let deployment = FakeDeployment::default();
+        let report = place(&fault(), Placement::Cut, &deployment, &silent(), 1, 0)
+            .await
+            .expect("a fault that did not land is reported, not an error");
+        assert!(
+            matches!(report.result, FaultResult::Missed(_)),
+            "{:?}",
+            report.result
+        );
+    }
+
     #[tokio::test]
     async fn a_fault_reports_fired_when_recovery_succeeds() {
         let deployment = FakeDeployment::default();
-        let report = place(
-            &fault(),
-            killing(&deployment),
-            &deployment,
-            1,
-            Placed {
-                at_ns: 42,
-                offset_ns: 0,
-            },
-        )
-        .await
-        .expect("recovery succeeded, so a report comes back");
+        let report = place(&fault(), killing(&deployment), &deployment, &silent(), 1, 0)
+            .await
+            .expect("recovery succeeded, so a report comes back");
         assert!(matches!(report.result, FaultResult::Fired { .. }));
     }
 
@@ -848,17 +912,7 @@ mod tests {
             restart_fails: true,
             ..Default::default()
         };
-        let result = place(
-            &fault(),
-            killing(&deployment),
-            &deployment,
-            1,
-            Placed {
-                at_ns: 42,
-                offset_ns: 0,
-            },
-        )
-        .await;
+        let result = place(&fault(), killing(&deployment), &deployment, &silent(), 1, 0).await;
         assert!(result.is_err());
     }
 
@@ -870,17 +924,7 @@ mod tests {
             resume_fails: true,
             ..Default::default()
         };
-        let result = place(
-            &fault(),
-            killing(&deployment),
-            &deployment,
-            1,
-            Placed {
-                at_ns: 42,
-                offset_ns: 0,
-            },
-        )
-        .await;
+        let result = place(&fault(), killing(&deployment), &deployment, &silent(), 1, 0).await;
         assert!(result.is_err());
     }
 
@@ -891,18 +935,9 @@ mod tests {
             kill_fails: true,
             ..Default::default()
         };
-        let report = place(
-            &fault(),
-            killing(&deployment),
-            &deployment,
-            1,
-            Placed {
-                at_ns: 42,
-                offset_ns: 0,
-            },
-        )
-        .await
-        .expect("kill-failure is a miss, not an error");
+        let report = place(&fault(), killing(&deployment), &deployment, &silent(), 1, 0)
+            .await
+            .expect("kill-failure is a miss, not an error");
         assert!(matches!(
             report.result,
             FaultResult::Missed(FaultMissReason::Failed(_))

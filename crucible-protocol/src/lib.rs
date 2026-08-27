@@ -42,10 +42,9 @@ pub struct Placement {
 
 /// What a plugin made of some bytes.
 pub struct Carried<'a> {
-    /// What goes on the wire. Borrowed unless the plugin needs to mutate the
-    /// wire.
-    pub forward: std::borrow::Cow<'a, [u8]>,
-    /// How far into `forward` the fleet is held.
+    /// Ordered buffer of bytes from the wire.
+    pub forward: Vec<std::borrow::Cow<'a, [u8]>>,
+    /// How many of them go before the fleet is held.
     pub freeze_after: Option<usize>,
     /// Where a fault could go, found in these bytes.
     pub found: Vec<Placement>,
@@ -53,12 +52,18 @@ pub struct Carried<'a> {
     pub did: Option<Did>,
 }
 
-/// A plugin's report, in terms the framework can act on.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// What a plugin made of the fault it was asked to place.
+///
+/// Only [`Did::Placed`] is a fault the run met. The rest are reasons it did
+/// not, and a run that did not meet its fault has tested nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub enum Did {
-    /// What it was asked to do landed.
+    /// Set in motion. Whether it happens is the fleet's to say, so this alone
+    /// proves nothing.
+    Asked,
+    /// Seen to happen, so the fleet met it.
     Placed(String),
-    /// It cannot be done here, so the run proves nothing.
+    /// Cannot be done here.
     Unplaceable(String),
 }
 
@@ -70,7 +75,11 @@ pub enum Did {
 /// One is made per direction, and holds whatever has not finished arriving.
 pub trait Kind: Send {
     /// Take the next bytes off the wire and say what goes on it in their place.
-    fn carry<'a>(&mut self, bytes: &'a [u8]) -> Carried<'a>;
+    ///
+    /// `placing` says whether a fault may be placed on this connection now:
+    /// the scenario has started, and this is the edge the schedule named.
+    /// Neither is anything the bytes can say, so the framework says it.
+    fn carry<'a>(&mut self, bytes: &'a [u8], placing: bool) -> Carried<'a>;
 }
 
 /// A link the proxy carries.

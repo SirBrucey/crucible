@@ -100,6 +100,15 @@ impl ConnEvent {
     }
 
     #[must_use]
+    pub fn did(id: ConnId, did: crate::Did) -> Self {
+        Self {
+            id,
+            ts_ns: now_ns(),
+            kind: ConnEventKind::Did { did },
+        }
+    }
+
+    #[must_use]
     pub fn froze(id: ConnId, mark: String) -> Self {
         Self::froze_at(id, now_ns(), mark)
     }
@@ -132,17 +141,20 @@ pub enum ConnEventKind {
     Failed {
         reason: String,
     },
-    /// The fault anchor tripped: this pair has forwarded `k` packets on its
-    /// direction and the proxy has frozen the fleet. Emitted once per arm, at the
-    /// trip, so a consumer can gate an action on the freeze actually being in
-    /// place rather than on its own independent packet count.
     /// The moment a schedule named has come, and the fleet is held on it.
+    /// Emitted once per arm, so a consumer can gate an action on the freeze
+    /// being in place rather than on a count of its own.
     Froze {
         mark: String,
     },
     /// Somewhere the plugin reading this connection says a fault could go.
     Placeable {
         placement: crate::Placement,
+    },
+    /// What the plugin reading this connection made of the fault it was asked
+    /// to place.
+    Did {
+        did: crate::Did,
     },
 }
 

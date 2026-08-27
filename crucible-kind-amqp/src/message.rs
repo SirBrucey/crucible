@@ -8,10 +8,13 @@
 use std::{borrow::Cow, collections::BTreeMap, ops::Range};
 
 use amq_protocol::{
-    frame::{AMQPFrame, parsing::parse_frame},
-    protocol::{AMQPClass, basic::AMQPMethod},
+    frame::{AMQPFrame, WriteContext, gen_frame, parsing::parse_frame},
+    protocol::{
+        AMQPClass,
+        basic::{AMQPMethod, Nack},
+    },
 };
-use crucible_protocol::{Carried, Direction, Placement, Property};
+use crucible_protocol::{Carried, Did, Direction, Placement, Property};
 
 /// What a fleet was doing, in terms a fault is placed against.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -80,6 +83,47 @@ pub struct Message {
     pub operation: Operation,
     pub channel: u16,
     pub at: Range<usize>,
+    /// What this is, for an operation that carries a message.
+    identity: Option<Identity>,
+}
+
+/// What names a message across deliveries of it.
+///
+/// A delivery tag counts what the broker has sent on a channel, so the same
+/// message sent twice is two tags. What the fleet called it holds across both;
+/// failing that, what it carried does.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Identity {
+    /// What the fleet called it, in a message id or a correlation id.
+    Named(String),
+    /// What it carried, for a fleet that named nothing. Two messages of the
+    /// same shape are one identity, which is as far as a body can tell.
+    Carried(u64),
+}
+
+impl Identity {
+    /// What the frames of a message from `at` say it is.
+    fn of(frames: &[Framed], at: usize) -> Option<Self> {
+        let AMQPFrame::Header(_, header) = &frames.get(at + 1)?.frame else {
+            return None;
+        };
+        let named = header
+            .properties
+            .message_id()
+            .as_ref()
+            .or(header.properties.correlation_id().as_ref());
+        if let Some(named) = named {
+            return Some(Identity::Named(named.to_string()));
+        }
+        let mut carried = std::hash::DefaultHasher::new();
+        for framed in &frames[at + 2..] {
+            let AMQPFrame::Body(_, payload) = &framed.frame else {
+                break;
+            };
+            std::hash::Hash::hash(payload, &mut carried);
+        }
+        Some(Identity::Carried(std::hash::Hasher::finish(&carried)))
+    }
 }
 
 /// One frame, and where it sat in the stream it was parsed from.
@@ -87,6 +131,16 @@ pub struct Message {
 struct Framed {
     frame: AMQPFrame,
     at: Range<usize>,
+}
+
+/// One whole frame on its way back to the wire, and where it sat in the stream.
+///
+/// Its bytes are the ones that arrived, so nothing the parser does not
+/// understand can be lost by writing it out again. Only a frame put back
+/// together across reads, or one a fault replaced, is owned.
+struct Wire<'a> {
+    at: Range<usize>,
+    bytes: Cow<'a, [u8]>,
 }
 
 /// Every whole frame at the front of `bytes`.
@@ -130,6 +184,10 @@ fn read(frames: &[Framed]) -> (Vec<Message>, usize) {
             operation,
             channel: framed.frame.channel_id(),
             at: framed.at.start..frames[last].at.end,
+            identity: operation
+                .has_body()
+                .then(|| Identity::of(frames, taken))
+                .flatten(),
         });
         taken = last + 1;
     }
@@ -157,6 +215,84 @@ fn body_ends(frames: &[Framed], at: usize) -> Option<usize> {
     Some(last)
 }
 
+/// What the two directions of a connection have to agree on.
+///
+/// A delivery and the ack that ends it cross opposite ways, so neither reader
+/// sees both. What a redelivery can be recognised by came with the delivery,
+/// and what asks for one is the ack.
+#[derive(Clone, Default, Debug)]
+pub struct Consuming(std::sync::Arc<std::sync::Mutex<Deliveries>>);
+
+#[derive(Default, Debug)]
+struct Deliveries {
+    /// What the consumer holds and has not finished with, by the tag naming
+    /// each delivery of it. Bounded by the prefetch the channel negotiated,
+    /// since that is how many the broker will let it hold at once.
+    outstanding: BTreeMap<(u16, u64), Identity>,
+    /// The message a fault asked the broker to send again.
+    asked: Option<Identity>,
+}
+
+impl Consuming {
+    /// The broker has handed `identity` to the consumer as `tag`.
+    fn delivered(&self, channel: u16, tag: u64, identity: Option<Identity>) {
+        if let Some(identity) = identity {
+            self.held().outstanding.insert((channel, tag), identity);
+        }
+    }
+
+    /// What the consumer is holding as `tag`.
+    fn holding(&self, channel: u16, tag: u64) -> Option<Identity> {
+        self.held().outstanding.get(&(channel, tag)).cloned()
+    }
+
+    /// The consumer is done with `tag`, one way or another.
+    fn finished(&self, channel: u16, tag: u64) {
+        self.held().outstanding.remove(&(channel, tag));
+    }
+
+    /// Ask for `identity` to be sent again.
+    fn ask(&self, identity: Identity) {
+        self.held().asked = Some(identity);
+    }
+
+    /// Whether `identity` is what was asked for, forgetting it if it is: one
+    /// fault asks once, so the next redelivery is the fleet's own doing.
+    fn answers(&self, identity: Option<&Identity>) -> bool {
+        let mut held = self.held();
+        if held.asked.is_none() || held.asked.as_ref() != identity {
+            return false;
+        }
+        held.asked = None;
+        true
+    }
+
+    /// Follow what the consumer is holding, and say when the message a fault
+    /// asked for comes round again.
+    fn track(&self, message: &Message) -> Option<Did> {
+        match message.operation {
+            Operation::Deliver { tag, redelivered } => {
+                self.delivered(message.channel, tag, message.identity.clone());
+                (redelivered && self.answers(message.identity.as_ref()))
+                    .then(|| Did::Placed("the broker delivered the message again".to_owned()))
+            }
+            Operation::Ack { tag } | Operation::Reject { tag } => {
+                self.finished(message.channel, tag);
+                None
+            }
+            Operation::Publish | Operation::Housekeeping => None,
+        }
+    }
+
+    fn held(&self) -> std::sync::MutexGuard<'_, Deliveries> {
+        // A poisoned lock means a reader panicked mid-update, so what the two
+        // directions agree on is already unreliable.
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
 /// Reads one direction of one connection, across as many reads as it takes.
 ///
 /// A frame can arrive split over several reads and a message over several
@@ -174,6 +310,8 @@ pub struct Reader {
     seen: Seen,
     /// The moment a schedule named, watched for as the run goes.
     watching: Option<String>,
+    /// What both directions of this connection agree on.
+    consuming: Consuming,
     /// Which way this reader's traffic runs, which every placement it finds is
     /// on.
     direction: Direction,
@@ -184,6 +322,22 @@ pub struct Reader {
 enum Side {
     Before,
     After,
+}
+
+impl Side {
+    /// How many of `wire` go out before the fleet is held on `message`.
+    ///
+    /// A message that began in an earlier read has already had those frames go,
+    /// so the most this side can still hold back is everything in this one.
+    fn holds(self, wire: &[Wire<'_>], message: &Message) -> usize {
+        let boundary = match self {
+            Side::Before => message.at.start,
+            Side::After => message.at.end,
+        };
+        wire.iter()
+            .position(|frame| frame.at.end > boundary)
+            .unwrap_or(wire.len())
+    }
 }
 
 impl std::fmt::Display for Side {
@@ -249,39 +403,74 @@ impl Seen {
 }
 
 impl crucible_protocol::Kind for Reader {
-    fn carry<'a>(&mut self, bytes: &'a [u8]) -> Carried<'a> {
-        // Where these bytes start in the stream, so an extent can be given back
-        // as an offset into what the caller just handed over.
-        let head = self.head();
+    fn carry<'a>(&mut self, bytes: &'a [u8], placing: bool) -> Carried<'a> {
+        let (mut wire, messages) = self.read(bytes);
         let mut freeze_after = None;
         let mut found = Vec::new();
-        for message in self.read(bytes) {
+        let mut did = None;
+        for message in messages {
+            if let Some(placement) = redelivery(&message, self.direction) {
+                if placing && self.watches(&placement) {
+                    // The schedule names one moment, so once this is done there
+                    // is nothing left to watch for.
+                    self.watching = None;
+                    did = Some(self.refuse(&mut wire, &message));
+                }
+                found.push(placement);
+            }
+            // After the fault, which reads what the consumer is holding before
+            // this lets go of it.
+            if let Some(answered) = self.consuming.track(&message) {
+                did = Some(answered);
+            }
             for (side, placement) in self.seen.count(message.operation, self.direction) {
-                if self.watching.as_deref() == Some(placement.mark.as_str()) {
-                    let at = match side {
-                        Side::Before => message.at.start,
-                        Side::After => message.at.end,
-                    };
-                    freeze_after = Some(at.saturating_sub(head));
+                if self.watches(&placement) {
+                    freeze_after = Some(side.holds(&wire, &message));
                 }
                 found.push(placement);
             }
         }
         Carried {
-            forward: Cow::Borrowed(bytes),
+            forward: wire.into_iter().map(|frame| frame.bytes).collect(),
             freeze_after,
             found,
-            did: None,
+            did,
         }
     }
+}
+
+/// Where `message` offers to have the fleet do the same thing twice.
+///
+/// A consumer's ack is the broker letting go of its copy. Refusing it instead,
+/// asking for the message back, is how the broker itself is made to send it
+/// again, so what arrives is a redelivery the fleet would have to be ready for
+/// rather than a copy this made up.
+fn redelivery(message: &Message, direction: Direction) -> Option<Placement> {
+    let Operation::Ack { tag } = message.operation else {
+        return None;
+    };
+    Some(Placement {
+        direction,
+        mark: format!("redeliver:{tag}"),
+        why: "a message the consumer finished with, delivered to it again".to_owned(),
+        exercises: Property::Idempotent,
+    })
+}
+
+/// `frame` as it goes on the wire.
+fn write(frame: &AMQPFrame) -> Option<Vec<u8>> {
+    let write = gen_frame::<Vec<u8>>(frame);
+    let (bytes, _) = write(WriteContext::from(Vec::new())).ok()?.into_inner();
+    Some(bytes)
 }
 
 impl Reader {
     /// Reads a fault-free run, so we can say where a fault should go.
     #[must_use]
-    pub fn new(direction: Direction) -> Self {
+    pub fn new(direction: Direction, consuming: Consuming) -> Self {
         Self {
             direction,
+            consuming,
             pending: Vec::new(),
             frames: Vec::new(),
             taken: 0,
@@ -290,31 +479,83 @@ impl Reader {
         }
     }
 
+    /// Whether `placement` is the moment a schedule named.
+    fn watches(&self, placement: &Placement) -> bool {
+        self.watching.as_deref() == Some(placement.mark.as_str())
+    }
+
+    /// Refuse `message` in place of the ack that would have let the broker drop
+    /// it, and ask for the message it ends to be sent again.
+    ///
+    /// Nothing is placed yet, the broker may dead-letter the message instead of
+    /// requeueing it.
+    fn refuse(&self, wire: &mut [Wire<'_>], message: &Message) -> Did {
+        let Operation::Ack { tag } = message.operation else {
+            return Did::Unplaceable("not an ack, so there is nothing to refuse".to_owned());
+        };
+        let Some(identity) = self.consuming.holding(message.channel, tag) else {
+            return Did::Unplaceable(
+                "nothing said what the consumer was finishing with, so a redelivery of it could \
+                 not be told from any other"
+                    .to_owned(),
+            );
+        };
+        let Some(ack) = wire.iter_mut().find(|frame| frame.at == message.at) else {
+            return Did::Unplaceable("the ack had already gone".to_owned());
+        };
+        let nack = AMQPFrame::Method(
+            message.channel,
+            AMQPClass::Basic(AMQPMethod::Nack(Nack {
+                delivery_tag: tag,
+                multiple: false,
+                requeue: true,
+            })),
+        );
+        let Some(refusal) = write(&nack) else {
+            return Did::Unplaceable("a refusal could not be written".to_owned());
+        };
+        ack.bytes = Cow::Owned(refusal);
+        self.consuming.ask(identity);
+        Did::Asked
+    }
+
     /// Reads a faulted run, holding the fleet when it sees `mark`.
     #[must_use]
-    pub fn watching(direction: Direction, mark: String) -> Self {
+    pub fn watching(direction: Direction, consuming: Consuming, mark: String) -> Self {
         Self {
             watching: Some(mark),
-            ..Self::new(direction)
+            ..Self::new(direction, consuming)
         }
     }
 
-    /// Where in the stream the next bytes handed over will start.
-    fn head(&self) -> usize {
-        self.taken + self.pending.len()
-    }
-
-    /// Take the next `bytes` off the wire and return the operations they
-    /// completed, in the order they were sent.
+    /// Take the next `bytes` off the wire and return every whole frame in them
+    /// along with the operations those completed, in the order they were sent.
     ///
-    /// Each one's `at` counts from the first byte this reader ever saw, so a
-    /// message that arrived over several reads still says where it began.
-    pub fn read(&mut self, bytes: &[u8]) -> Vec<Message> {
+    /// A frame that has not finished arriving is held back until the rest of it
+    /// turns up, so what comes out is always something the protocol recognises.
+    /// Extents count from the first byte this reader ever saw, so a message
+    /// that arrived over several reads still says where it began.
+    fn read<'a>(&mut self, bytes: &'a [u8]) -> (Vec<Wire<'a>>, Vec<Message>) {
+        // What was already held, so a frame that arrived whole can be given
+        // back as a slice of what the caller just handed over.
+        let held = self.pending.len();
         self.pending.extend_from_slice(bytes);
         // A frame is parsed once. Only the tail of one still arriving is ever
         // looked at again, so a long message costs what it is long.
         let decoded = decode(&self.pending);
         let consumed = decoded.last().map_or(0, |framed| framed.at.end);
+
+        let wire = decoded
+            .iter()
+            .map(|framed| Wire {
+                at: self.taken + framed.at.start..self.taken + framed.at.end,
+                bytes: match framed.at.start.checked_sub(held) {
+                    Some(start) => Cow::Borrowed(&bytes[start..framed.at.end - held]),
+                    None => Cow::Owned(self.pending[framed.at.clone()].to_vec()),
+                },
+            })
+            .collect();
+
         self.frames.extend(decoded.into_iter().map(|framed| Framed {
             frame: framed.frame,
             at: self.taken + framed.at.start..self.taken + framed.at.end,
@@ -326,7 +567,7 @@ impl Reader {
         // of it to turn up.
         let (messages, whole) = read(&self.frames);
         self.frames.drain(..whole);
-        messages
+        (wire, messages)
     }
 }
 
@@ -394,25 +635,27 @@ mod tests {
     }
 
     /// A delivery the broker pushed. This names its consumer.
-    fn pushed(redelivered: bool) -> Vec<u8> {
+    fn pushed(redelivered: bool, payload: &[u8]) -> Vec<u8> {
         let mut bytes = method(AMQPMethod::Deliver(Deliver {
             consumer_tag: "consumer-1".into(),
             delivery_tag: TAG,
             redelivered,
             ..Default::default()
         }));
-        bytes.extend(header(0));
+        bytes.extend(header(payload.len() as u64));
+        bytes.extend(body(payload));
         bytes
     }
 
     /// A delivery a consumer fetched.
-    fn fetched(redelivered: bool) -> Vec<u8> {
+    fn fetched(redelivered: bool, payload: &[u8]) -> Vec<u8> {
         let mut bytes = method(AMQPMethod::GetOk(GetOk {
             delivery_tag: TAG,
             redelivered,
             ..Default::default()
         }));
-        bytes.extend(header(0));
+        bytes.extend(header(payload.len() as u64));
+        bytes.extend(body(payload));
         bytes
     }
 
@@ -432,14 +675,116 @@ mod tests {
 
     /// Placements a fault-free run of `bytes` offers.
     fn placements(bytes: &[u8]) -> Vec<Placement> {
-        Reader::new(WAY).carry(bytes).found
+        Reader::new(WAY, Consuming::default())
+            .carry(bytes, false)
+            .found
     }
 
     /// Where a run watching `mark` holds the fleet.
     fn freeze(bytes: &[u8], mark: &str) -> Option<usize> {
-        Reader::watching(WAY, mark.to_owned())
-            .carry(bytes)
+        Reader::watching(WAY, Consuming::default(), mark.to_owned())
+            .carry(bytes, true)
             .freeze_after
+    }
+
+    /// A consumer's connection to the broker: what it is sent, and what it
+    /// sends back, watching for `mark` on the way out.
+    fn consumer(mark: &str) -> (Reader, Reader) {
+        let consuming = Consuming::default();
+        (
+            Reader::new(Direction::UpstreamToClient, consuming.clone()),
+            Reader::watching(WAY, consuming, mark.to_owned()),
+        )
+    }
+
+    /// Every ack is a message the consumer has finished with, so every ack is
+    /// somewhere the fleet could be asked to do the same work twice.
+    #[test]
+    fn an_ack_offers_to_have_the_message_delivered_again() {
+        let offered: Vec<(String, Property)> = placements(&ack())
+            .into_iter()
+            .map(|placement| (placement.mark, placement.exercises))
+            .collect();
+        assert!(
+            offered.contains(&(format!("redeliver:{TAG}"), Property::Idempotent)),
+            "{offered:?}"
+        );
+    }
+
+    /// Nothing else is: a publish has not been delivered to anyone, and a
+    /// delivery has not been finished with.
+    #[test]
+    fn nothing_else_offers_a_redelivery() {
+        for bytes in [
+            publish(b"an order"),
+            pushed(false, b"an order"),
+            fetched(false, b"an order"),
+        ] {
+            let marks: Vec<String> = placements(&bytes)
+                .into_iter()
+                .map(|placement| placement.mark)
+                .collect();
+            assert!(
+                !marks.iter().any(|mark| mark.starts_with("redeliver:")),
+                "{marks:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_redelivery_refuses_the_ack_and_asks_for_the_message_back() {
+        let (mut from_broker, mut to_broker) = consumer(&format!("redeliver:{TAG}"));
+        from_broker.carry(&pushed(false, b"an order"), false);
+        let forward = to_broker.carry(&ack(), true).forward.concat();
+
+        assert_eq!(operations(&forward), [Operation::Reject { tag: TAG }]);
+        let AMQPFrame::Method(_, AMQPClass::Basic(AMQPMethod::Nack(nack))) =
+            &decode(&forward)[0].frame
+        else {
+            panic!("a refusal is a nack: {:?}", decode(&forward)[0].frame);
+        };
+        assert!(
+            nack.requeue,
+            "asking for it back is what makes it come again"
+        );
+    }
+
+    #[test]
+    fn a_redelivery_is_placed_only_when_the_message_comes_round_again() {
+        let (mut from_broker, mut to_broker) = consumer(&format!("redeliver:{TAG}"));
+        from_broker.carry(&pushed(false, b"an order"), false);
+        assert_eq!(to_broker.carry(&ack(), true).did, Some(Did::Asked));
+
+        let redelivered = pushed(true, b"an order");
+        let again = from_broker.carry(&redelivered, false);
+        assert!(matches!(again.did, Some(Did::Placed(_))), "{:?}", again.did);
+    }
+
+    #[test]
+    fn another_message_coming_round_again_places_nothing() {
+        let (mut from_broker, mut to_broker) = consumer(&format!("redeliver:{TAG}"));
+        from_broker.carry(&pushed(false, b"an order"), false);
+        to_broker.carry(&ack(), true);
+
+        let unrelated = pushed(true, b"a different order");
+        assert_eq!(from_broker.carry(&unrelated, false).did, None);
+    }
+
+    #[test]
+    fn an_ack_for_a_delivery_nothing_saw_is_not_refused() {
+        let (_, mut to_broker) = consumer(&format!("redeliver:{TAG}"));
+        let bytes = ack();
+        let carried = to_broker.carry(&bytes, true);
+        assert!(
+            matches!(carried.did, Some(Did::Unplaceable(_))),
+            "{:?}",
+            carried.did
+        );
+        assert_eq!(
+            operations(&carried.forward.concat()),
+            [Operation::Ack { tag: TAG }],
+            "left alone"
+        );
     }
 
     /// A fault before an operation and one after it leave different sides
@@ -450,20 +795,18 @@ mod tests {
             .into_iter()
             .map(|placement| placement.mark)
             .collect();
-        assert_eq!(
-            marks,
-            [format!("ack:{TAG}:before"), format!("ack:{TAG}:after")]
-        );
+        for side in ["before", "after"] {
+            assert!(marks.contains(&format!("ack:{TAG}:{side}")), "{marks:?}");
+        }
     }
 
+    /// An ack is one frame, so a fault before it lets nothing of it go and a
+    /// fault after it lets the whole of it go.
     #[test]
     fn the_fleet_is_held_where_the_watched_mark_falls() {
         let bytes = ack();
         assert_eq!(freeze(&bytes, &format!("ack:{TAG}:before")), Some(0));
-        assert_eq!(
-            freeze(&bytes, &format!("ack:{TAG}:after")),
-            Some(bytes.len())
-        );
+        assert_eq!(freeze(&bytes, &format!("ack:{TAG}:after")), Some(1));
     }
 
     #[test]
@@ -475,7 +818,7 @@ mod tests {
     /// what the broker labelled rather than on however far into the run it fell.
     #[test]
     fn a_placement_on_a_delivery_names_the_message() {
-        let marks: Vec<String> = placements(&pushed(false))
+        let marks: Vec<String> = placements(&pushed(false, b"an order"))
             .into_iter()
             .map(|placement| placement.mark)
             .collect();
@@ -490,11 +833,11 @@ mod tests {
 
     #[rstest]
     fn a_delivery_says_whether_the_broker_has_sent_it_before(
-        #[values(pushed, fetched)] delivery: fn(bool) -> Vec<u8>,
+        #[values(pushed, fetched)] delivery: fn(bool, &[u8]) -> Vec<u8>,
         #[values(true, false)] redelivered: bool,
     ) {
         assert_eq!(
-            operations(&delivery(redelivered)),
+            operations(&delivery(redelivered, b"an order")),
             [Operation::Deliver {
                 tag: TAG,
                 redelivered
@@ -518,13 +861,45 @@ mod tests {
     fn a_message_split_across_reads_is_held_on_the_read_that_finishes_it() {
         let bytes = publish(b"an order");
         let split = bytes.len() - 4;
-        let mut reader = Reader::watching(WAY, "publish:1:after".to_owned());
+        let mut reader = Reader::watching(WAY, Consuming::default(), "publish:1:after".to_owned());
         assert_eq!(
-            reader.carry(&bytes[..split]).freeze_after,
+            reader.carry(&bytes[..split], true).freeze_after,
             None,
             "still arriving"
         );
-        assert_eq!(reader.carry(&bytes[split..]).freeze_after, Some(4));
+        assert_eq!(
+            reader.carry(&bytes[split..], true).freeze_after,
+            Some(1),
+            "the frame that finished it"
+        );
+    }
+
+    /// What comes back is what arrived, so nothing the parser does not
+    /// understand can be lost by writing it out again.
+    #[test]
+    fn what_is_carried_is_what_arrived() {
+        let bytes = [publish(b"an order"), ack()].concat();
+        assert_eq!(
+            Reader::new(WAY, Consuming::default())
+                .carry(&bytes, false)
+                .forward
+                .concat(),
+            bytes
+        );
+    }
+
+    /// A read can end mid-frame. Half a frame is not something the fleet can
+    /// act on, so it waits for the rest and goes out whole.
+    #[test]
+    fn a_frame_split_across_reads_goes_out_whole() {
+        let bytes = ack();
+        let split = bytes.len() - 4;
+        let mut reader = Reader::new(WAY, Consuming::default());
+        assert!(
+            reader.carry(&bytes[..split], false).forward.is_empty(),
+            "none of it is whole yet"
+        );
+        assert_eq!(reader.carry(&bytes[split..], false).forward.concat(), bytes);
     }
 
     /// A fault that goes before an operation which began in an earlier read
@@ -533,8 +908,8 @@ mod tests {
     fn a_message_split_before_the_mark_holds_the_whole_read() {
         let bytes = publish(b"an order");
         let split = bytes.len() - 4;
-        let mut reader = Reader::watching(WAY, "publish:1:before".to_owned());
-        assert_eq!(reader.carry(&bytes[..split]).freeze_after, None);
-        assert_eq!(reader.carry(&bytes[split..]).freeze_after, Some(0));
+        let mut reader = Reader::watching(WAY, Consuming::default(), "publish:1:before".to_owned());
+        assert_eq!(reader.carry(&bytes[..split], true).freeze_after, None);
+        assert_eq!(reader.carry(&bytes[split..], true).freeze_after, Some(0));
     }
 }

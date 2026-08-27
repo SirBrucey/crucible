@@ -266,6 +266,13 @@ impl Anchor {
         self.active.store(true, Ordering::SeqCst);
     }
 
+    /// Whether a fault may be placed on this connection now: the scenario has
+    /// started and this is the edge the schedule named.
+    #[must_use]
+    pub fn placing(&self, peer: IpAddr) -> bool {
+        self.active.load(Ordering::SeqCst) && on_edge(&self.edge, peer)
+    }
+
     /// Whether a moment offered on this connection is the one the schedule
     /// named, and if it is, hold the fleet.
     ///
@@ -401,6 +408,25 @@ impl Relay {
     }
 }
 
+/// Say that this connection has been cut off, which is the fault being placed:
+/// nothing else can see a cut land, and a run that reports one it never made is
+/// a run that judged a fleet it never broke.
+fn severed(
+    events: &mpsc::UnboundedSender<ConnEvent>,
+    conn: Conn,
+    direction: Direction,
+    when: &str,
+) {
+    tracing::debug!(%conn.peer, ?direction, "severed {when}");
+    emit(
+        events,
+        ConnEvent::did(
+            conn.id,
+            crucible_protocol::Did::Placed(format!("the edge was cut off {when}")),
+        ),
+    );
+}
+
 /// Send a connection event to the drain task in `main`, which holds the receiver
 /// for as long as any forward task (or the accept loop) holds a sender.
 // FIXME: propagate this for real recovery once the forward tasks report failures
@@ -515,7 +541,7 @@ async fn forward_bytes(
         let read = tokio::select! {
             read = read.read(&mut buf) => read,
             () = gate.severing() => {
-                tracing::debug!(%conn.peer, ?direction, "severed while waiting for traffic");
+                severed(&events, conn, direction, "waiting for traffic");
                 break Ok(bytes_total);
             }
         };
@@ -525,40 +551,59 @@ async fn forward_bytes(
             Err(e) => break Err(format!("{read_label}: {e}")),
         };
         if !gate.passable().await {
-            tracing::debug!(%conn.peer, ?direction, "severed with traffic in hand");
+            severed(&events, conn, direction, "with traffic in hand");
             break Ok(bytes_total);
         }
         // What goes on the wire, which is what arrived unless the plugin had
-        // reason to change it.
-        let carried = operations.carry(&buf[..n]);
-        let forward = carried.forward.as_ref();
+        // reason to change it. Anything still arriving stays with the plugin
+        // until the rest of it turns up.
+        let placing = anchor
+            .as_ref()
+            .is_some_and(|anchor| anchor.placing(conn.peer));
+        let carried = operations.carry(&buf[..n], placing);
         for placement in carried.found {
             emit(&events, ConnEvent::placeable(conn.id, placement));
         }
-        // The plugin says where in these bytes the moment falls, so what comes
-        // before it goes out first and the fleet is held on the moment itself.
-        let held_at = carried.freeze_after.unwrap_or(forward.len());
-        if let Err(e) = write.write_all(&forward[..held_at]).await {
-            break Err(format!("{write_label}: {e}"));
+        if let Some(did) = carried.did {
+            tracing::info!(%conn.peer, ?direction, ?did, "the plugin changed what crossed");
+            emit(&events, ConnEvent::did(conn.id, did));
         }
-        if carried.freeze_after.is_some()
-            && let Some(anchor) = &anchor
-            && anchor.reached(conn.peer)
-        {
-            emit(&events, ConnEvent::froze(conn.id, anchor.mark.clone()));
-            // Hold here, in the task carrying the moment, so nothing else
-            // crosses while the fault is placed.
-            if !gate.passable().await {
-                break Ok(bytes_total);
+        // The plugin says how many of these go before the moment, so those go
+        // out first and the fleet is held on the moment itself. None of them
+        // going first is a moment before anything in this read.
+        let mut written: u64 = 0;
+        let mut cut_off = false;
+        for sent in 0..=carried.forward.len() {
+            if carried.freeze_after == Some(sent)
+                && let Some(anchor) = &anchor
+                && anchor.reached(conn.peer)
+            {
+                emit(&events, ConnEvent::froze(conn.id, anchor.mark.clone()));
+                // Hold here, in the task carrying the moment, so nothing else
+                // crosses while the fault is placed. This is the connection a
+                // cut is most likely to take, so it is the one that has to say
+                // the cut landed.
+                if !gate.passable().await {
+                    severed(&events, conn, direction, "on the moment it was held");
+                    cut_off = true;
+                    break;
+                }
             }
+            let Some(frame) = carried.forward.get(sent) else {
+                break;
+            };
+            if let Err(e) = write.write_all(frame).await {
+                return Err(format!("{write_label}: {e}"));
+            }
+            written += frame.len() as u64;
         }
-        if let Err(e) = write.write_all(&forward[held_at..]).await {
-            break Err(format!("{write_label}: {e}"));
+        // Only once it is through: what the gate held back and then severed was
+        // never forwarded, and the learn pass counts these as traffic.
+        emit(&events, ConnEvent::wrote(conn.id, direction, written));
+        bytes_total += written;
+        if cut_off {
+            break Ok(bytes_total);
         }
-        // Only once it is through: bytes the gate held back and then severed
-        // were never forwarded, and the learn pass counts these as traffic.
-        emit(&events, ConnEvent::wrote(conn.id, direction, n as u64));
-        bytes_total += n as u64;
     }
 }
 
@@ -616,6 +661,21 @@ mod tests {
             watch::channel(false).1,
             every_peer(),
         )
+    }
+
+    /// A kind that holds the fleet before anything it is handed goes out, which
+    /// is what a fault placed before an operation asks for.
+    struct Before;
+
+    impl Kind for Before {
+        fn carry<'a>(&mut self, bytes: &'a [u8], _placing: bool) -> crucible_protocol::Carried<'a> {
+            crucible_protocol::Carried {
+                forward: vec![std::borrow::Cow::Borrowed(bytes)],
+                freeze_after: Some(0),
+                found: Vec::new(),
+                did: None,
+            }
+        }
     }
 
     /// A gate held by `pause`.
@@ -717,10 +777,13 @@ mod tests {
                 ConnEventKind::Wrote { bytes, .. } => {
                     *wrote_counts.entry(event.id).or_default() += bytes;
                 }
-                // Nothing reads these bytes, so it can say nothing about where
-                // a fault would go.
+                // Nothing reads these bytes, so it can neither say where a
+                // fault would go nor change what crosses.
                 ConnEventKind::Placeable { placement } => {
                     panic!("unexpected placement from an unread kind: {placement:?}")
+                }
+                ConnEventKind::Did { did } => {
+                    panic!("an unread kind changed nothing: {did:?}")
                 }
                 ConnEventKind::Closed {
                     bytes_client_to_upstream,
@@ -984,6 +1047,46 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
+    }
+
+    /// A moment before the first of them is still a moment, and the fleet has
+    /// to be held on it rather than after whatever it was to come before.
+    #[tokio::test]
+    async fn a_moment_before_anything_in_a_read_holds_the_fleet() {
+        let echo = spawn_echo().await;
+        let (anchor, mut pause_rx, _trip) = anchor("1");
+        anchor.arm();
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let fronted = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(fronted).await.unwrap();
+        let (inbound, peer) = listener.accept().await.unwrap();
+        let (client_r, _client_w) = inbound.into_split();
+        let (_upstream_r, upstream_w) = TcpStream::connect(echo).await.unwrap().into_split();
+        let (events, _drain) = mpsc::unbounded_channel();
+
+        tokio::spawn(forward_bytes(
+            Conn {
+                id: 0,
+                peer: peer.ip(),
+            },
+            Half {
+                read: client_r,
+                write: upstream_w,
+                direction: Direction::ClientToUpstream,
+            },
+            Box::new(Before),
+            events,
+            held(pause_rx.clone()),
+            Some(anchor),
+        ));
+
+        client.write_all(b"a").await.unwrap();
+        timeout(Duration::from_secs(2), pause_rx.changed())
+            .await
+            .expect("the fleet is held on a moment before anything")
+            .expect("the pause watch is live");
+        assert!(*pause_rx.borrow());
     }
 
     /// A cut takes the connection it lands on, not the service. What the caller

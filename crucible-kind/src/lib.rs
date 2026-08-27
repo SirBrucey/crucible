@@ -21,6 +21,8 @@ pub struct Kinds {
     kind: String,
     /// The moment to watch for, and which way the traffic carrying it runs.
     watching: Option<(Direction, String)>,
+    /// What a pair's two directions agree on, for a kind whose readers need to.
+    consuming: crucible_kind_amqp::message::Consuming,
 }
 
 impl Kinds {
@@ -29,6 +31,7 @@ impl Kinds {
         Self {
             kind: kind.to_owned(),
             watching,
+            consuming: crucible_kind_amqp::message::Consuming::default(),
         }
     }
 
@@ -41,12 +44,17 @@ impl Kinds {
             .filter(|(way, _)| *way == direction)
             .map(|(_, mark)| mark.clone());
         match (self.kind.as_str(), mark) {
-            (crucible_kind_amqp::NAME, Some(mark)) => Box::new(
-                crucible_kind_amqp::message::Reader::watching(direction, mark),
-            ),
-            (crucible_kind_amqp::NAME, None) => {
-                Box::new(crucible_kind_amqp::message::Reader::new(direction))
+            (crucible_kind_amqp::NAME, Some(mark)) => {
+                Box::new(crucible_kind_amqp::message::Reader::watching(
+                    direction,
+                    self.consuming.clone(),
+                    mark,
+                ))
             }
+            (crucible_kind_amqp::NAME, None) => Box::new(crucible_kind_amqp::message::Reader::new(
+                direction,
+                self.consuming.clone(),
+            )),
             // A mark on an unread kind is a count of reads, so every read is a
             // candidate and whoever holds the count picks between them.
             (_, mark) => Box::new(Unread {
@@ -88,10 +96,14 @@ struct Unread {
 }
 
 impl Kind for Unread {
-    fn carry<'a>(&mut self, bytes: &'a [u8]) -> Carried<'a> {
+    // It cannot read the traffic, so it cannot change it either, and whether a
+    // fault may be placed here is not its business.
+    fn carry<'a>(&mut self, bytes: &'a [u8], _placing: bool) -> Carried<'a> {
         Carried {
-            forward: Cow::Borrowed(bytes),
-            freeze_after: self.watching.then_some(bytes.len()),
+            // One read, which it has to take whole because it cannot see
+            // anything smaller.
+            forward: vec![Cow::Borrowed(bytes)],
+            freeze_after: self.watching.then_some(1),
             // It cannot say where a fault should go.
             found: Vec::new(),
             did: None,
@@ -119,8 +131,8 @@ mod tests {
     fn a_kind_with_no_plugin_is_carried_untouched() {
         assert!(!is_read("http"));
         let mut reader = Kinds::new("http", None).reader(Direction::ClientToUpstream);
-        let carried = reader.carry(b"anything at all");
-        assert_eq!(carried.forward.as_ref(), b"anything at all");
+        let carried = reader.carry(b"anything at all", false);
+        assert_eq!(carried.forward.concat(), b"anything at all");
         assert_eq!(carried.freeze_after, None);
         assert!(carried.found.is_empty());
     }
@@ -130,8 +142,8 @@ mod tests {
     #[test]
     fn a_kind_with_no_plugin_offers_every_read() {
         let mut reader = watching().reader(Direction::ClientToUpstream);
-        assert_eq!(reader.carry(b"one").freeze_after, Some(3));
-        assert_eq!(reader.carry(b"two").freeze_after, Some(3));
+        assert_eq!(reader.carry(b"one", true).freeze_after, Some(1));
+        assert_eq!(reader.carry(b"two", true).freeze_after, Some(1));
     }
 
     /// Only the direction a schedule named offers moments; the other way is
@@ -139,7 +151,7 @@ mod tests {
     #[test]
     fn the_other_direction_offers_nothing() {
         let mut other = watching().reader(Direction::UpstreamToClient);
-        assert_eq!(other.carry(b"reply").freeze_after, None);
+        assert_eq!(other.carry(b"reply", true).freeze_after, None);
     }
 
     /// A mark on an unread kind is a count the framework keeps, so a plugin's

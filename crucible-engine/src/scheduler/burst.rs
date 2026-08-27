@@ -11,7 +11,7 @@
 use crucible_protocol::{Burst, Direction, Edge, EdgeProfile};
 
 use crucible_core::{
-    fault::{Anchor, Fault, Losing, Primitive, Taking},
+    fault::{Anchor, By, Drive, Fault, Primitive},
     learned::Learned,
     plan,
     schedule::Schedule,
@@ -31,6 +31,9 @@ struct Point<'a> {
     direction: Direction,
     mark: String,
     why: String,
+    /// What faulting here is good for. A moment a plugin named is only a moment
+    /// for the property it named it for.
+    exercises: Invariant,
     /// How much traffic was around it, so a short budget keeps the busiest.
     weight: u32,
 }
@@ -42,17 +45,19 @@ struct Point<'a> {
 /// by the middle of a burst first and its edges after.
 fn points_on(profile: &EdgeProfile) -> Vec<Point<'_>> {
     if !profile.placements.is_empty() {
-        return profile
-            .placements
-            .iter()
-            .map(|placement| Point {
-                edge: &profile.edge,
-                direction: placement.direction,
-                mark: placement.mark.clone(),
-                why: placement.why.clone(),
-                weight: 1,
-            })
-            .collect();
+        let named = profile.placements.iter().map(|placement| Point {
+            edge: &profile.edge,
+            direction: placement.direction,
+            mark: placement.mark.clone(),
+            why: placement.why.clone(),
+            exercises: placement.exercises.into(),
+            weight: 1,
+        });
+        // A property with fewer moments than another would otherwise sit behind
+        // every one of them, and be the first thing a budget drops. Taking one
+        // of each in turn spends a short budget across the properties rather
+        // than on whichever the traffic happened to offer most of.
+        return in_turn(named, |point| point.exercises);
     }
 
     // Per burst, in preference order, then transposed so every burst gets its
@@ -72,6 +77,9 @@ fn points_on(profile: &EdgeProfile) -> Vec<Point<'_>> {
                     direction,
                     mark: k.to_string(),
                     why: format!("{k} reads into what this edge carried"),
+                    // Nothing read this edge, so all a moment on it can say is
+                    // that the fleet was part way through something.
+                    exercises: Invariant::Durable,
                     weight: burst.packets,
                 });
             }
@@ -83,6 +91,28 @@ fn points_on(profile: &EdgeProfile) -> Vec<Point<'_>> {
         round.sort_by_key(|point| std::cmp::Reverse(point.weight));
     }
     rounds.concat()
+}
+
+/// `items` reordered so one of every group comes before any group's second,
+/// keeping the order within each group and the order the groups first appear.
+fn in_turn<T, K: PartialEq>(items: impl Iterator<Item = T>, group: impl Fn(&T) -> K) -> Vec<T> {
+    let mut groups: Vec<(K, std::collections::VecDeque<T>)> = Vec::new();
+    for item in items {
+        let key = group(&item);
+        match groups.iter_mut().find(|(seen, _)| *seen == key) {
+            Some((_, members)) => members.push_back(item),
+            None => groups.push((key, [item].into())),
+        }
+    }
+    let mut taken = Vec::with_capacity(groups.iter().map(|(_, members)| members.len()).sum());
+    while groups.iter().any(|(_, members)| !members.is_empty()) {
+        taken.extend(
+            groups
+                .iter_mut()
+                .filter_map(|(_, members)| members.pop_front()),
+        );
+    }
+    taken
 }
 
 /// Where in `burst` a fault can go, from the middle outwards.
@@ -153,7 +183,7 @@ impl BurstScheduler {
         // One point is faulted every way the fleet can be broken there, and
         // covering those comes before covering more points, so they multiply
         // what a point costs. A way no point can place must not be costed.
-        let ways: Vec<(Invariant, Losing)> = testable
+        let ways: Vec<(Invariant, Drive)> = testable
             .iter()
             .flat_map(|(invariant, ways)| ways.iter().map(|by| (*invariant, *by)))
             .filter_map(|(invariant, by)| Some((invariant, placeable(invariant, by)?)))
@@ -177,15 +207,22 @@ impl BurstScheduler {
         }
 
         // What one point costs, which is not the same everywhere: what an edge
-        // has to break depends on the edge.
-        let cost =
-            |edge: &Edge| -> usize { ways.iter().map(|(_, by)| targets(*by, edge).len()).sum() };
+        // has to break depends on the edge, and a moment is only spent on what
+        // it is good for.
+        let cost = |point: &Point<'_>| -> usize {
+            ways.iter()
+                .filter(|(invariant, _)| *invariant == point.exercises)
+                .map(|(_, by)| targets(*by, point.edge).len())
+                .sum()
+        };
+        // A moment nothing can be placed on is not a moment this campaign has.
+        points.retain(|point| cost(point) > 0);
         if let Some(budget) = budget {
             let mut spent = 0;
             points.retain(|point| {
-                let affordable = budget.fits(spent + cost(point.edge));
+                let affordable = budget.fits(spent + cost(point));
                 if affordable {
-                    spent += cost(point.edge);
+                    spent += cost(point);
                 }
                 affordable
             });
@@ -194,7 +231,7 @@ impl BurstScheduler {
         let mut schedules: Vec<Schedule> = Vec::new();
         let mut next_id: u32 = Schedule::LEARN_ID + 1;
         for point in &points {
-            for (invariant, by) in &ways {
+            for (invariant, by) in ways.iter().filter(|(it, _)| *it == point.exercises) {
                 for taking in targets(*by, point.edge) {
                     let anchor = Anchor {
                         edge: point.edge.clone(),
@@ -204,10 +241,9 @@ impl BurstScheduler {
                     };
                     let fault = match invariant {
                         Invariant::Durable => Fault::Durable { anchor, by: taking },
+                        Invariant::Idempotent => Fault::Idempotent { anchor, by: taking },
                         // `placeable` kept these out of `ways`.
-                        Invariant::Recovers | Invariant::Idempotent | Invariant::Converges => {
-                            continue;
-                        }
+                        Invariant::Recovers | Invariant::Converges => continue,
                     };
                     schedules.push(Schedule::faulted(
                         next_id,
@@ -242,29 +278,30 @@ impl BurstScheduler {
 
 /// What breaking `edge` by `losing` takes from the fleet: the services at its
 /// ends, or the link between them.
-fn targets(losing: Losing, edge: &Edge) -> Vec<Taking> {
+fn targets(losing: Drive, edge: &Edge) -> Vec<By> {
     match losing {
-        Losing::Kill => edge
+        Drive::Kill => edge
             .client
             .iter()
             .chain(std::iter::once(&edge.upstream))
-            .map(|service| Taking::Kill(service.clone()))
+            .map(|service| By::Kill(service.clone()))
             .collect(),
-        Losing::Cut => edge
+        Drive::Cut => edge
             .within_fleet()
-            .then(|| Taking::Cut(edge.clone()))
+            .then(|| By::Cut(edge.clone()))
             .into_iter()
             .collect(),
+        Drive::Repeat => vec![By::Repeat(edge.clone())],
     }
 }
 
 /// How a burst breaks the fleet to test `invariant`, if it can. Recovery
 /// degrades the fleet from the start rather than part way through, so a burst
 /// cannot test it.
-fn placeable(invariant: Invariant, by: Primitive) -> Option<Losing> {
+fn placeable(invariant: Invariant, by: Primitive) -> Option<Drive> {
     match invariant {
-        Invariant::Durable => Losing::try_from(by).ok(),
-        Invariant::Recovers | Invariant::Idempotent | Invariant::Converges => None,
+        Invariant::Durable | Invariant::Idempotent => Drive::try_from(by).ok(),
+        Invariant::Recovers | Invariant::Converges => None,
     }
 }
 
@@ -314,6 +351,22 @@ mod tests {
             },
             client_to_upstream: c2u,
             upstream_to_client: u2c,
+        }
+    }
+
+    /// An edge a plugin read, which named `moments` on it.
+    fn named(moments: Vec<(&str, crucible_protocol::Property)>) -> EdgeProfile {
+        EdgeProfile {
+            placements: moments
+                .into_iter()
+                .map(|(mark, exercises)| crucible_protocol::Placement {
+                    direction: Direction::ClientToUpstream,
+                    mark: mark.to_owned(),
+                    why: format!("what {mark} catches"),
+                    exercises,
+                })
+                .collect(),
+            ..from(Some("api"), "broker", vec![], vec![])
         }
     }
 
@@ -494,6 +547,55 @@ mod tests {
             None,
         );
         assert_eq!(s.total(), 0);
+    }
+
+    /// A property with fewer moments than another must not sit behind every one
+    /// of them, or a budget spends itself before reaching it.
+    #[test]
+    fn a_budget_reaches_every_property_before_any_of_them_twice() {
+        use crucible_protocol::Property::{Durable, Idempotent};
+        let spent: Vec<String> = points_on(&named(vec![
+            ("publish:1", Durable),
+            ("publish:2", Durable),
+            ("redeliver:1", Idempotent),
+            ("redeliver:2", Idempotent),
+            ("redeliver:3", Idempotent),
+        ]))
+        .into_iter()
+        .map(|point| point.mark)
+        .collect();
+        assert_eq!(
+            spent,
+            [
+                "publish:1",
+                "redeliver:1",
+                "publish:2",
+                "redeliver:2",
+                "redeliver:3"
+            ]
+        );
+    }
+
+    /// A plugin names a moment for one property. Faulting there for another
+    /// asks it to hold the fleet somewhere it was never watching, and the run
+    /// comes back having tested nothing.
+    #[test]
+    fn a_moment_is_only_spent_on_what_it_was_named_for() {
+        let s = driven(
+            &[named(vec![
+                ("ack:1:before", crucible_protocol::Property::Durable),
+                ("redeliver:1", crucible_protocol::Property::Idempotent),
+            ])],
+            vec![Primitive::Kill],
+            None,
+        );
+        let marks: Vec<String> = std::iter::from_fn({
+            let mut s = s;
+            move || s.next()
+        })
+        .filter_map(|schedule| schedule.fault?.anchor().map(|at| at.mark.clone()))
+        .collect();
+        assert!(marks.iter().all(|mark| mark == "ack:1:before"), "{marks:?}");
     }
 
     #[test]

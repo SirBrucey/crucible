@@ -74,9 +74,9 @@ impl Sessions {
                     pending.placements.push(placement);
                 }
             }
-            // A control signal about the fault anchor, not part of a session's
-            // byte accounting; the freeze waiter consumes it elsewhere.
-            ConnEventKind::Froze { .. } => {}
+            // What the fault did, not part of a session's byte accounting;
+            // whoever is waiting on the fault consumes these elsewhere.
+            ConnEventKind::Froze { .. } | ConnEventKind::Did { .. } => {}
         }
     }
 }
