@@ -13,6 +13,9 @@ pub enum Fault {
     /// Have the fleet do the same work twice at the anchor, and read whether
     /// doing it twice left what doing it once would.
     Idempotent { anchor: Anchor, by: By },
+    /// Tell the fleet things in an order it was not told them in, and read
+    /// whether it settled where it would have anyway.
+    Converges { anchor: Anchor, by: By },
     /// Run the whole scenario degraded, then put it back and see whether the
     /// fleet catches up on what it accepted while it was.
     Recovers { by: By },
@@ -31,6 +34,9 @@ pub enum By {
     /// One edge, carrying a message it already carried, so whoever reads it is
     /// asked to do the same work twice.
     Repeat(Edge),
+    /// One edge, carrying its messages in an order the broker did not send
+    /// them in, so a fleet relying on that order is asked to do without it.
+    Reorder(Edge),
 }
 
 impl By {
@@ -40,6 +46,7 @@ impl By {
             By::Kill(_) => Primitive::Kill,
             By::Cut(_) => Primitive::Cut,
             By::Repeat(_) => Primitive::Redeliver,
+            By::Reorder(_) => Primitive::Reorder,
         }
     }
 
@@ -48,7 +55,7 @@ impl By {
     pub fn target(&self) -> String {
         match self {
             By::Kill(service) => service.clone(),
-            By::Cut(edge) | By::Repeat(edge) => edge.to_string(),
+            By::Cut(edge) | By::Repeat(edge) | By::Reorder(edge) => edge.to_string(),
         }
     }
 }
@@ -59,6 +66,7 @@ impl std::fmt::Display for By {
             By::Kill(service) => write!(f, "killing {service}"),
             By::Cut(edge) => write!(f, "cutting {edge}"),
             By::Repeat(edge) => write!(f, "repeating a message on {edge}"),
+            By::Reorder(edge) => write!(f, "reordering messages on {edge}"),
         }
     }
 }
@@ -72,6 +80,7 @@ pub enum Drive {
     Kill,
     Cut,
     Repeat,
+    Reorder,
 }
 
 impl From<Drive> for Primitive {
@@ -80,6 +89,7 @@ impl From<Drive> for Primitive {
             Drive::Kill => Primitive::Kill,
             Drive::Cut => Primitive::Cut,
             Drive::Repeat => Primitive::Redeliver,
+            Drive::Reorder => Primitive::Reorder,
         }
     }
 }
@@ -93,7 +103,7 @@ impl TryFrom<Primitive> for Drive {
             Primitive::Kill => Ok(Self::Kill),
             Primitive::Cut => Ok(Self::Cut),
             Primitive::Redeliver => Ok(Self::Repeat),
-            Primitive::Reorder => Err(primitive),
+            Primitive::Reorder => Ok(Self::Reorder),
         }
     }
 }
@@ -106,6 +116,7 @@ impl Fault {
         match self {
             Fault::Durable { .. } => Invariant::Durable,
             Fault::Idempotent { .. } => Invariant::Idempotent,
+            Fault::Converges { .. } => Invariant::Converges,
             Fault::Recovers { .. } => Invariant::Recovers,
         }
     }
@@ -114,7 +125,9 @@ impl Fault {
     #[must_use]
     pub fn anchor(&self) -> Option<&Anchor> {
         match self {
-            Fault::Durable { anchor, .. } | Fault::Idempotent { anchor, .. } => Some(anchor),
+            Fault::Durable { anchor, .. }
+            | Fault::Idempotent { anchor, .. }
+            | Fault::Converges { anchor, .. } => Some(anchor),
             // Imposed before there is any traffic to land in.
             Fault::Recovers { .. } => None,
         }
@@ -126,6 +139,7 @@ impl Fault {
         match self {
             Fault::Durable { by, .. }
             | Fault::Idempotent { by, .. }
+            | Fault::Converges { by, .. }
             | Fault::Recovers { by, .. } => by,
         }
     }

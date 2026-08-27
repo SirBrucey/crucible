@@ -13,6 +13,11 @@ pub struct Durable;
 /// differs is the fault, not the reading.
 pub struct Recovers;
 
+/// Convergence asks it too. Every step was answered whichever order the fleet
+/// was told about them in, so it owes all of them: what differs is the route it
+/// took to owing them, which the settled state is not a reading of.
+pub struct Converges;
+
 /// Idempotency asks it too. Every step was answered, so the fleet owes all of
 /// them and no more: doing one of them twice has to leave what doing it once
 /// would. What differs is again the fault, not the reading.
@@ -121,6 +126,12 @@ impl Driver for Recovers {
 }
 
 impl Driver for Idempotent {
+    fn drive(&mut self, observations: &Observations) -> Verdict {
+        Durable.drive(observations)
+    }
+}
+
+impl Driver for Converges {
     fn drive(&mut self, observations: &Observations) -> Verdict {
         Durable.drive(observations)
     }

@@ -304,7 +304,7 @@ impl Orchestrator<Ready> {
             let (mut observations, fault_report) = match fault {
                 // Placed on one moment, so the scenario is in flight when it
                 // lands and the two run together.
-                Fault::Durable { .. } | Fault::Idempotent { .. } => {
+                Fault::Durable { .. } | Fault::Idempotent { .. } | Fault::Converges { .. } => {
                     anchored_run(
                         deployment.as_ref(),
                         placement,
@@ -525,10 +525,10 @@ impl<'a> Placement<'a> {
                 .contains(&Primitive::Cut)
                 .then_some(Placement::Cut)
                 .ok_or_else(|| unreachable_fault(fault)),
-            By::Repeat(_) => deployment
+            By::Repeat(_) | By::Reorder(_) => deployment
                 .substrate()
                 .primitives()
-                .contains(&Primitive::Redeliver)
+                .contains(&fault.primitive())
                 .then_some(Placement::Rewritten)
                 .ok_or_else(|| unreachable_fault(fault)),
         }

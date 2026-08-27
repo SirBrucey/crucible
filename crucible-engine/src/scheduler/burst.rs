@@ -242,8 +242,9 @@ impl BurstScheduler {
                     let fault = match invariant {
                         Invariant::Durable => Fault::Durable { anchor, by: taking },
                         Invariant::Idempotent => Fault::Idempotent { anchor, by: taking },
-                        // `placeable` kept these out of `ways`.
-                        Invariant::Recovers | Invariant::Converges => continue,
+                        Invariant::Converges => Fault::Converges { anchor, by: taking },
+                        // `placeable` kept this out of `ways`.
+                        Invariant::Recovers => continue,
                     };
                     schedules.push(Schedule::faulted(
                         next_id,
@@ -292,6 +293,7 @@ fn targets(losing: Drive, edge: &Edge) -> Vec<By> {
             .into_iter()
             .collect(),
         Drive::Repeat => vec![By::Repeat(edge.clone())],
+        Drive::Reorder => vec![By::Reorder(edge.clone())],
     }
 }
 
@@ -300,8 +302,10 @@ fn targets(losing: Drive, edge: &Edge) -> Vec<By> {
 /// cannot test it.
 fn placeable(invariant: Invariant, by: Primitive) -> Option<Drive> {
     match invariant {
-        Invariant::Durable | Invariant::Idempotent => Drive::try_from(by).ok(),
-        Invariant::Recovers | Invariant::Converges => None,
+        Invariant::Durable | Invariant::Idempotent | Invariant::Converges => {
+            Drive::try_from(by).ok()
+        }
+        Invariant::Recovers => None,
     }
 }
 
