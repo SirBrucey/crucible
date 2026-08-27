@@ -407,8 +407,21 @@ async fn read_checks(
     let mut readings = Vec::with_capacity(queries.len());
     for (check, query) in queries {
         let endpoint = endpoint_for_control_plane(deployment, query.as_ref())?;
+        // A fault can leave the fleet with nothing to answer from, which is
+        // what the run is there to find out rather than a reason to stop.
+        let value = match query.read(endpoint).await {
+            Ok(value) => Some(value),
+            Err(e) => {
+                tracing::debug!(
+                    observable = %check.observable(),
+                    error = %e,
+                    "the fleet had nothing to read once it settled",
+                );
+                None
+            }
+        };
         readings.push(Observed {
-            value: query.read(endpoint).await?,
+            value,
             check: check.clone(),
         });
     }

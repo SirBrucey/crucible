@@ -124,7 +124,10 @@ pub type Checkpoint = Vec<Option<crate::plan::Value>>;
 #[derive(Debug)]
 pub struct Observed {
     pub check: crate::plan::Check,
-    pub value: crate::plan::Value,
+    /// What the fleet was holding, or `None` where there was nothing to read.
+    /// A fault can leave a fleet with no row to answer from, which is a
+    /// reading of the fleet rather than a failure to take one.
+    pub value: Option<crate::plan::Value>,
 }
 
 impl Observed {
@@ -133,7 +136,7 @@ impl Observed {
     /// check states, or an ordering asked of values that have none.
     #[must_use]
     pub fn holds(&self) -> Option<bool> {
-        let (reading, stated) = (&self.value, &self.check.value);
+        let (reading, stated) = (self.value.as_ref()?, &self.check.value);
         // The check pass held the author's value to the shape the observable
         // declares, so a reading of another shape is the plugin answering with
         // something it never said it would.
@@ -166,7 +169,7 @@ pub fn unmet(
         };
         let observed = Observed {
             check: check.clone(),
-            value: value.clone(),
+            value: Some(value.clone()),
         };
         if observed.holds() != Some(true) {
             return Some(format!("`{}` reads {value}", check.stated()));

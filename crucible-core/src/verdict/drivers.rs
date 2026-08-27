@@ -92,7 +92,7 @@ impl Driver for Durable {
         let settled: Checkpoint = observations
             .checks
             .iter()
-            .map(|observed| Some(observed.value.clone()))
+            .map(|observed| observed.value.clone())
             .collect();
         // Any outcome the run admits is enough: what is in doubt is what the
         // fleet accepted, and it is not held to the strictest reading of that.
@@ -361,7 +361,7 @@ mod tests {
                 op: crate::schema::CmpOp::Eq,
                 value: plan::Value::Int(read),
             },
-            value: plan::Value::Int(read),
+            value: Some(plan::Value::Int(read)),
         }
     }
 
@@ -380,6 +380,26 @@ mod tests {
         obs.checks = vec![reading(settled)];
         obs.fault_free = fault_free.iter().copied().map(checkpoint).collect();
         Durable.drive(&obs)
+    }
+
+    /// A fault can leave the fleet with no row to answer from. That is a
+    /// reading of the fleet, and the run says what it could not read rather
+    /// than holding the fleet to a value it never had.
+    #[test]
+    fn a_check_the_fleet_cannot_answer_is_not_a_failure() {
+        let mut obs = Observations::empty();
+        obs.fault = Some(fired_throughout());
+        obs.outcomes = vec![outcome(Ack::Acked)];
+        obs.checks = vec![Observed {
+            value: None,
+            ..reading(3)
+        }];
+        obs.fault_free = vec![checkpoint(0), checkpoint(3)];
+        assert!(
+            matches!(Durable.drive(&obs), Verdict::Inconclusive { .. }),
+            "{:?}",
+            Durable.drive(&obs)
+        );
     }
 
     #[test]
