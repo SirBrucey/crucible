@@ -45,18 +45,19 @@ struct Point<'a> {
 /// by the middle of a burst first and its edges after.
 fn points_on(profile: &EdgeProfile) -> Vec<Point<'_>> {
     if !profile.placements.is_empty() {
-        return profile
-            .placements
-            .iter()
-            .map(|placement| Point {
-                edge: &profile.edge,
-                direction: placement.direction,
-                mark: placement.mark.clone(),
-                why: placement.why.clone(),
-                exercises: placement.exercises.into(),
-                weight: 1,
-            })
-            .collect();
+        let named = profile.placements.iter().map(|placement| Point {
+            edge: &profile.edge,
+            direction: placement.direction,
+            mark: placement.mark.clone(),
+            why: placement.why.clone(),
+            exercises: placement.exercises.into(),
+            weight: 1,
+        });
+        // A property with fewer moments than another would otherwise sit behind
+        // every one of them, and be the first thing a budget drops. Taking one
+        // of each in turn spends a short budget across the properties rather
+        // than on whichever the traffic happened to offer most of.
+        return in_turn(named, |point| point.exercises);
     }
 
     // Per burst, in preference order, then transposed so every burst gets its
@@ -90,6 +91,28 @@ fn points_on(profile: &EdgeProfile) -> Vec<Point<'_>> {
         round.sort_by_key(|point| std::cmp::Reverse(point.weight));
     }
     rounds.concat()
+}
+
+/// `items` reordered so one of every group comes before any group's second,
+/// keeping the order within each group and the order the groups first appear.
+fn in_turn<T, K: PartialEq>(items: impl Iterator<Item = T>, group: impl Fn(&T) -> K) -> Vec<T> {
+    let mut groups: Vec<(K, std::collections::VecDeque<T>)> = Vec::new();
+    for item in items {
+        let key = group(&item);
+        match groups.iter_mut().find(|(seen, _)| *seen == key) {
+            Some((_, members)) => members.push_back(item),
+            None => groups.push((key, [item].into())),
+        }
+    }
+    let mut taken = Vec::with_capacity(groups.iter().map(|(_, members)| members.len()).sum());
+    while groups.iter().any(|(_, members)| !members.is_empty()) {
+        taken.extend(
+            groups
+                .iter_mut()
+                .filter_map(|(_, members)| members.pop_front()),
+        );
+    }
+    taken
 }
 
 /// Where in `burst` a fault can go, from the middle outwards.
@@ -524,6 +547,33 @@ mod tests {
             None,
         );
         assert_eq!(s.total(), 0);
+    }
+
+    /// A property with fewer moments than another must not sit behind every one
+    /// of them, or a budget spends itself before reaching it.
+    #[test]
+    fn a_budget_reaches_every_property_before_any_of_them_twice() {
+        use crucible_protocol::Property::{Durable, Idempotent};
+        let spent: Vec<String> = points_on(&named(vec![
+            ("publish:1", Durable),
+            ("publish:2", Durable),
+            ("redeliver:1", Idempotent),
+            ("redeliver:2", Idempotent),
+            ("redeliver:3", Idempotent),
+        ]))
+        .into_iter()
+        .map(|point| point.mark)
+        .collect();
+        assert_eq!(
+            spent,
+            [
+                "publish:1",
+                "redeliver:1",
+                "publish:2",
+                "redeliver:2",
+                "redeliver:3"
+            ]
+        );
     }
 
     /// A plugin names a moment for one property. Faulting there for another
