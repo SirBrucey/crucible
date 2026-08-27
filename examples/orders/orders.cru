@@ -1,6 +1,7 @@
 // The `orders` example fleet: an HTTP API, a broker, a database, and an
-// inventory consumer, with a durability scenario that posts three orders and
-// asserts all three persist.
+// inventory consumer. The scenario places three orders and amends one of them
+// twice, so what the fleet settles on depends on what it kept, what it did
+// once, and the order it was told things in.
 
 fleet "orders" {
   deployment: docker;
@@ -62,17 +63,23 @@ scenario "orders_durability" {
   budget: 5m;
   consistent_within: 15s;
 
-  do { http POST api "/orders" body { item: "book", quantity: 4 } };
-  do { http POST api "/orders" body { item: "pen", quantity: 10 } };
-  do { http POST api "/orders" body { item: "mug", quantity: 1 } };
+  do { http POST api "/orders" body { id: 1, item: "book", quantity: 4 } };
+  do { http POST api "/orders" body { id: 2, item: "pen", quantity: 10 } };
+  do { http POST api "/orders" body { id: 3, item: "mug", quantity: 1 } };
+
+  // The customer changes their mind twice about the same order. Told these the
+  // other way round, the fleet keeps the earlier amendment.
+  do { http PUT api "/orders/1" body { quantity: 6 } };
+  do { http PUT api "/orders/1" body { quantity: 2 } };
 
   // The orders are what the API wrote down; the levels are what the consumer
   // did about them, which is the half a fault can lose without the API ever
   // hearing about it. Stock starts at book 100, pen 500, mug 250.
   expect {
     db.orders.count == 3;
-    db.stock.select level where item = "book" == 96;
+    db.stock.select level where item = "book" == 98;
     db.stock.select level where item = "pen" == 490;
     db.stock.select level where item = "mug" == 249;
+    db.orders.select quantity where id = 1 == 2;
   }
 }

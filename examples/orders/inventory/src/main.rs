@@ -18,6 +18,8 @@ use tokio::net::TcpListener;
 const EXCHANGE: &str = "orders";
 const QUEUE: &str = "orders.inventory";
 const BINDING: &str = "order.*";
+const CREATED_KEY: &str = "order.created";
+const MODIFY_KEY: &str = "order.modified";
 const CONSUMER_TAG: &str = "orders.inventory";
 const RETRY_ATTEMPTS: u32 = 30;
 const RETRY_DELAY: Duration = Duration::from_secs(1);
@@ -28,6 +30,14 @@ const INITIAL_STOCK: &[(&str, i32)] = &[("book", 100), ("pen", 500), ("mug", 250
 struct OrderCreated {
     id: u64,
     item: String,
+    quantity: i32,
+}
+
+/// A customer changing their mind. Nothing here reads what the order was
+/// before, so the answer is whichever of these arrived last.
+#[derive(Deserialize)]
+struct OrderModified {
+    id: u64,
     quantity: i32,
 }
 
@@ -103,13 +113,24 @@ async fn main() -> anyhow::Result<()> {
 
     while let Some(delivery) = consumer.next().await {
         let delivery = delivery.context("delivery error")?;
-        match serde_json::from_slice::<OrderCreated>(&delivery.data) {
-            Ok(event) => {
-                if let Err(e) = apply_order(&db, &event).await {
-                    tracing::warn!(?e, order_id = event.id, "failed to apply order");
+        match delivery.routing_key.as_str() {
+            CREATED_KEY => match serde_json::from_slice::<OrderCreated>(&delivery.data) {
+                Ok(event) => {
+                    if let Err(e) = apply_order(&db, &event).await {
+                        tracing::warn!(?e, order_id = event.id, "failed to apply order");
+                    }
                 }
-            }
-            Err(e) => tracing::warn!(?e, "failed to parse event"),
+                Err(e) => tracing::warn!(?e, "failed to parse order"),
+            },
+            MODIFY_KEY => match serde_json::from_slice::<OrderModified>(&delivery.data) {
+                Ok(event) => {
+                    if let Err(e) = apply_modification(&db, &event).await {
+                        tracing::warn!(?e, order_id = event.id, "failed to modify order");
+                    }
+                }
+                Err(e) => tracing::warn!(?e, "failed to parse modification"),
+            },
+            key => tracing::warn!(%key, "nothing consumes this"),
         }
         delivery
             .ack(BasicAckOptions::default())
@@ -137,6 +158,42 @@ async fn init_stock(db: &Pool<MySql>) -> anyhow::Result<()> {
             .await
             .context("seed stock")?;
     }
+    Ok(())
+}
+
+/// Take the order at what it was last changed to, and give back or take the
+/// difference in stock.
+///
+/// What the stock ends at is worked out from what the order was, so two of
+/// these applied the other way round leave both the order and the stock
+/// somewhere the fleet was never told to put them.
+async fn apply_modification(db: &Pool<MySql>, event: &OrderModified) -> anyhow::Result<()> {
+    let mut tx = db.begin().await.context("begin")?;
+    let (item, was): (String, i32) =
+        sqlx::query_as("SELECT item, quantity FROM orders WHERE id = ?")
+            .bind(event.id)
+            .fetch_one(&mut *tx)
+            .await
+            .context("read order")?;
+    sqlx::query("UPDATE orders SET quantity = ? WHERE id = ?")
+        .bind(event.quantity)
+        .bind(event.id)
+        .execute(&mut *tx)
+        .await
+        .context("modify order")?;
+    sqlx::query("UPDATE stock SET level = level + ? WHERE item = ?")
+        .bind(was - event.quantity)
+        .bind(&item)
+        .execute(&mut *tx)
+        .await
+        .context("adjust stock")?;
+    tx.commit().await.context("commit")?;
+    tracing::info!(
+        order_id = event.id,
+        was,
+        now = event.quantity,
+        "modified order",
+    );
     Ok(())
 }
 
