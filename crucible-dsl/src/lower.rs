@@ -600,7 +600,10 @@ fn sorted(names: impl IntoIterator<Item = String>) -> Vec<String> {
 fn head_label(head: &HeadPattern) -> String {
     match head {
         HeadPattern::Exact(name) => name.clone(),
-        HeadPattern::Wildcard { segment, tail } => format!("<{segment}>.{tail}"),
+        HeadPattern::Wildcard { segments, tail } => {
+            let named: Vec<String> = segments.iter().map(|s| format!("<{s}>")).collect();
+            format!("{}.{tail}", named.join("."))
+        }
     }
 }
 
@@ -615,7 +618,10 @@ fn path_span(path: &[Spanned<String>]) -> Option<Span> {
 fn head_matches(pattern: &HeadPattern, path: &[Spanned<String>]) -> bool {
     match pattern {
         HeadPattern::Exact(name) => path.len() == 1 && path[0].node == *name,
-        HeadPattern::Wildcard { tail, .. } => path.len() == 2 && path[1].node == *tail,
+        HeadPattern::Wildcard { segments, tail } => match path.split_last() {
+            Some((last, rest)) => last.node == *tail && rest.len() == segments.len(),
+            None => false,
+        },
     }
 }
 
@@ -681,7 +687,7 @@ mod tests {
         scenario "s" {
           consistent_within: 10s;
           do { http POST api "/orders" body { item: "book", quantity: 1 } };
-          expect { db.orders.count where item = "book" == 1; }
+          expect { db.orders.orders.count where item = "book" == 1; }
         }
     "#;
 
@@ -726,7 +732,7 @@ mod tests {
         let check = &scenario.checks[0];
         assert_eq!(check.service, "db");
         assert_eq!(check.observer, "mariadb");
-        assert_eq!(check.observable, ["orders", "count"]);
+        assert_eq!(check.observable, ["orders", "orders", "count"]);
         assert_eq!(
             check.filter,
             Some(("item".to_string(), plan::Value::Str("book".to_string()))),
@@ -802,12 +808,12 @@ mod tests {
 
     #[test]
     fn a_missing_required_attribute_is_reported() {
-        let src = r#"fleet "f" { deployment: docker; service api { image: "x" } }
+        let src = r#"fleet "f" { deployment: docker; service api { kinds: [http], ports: { http: 80 } } }
                      scenario "s" { consistent_within: 1s; }"#;
         // Naming the plugin that reads it says where the requirement came from,
         // which matters once several plugins read a service's attributes.
         let diags = diagnose(src);
-        let diag = find(&diags, "is missing `ports`");
+        let diag = find(&diags, "is missing `image`");
         assert!(diag.message.contains("docker"), "{}", diag.message);
     }
 
@@ -839,7 +845,7 @@ mod tests {
         let diag = find(&diags, "no observable `orders.rows`");
         assert_eq!(
             diag.help.as_ref().unwrap().suggestions,
-            ["<table>.count", "<table>.select"],
+            ["<database>.<table>.count", "<database>.<table>.select"],
         );
         // The span covers the observable path, not the valid `db` service.
         assert_eq!(&src[diag.span.start..diag.span.end], "orders.rows");

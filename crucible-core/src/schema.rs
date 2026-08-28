@@ -67,9 +67,9 @@ impl AttrSchema {
 pub enum HeadPattern {
     /// A fixed operation name, e.g. `POST`.
     Exact(String),
-    /// A named wildcard segment and a fixed tail, e.g. `table` and `count` for a
-    /// head like `orders.count`.
-    Wildcard { segment: String, tail: String },
+    /// One name per wildcard segment, then a fixed tail. The plugin parses for
+    /// valid segments.
+    Wildcard { segments: Vec<String>, tail: String },
 }
 
 impl HeadPattern {
@@ -79,9 +79,9 @@ impl HeadPattern {
     }
 
     #[must_use]
-    pub fn wildcard(segment: &str, tail: &str) -> Self {
+    pub fn wildcard(segments: &[&str], tail: &str) -> Self {
         Self::Wildcard {
-            segment: segment.to_owned(),
+            segments: segments.iter().map(|s| (*s).to_owned()).collect(),
             tail: tail.to_owned(),
         }
     }

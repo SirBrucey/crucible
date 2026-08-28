@@ -20,8 +20,6 @@ use crate::{
 const WHERE: &str = "where";
 /// The alias every projection is named by.
 const ALIAS: &str = "n";
-/// Schemas the server keeps for itself, which are never the fleet's state.
-const RESERVED: [&str; 4] = ["information_schema", "mysql", "performance_schema", "sys"];
 
 /// Reads persisted state from a `MariaDB` database.
 pub struct Mariadb {
@@ -29,11 +27,12 @@ pub struct Mariadb {
     password: String,
 }
 
-/// One reading, in the terms this plugin runs it: which table, which rows of it,
-/// and what to take from those rows.
+/// One reading, in the terms this plugin runs it: which database and table,
+/// which rows of it, and what to take from those rows.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Selection {
     pub service: String,
+    pub database: String,
     pub table: String,
     pub filter: Option<Filter>,
     pub take: Take,
@@ -83,10 +82,6 @@ pub enum Error {
     },
     #[error("`{0}` holds nothing a plan can carry")]
     Unreadable(String),
-    #[error("the fleet holds no database to read")]
-    NoDatabase,
-    #[error("the fleet holds several databases, so which to read is ambiguous: {0}")]
-    ManyDatabases(String),
     #[error(transparent)]
     Sql(#[from] sqlx::Error),
 }
@@ -122,13 +117,13 @@ impl Observer for Mariadb {
     fn signatures() -> Vec<OpSig> {
         vec![
             OpSig::observable(
-                HeadPattern::wildcard("table", "count"),
+                HeadPattern::wildcard(&["database", "table"], "count"),
                 ValueType::Int,
                 CmpOp::ALL.to_vec(),
             )
             .with_clause(ClauseDecl::new(WHERE, ClauseShape::Filter)),
             OpSig::observable(
-                HeadPattern::wildcard("table", "select"),
+                HeadPattern::wildcard(&["database", "table"], "select"),
                 ValueType::Int,
                 CmpOp::ALL.to_vec(),
             )
@@ -137,9 +132,8 @@ impl Observer for Mariadb {
         ]
     }
 
-    /// Which database holds the state is discovered rather than declared, since
-    /// the deployment is what creates it. Only the credentials to read it with
-    /// are the author's to give, and they default to the unprivileged case.
+    /// Only the credentials to read with are the author's to give, and they
+    /// default to the unprivileged case.
     fn attr_schema() -> AttrSchema {
         AttrSchema::new(vec![
             AttrDecl::optional("user", ValueType::Str),
@@ -148,9 +142,9 @@ impl Observer for Mariadb {
     }
 
     fn bind(check: &plan::Check) -> Result<Self::Query, Self::Error> {
-        let (table, take) = match check.observable.as_slice() {
-            [table, reading] if reading == "count" => (table, Take::Count),
-            [table, reading] if reading == "select" => {
+        let (database, table, take) = match check.observable.as_slice() {
+            [database, table, reading] if reading == "count" => (database, table, Take::Count),
+            [database, table, reading] if reading == "select" => {
                 let Some(plan::Value::Ident(column)) = check.args.first() else {
                     return Err(Error::NoColumn);
                 };
@@ -162,14 +156,16 @@ impl Observer for Mariadb {
                 if check.filter.is_none() {
                     return Err(Error::Unnarrowed);
                 }
-                (table, Take::Column(column.clone()))
+                (database, table, Take::Column(column.clone()))
             }
             _ => return Err(Error::Observable(check.observable.join("."))),
         };
-        // The table goes into the statement rather than a bound parameter, so it
-        // must be a bare name and nothing else.
-        if !is_bare_name(table) {
-            return Err(Error::Name(table.clone()));
+        // These go into the statement rather than a bound parameter, so they
+        // must be bare names and nothing else.
+        for name in [database, table] {
+            if !is_bare_name(name) {
+                return Err(Error::Name(name.clone()));
+            }
         }
         let filter = check
             .filter
@@ -191,6 +187,7 @@ impl Observer for Mariadb {
             .transpose()?;
         Ok(Selection {
             service: check.service.clone(),
+            database: database.clone(),
             table: table.clone(),
             filter,
             take,
@@ -244,7 +241,6 @@ impl Read {
             format!("{}:{}", self.user, self.password)
         };
         let pool = Pool::<MySql>::connect(&format!("mysql://{credentials}@{endpoint}")).await?;
-        let database = sole_database(&pool).await?;
 
         // The clause and the value it binds come from one place, so a statement
         // can never be built with one and not the other.
@@ -259,12 +255,9 @@ impl Read {
             Take::Count => "COUNT(*)".to_owned(),
             Take::Column(column) => format!("`{column}`"),
         };
-        // The table and columns are bare names, checked when the check bound.
-        // The database is the server's own, so it is quoted rather than trusted.
         let sql = format!(
             "SELECT {projection} AS {ALIAS} FROM `{}`.`{}`{clause}",
-            quote(&database),
-            self.selection.table
+            self.selection.database, self.selection.table
         );
         // The statement is built rather than fixed, so what goes into it is
         // checked: the table and columns are bare names, and the value the
@@ -308,35 +301,9 @@ fn value_of(row: &MySqlRow, name: &str) -> Result<plan::Value, Error> {
     Err(Error::Unreadable(name.to_owned()))
 }
 
-/// The one database the fleet keeps its state in. The deployment creates it, so
-/// the author does not name it; several would leave the choice ambiguous.
-async fn sole_database(pool: &Pool<MySql>) -> Result<String, Error> {
-    let mut names: Vec<String> = sqlx::query("SHOW DATABASES")
-        .fetch_all(pool)
-        .await?
-        .into_iter()
-        .map(|row| row.get::<String, _>(0))
-        .filter(|name| !RESERVED.contains(&name.as_str()))
-        .collect();
-    names.sort();
-    match names.len() {
-        0 => Err(Error::NoDatabase),
-        1 => Ok(names.remove(0)),
-        _ => Err(Error::ManyDatabases(names.join(", "))),
-    }
-}
-
 /// Whether `s` is a bare name, safe to place in a statement directly.
 fn is_bare_name(s: &str) -> bool {
     !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-}
-
-/// Quote an identifier the server gave us rather than the author. A backtick is
-/// legal in a database name, and doubling it is how one is written inside
-/// quotes; without this a name carrying one would end the quoting early and the
-/// rest of the statement would parse as something else entirely.
-fn quote(identifier: &str) -> String {
-    identifier.replace('`', "``")
 }
 
 #[cfg(test)]
@@ -361,10 +328,15 @@ mod tests {
     }
 
     /// A `select` check: the column it names, and the row it narrows to.
-    fn select(table: &str, column: &str, filter: Option<(&str, plan::Value)>) -> plan::Check {
+    fn select(
+        database: &str,
+        table: &str,
+        column: &str,
+        filter: Option<(&str, plan::Value)>,
+    ) -> plan::Check {
         plan::Check {
             args: vec![plan::Value::Ident(column.into())],
-            ..check(&[table, "select"], filter)
+            ..check(&[database, table, "select"], filter)
         }
     }
 
@@ -374,7 +346,7 @@ mod tests {
         let count = signatures
             .iter()
             .find(|sig| matches!(&sig.head, HeadPattern::Wildcard { tail, .. } if tail == "count"))
-            .expect("mariadb has a `<table>.count` observable");
+            .expect("mariadb has a `<database>.<table>.count` observable");
 
         assert_eq!(count.result, Some(ValueType::Int));
         assert!(count.cmp_ops.contains(&CmpOp::Eq));
@@ -388,11 +360,12 @@ mod tests {
 
     #[test]
     fn a_check_binds_to_a_count() {
-        let bound = Mariadb::bind(&check(&["orders", "count"], None)).expect("binds");
+        let bound = Mariadb::bind(&check(&["orders", "orders", "count"], None)).expect("binds");
         assert_eq!(
             bound,
             Selection {
                 service: "db".into(),
+                database: "orders".into(),
                 table: "orders".into(),
                 filter: None,
                 take: Take::Count,
@@ -403,12 +376,14 @@ mod tests {
     #[test]
     fn a_select_binds_to_the_column_it_names() {
         let bound = Mariadb::bind(&select(
+            "orders",
             "stock",
             "level",
             Some(("item", plan::Value::Str("book".into()))),
         ))
         .expect("binds");
         assert_eq!(bound.take, Take::Column("level".into()));
+        assert_eq!(bound.database, "orders");
         assert_eq!(bound.table, "stock");
     }
 
@@ -417,6 +392,7 @@ mod tests {
         let unnamed = plan::Check {
             args: Vec::new(),
             ..select(
+                "orders",
                 "stock",
                 "level",
                 Some(("item", plan::Value::Str("book".into()))),
@@ -428,7 +404,7 @@ mod tests {
     #[test]
     fn a_select_reading_more_than_one_row_is_rejected() {
         assert!(matches!(
-            Mariadb::bind(&select("stock", "level", None)),
+            Mariadb::bind(&select("orders", "stock", "level", None)),
             Err(Error::Unnarrowed),
         ));
     }
@@ -436,7 +412,7 @@ mod tests {
     #[test]
     fn a_filter_binds_with_the_check() {
         let bound = Mariadb::bind(&check(
-            &["orders", "count"],
+            &["orders", "orders", "count"],
             Some(("item", plan::Value::Str("book".into()))),
         ))
         .expect("binds");
@@ -450,17 +426,17 @@ mod tests {
     }
 
     #[test]
-    fn a_name_the_server_gave_us_is_quoted() {
-        // A backtick is legal in a database name, and the server's names are not
-        // ours to reject. Left raw, one would close the quoting early and the
-        // rest of the statement would parse as something else.
-        assert_eq!(super::quote("orders`#"), "orders``#");
-        assert_eq!(super::quote("orders"), "orders");
+    fn an_observable_this_does_not_read_is_rejected() {
+        let bound = Mariadb::bind(&check(&["orders", "orders", "sum"], None));
+        assert!(matches!(bound, Err(Error::Observable(_))));
     }
 
+    /// The head the grammar matches has a segment per name the signature gives,
+    /// so an unqualified one never reaches a fleet. It is refused here too,
+    /// rather than read as a table with no database.
     #[test]
-    fn an_observable_this_does_not_read_is_rejected() {
-        let bound = Mariadb::bind(&check(&["orders", "sum"], None));
+    fn a_table_without_a_database_is_rejected() {
+        let bound = Mariadb::bind(&check(&["orders", "count"], None));
         assert!(matches!(bound, Err(Error::Observable(_))));
     }
 
@@ -468,7 +444,19 @@ mod tests {
     fn a_table_that_is_not_a_bare_name_is_rejected() {
         // It is placed in the statement directly, so anything else could carry
         // SQL of its own.
-        let bound = Mariadb::bind(&check(&["orders; DROP TABLE orders", "count"], None));
+        let bound = Mariadb::bind(&check(
+            &["orders", "orders; DROP TABLE orders", "count"],
+            None,
+        ));
+        assert!(matches!(bound, Err(Error::Name(_))));
+    }
+
+    #[test]
+    fn a_database_that_is_not_a_bare_name_is_rejected() {
+        let bound = Mariadb::bind(&check(
+            &["orders`; DROP TABLE orders; --", "orders", "count"],
+            None,
+        ));
         assert!(matches!(bound, Err(Error::Name(_))));
     }
 }

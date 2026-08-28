@@ -722,7 +722,7 @@ impl Deployment for Docker {
     fn attr_schema() -> AttrSchema {
         AttrSchema::new(vec![
             AttrDecl::required("image", ValueType::Str),
-            AttrDecl::required("ports", ValueType::MapOf(Box::new(ValueType::Int))),
+            AttrDecl::optional("ports", ValueType::MapOf(Box::new(ValueType::Int))),
             AttrDecl::optional("env", ValueType::List(Box::new(ValueType::Str))),
             AttrDecl::optional("healthcheck", ValueType::List(Box::new(ValueType::Str))),
             AttrDecl::optional(
@@ -742,10 +742,10 @@ impl Deployment for Docker {
             .attr("image")
             .and_then(plan::Value::as_str)
             .ok_or_else(|| missing("image"))?;
-        let stated = service
-            .attr("ports")
-            .and_then(plan::Value::as_map)
-            .ok_or_else(|| missing("ports"))?;
+        let stated = match service.attr("ports") {
+            Some(value) => value.as_map().ok_or_else(|| missing("ports"))?,
+            None => &[],
+        };
 
         let mut ports = BTreeMap::new();
         for (kind, port) in stated {
@@ -1131,7 +1131,7 @@ mod tests {
     }
 
     #[test]
-    fn image_and_ports_are_required_env_is_optional() {
+    fn only_the_image_is_required() {
         let schema = Docker::attr_schema();
 
         let image = schema.attr("image").expect("image is declared");
@@ -1139,7 +1139,7 @@ mod tests {
         assert_eq!(image.ty, ValueType::Str);
 
         let ports = schema.attr("ports").expect("ports is declared");
-        assert!(ports.required);
+        assert!(!ports.required);
         assert_eq!(ports.ty, ValueType::MapOf(Box::new(ValueType::Int)));
 
         assert!(!schema.attr("env").expect("env is declared").required);
@@ -1209,5 +1209,22 @@ mod tests {
             ("ports", plan::Value::Map(Vec::new())),
         ]));
         assert!(matches!(bound, Err(BindError::MissingKind { .. })));
+    }
+
+    /// A queue worker dials out and is dialled by nothing, so it speaks no kind
+    /// and there is no port for it to state.
+    #[test]
+    fn a_service_nothing_dials_states_no_ports() {
+        let bound = Docker::bind(&plan::Service {
+            name: "worker".into(),
+            kinds: Vec::new(),
+            attrs: vec![(
+                "image".to_owned(),
+                plan::Value::Str("example/worker:1".into()),
+            )],
+        })
+        .expect("binds");
+
+        assert!(bound.ports.is_empty());
     }
 }

@@ -445,7 +445,7 @@ mod tests {
         vec![plan::Check {
             service: "db".into(),
             observer: "mariadb".into(),
-            observable: vec!["orders".into(), "count".into()],
+            observable: vec!["orders".into(), "orders".into(), "count".into()],
             args: Vec::new(),
             filter: None,
             op: crucible_core::schema::CmpOp::Eq,

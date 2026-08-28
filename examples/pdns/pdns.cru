@@ -46,7 +46,7 @@ scenario "records_resolve" {
   // The rows are what the API wrote; the answers are what the nameserver serves
   // from them, which is the half a fault can lose without the API noticing.
   expect {
-    db.records.count where type = "A" == 2;
+    db.pdns.records.count where type = "A" == 2;
     ns.resolve "www.example.test" == "192.0.2.1";
     ns.resolve "mail.example.test" == "192.0.2.2";
   }
