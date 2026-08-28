@@ -436,7 +436,7 @@ mod tests {
                 plan::Value::Ident("api".into()),
                 plan::Value::Str("/orders".into()),
             ],
-            body: None,
+            blocks: std::collections::BTreeMap::new(),
             expect: None,
         }]
     }

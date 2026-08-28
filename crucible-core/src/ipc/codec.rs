@@ -154,7 +154,7 @@ mod tests {
                 crate::plan::Value::Ident("api".into()),
                 crate::plan::Value::Str("/orders".into()),
             ],
-            body: None,
+            blocks: std::collections::BTreeMap::new(),
             expect: None,
         }
     }

@@ -59,8 +59,12 @@ pub struct OpCall {
 /// A clause attached to an operation call.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Clause {
-    /// A `body { ... }` payload.
-    Body(Spanned<Value>),
+    /// A `<keyword> { ... }` payload. Which keywords an operation takes is the
+    /// plugin's to declare.
+    Block {
+        keyword: Spanned<String>,
+        value: Spanned<Value>,
+    },
     /// A `where <column> = <value>` filter.
     Where(Filter),
 }

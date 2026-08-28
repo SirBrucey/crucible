@@ -1,7 +1,7 @@
 //! Lowering a parsed file to a [`plan::Plan`], resolving plugins and validating
 //! service attributes and operation signatures as it goes.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crucible_core::{
     plan,
@@ -277,7 +277,7 @@ impl<'a> Lowerer<'a> {
             driver: driver.node.clone(),
             operation: operation.node.clone(),
             args: op.args.iter().map(|arg| lower_value(&arg.node)).collect(),
-            body: body_of(op),
+            blocks: blocks_of(op),
             expect: step
                 .node
                 .expect
@@ -492,11 +492,18 @@ impl<'a> Lowerer<'a> {
     fn check_clauses(&mut self, op: &OpCall, sig: &OpSig) {
         for clause in &op.clauses {
             let keyword = match &clause.node {
-                Clause::Body(_) => "body",
+                Clause::Block { keyword, .. } => keyword.node.as_str(),
                 Clause::Where(_) => "where",
             };
             if !sig.clauses.iter().any(|decl| decl.keyword == keyword) {
-                self.error(clause.span, format!("this operation takes no `{keyword}`"));
+                let known = sorted(sig.clauses.iter().map(|decl| decl.keyword.clone()));
+                self.error_options(
+                    clause.span,
+                    format!("this operation takes no `{keyword}`"),
+                    "clauses:",
+                    known,
+                    "this operation takes no clauses",
+                );
             }
         }
     }
@@ -571,14 +578,20 @@ fn lower_attrs(service: &ast::Service) -> Vec<(String, plan::Value)> {
         .collect()
 }
 
-fn body_of(op: &OpCall) -> Option<Vec<(String, plan::Value)>> {
-    op.clauses.iter().find_map(|clause| match &clause.node {
-        Clause::Body(value) => Some(match &value.node {
-            Value::Map(entries) => lower_pairs(entries),
-            _ => Vec::new(),
-        }),
-        Clause::Where(_) => None,
-    })
+fn blocks_of(op: &OpCall) -> BTreeMap<String, Vec<(String, plan::Value)>> {
+    op.clauses
+        .iter()
+        .filter_map(|clause| match &clause.node {
+            Clause::Block { keyword, value } => Some((
+                keyword.node.clone(),
+                match &value.node {
+                    Value::Map(entries) => lower_pairs(entries),
+                    _ => Vec::new(),
+                },
+            )),
+            Clause::Where(_) => None,
+        })
+        .collect()
 }
 
 fn where_of(op: &OpCall) -> Option<(String, plan::Value)> {
@@ -586,7 +599,7 @@ fn where_of(op: &OpCall) -> Option<(String, plan::Value)> {
         Clause::Where(filter) => {
             Some((filter.column.node.clone(), lower_value(&filter.value.node)))
         }
-        Clause::Body(_) => None,
+        Clause::Block { .. } => None,
     })
 }
 
@@ -700,8 +713,7 @@ mod tests {
     fn a_body_may_state_a_value_is_absent() {
         let plan = lower_ok(&VALID.replace(r#"item: "book", quantity: 1"#, "item: null"));
         let body = plan.scenarios[0].steps[0]
-            .body
-            .as_ref()
+            .block("body")
             .expect("the step carries a body");
         assert_eq!(body[0].1, plan::Value::Null);
     }
@@ -726,7 +738,7 @@ mod tests {
         let step = &scenario.steps[0];
         assert_eq!(step.driver, "http");
         assert_eq!(step.operation, "POST");
-        assert!(step.body.is_some());
+        assert!(step.block("body").is_some());
 
         // The check binds `db`'s kind to the mariadb observer, and keeps the filter.
         let check = &scenario.checks[0];

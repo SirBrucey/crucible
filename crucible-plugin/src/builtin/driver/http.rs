@@ -18,6 +18,9 @@ use crate::{
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// The clause carrying a request payload.
 const BODY: &str = "body";
+/// The clause carrying request headers.
+const HEADERS: &str = "headers";
+const CONTENT_TYPE: &str = "content-type";
 
 /// Drives HTTP requests against a service.
 pub struct Http {
@@ -31,8 +34,18 @@ pub struct Request {
     pub service: String,
     pub path: String,
     pub body: Option<Vec<u8>>,
+    pub headers: Vec<(String, String)>,
     /// The status the step says this answers with.
     pub expect: Option<StatusCode>,
+}
+
+impl Request {
+    /// Whether the step named `header`, matched the way HTTP matches one.
+    fn states(&self, header: &str) -> bool {
+        self.headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case(header))
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -47,6 +60,8 @@ pub enum Error {
     Path(String),
     #[error("`{0}` takes no body")]
     Body(Method),
+    #[error("header `{name}` carries {value}, and a header is text")]
+    Header { name: String, value: plan::Value },
     #[error("a body carries {0:?}, whose millisecond count does not fit a `u64`")]
     Duration(Duration),
     #[error(transparent)]
@@ -72,6 +87,21 @@ impl Http {
             client: Client::builder().timeout(REQUEST_TIMEOUT).build()?,
         })
     }
+}
+
+/// Headers are authored as plan values and sent as text, so anything that is
+/// not text is refused rather than given a spelling of its own.
+fn headers(fields: &[(String, plan::Value)]) -> Result<Vec<(String, String)>, Error> {
+    fields
+        .iter()
+        .map(|(name, value)| match value {
+            plan::Value::Str(s) | plan::Value::Ident(s) => Ok((name.clone(), s.clone())),
+            other => Err(Error::Header {
+                name: name.clone(),
+                value: other.clone(),
+            }),
+        })
+        .collect()
 }
 
 /// A body is authored as plan values and sent as a JSON object.
@@ -115,15 +145,19 @@ impl Driver for Http {
     fn signatures() -> Vec<OpSig> {
         vec![
             OpSig::action(HeadPattern::exact("POST"), request_params(), ValueType::Int)
-                .with_clause(ClauseDecl::new(BODY, ClauseShape::Block)),
+                .with_clause(ClauseDecl::new(BODY, ClauseShape::Block))
+                .with_clause(ClauseDecl::new(HEADERS, ClauseShape::Block)),
             OpSig::action(HeadPattern::exact("PUT"), request_params(), ValueType::Int)
-                .with_clause(ClauseDecl::new(BODY, ClauseShape::Block)),
-            OpSig::action(HeadPattern::exact("GET"), request_params(), ValueType::Int),
+                .with_clause(ClauseDecl::new(BODY, ClauseShape::Block))
+                .with_clause(ClauseDecl::new(HEADERS, ClauseShape::Block)),
+            OpSig::action(HeadPattern::exact("GET"), request_params(), ValueType::Int)
+                .with_clause(ClauseDecl::new(HEADERS, ClauseShape::Block)),
             OpSig::action(
                 HeadPattern::exact("DELETE"),
                 request_params(),
                 ValueType::Int,
-            ),
+            )
+            .with_clause(ClauseDecl::new(HEADERS, ClauseShape::Block)),
         ]
     }
 
@@ -148,14 +182,20 @@ impl Driver for Http {
         if !path.starts_with('/') {
             return Err(Error::Path(path.to_owned()));
         }
-        if step.body.is_some() && !takes_body(&step.operation) {
+        let body = step.block(BODY);
+        if body.is_some() && !takes_body(&step.operation) {
             return Err(Error::Body(method));
         }
         Ok(Request {
             method,
             service: service.to_owned(),
             path: path.to_owned(),
-            body: step.body.as_deref().map(encode).transpose()?,
+            body: body.map(encode).transpose()?,
+            headers: step
+                .block(HEADERS)
+                .map(headers)
+                .transpose()?
+                .unwrap_or_default(),
             expect: expected_status(step.expect.as_ref())?,
         })
     }
@@ -220,10 +260,16 @@ impl Call {
         let url = format!("http://{endpoint}{}", request.path);
 
         let mut builder = self.client.request(request.method.clone(), url);
+        for (name, value) in &request.headers {
+            builder = builder.header(name, value);
+        }
         if let Some(body) = request.body.clone() {
-            builder = builder
-                .header("content-type", "application/json")
-                .body(body);
+            // A header is appended rather than replaced, so the content type is
+            // only supplied where the step did not name one of its own.
+            if !request.states(CONTENT_TYPE) {
+                builder = builder.header(CONTENT_TYPE, "application/json");
+            }
+            builder = builder.body(body);
         }
 
         let outcome = match builder.send().await {
@@ -297,15 +343,26 @@ mod tests {
         schema::{ClauseShape, HeadPattern},
     };
     use reqwest::Method;
+    use std::collections::BTreeMap;
 
     fn step(operation: &str, args: Vec<plan::Value>) -> plan::Step {
         plan::Step {
             driver: "http".into(),
             operation: operation.into(),
             args,
-            body: None,
+            blocks: BTreeMap::new(),
             expect: None,
         }
+    }
+
+    /// A step carrying one `<keyword> { ... }` clause.
+    fn with_block(
+        mut step: plan::Step,
+        keyword: &str,
+        entries: Vec<(String, plan::Value)>,
+    ) -> plan::Step {
+        step.blocks.insert(keyword.to_owned(), entries);
+        step
     }
 
     fn post_to(service: &str, path: &str) -> plan::Step {
@@ -368,6 +425,45 @@ mod tests {
     }
 
     #[test]
+    fn headers_bind_to_the_request() {
+        let step = with_block(
+            post_to("api", "/orders"),
+            "headers",
+            vec![("Authorization".into(), plan::Value::Str("token:abc".into()))],
+        );
+        let bound = Http::bind(&step).expect("binds");
+        assert_eq!(
+            bound.headers,
+            [("Authorization".to_owned(), "token:abc".to_owned())],
+        );
+    }
+
+    /// A header is text on the wire, so a value with no spelling of its own is
+    /// refused rather than given one here.
+    #[test]
+    fn a_header_that_is_not_text_is_rejected() {
+        let step = with_block(
+            post_to("api", "/orders"),
+            "headers",
+            vec![("Retry-After".into(), plan::Value::Int(30))],
+        );
+        assert!(matches!(Http::bind(&step), Err(Error::Header { .. })));
+    }
+
+    /// The default content type is only supplied where the step did not name
+    /// one, because a header is appended rather than replaced.
+    #[test]
+    fn a_stated_content_type_is_the_one_that_stands() {
+        let step = with_block(
+            post_to("api", "/orders"),
+            "headers",
+            vec![("Content-Type".into(), plan::Value::Str("text/plain".into()))],
+        );
+        let bound = Http::bind(&step).expect("binds");
+        assert!(bound.states("content-type"));
+    }
+
+    #[test]
     fn a_step_binds_to_a_request() {
         let bound = Http::bind(&post_to("api", "/orders")).expect("binds");
         assert_eq!(
@@ -377,6 +473,7 @@ mod tests {
                 service: "api".into(),
                 path: "/orders".into(),
                 body: None,
+                headers: Vec::new(),
                 expect: None,
             },
         );
@@ -384,11 +481,14 @@ mod tests {
 
     #[test]
     fn a_body_binds_to_json() {
-        let mut step = post_to("api", "/orders");
-        step.body = Some(vec![
-            ("item".into(), plan::Value::Str("book".into())),
-            ("quantity".into(), plan::Value::Int(4)),
-        ]);
+        let step = with_block(
+            post_to("api", "/orders"),
+            "body",
+            vec![
+                ("item".into(), plan::Value::Str("book".into())),
+                ("quantity".into(), plan::Value::Int(4)),
+            ],
+        );
         let bound = Http::bind(&step).expect("binds");
         let body = bound.body.expect("a body was authored");
         let sent: serde_json::Value = serde_json::from_slice(&body).expect("valid json");
@@ -404,14 +504,17 @@ mod tests {
 
     #[test]
     fn an_operation_that_declares_no_body_will_not_take_one() {
-        let mut step = step(
-            "GET",
-            vec![
-                plan::Value::Ident("api".into()),
-                plan::Value::Str("/orders".into()),
-            ],
+        let step = with_block(
+            step(
+                "GET",
+                vec![
+                    plan::Value::Ident("api".into()),
+                    plan::Value::Str("/orders".into()),
+                ],
+            ),
+            "body",
+            vec![("item".into(), plan::Value::Str("book".into()))],
         );
-        step.body = Some(vec![("item".into(), plan::Value::Str("book".into()))]);
         assert!(matches!(Http::bind(&step), Err(Error::Body(_))));
     }
 
