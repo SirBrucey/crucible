@@ -116,6 +116,8 @@ impl Driver for Http {
         vec![
             OpSig::action(HeadPattern::exact("POST"), request_params(), ValueType::Int)
                 .with_clause(ClauseDecl::new(BODY, ClauseShape::Block)),
+            OpSig::action(HeadPattern::exact("PUT"), request_params(), ValueType::Int)
+                .with_clause(ClauseDecl::new(BODY, ClauseShape::Block)),
             OpSig::action(HeadPattern::exact("GET"), request_params(), ValueType::Int),
             OpSig::action(
                 HeadPattern::exact("DELETE"),
@@ -130,6 +132,7 @@ impl Driver for Http {
         // runs something it did not offer.
         let method = match step.operation.as_str() {
             "POST" => Method::POST,
+            "PUT" => Method::PUT,
             "GET" => Method::GET,
             "DELETE" => Method::DELETE,
             other => return Err(Error::Method(other.to_owned())),
@@ -340,7 +343,7 @@ mod tests {
     }
 
     #[test]
-    fn exposes_post_get_and_delete() {
+    fn exposes_the_methods_a_scenario_drives_with() {
         let heads: Vec<String> = Http::signatures()
             .into_iter()
             .filter_map(|sig| match sig.head {
@@ -348,7 +351,7 @@ mod tests {
                 HeadPattern::Wildcard { .. } => None,
             })
             .collect();
-        assert_eq!(heads, ["POST", "GET", "DELETE"]);
+        assert_eq!(heads, ["POST", "PUT", "GET", "DELETE"]);
     }
 
     #[test]

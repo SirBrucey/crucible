@@ -189,9 +189,9 @@ fn proxy_fault_args(fault: &Fault) -> Vec<String> {
             ]
         }
         (None, By::Cut(edge)) => vec!["--degrade".to_owned(), edge_arg(edge)],
-        // A kill is done to the container, and repeating a message needs a
-        // moment to repeat, so an unanchored one is nothing the proxy can do.
-        (None, By::Kill(_) | By::Repeat(_)) => Vec::new(),
+        // A kill is done to the container, and changing what crosses needs a
+        // moment to change, so an unanchored one is nothing the proxy can do.
+        (None, By::Kill(_) | By::Repeat(_) | By::Reorder(_)) => Vec::new(),
     }
 }
 
@@ -850,7 +850,7 @@ impl Substrate for Proxy {
 /// built.
 impl Faults for Proxy {
     fn primitives(&self) -> BTreeSet<Primitive> {
-        [Primitive::Cut, Primitive::Redeliver].into()
+        [Primitive::Cut, Primitive::Redeliver, Primitive::Reorder].into()
     }
 }
 

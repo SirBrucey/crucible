@@ -60,8 +60,7 @@ struct Cli {
 /// Changing what crosses happens in the stream itself, as the bytes pass, so
 /// there is nothing to hold.
 ///
-/// Narrower than [`Primitive`]: one it cannot place is refused as the proxy
-/// starts rather than when the traffic arrives.
+/// Narrower than [`Primitive`], which names what is done rather than where.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Fault {
     /// Wait to be told the service has been killed and brought back. That
@@ -75,15 +74,12 @@ enum Fault {
     Rewritten,
 }
 
-impl TryFrom<Primitive> for Fault {
-    type Error = Error;
-
-    fn try_from(primitive: Primitive) -> Result<Self> {
+impl From<Primitive> for Fault {
+    fn from(primitive: Primitive) -> Self {
         match primitive {
-            Primitive::Kill => Ok(Self::Kill),
-            Primitive::Cut => Ok(Self::Cut),
-            Primitive::Redeliver => Ok(Self::Rewritten),
-            Primitive::Reorder => Err(Error::UnplaceableFault { primitive }),
+            Primitive::Kill => Self::Kill,
+            Primitive::Cut => Self::Cut,
+            Primitive::Redeliver | Primitive::Reorder => Self::Rewritten,
         }
     }
 }
@@ -211,7 +207,7 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let fault = Fault::try_from(cli.fault)?;
+    let fault = Fault::from(cli.fault);
 
     // The network every pair in this sidecar forwards on, frozen while a fault
     // is placed. SIGUSR1 arms the anchor at scenario start, so it counts only

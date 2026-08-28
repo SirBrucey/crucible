@@ -304,7 +304,7 @@ impl Orchestrator<Ready> {
             let (mut observations, fault_report) = match fault {
                 // Placed on one moment, so the scenario is in flight when it
                 // lands and the two run together.
-                Fault::Durable { .. } | Fault::Idempotent { .. } => {
+                Fault::Durable { .. } | Fault::Idempotent { .. } | Fault::Converges { .. } => {
                     anchored_run(
                         deployment.as_ref(),
                         placement,
@@ -407,8 +407,21 @@ async fn read_checks(
     let mut readings = Vec::with_capacity(queries.len());
     for (check, query) in queries {
         let endpoint = endpoint_for_control_plane(deployment, query.as_ref())?;
+        // A fault can leave the fleet with nothing to answer from, which is
+        // what the run is there to find out rather than a reason to stop.
+        let value = match query.read(endpoint).await {
+            Ok(value) => Some(value),
+            Err(e) => {
+                tracing::debug!(
+                    observable = %check.observable(),
+                    error = %e,
+                    "the fleet had nothing to read once it settled",
+                );
+                None
+            }
+        };
         readings.push(Observed {
-            value: query.read(endpoint).await?,
+            value,
             check: check.clone(),
         });
     }
@@ -525,10 +538,10 @@ impl<'a> Placement<'a> {
                 .contains(&Primitive::Cut)
                 .then_some(Placement::Cut)
                 .ok_or_else(|| unreachable_fault(fault)),
-            By::Repeat(_) => deployment
+            By::Repeat(_) | By::Reorder(_) => deployment
                 .substrate()
                 .primitives()
-                .contains(&Primitive::Redeliver)
+                .contains(&fault.primitive())
                 .then_some(Placement::Rewritten)
                 .ok_or_else(|| unreachable_fault(fault)),
         }

@@ -3,9 +3,9 @@ use std::{sync::Arc, time::Duration};
 use anyhow::Context;
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{Path, State},
     http::StatusCode,
-    routing::{get, post},
+    routing::{get, post, put},
 };
 use lapin::{
     BasicProperties, Channel, Connection, ConnectionProperties, ExchangeKind,
@@ -18,12 +18,21 @@ use tokio::net::TcpListener;
 
 const EXCHANGE: &str = "orders";
 const ROUTING_KEY: &str = "order.created";
+const MODIFY_KEY: &str = "order.modified";
 const RETRY_ATTEMPTS: u32 = 30;
 const RETRY_DELAY: Duration = Duration::from_secs(1);
 
+/// The caller names the order, which is what lets it be referred to again and
+/// what a fleet would use to recognise a create it has already seen.
 #[derive(Deserialize)]
 struct OrderRequest {
+    id: u64,
     item: String,
+    quantity: i32,
+}
+
+#[derive(Deserialize)]
+struct ModifyRequest {
     quantity: i32,
 }
 
@@ -36,6 +45,14 @@ struct OrderResponse {
 struct OrderCreated {
     id: u64,
     item: String,
+    quantity: i32,
+}
+
+/// A customer changing their mind. What the order ends up for is whichever of
+/// these the fleet was told last, so the order they arrive in is the answer.
+#[derive(Serialize)]
+struct OrderModified {
+    id: u64,
     quantity: i32,
 }
 
@@ -57,7 +74,7 @@ async fn main() -> anyhow::Result<()> {
     let db = connect_db(&database_url).await?;
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS orders (
-            id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+            id BIGINT UNSIGNED PRIMARY KEY,
             item VARCHAR(255) NOT NULL,
             quantity INT NOT NULL
         )",
@@ -84,6 +101,7 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/healthz", get(|| async { StatusCode::OK }))
         .route("/orders", post(create_order))
+        .route("/orders/{id}", put(modify_order))
         .with_state(state);
 
     let listener = TcpListener::bind(&listen_addr)
@@ -124,7 +142,8 @@ async fn create_order(
     State(state): State<Arc<AppState>>,
     Json(req): Json<OrderRequest>,
 ) -> Result<Json<OrderResponse>, StatusCode> {
-    let result = sqlx::query("INSERT INTO orders (item, quantity) VALUES (?, ?)")
+    sqlx::query("INSERT INTO orders (id, item, quantity) VALUES (?, ?, ?)")
+        .bind(req.id)
         .bind(&req.item)
         .bind(req.quantity)
         .execute(&state.db)
@@ -133,7 +152,7 @@ async fn create_order(
             tracing::warn!(?e, "insert failed");
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
-    let order_id = result.last_insert_id();
+    let order_id = req.id;
 
     let event = OrderCreated {
         id: order_id,
@@ -157,4 +176,34 @@ async fn create_order(
         })?;
 
     Ok(Json(OrderResponse { order_id }))
+}
+
+/// Change what an order is for. Nothing here reads what it was, so two of these
+/// applied the other way round leave the order at the earlier amount.
+async fn modify_order(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<u64>,
+    Json(req): Json<ModifyRequest>,
+) -> Result<StatusCode, StatusCode> {
+    let event = OrderModified {
+        id,
+        quantity: req.quantity,
+    };
+    let payload = serde_json::to_vec(&event).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    state
+        .channel
+        .basic_publish(
+            EXCHANGE,
+            MODIFY_KEY,
+            BasicPublishOptions::default(),
+            &payload,
+            BasicProperties::default(),
+        )
+        .await
+        .map_err(|e| {
+            tracing::warn!(?e, "publish failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    Ok(StatusCode::ACCEPTED)
 }

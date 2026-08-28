@@ -312,6 +312,12 @@ pub struct Reader {
     watching: Option<String>,
     /// What both directions of this connection agree on.
     consuming: Consuming,
+    /// The last delivery this carried on each channel, so the one before can be
+    /// offered as somewhere the fleet could be told things out of order.
+    last: BTreeMap<u16, u64>,
+    /// A message kept back, waiting for the one the broker sent next to go
+    /// first.
+    held: Option<Vec<u8>>,
     /// Which way this reader's traffic runs, which every placement it finds is
     /// on.
     direction: Direction,
@@ -408,6 +414,9 @@ impl crucible_protocol::Kind for Reader {
         let mut freeze_after = None;
         let mut found = Vec::new();
         let mut did = None;
+        // What a reorder keeps back, and what lets it go.
+        let mut keep: Option<Range<usize>> = None;
+        let mut release = false;
         for message in messages {
             if let Some(placement) = redelivery(&message, self.direction) {
                 if placing && self.watches(&placement) {
@@ -417,6 +426,20 @@ impl crucible_protocol::Kind for Reader {
                     did = Some(self.refuse(&mut wire, &message));
                 }
                 found.push(placement);
+            }
+            if let Operation::Deliver { tag, .. } = message.operation {
+                // A delivery is offered once another follows it, so what the
+                // schedule names is known to have something to go behind.
+                if let Some(before) = self.last.insert(message.channel, tag) {
+                    found.push(reorderable(before, self.direction));
+                }
+                if placing && self.watches(&reorderable(tag, self.direction)) {
+                    self.watching = None;
+                    keep = Some(message.at.clone());
+                } else if self.held.is_some() {
+                    // The one the broker sent next, which goes first.
+                    release = true;
+                }
             }
             // After the fault, which reads what the consumer is holding before
             // this lets go of it.
@@ -430,8 +453,28 @@ impl crucible_protocol::Kind for Reader {
                 found.push(placement);
             }
         }
+
+        let mut forward: Vec<Cow<'a, [u8]>> = Vec::with_capacity(wire.len());
+        let mut kept = Vec::new();
+        for frame in wire {
+            match &keep {
+                Some(at) if at.contains(&frame.at.start) => kept.extend_from_slice(&frame.bytes),
+                _ => forward.push(frame.bytes),
+            }
+        }
+        if !kept.is_empty() {
+            self.held = Some(kept);
+            did = Some(Did::Asked);
+        }
+        if release && let Some(kept) = self.held.take() {
+            forward.push(Cow::Owned(kept));
+            did = Some(Did::Placed(
+                "a message the broker sent first arrived after the one it sent next".to_owned(),
+            ));
+        }
+
         Carried {
-            forward: wire.into_iter().map(|frame| frame.bytes).collect(),
+            forward,
             freeze_after,
             found,
             did,
@@ -457,6 +500,22 @@ fn redelivery(message: &Message, direction: Direction) -> Option<Placement> {
     })
 }
 
+/// Where a message the broker has already sent offers to arrive after one sent
+/// later, which is what a fleet relying on the order it was told things would
+/// not survive.
+///
+/// A delivery is only offered once another follows it: holding one back with
+/// nothing behind it to go first would take the message away rather than
+/// reorder it, and that is a different fault.
+fn reorderable(followed: u64, direction: Direction) -> Placement {
+    Placement {
+        direction,
+        mark: format!("reorder:{followed}"),
+        why: "a message held back until after the one the broker sent next".to_owned(),
+        exercises: Property::Converges,
+    }
+}
+
 /// `frame` as it goes on the wire.
 fn write(frame: &AMQPFrame) -> Option<Vec<u8>> {
     let write = gen_frame::<Vec<u8>>(frame);
@@ -471,6 +530,8 @@ impl Reader {
         Self {
             direction,
             consuming,
+            last: BTreeMap::new(),
+            held: None,
             pending: Vec::new(),
             frames: Vec::new(),
             taken: 0,
@@ -673,6 +734,35 @@ mod tests {
             .collect()
     }
 
+    /// A delivery of `payload` the broker labelled `tag`.
+    fn delivered(tag: u64, payload: &[u8]) -> Vec<u8> {
+        let mut bytes = method(AMQPMethod::Deliver(Deliver {
+            consumer_tag: "consumer-1".into(),
+            delivery_tag: tag,
+            redelivered: false,
+            ..Default::default()
+        }));
+        bytes.extend(header(payload.len() as u64));
+        bytes.extend(body(payload));
+        bytes
+    }
+
+    /// The marks a run offered.
+    fn marks(found: Vec<Placement>) -> Vec<String> {
+        found.into_iter().map(|placement| placement.mark).collect()
+    }
+
+    /// The delivery tags in `bytes`, in the order they go on the wire.
+    fn tags(bytes: &[u8]) -> Vec<u64> {
+        operations(bytes)
+            .into_iter()
+            .filter_map(|operation| match operation {
+                Operation::Deliver { tag, .. } => Some(tag),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Placements a fault-free run of `bytes` offers.
     fn placements(bytes: &[u8]) -> Vec<Placement> {
         Reader::new(WAY, Consuming::default())
@@ -768,6 +858,49 @@ mod tests {
 
         let unrelated = pushed(true, b"a different order");
         assert_eq!(from_broker.carry(&unrelated, false).did, None);
+    }
+
+    /// A delivery is only somewhere to reorder once another follows it: with
+    /// nothing behind it to go first, holding it back takes the message away.
+    #[test]
+    fn a_delivery_offers_a_reorder_once_another_follows_it() {
+        let mut reader = Reader::new(Direction::UpstreamToClient, Consuming::default());
+        let first = delivered(1, b"an order");
+        assert!(
+            marks(reader.carry(&first, false).found)
+                .iter()
+                .all(|mark| !mark.starts_with("reorder:")),
+            "nothing has followed it yet"
+        );
+        let second = delivered(2, b"another order");
+        assert!(marks(reader.carry(&second, false).found).contains(&"reorder:1".to_owned()));
+    }
+
+    #[test]
+    fn a_reorder_holds_a_message_back_until_the_next_one_has_gone() {
+        let mut reader = Reader::watching(
+            Direction::UpstreamToClient,
+            Consuming::default(),
+            "reorder:1".into(),
+        );
+
+        let first = delivered(1, b"an order");
+        let held = reader.carry(&first, true);
+        assert!(held.forward.is_empty(), "the marked message is kept back");
+        assert_eq!(held.did, Some(Did::Asked));
+
+        let second = delivered(2, b"another order");
+        let released = reader.carry(&second, true);
+        assert_eq!(
+            tags(&released.forward.concat()),
+            [2, 1],
+            "the one sent first arrives second"
+        );
+        assert!(
+            matches!(released.did, Some(Did::Placed(_))),
+            "{:?}",
+            released.did
+        );
     }
 
     #[test]

@@ -94,9 +94,9 @@ fn degradations<'a>(
                         .filter(|profile| profile.edge.within_fleet())
                         .map(|profile| By::Cut(profile.edge.clone())),
                 ),
-                // Repeating a message needs a message to repeat, and a fleet
-                // held down from the start never sends one.
-                Drive::Repeat => Box::new(std::iter::empty()),
+                // Changing what crosses needs something to cross, and a fleet
+                // held down from the start never sends anything.
+                Drive::Repeat | Drive::Reorder => Box::new(std::iter::empty()),
             }
         })
 }

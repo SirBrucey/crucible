@@ -13,6 +13,11 @@ pub struct Durable;
 /// differs is the fault, not the reading.
 pub struct Recovers;
 
+/// Convergence asks it too. Every step was answered whichever order the fleet
+/// was told about them in, so it owes all of them: what differs is the route it
+/// took to owing them, which the settled state is not a reading of.
+pub struct Converges;
+
 /// Idempotency asks it too. Every step was answered, so the fleet owes all of
 /// them and no more: doing one of them twice has to leave what doing it once
 /// would. What differs is again the fault, not the reading.
@@ -87,7 +92,7 @@ impl Driver for Durable {
         let settled: Checkpoint = observations
             .checks
             .iter()
-            .map(|observed| Some(observed.value.clone()))
+            .map(|observed| observed.value.clone())
             .collect();
         // Any outcome the run admits is enough: what is in doubt is what the
         // fleet accepted, and it is not held to the strictest reading of that.
@@ -121,6 +126,12 @@ impl Driver for Recovers {
 }
 
 impl Driver for Idempotent {
+    fn drive(&mut self, observations: &Observations) -> Verdict {
+        Durable.drive(observations)
+    }
+}
+
+impl Driver for Converges {
     fn drive(&mut self, observations: &Observations) -> Verdict {
         Durable.drive(observations)
     }
@@ -350,7 +361,7 @@ mod tests {
                 op: crate::schema::CmpOp::Eq,
                 value: plan::Value::Int(read),
             },
-            value: plan::Value::Int(read),
+            value: Some(plan::Value::Int(read)),
         }
     }
 
@@ -369,6 +380,26 @@ mod tests {
         obs.checks = vec![reading(settled)];
         obs.fault_free = fault_free.iter().copied().map(checkpoint).collect();
         Durable.drive(&obs)
+    }
+
+    /// A fault can leave the fleet with no row to answer from. That is a
+    /// reading of the fleet, and the run says what it could not read rather
+    /// than holding the fleet to a value it never had.
+    #[test]
+    fn a_check_the_fleet_cannot_answer_is_not_a_failure() {
+        let mut obs = Observations::empty();
+        obs.fault = Some(fired_throughout());
+        obs.outcomes = vec![outcome(Ack::Acked)];
+        obs.checks = vec![Observed {
+            value: None,
+            ..reading(3)
+        }];
+        obs.fault_free = vec![checkpoint(0), checkpoint(3)];
+        assert!(
+            matches!(Durable.drive(&obs), Verdict::Inconclusive { .. }),
+            "{:?}",
+            Durable.drive(&obs)
+        );
     }
 
     #[test]
