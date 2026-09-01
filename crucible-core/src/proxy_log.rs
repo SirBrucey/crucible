@@ -297,7 +297,7 @@ mod tests {
     }
 
     fn a_session() -> impl Strategy<Value = Session> {
-        ("[a-z]{1,12}", prop::collection::vec(a_write(), 0..3000)).prop_map(|(service, writes)| {
+        ("[a-z_]{1,24}", prop::collection::vec(a_write(), 0..3000)).prop_map(|(service, writes)| {
             Session {
                 service,
                 conn_id: 0,
@@ -313,9 +313,14 @@ mod tests {
     proptest! {
         /// The session catalogue must always fit the IPC frame, however much
         /// traffic a learn run observed. Grounds the bound on the wire type.
+        ///
+        /// The session count and name length reach well past a small fleet's. A
+        /// real one runs more services, under longer names, and opens a
+        /// connection per publish, and it was a fleet of that shape that first
+        /// overran the frame this asserts against while the test still passed.
         #[test]
         fn catalogue_always_fits_the_frame(
-            sessions in prop::collection::vec(a_session(), 0..8),
+            sessions in prop::collection::vec(a_session(), 0..64),
         ) {
             let profiles = edge_profiles_from_sessions(&sessions, 0, &HashMap::new());
             let catalogue = WorkerToRunner::SessionCatalogue(crate::learned::Learned {
