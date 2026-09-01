@@ -34,8 +34,17 @@ struct Point<'a> {
     /// What faulting here is good for. A moment a plugin named is only a moment
     /// for the property it named it for.
     exercises: Invariant,
-    /// How much traffic was around it, so a short budget keeps the busiest.
-    weight: u32,
+    /// How many packets were in the burst this came from, so a short budget
+    /// keeps the busiest. A moment a plugin named came from no burst.
+    packets: Option<u32>,
+}
+
+impl Point<'_> {
+    /// The group this point takes its turn in, so the budget is spread across
+    /// the properties and the bursts do not crowd out the named moments.
+    fn bucket(&self) -> (Invariant, bool) {
+        (self.exercises, self.packets.is_none())
+    }
 }
 
 /// Where a fault can go on `profile`, in the order the points should be spent.
@@ -45,19 +54,18 @@ struct Point<'a> {
 /// by the middle of a burst first and its edges after.
 fn points_on(profile: &EdgeProfile) -> Vec<Point<'_>> {
     if !profile.placements.is_empty() {
-        let named = profile.placements.iter().map(|placement| Point {
-            edge: &profile.edge,
-            direction: placement.direction,
-            mark: placement.mark.clone(),
-            why: placement.why.clone(),
-            exercises: placement.exercises.into(),
-            weight: 1,
-        });
-        // A property with fewer moments than another would otherwise sit behind
-        // every one of them, and be the first thing a budget drops. Taking one
-        // of each in turn spends a short budget across the properties rather
-        // than on whichever the traffic happened to offer most of.
-        return in_turn(named, |point| point.exercises);
+        return profile
+            .placements
+            .iter()
+            .map(|placement| Point {
+                edge: &profile.edge,
+                direction: placement.direction,
+                mark: placement.mark.clone(),
+                why: placement.why.clone(),
+                exercises: placement.exercises.into(),
+                packets: None,
+            })
+            .collect();
     }
 
     // Per burst, in preference order, then transposed so every burst gets its
@@ -80,7 +88,7 @@ fn points_on(profile: &EdgeProfile) -> Vec<Point<'_>> {
                     // Nothing read this edge, so all a moment on it can say is
                     // that the fleet was part way through something.
                     exercises: Invariant::Durable,
-                    weight: burst.packets,
+                    packets: Some(burst.packets),
                 });
             }
         }
@@ -88,7 +96,7 @@ fn points_on(profile: &EdgeProfile) -> Vec<Point<'_>> {
     // Where a budget runs out part way through, the busiest bursts are the ones
     // worth keeping.
     for round in &mut rounds {
-        round.sort_by_key(|point| std::cmp::Reverse(point.weight));
+        round.sort_by_key(|point| std::cmp::Reverse(point.packets));
     }
     rounds.concat()
 }
@@ -193,18 +201,13 @@ impl BurstScheduler {
         // first.
         let on_edge: Vec<Vec<Point<'_>>> = learned.profiles.iter().map(points_on).collect();
         let found: usize = on_edge.iter().map(Vec::len).sum();
-        let mut points: Vec<Point<'_>> = Vec::with_capacity(found);
+        let mut by_edge: Vec<Point<'_>> = Vec::with_capacity(found);
         for round in 0..on_edge.iter().map(Vec::len).max().unwrap_or(0) {
-            let mut taken: Vec<Point<'_>> = on_edge
-                .iter()
-                .filter_map(|edge| edge.get(round))
-                .cloned()
-                .collect();
-            // Where a budget runs out part way through a round, the busiest
-            // points are the ones worth keeping.
-            taken.sort_by_key(|point| std::cmp::Reverse(point.weight));
-            points.extend(taken);
+            by_edge.extend(on_edge.iter().filter_map(|edge| edge.get(round)).cloned());
         }
+        // Then by turn, so a property with few moments is covered before one
+        // with many, and the bursts take their share rather than all of it.
+        let mut points = in_turn(by_edge.into_iter(), Point::bucket);
 
         // What one point costs, which is not the same everywhere: what an edge
         // has to break depends on the edge, and a moment is only spent on what
@@ -377,7 +380,11 @@ mod tests {
     /// An unbounded campaign against a fleet that can be killed, so durability
     /// is on.
     fn scheduler(profiles: &[EdgeProfile]) -> BurstScheduler {
-        driven(profiles, vec![Primitive::Kill], None)
+        driven(
+            profiles,
+            &[(Invariant::Durable, vec![Primitive::Kill])],
+            None,
+        )
     }
 
     /// A budget that affords exactly `schedules` runs.
@@ -389,23 +396,27 @@ mod tests {
         }
     }
 
-    /// A campaign testing durability by every way of breaking the fleet in
-    /// `ways`, fitted to a budget affording `capacity` schedules.
+    /// A campaign testing each invariant by the ways it names, fitted to a
+    /// budget affording `capacity` schedules.
     fn driven(
         profiles: &[EdgeProfile],
-        ways: Vec<Primitive>,
+        testable: &[(Invariant, Vec<Primitive>)],
         capacity: Option<u32>,
     ) -> BurstScheduler {
         let learned = Learned {
             profiles: profiles.to_vec(),
             trajectory: Vec::new(),
-            primitives: ways.iter().copied().collect(),
+            primitives: testable
+                .iter()
+                .flat_map(|(_, ways)| ways)
+                .copied()
+                .collect(),
         };
         BurstScheduler::new(
             &fixture::fleet(),
             &fixture::scenario(),
             &learned,
-            &[(Invariant::Durable, ways)],
+            testable,
             capacity.map(affording),
         )
     }
@@ -462,7 +473,7 @@ mod tests {
     fn every_way_of_breaking_the_fleet_gets_its_own_schedule() {
         let s = driven(
             &[from(Some("api"), "db", vec![burst(1, 4)], vec![])],
-            vec![Primitive::Kill, Primitive::Cut],
+            &[(Invariant::Durable, vec![Primitive::Kill, Primitive::Cut])],
             None,
         );
         assert_eq!(s.total(), 9);
@@ -523,7 +534,7 @@ mod tests {
     fn a_kill_can_take_either_end_of_an_edge() {
         let taken = taken(driven(
             &[from(Some("inventory"), "broker", vec![burst(1, 4)], vec![])],
-            vec![Primitive::Kill],
+            &[(Invariant::Durable, vec![Primitive::Kill])],
             None,
         ));
         assert!(taken.contains(&"inventory".to_string()));
@@ -534,7 +545,7 @@ mod tests {
     fn an_edge_from_outside_the_fleet_offers_only_its_upstream() {
         let taken = taken(driven(
             &[profile("api", vec![burst(1, 4)], vec![])],
-            vec![Primitive::Kill],
+            &[(Invariant::Durable, vec![Primitive::Kill])],
             None,
         ));
         assert!(taken.iter().all(|target| target == "api"), "{taken:?}");
@@ -547,7 +558,7 @@ mod tests {
     fn the_edge_the_scenario_is_driven_over_is_not_cut() {
         let s = driven(
             &[profile("api", vec![burst(1, 4)], vec![])],
-            vec![Primitive::Cut],
+            &[(Invariant::Durable, vec![Primitive::Cut])],
             None,
         );
         assert_eq!(s.total(), 0);
@@ -558,16 +569,27 @@ mod tests {
     #[test]
     fn a_budget_reaches_every_property_before_any_of_them_twice() {
         use crucible_protocol::Property::{Durable, Idempotent};
-        let spent: Vec<String> = points_on(&named(vec![
+        let profiles = [named(vec![
             ("publish:1", Durable),
             ("publish:2", Durable),
             ("redeliver:1", Idempotent),
             ("redeliver:2", Idempotent),
             ("redeliver:3", Idempotent),
-        ]))
-        .into_iter()
-        .map(|point| point.mark)
-        .collect();
+        ])];
+        let mut scheduler = driven(
+            &profiles,
+            &[
+                (Invariant::Durable, vec![Primitive::Kill]),
+                (Invariant::Idempotent, vec![Primitive::Redeliver]),
+            ],
+            None,
+        );
+
+        let mut spent = Vec::new();
+        while let Some(schedule) = scheduler.next() {
+            spent.push(fault(&schedule).mark.clone());
+        }
+        spent.dedup();
         assert_eq!(
             spent,
             [
@@ -580,6 +602,30 @@ mod tests {
         );
     }
 
+    /// Bursts on a busy edge must not spend the budget before the moments a
+    /// plugin named on a quiet one are reached.
+    #[test]
+    fn a_busy_edge_does_not_spend_the_budget_before_a_named_moment() {
+        use crucible_protocol::Property::Durable;
+        let profiles = [
+            profile("db", vec![burst(1, 900), burst(2, 800)], vec![]),
+            named(vec![("publish:1", Durable)]),
+        ];
+        let mut scheduler = driven(
+            &profiles,
+            &[(Invariant::Durable, vec![Primitive::Kill])],
+            None,
+        );
+
+        let mut spent = Vec::new();
+        while let Some(schedule) = scheduler.next() {
+            spent.push(fault(&schedule).mark.clone());
+        }
+        spent.dedup();
+        let named = spent.iter().position(|mark| mark == "publish:1");
+        assert_eq!(named, Some(1), "{spent:?}");
+    }
+
     /// A plugin names a moment for one property. Faulting there for another
     /// asks it to hold the fleet somewhere it was never watching, and the run
     /// comes back having tested nothing.
@@ -590,7 +636,7 @@ mod tests {
                 ("ack:1:before", crucible_protocol::Property::Durable),
                 ("redeliver:1", crucible_protocol::Property::Idempotent),
             ])],
-            vec![Primitive::Kill],
+            &[(Invariant::Durable, vec![Primitive::Kill])],
             None,
         );
         let marks: Vec<String> = std::iter::from_fn({
@@ -606,7 +652,7 @@ mod tests {
     fn a_cut_takes_the_edge_itself() {
         let taken = taken(driven(
             &[from(Some("api"), "db", vec![burst(1, 4)], vec![])],
-            vec![Primitive::Cut],
+            &[(Invariant::Durable, vec![Primitive::Cut])],
             None,
         ));
         assert!(
@@ -619,7 +665,7 @@ mod tests {
     fn a_budget_that_affords_one_point_takes_the_middle_of_each_burst() {
         let s = driven(
             &[profile("db", vec![burst(0, 4), burst(1, 4)], vec![])],
-            vec![Primitive::Kill],
+            &[(Invariant::Durable, vec![Primitive::Kill])],
             Some(2),
         );
         assert_eq!(s.coverage().taken, 2, "one point in each burst");
@@ -639,7 +685,7 @@ mod tests {
     fn a_second_point_lands_on_the_boundary_the_service_is_on() {
         let s = driven(
             &[profile("db", vec![burst(1, 4)], vec![burst(1, 4)])],
-            vec![Primitive::Kill],
+            &[(Invariant::Durable, vec![Primitive::Kill])],
             Some(4),
         );
         assert_eq!(s.coverage().taken, 4, "both points each way");
@@ -660,7 +706,7 @@ mod tests {
     fn a_budget_below_one_point_per_burst_keeps_the_busiest() {
         let s = driven(
             &[profile("db", vec![burst(0, 1), burst(1, 9)], vec![])],
-            vec![Primitive::Kill],
+            &[(Invariant::Durable, vec![Primitive::Kill])],
             Some(1),
         );
         assert_eq!(s.coverage().taken, 1);
@@ -694,7 +740,7 @@ mod tests {
     fn covering_both_ways_of_breaking_the_fleet_comes_before_more_points() {
         let s = driven(
             &[from(Some("api"), "db", vec![burst(0, 4)], vec![])],
-            vec![Primitive::Kill, Primitive::Cut],
+            &[(Invariant::Durable, vec![Primitive::Kill, Primitive::Cut])],
             Some(3),
         );
         assert_eq!(s.coverage().taken, 1, "one point, broken every way");

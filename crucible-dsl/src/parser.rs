@@ -325,8 +325,10 @@ impl Parser {
         let mut args = Vec::new();
         let mut clauses = Vec::new();
         loop {
-            if self.at_kw("body") {
-                let clause = self.body_clause();
+            if self.at_block_clause() {
+                let Some(clause) = self.block_clause() else {
+                    break;
+                };
                 end = clause.span.end;
                 clauses.push(clause);
             } else if self.is_value_start() {
@@ -347,12 +349,21 @@ impl Parser {
         ))
     }
 
-    fn body_clause(&mut self) -> Spanned<Clause> {
-        let start = self.peek_span();
-        self.consume_kw("body");
-        let map = self.map();
-        let span = Span::new(start.start, map.span.end);
-        Spanned::new(Clause::Body(map), span)
+    /// Whether the cursor is on `<keyword> {`. An identifier alone is a
+    /// positional argument, so the brace is what tells a clause from one.
+    fn at_block_clause(&self) -> bool {
+        matches!(self.peek(), TokenKind::Ident(_))
+            && matches!(
+                self.tokens.get(self.pos + 1).map(|t| &t.kind),
+                Some(TokenKind::LBrace)
+            )
+    }
+
+    fn block_clause(&mut self) -> Option<Spanned<Clause>> {
+        let keyword = self.expect_ident("a clause keyword")?;
+        let value = self.map();
+        let span = Span::new(keyword.span.start, value.span.end);
+        Some(Spanned::new(Clause::Block { keyword, value }, span))
     }
 
     /// Whether the next token can begin a value (and so a positional argument).
@@ -648,7 +659,9 @@ mod tests {
                 &Value::Str("/orders".to_string())
             ],
         );
-        assert!(matches!(step.clauses[0].node, Clause::Body(_)));
+        assert!(
+            matches!(&step.clauses[0].node, Clause::Block { keyword, .. } if keyword.node == "body")
+        );
 
         assert_eq!(scenario.expect.len(), 2);
         let first = &scenario.expect[0].node;

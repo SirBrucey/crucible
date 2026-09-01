@@ -269,18 +269,27 @@ impl Consuming {
 
     /// Follow what the consumer is holding, and say when the message a fault
     /// asked for comes round again.
-    fn track(&self, message: &Message) -> Option<Did> {
+    ///
+    /// `direction` tells a consumer's ack from the broker's confirm of a
+    /// publish, which share a frame and number their tags separately, so a
+    /// confirm would otherwise end a delivery that happened to share a tag.
+    fn track(&self, message: &Message, direction: Direction) -> Option<Did> {
         match message.operation {
             Operation::Deliver { tag, redelivered } => {
                 self.delivered(message.channel, tag, message.identity.clone());
                 (redelivered && self.answers(message.identity.as_ref()))
                     .then(|| Did::Placed("the broker delivered the message again".to_owned()))
             }
-            Operation::Ack { tag } | Operation::Reject { tag } => {
+            Operation::Ack { tag } | Operation::Reject { tag }
+                if direction == Direction::ClientToUpstream =>
+            {
                 self.finished(message.channel, tag);
                 None
             }
-            Operation::Publish | Operation::Housekeeping => None,
+            Operation::Ack { .. }
+            | Operation::Reject { .. }
+            | Operation::Publish
+            | Operation::Housekeeping => None,
         }
     }
 
@@ -443,7 +452,7 @@ impl crucible_protocol::Kind for Reader {
             }
             // After the fault, which reads what the consumer is holding before
             // this lets go of it.
-            if let Some(answered) = self.consuming.track(&message) {
+            if let Some(answered) = self.consuming.track(&message, self.direction) {
                 did = Some(answered);
             }
             for (side, placement) in self.seen.count(message.operation, self.direction) {
@@ -488,10 +497,17 @@ impl crucible_protocol::Kind for Reader {
 /// asking for the message back, is how the broker itself is made to send it
 /// again, so what arrives is a redelivery the fleet would have to be ready for
 /// rather than a copy this made up.
+///
+/// `basic.ack` travels both ways: a consumer sends one to the broker, and the
+/// broker sends one back to confirm a publish. Only the first ends a delivery
+/// there is anything to ask for again.
 fn redelivery(message: &Message, direction: Direction) -> Option<Placement> {
     let Operation::Ack { tag } = message.operation else {
         return None;
     };
+    if direction != Direction::ClientToUpstream {
+        return None;
+    }
     Some(Placement {
         direction,
         mark: format!("redeliver:{tag}"),
@@ -799,6 +815,35 @@ mod tests {
             offered.contains(&(format!("redeliver:{TAG}"), Property::Idempotent)),
             "{offered:?}"
         );
+    }
+
+    /// `basic.ack` from the broker confirms a publish rather than ending a
+    /// delivery, so there is nothing there to ask for again.
+    #[test]
+    fn a_publisher_confirm_offers_no_redelivery() {
+        let marks: Vec<String> = Reader::new(Direction::UpstreamToClient, Consuming::default())
+            .carry(&ack(), false)
+            .found
+            .into_iter()
+            .map(|placement| placement.mark)
+            .collect();
+        assert!(
+            !marks.iter().any(|mark| mark.starts_with("redeliver:")),
+            "{marks:?}"
+        );
+    }
+
+    /// A confirm numbers its tags apart from a delivery's, so one arriving on a
+    /// tag a delivery is using must not end that delivery.
+    #[test]
+    fn a_publisher_confirm_does_not_end_a_delivery() {
+        let (mut from_broker, mut to_broker) = consumer(&format!("redeliver:{TAG}"));
+        from_broker.carry(&pushed(false, b"an order"), false);
+        from_broker.carry(&ack(), false);
+
+        let ack = ack();
+        let carried = to_broker.carry(&ack, true);
+        assert_eq!(carried.did, Some(Did::Asked));
     }
 
     /// Nothing else is: a publish has not been delivered to anyone, and a

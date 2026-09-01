@@ -76,10 +76,10 @@ scenario "orders_durability" {
   // did about them, which is the half a fault can lose without the API ever
   // hearing about it. Stock starts at book 100, pen 500, mug 250.
   expect {
-    db.orders.count == 3;
-    db.stock.select level where item = "book" == 98;
-    db.stock.select level where item = "pen" == 490;
-    db.stock.select level where item = "mug" == 249;
-    db.orders.select quantity where id = 1 == 2;
+    db.orders.orders.count == 3;
+    db.orders.stock.select level where item = "book" == 98;
+    db.orders.stock.select level where item = "pen" == 490;
+    db.orders.stock.select level where item = "mug" == 249;
+    db.orders.orders.select quantity where id = 1 == 2;
   }
 }

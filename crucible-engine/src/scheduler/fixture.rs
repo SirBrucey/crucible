@@ -32,7 +32,7 @@ pub(super) fn scenario() -> plan::Scenario {
                 plan::Value::Ident("api".into()),
                 plan::Value::Str("/orders".into()),
             ],
-            body: None,
+            blocks: std::collections::BTreeMap::new(),
             expect: None,
         }],
         checks: vec![plan::Check {

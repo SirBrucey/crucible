@@ -7,11 +7,15 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Maximum size of a single frame. Anything larger is refused as malformed.
 ///
-/// Kept small on purpose. The handshake is tens of bytes; the biggest current
-/// message is [`WorkerToRunner::SessionCatalogue`](crate::ipc::WorkerToRunner::SessionCatalogue),
-/// whose per-edge burst lists are trimmed to a fixed cap on the learn side so it
-/// always fits (see [`crate::proxy_log::edge_profiles_from_sessions`]).
-pub(crate) const MAX_FRAME_SIZE: usize = 4096;
+/// A bound on what a peer may claim to be sending, not on what a message may
+/// say. The largest messages carry a whole fleet
+/// ([`RunnerToWorker::Run`](crate::ipc::RunnerToWorker::Run)) and everything a
+/// learn run saw of it
+/// ([`WorkerToRunner::SessionCatalogue`](crate::ipc::WorkerToRunner::SessionCatalogue)),
+/// so both grow with the fleet under test and neither has a natural ceiling.
+/// This sits far enough above them that how much a run has to report is decided
+/// where the reporting happens.
+pub(crate) const MAX_FRAME_SIZE: usize = 16 << 20;
 
 // The frame header stores the payload length as a big-endian u32, so the cap
 // must fit in a u32. Pinned at compile time, which lets `write_frame` convert
@@ -33,37 +37,31 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 /// Serialize `message` with postcard and write it as a length-prefixed frame.
 ///
-/// The frame is a 4-byte big-endian length header followed by the postcard payload.
-/// Encoding uses a stack-allocated buffer of `MAX_FRAME_SIZE` bytes; larger
-/// messages are rejected as `Error::TooLarge`.
+/// The frame is a 4-byte big-endian length header followed by the postcard
+/// payload, encoded into a buffer the size of the message.
 ///
 /// # Errors
-/// Returns `Error::TooLarge` if the encoded message overflows the
-/// `MAX_FRAME_SIZE` buffer, `Error::Postcard` for any other serialization
-/// failure, and `Error::Io` if writing the length header or payload to `writer`
-/// fails.
+/// Returns `Error::TooLarge` if the encoded message exceeds `MAX_FRAME_SIZE`,
+/// `Error::Postcard` for any other serialization failure, and `Error::Io` if
+/// writing the length header or payload to `writer` fails.
 pub async fn write_frame<T, W>(writer: &mut W, message: &T) -> Result<()>
 where
     T: Serialize,
     W: AsyncWriteExt + Unpin,
 {
-    let mut buf = [0u8; MAX_FRAME_SIZE];
-    let bytes = match postcard::to_slice(message, &mut buf) {
-        Ok(bytes) => bytes,
-        Err(postcard::Error::SerializeBufferFull) => {
-            return Err(Error::TooLarge {
-                size: MAX_FRAME_SIZE + 1,
-                max: MAX_FRAME_SIZE,
-            });
-        }
-        Err(e) => return Err(e.into()),
-    };
-    // Safe by construction: `bytes` never exceeds MAX_FRAME_SIZE, which the
-    // compile-time assertion above pins within u32 range.
+    let bytes: Vec<u8> = postcard::to_extend(message, Vec::new())?;
+    if bytes.len() > MAX_FRAME_SIZE {
+        return Err(Error::TooLarge {
+            size: bytes.len(),
+            max: MAX_FRAME_SIZE,
+        });
+    }
+    // Safe by construction: the check above holds `bytes` at or under
+    // MAX_FRAME_SIZE, which the compile-time assertion pins within u32 range.
     #[allow(clippy::cast_possible_truncation)]
     let len = bytes.len() as u32;
     writer.write_all(&len.to_be_bytes()).await?;
-    writer.write_all(bytes).await?;
+    writer.write_all(&bytes).await?;
     Ok(())
 }
 
@@ -87,9 +85,10 @@ where
             max: MAX_FRAME_SIZE,
         });
     }
-    let mut bytes = [0u8; MAX_FRAME_SIZE];
-    reader.read_exact(&mut bytes[..len]).await?;
-    let message = postcard::from_bytes(&bytes[..len])?;
+    // The length decides the allocation.
+    let mut bytes = vec![0u8; len];
+    reader.read_exact(&mut bytes).await?;
+    let message = postcard::from_bytes(&bytes)?;
     Ok(message)
 }
 
@@ -154,7 +153,7 @@ mod tests {
                 crate::plan::Value::Ident("api".into()),
                 crate::plan::Value::Str("/orders".into()),
             ],
-            body: None,
+            blocks: std::collections::BTreeMap::new(),
             expect: None,
         }
     }

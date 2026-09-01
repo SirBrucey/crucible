@@ -84,14 +84,9 @@ impl Sessions {
 /// Consecutive packets more than this far apart start a new burst.
 const BURST_GAP_NS: u128 = 20_000_000; // 20 ms
 
-/// Cap on the total bursts in one catalogue so it always fits the IPC frame. A
-/// learn run with more bursts than this keeps the busiest.
-const MAX_TOTAL_BURSTS: usize = 100;
-
 /// Derive per-edge bursts from a session catalogue, split by direction and made
 /// scenario-relative to `scenario_start_ns` (writes before scenario start are
-/// ignored). Each direction's packets are clustered into bursts, then the whole
-/// catalogue is trimmed if it would not fit the IPC frame.
+/// ignored). Each direction's packets are clustered into bursts.
 ///
 /// `addresses` names the service behind a peer, so an edge carries both the
 /// service that dialled and the one it reached. A peer it does not name came
@@ -132,21 +127,27 @@ pub fn edge_profiles_from_sessions<S: std::hash::BuildHasher>(
         }
     }
 
-    let mut profiles: Vec<EdgeProfile> = by_edge
+    by_edge
         .into_iter()
         .map(|(edge, (mut c2u, mut u2c))| {
             c2u.sort_unstable_by_key(|packet| packet.at);
             u2c.sort_unstable_by_key(|packet| packet.at);
+            let placements = placeable.remove(&edge).unwrap_or_default();
+            // A protocol-aware plugin drives more accurate faults, so bursts are
+            // unnecessary on an edge it read.
+            let (client_to_upstream, upstream_to_client) = if placements.is_empty() {
+                (bursts(&c2u), bursts(&u2c))
+            } else {
+                (Vec::new(), Vec::new())
+            };
             EdgeProfile {
-                client_to_upstream: bursts(&c2u),
-                upstream_to_client: bursts(&u2c),
-                placements: placeable.remove(&edge).unwrap_or_default(),
+                client_to_upstream,
+                upstream_to_client,
+                placements,
                 edge,
             }
         })
-        .collect();
-    sample_to_frame(&mut profiles);
-    profiles
+        .collect()
 }
 
 /// The service that dialled, or `None` for a caller from outside the fleet.
@@ -190,52 +191,6 @@ fn bursts(packets: &[Packet]) -> Vec<Burst> {
         }
     }
     bursts
-}
-
-/// Trim the catalogue to `MAX_TOTAL_BURSTS` if it holds more, so the serialized
-/// catalogue always fits the IPC frame. A no-op for a normal-sized run; only a
-/// pathologically busy learn is trimmed, and the drop is logged.
-///
-/// The busiest bursts are kept, which is the same preference the scheduler
-/// applies when it cannot afford them all.
-fn sample_to_frame(profiles: &mut [EdgeProfile]) {
-    let total: usize = profiles
-        .iter()
-        .map(|p| p.client_to_upstream.len() + p.upstream_to_client.len())
-        .sum();
-    if total <= MAX_TOTAL_BURSTS {
-        return;
-    }
-    let mut flat: Vec<(usize, bool, Burst)> = Vec::with_capacity(total);
-    for (i, profile) in profiles.iter().enumerate() {
-        flat.extend(profile.client_to_upstream.iter().map(|&b| (i, true, b)));
-        flat.extend(profile.upstream_to_client.iter().map(|&b| (i, false, b)));
-    }
-    flat.sort_unstable_by_key(|(_, _, burst)| std::cmp::Reverse(burst.packets));
-    flat.truncate(MAX_TOTAL_BURSTS);
-    for profile in profiles.iter_mut() {
-        profile.client_to_upstream.clear();
-        profile.upstream_to_client.clear();
-    }
-    for (i, is_c2u, burst) in flat {
-        if is_c2u {
-            profiles[i].client_to_upstream.push(burst);
-        } else {
-            profiles[i].upstream_to_client.push(burst);
-        }
-    }
-    // Picking the busiest left each edge in size order, and a burst's position on
-    // its edge is what makes it the first or the third. `mid` rises across an
-    // edge's bursts, so it puts them back in the order they happened.
-    for profile in profiles.iter_mut() {
-        profile.client_to_upstream.sort_unstable_by_key(|b| b.mid);
-        profile.upstream_to_client.sort_unstable_by_key(|b| b.mid);
-    }
-    tracing::warn!(
-        total,
-        cap = MAX_TOTAL_BURSTS,
-        "learn produced more bursts than fit the catalogue; kept the busiest"
-    );
 }
 
 impl Extend<(String, ConnEvent)> for Sessions {
@@ -297,7 +252,7 @@ mod tests {
     }
 
     fn a_session() -> impl Strategy<Value = Session> {
-        ("[a-z]{1,12}", prop::collection::vec(a_write(), 0..3000)).prop_map(|(service, writes)| {
+        ("[a-z_]{1,24}", prop::collection::vec(a_write(), 0..3000)).prop_map(|(service, writes)| {
             Session {
                 service,
                 conn_id: 0,
@@ -311,11 +266,16 @@ mod tests {
     }
 
     proptest! {
-        /// The session catalogue must always fit the IPC frame, however much
-        /// traffic a learn run observed. Grounds the bound on the wire type.
+        /// Nothing trims the catalogue to fit the frame, so the frame has to be
+        /// wide enough for a run far busier than a real one.
+        ///
+        /// The session count and name length reach well past a small fleet's. A
+        /// real one runs more services, under longer names, and opens a
+        /// connection per publish, and it was a fleet of that shape that first
+        /// overran the frame this asserts against while the test still passed.
         #[test]
-        fn catalogue_always_fits_the_frame(
-            sessions in prop::collection::vec(a_session(), 0..8),
+        fn a_busy_runs_catalogue_fits_the_frame(
+            sessions in prop::collection::vec(a_session(), 0..64),
         ) {
             let profiles = edge_profiles_from_sessions(&sessions, 0, &HashMap::new());
             let catalogue = WorkerToRunner::SessionCatalogue(crate::learned::Learned {
@@ -441,6 +401,25 @@ mod tests {
             .map(|profile| profile.edge.client.as_deref())
             .collect();
         assert_eq!(clients, [Some("api"), Some("inventory")]);
+    }
+
+    /// A protocol-aware plugin drives more accurate faults, so bursts are
+    /// unnecessary on an edge it read.
+    #[test]
+    fn an_edge_a_plugin_read_carries_its_placements_and_no_bursts() {
+        let mut session = dialled("broker", "10.0.0.1", 100);
+        session.placements = vec![Placement {
+            direction: Direction::ClientToUpstream,
+            mark: "ack:1:after".into(),
+            why: "an ack the broker has taken".into(),
+            exercises: crucible_protocol::Property::Durable,
+        }];
+        let profiles = edge_profiles_from_sessions(&[session], 0, &HashMap::new());
+
+        let profile = profiles.first().expect("the edge was seen");
+        assert_eq!(profile.placements.len(), 1);
+        assert!(profile.client_to_upstream.is_empty());
+        assert!(profile.upstream_to_client.is_empty());
     }
 
     #[test]

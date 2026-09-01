@@ -436,7 +436,7 @@ mod tests {
                 plan::Value::Ident("api".into()),
                 plan::Value::Str("/orders".into()),
             ],
-            body: None,
+            blocks: std::collections::BTreeMap::new(),
             expect: None,
         }]
     }
@@ -445,7 +445,7 @@ mod tests {
         vec![plan::Check {
             service: "db".into(),
             observer: "mariadb".into(),
-            observable: vec!["orders".into(), "count".into()],
+            observable: vec!["orders".into(), "orders".into(), "count".into()],
             args: Vec::new(),
             filter: None,
             op: crucible_core::schema::CmpOp::Eq,

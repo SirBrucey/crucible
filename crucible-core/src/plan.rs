@@ -1,6 +1,7 @@
 //! The lowered form of a `.cru` file: the runtime's input.
 
 use std::{
+    collections::BTreeMap,
     hash::{Hash, Hasher},
     time::Duration,
 };
@@ -79,10 +80,20 @@ pub struct Step {
     pub driver: String,
     pub operation: String,
     pub args: Vec<Value>,
-    pub body: Option<Vec<(String, Value)>>,
+    /// The `<keyword> { ... }` clauses the step was written with, keyed by
+    /// keyword. The driver declared them, so it is the one that reads them.
+    pub blocks: BTreeMap<String, Vec<(String, Value)>>,
     /// What the author says this produces, in the driver's own terms. None
     /// leaves the driver's default for the operation standing.
     pub expect: Option<Value>,
+}
+
+impl Step {
+    /// The entries of the `keyword { ... }` clause, if the step carries one.
+    #[must_use]
+    pub fn block(&self, keyword: &str) -> Option<&[(String, Value)]> {
+        self.blocks.get(keyword).map(Vec::as_slice)
+    }
 }
 
 /// A settled-state check, carrying the service and observer that answer it.
