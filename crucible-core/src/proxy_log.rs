@@ -137,10 +137,18 @@ pub fn edge_profiles_from_sessions<S: std::hash::BuildHasher>(
         .map(|(edge, (mut c2u, mut u2c))| {
             c2u.sort_unstable_by_key(|packet| packet.at);
             u2c.sort_unstable_by_key(|packet| packet.at);
+            let placements = placeable.remove(&edge).unwrap_or_default();
+            // A protocol-aware plugin drives more accurate faults, so bursts are
+            // unnecessary on an edge it read.
+            let (client_to_upstream, upstream_to_client) = if placements.is_empty() {
+                (bursts(&c2u), bursts(&u2c))
+            } else {
+                (Vec::new(), Vec::new())
+            };
             EdgeProfile {
-                client_to_upstream: bursts(&c2u),
-                upstream_to_client: bursts(&u2c),
-                placements: placeable.remove(&edge).unwrap_or_default(),
+                client_to_upstream,
+                upstream_to_client,
+                placements,
                 edge,
             }
         })
@@ -446,6 +454,25 @@ mod tests {
             .map(|profile| profile.edge.client.as_deref())
             .collect();
         assert_eq!(clients, [Some("api"), Some("inventory")]);
+    }
+
+    /// A protocol-aware plugin drives more accurate faults, so bursts are
+    /// unnecessary on an edge it read.
+    #[test]
+    fn an_edge_a_plugin_read_carries_its_placements_and_no_bursts() {
+        let mut session = dialled("broker", "10.0.0.1", 100);
+        session.placements = vec![Placement {
+            direction: Direction::ClientToUpstream,
+            mark: "ack:1:after".into(),
+            why: "an ack the broker has taken".into(),
+            exercises: crucible_protocol::Property::Durable,
+        }];
+        let profiles = edge_profiles_from_sessions(&[session], 0, &HashMap::new());
+
+        let profile = profiles.first().expect("the edge was seen");
+        assert_eq!(profile.placements.len(), 1);
+        assert!(profile.client_to_upstream.is_empty());
+        assert!(profile.upstream_to_client.is_empty());
     }
 
     #[test]
