@@ -41,6 +41,7 @@ pub(super) fn scenario() -> plan::Scenario {
             observable: vec!["orders".into(), "count".into()],
             args: Vec::new(),
             filter: None,
+            moves: crucible_core::schema::Moves::Counts,
             clauses: std::collections::BTreeMap::new(),
             op: CmpOp::Eq,
             value: plan::Value::Int(1),

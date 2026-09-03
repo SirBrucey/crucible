@@ -451,6 +451,7 @@ mod tests {
 
     fn checks() -> Vec<plan::Check> {
         vec![plan::Check {
+            moves: crucible_core::schema::Moves::Counts,
             service: "db".into(),
             observer: "mariadb".into(),
             observable: vec!["orders".into(), "orders".into(), "count".into()],

@@ -27,6 +27,8 @@ pub enum Primitive {
     Redeliver,
     /// Hold a message back until a later one has passed it.
     Reorder,
+    /// Take a message off the wire, so what was waiting for it never hears.
+    Drop,
 }
 
 #[cfg(test)]

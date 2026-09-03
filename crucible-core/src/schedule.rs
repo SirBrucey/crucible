@@ -3,7 +3,7 @@
 
 use std::time::Duration;
 
-use crate::{fault::Fault, plan, verdict::Checkpoint};
+use crate::{fault::Fault, plan, verdict::Trajectory};
 
 /// Everything a worker needs to run once. Derived from a plan rather than
 /// copied out of it: the steps and checks are the scenario's, plus whatever the
@@ -23,7 +23,7 @@ pub struct Schedule {
     pub fault: Option<Fault>,
     /// What the fault-free run left after each step, which we judge against.
     /// Empty for the fault-free run itself.
-    pub trajectory: Vec<Checkpoint>,
+    pub trajectory: Trajectory,
     /// How long the fleet may take to settle, as the scenario states it.
     pub consistent_within: Duration,
 }
@@ -47,7 +47,7 @@ impl Schedule {
             steps,
             checks,
             fault: None,
-            trajectory: Vec::new(),
+            trajectory: Trajectory::default(),
             consistent_within,
         }
     }
@@ -61,7 +61,7 @@ impl Schedule {
         steps: Vec<plan::Step>,
         checks: Vec<plan::Check>,
         fault: Fault,
-        trajectory: Vec<Checkpoint>,
+        trajectory: Trajectory,
         consistent_within: Duration,
     ) -> Self {
         Self {

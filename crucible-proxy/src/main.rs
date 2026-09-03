@@ -79,7 +79,7 @@ impl From<Primitive> for Fault {
         match primitive {
             Primitive::Kill => Self::Kill,
             Primitive::Cut => Self::Cut,
-            Primitive::Redeliver | Primitive::Reorder => Self::Rewritten,
+            Primitive::Redeliver | Primitive::Reorder | Primitive::Drop => Self::Rewritten,
         }
     }
 }

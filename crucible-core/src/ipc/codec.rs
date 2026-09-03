@@ -165,6 +165,7 @@ mod tests {
             observable: vec!["orders".into(), "count".into()],
             args: Vec::new(),
             filter: None,
+            moves: crate::schema::Moves::Counts,
             clauses: std::collections::BTreeMap::new(),
             op: crate::schema::CmpOp::Eq,
             value: crate::plan::Value::Int(3),
@@ -179,8 +180,8 @@ mod tests {
                 fleet(),
                 vec![step()],
                 vec![check()],
-                crate::fault::Fault::Durable {
-                    anchor: crate::fault::Anchor {
+                crate::fault::Fault::at(
+                    crate::fault::Anchor {
                         edge: crucible_protocol::Edge {
                             client: Some("api".into()),
                             upstream: "db".into(),
@@ -189,12 +190,14 @@ mod tests {
                         mark: "ack:7:before".into(),
                         why: "an ack the consumer has sent and the broker has not seen".into(),
                     },
-                    by: crate::fault::By::Kill("db".into()),
-                },
-                vec![
+                    crate::fault::By::Kill("db".into()),
+                ),
+                [
                     vec![Some(crate::plan::Value::Int(0))],
                     vec![Some(crate::plan::Value::Int(3))],
-                ],
+                ]
+                .into_iter()
+                .collect(),
                 std::time::Duration::from_secs(15),
             ),
         )))
@@ -215,6 +218,7 @@ mod tests {
         roundtrip(WorkerToRunner::RunResult {
             schedule_id: 7,
             verdict: Verdict::Fail {
+                invariant: Some(crate::verdict::Invariant::Durable),
                 reason: "acked order 3 (book x4) is absent from persisted state after heal".into(),
             },
         })

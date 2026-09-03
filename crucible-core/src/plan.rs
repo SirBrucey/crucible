@@ -108,6 +108,10 @@ pub struct Check {
     /// The `<keyword>: <value>` clauses the check was written with, keyed by
     /// keyword. The observer declared them, so it is the one that reads them.
     pub clauses: BTreeMap<String, Value>,
+    /// How a step changes this reading, as its observer declared. A verdict
+    /// reads the fleet's settled state against what its steps would have left,
+    /// and cannot work that out without knowing this.
+    pub moves: crate::schema::Moves,
     pub op: CmpOp,
     pub value: Value,
 }

@@ -14,7 +14,7 @@ use crucible_core::{
     learned::Learned,
     observer::{Reported, SessionObserver},
     proxy_log::edge_profiles_from_sessions,
-    verdict::{Checkpoint, Observations, Observed, StepWindow, driver_for},
+    verdict::{Checkpoint, Observations, Observed, StepWindow, Trajectory},
 };
 use crucible_plugin::{
     Action, DeploymentRuntime, Kill, Substrate, Targeted, registry::PreparedCheck,
@@ -179,8 +179,8 @@ fn unreachable_fault(fault: &Fault) -> crucible_plugin::Error {
     crucible_plugin::Error::new(
         "orchestrator",
         format!(
-            "a schedule was generated for `{:?}`, which cannot be run against this fleet",
-            fault.invariant()
+            "a schedule was generated for `{}`, which cannot be run against this fleet",
+            fault.taking()
         ),
     )
 }
@@ -281,7 +281,7 @@ impl Orchestrator<Ready> {
         schedule_id: u32,
         fault: &Fault,
         queries: Vec<PreparedCheck>,
-        fault_free: Vec<Checkpoint>,
+        fault_free: Trajectory,
         consistent_within: Duration,
     ) -> Result<((Verdict, FaultReport), Orchestrator<Done>), crucible_plugin::Error> {
         let Orchestrator {
@@ -291,20 +291,19 @@ impl Orchestrator<Ready> {
                 actions,
             },
         } = self;
-        // The scheduler only emits a schedule whose fault it can place and whose
-        // verdict it can read, so both of these resolve for anything it produced.
+        // The scheduler only emits a schedule whose fault it can place, so this
+        // resolves for anything it produced.
         let placement = Placement::of(fault, deployment.as_ref())?;
-        let mut driver = driver_for(fault.invariant()).ok_or_else(|| unreachable_fault(fault))?;
 
         // Run the fault sequence borrowing the replica handles, so whatever the
         // outcome we still own them afterwards: on success they move into `Done`
         // for the caller to tear down, on error we tear down here rather than
         // dropping the only handle to the replica and its observer tasks.
         let outcome: Result<(Verdict, FaultReport), crucible_plugin::Error> = async {
-            let (mut observations, fault_report) = match fault {
+            let (mut observations, fault_report) = match fault.anchor() {
                 // Placed on one moment, so the scenario is in flight when it
                 // lands and the two run together.
-                Fault::Durable { .. } | Fault::Idempotent { .. } | Fault::Converges { .. } => {
+                Some(_) => {
                     anchored_run(
                         deployment.as_ref(),
                         placement,
@@ -319,7 +318,7 @@ impl Orchestrator<Ready> {
                 // Imposed before the scenario and lifted after it, so the fleet
                 // is degraded throughout and put back with something to catch
                 // up on.
-                Fault::Recovers { .. } => {
+                None => {
                     degraded_run(
                         deployment.as_ref(),
                         placement,
@@ -346,7 +345,7 @@ impl Orchestrator<Ready> {
             observations.checks = read_checks(deployment.as_ref(), &queries).await?;
             observations.fault_free = fault_free;
             session_observer.observe(&mut observations);
-            let verdict = driver.drive(&observations);
+            let verdict = observations.verdict();
             Ok((verdict, fault_report))
         }
         .await;
@@ -538,7 +537,7 @@ impl<'a> Placement<'a> {
                 .contains(&Primitive::Cut)
                 .then_some(Placement::Cut)
                 .ok_or_else(|| unreachable_fault(fault)),
-            By::Repeat(_) | By::Reorder(_) => deployment
+            By::Repeat(_) | By::Reorder(_) | By::Drop(_) => deployment
                 .substrate()
                 .primitives()
                 .contains(&fault.primitive())
@@ -865,8 +864,8 @@ mod tests {
 
     /// A kill of `db`, anchored in what `api` was saying to it.
     fn fault() -> Fault {
-        Fault::Durable {
-            anchor: crucible_core::fault::Anchor {
+        Fault::at(
+            crucible_core::fault::Anchor {
                 edge: crucible_protocol::Edge {
                     client: Some("api".into()),
                     upstream: "db".into(),
@@ -875,8 +874,8 @@ mod tests {
                 mark: "ack:7:before".into(),
                 why: "an ack the consumer has sent and the broker has not seen".into(),
             },
-            by: By::Kill("db".into()),
-        }
+            By::Kill("db".into()),
+        )
     }
 
     /// A fleet that says nothing of itself, for a fault that is not placed by

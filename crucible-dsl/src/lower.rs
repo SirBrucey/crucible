@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use crucible_core::{
     plan,
-    schema::{ClauseShape, CmpOp, HeadPattern, OpSig, Param, ParamType, ValueType},
+    schema::{ClauseShape, CmpOp, HeadPattern, Moves, OpSig, Param, ParamType, ValueType},
 };
 use crucible_plugin::{Registry, registry::ServiceSchema};
 
@@ -425,6 +425,9 @@ impl<'a> Lowerer<'a> {
                 .collect(),
             filter: where_of(observable),
             clauses: values_of(observable),
+            // Declared by the observable this resolved to, since the plugin
+            // answering the reading is the one that knows what it is.
+            moves: sig.moves.unwrap_or(Moves::Sets),
             op: plugin_cmp(predicate.node.op.node),
             value: lower_value(&predicate.node.right.node),
         })

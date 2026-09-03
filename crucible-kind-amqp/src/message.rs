@@ -14,7 +14,7 @@ use amq_protocol::{
         basic::{AMQPMethod, Nack},
     },
 };
-use crucible_protocol::{Carried, Did, Direction, Placement, Property};
+use crucible_protocol::{Carried, Did, Direction, Doing, Placement, Primitive};
 
 /// What a fleet was doing, in terms a fault is placed against.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -409,7 +409,7 @@ impl Seen {
                     direction,
                     mark: format!("{name}:{side}"),
                     why: why.to_owned(),
-                    exercises: Property::Durable,
+                    doing: Doing::Holding,
                 };
                 (side, placement)
             })
@@ -512,7 +512,7 @@ fn redelivery(message: &Message, direction: Direction) -> Option<Placement> {
         direction,
         mark: format!("redeliver:{tag}"),
         why: "a message the consumer finished with, delivered to it again".to_owned(),
-        exercises: Property::Idempotent,
+        doing: Doing::Rewriting(Primitive::Redeliver),
     })
 }
 
@@ -528,7 +528,7 @@ fn reorderable(followed: u64, direction: Direction) -> Placement {
         direction,
         mark: format!("reorder:{followed}"),
         why: "a message held back until after the one the broker sent next".to_owned(),
-        exercises: Property::Converges,
+        doing: Doing::Rewriting(Primitive::Reorder),
     }
 }
 
@@ -807,12 +807,15 @@ mod tests {
     /// somewhere the fleet could be asked to do the same work twice.
     #[test]
     fn an_ack_offers_to_have_the_message_delivered_again() {
-        let offered: Vec<(String, Property)> = placements(&ack())
+        let offered: Vec<(String, Doing)> = placements(&ack())
             .into_iter()
-            .map(|placement| (placement.mark, placement.exercises))
+            .map(|placement| (placement.mark, placement.doing))
             .collect();
         assert!(
-            offered.contains(&(format!("redeliver:{TAG}"), Property::Idempotent)),
+            offered.contains(&(
+                format!("redeliver:{TAG}"),
+                Doing::Rewriting(Primitive::Redeliver)
+            )),
             "{offered:?}"
         );
     }

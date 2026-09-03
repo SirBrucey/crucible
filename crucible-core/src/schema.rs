@@ -19,6 +19,22 @@ pub enum ValueType {
     ServiceRef,
 }
 
+/// How a step changes a reading, which is what says where the fleet would have
+/// settled had its steps arrived in another order, or one of them twice.
+///
+/// The plugin that answers the reading says which, since it is what
+/// knows what its observable is. A count and a value the fleet holds are read
+/// the same way off the wire and behave nothing alike under a fault.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Deserialize, serde::Serialize)]
+pub enum Moves {
+    /// Each step moves it by some amount. The steps reach the same total
+    /// whichever order they arrive in, and taking one twice moves it twice.
+    Counts,
+    /// Each step sets it outright. It ends where whichever step arrived last
+    /// set it, and taking one twice leaves it where taking it once would.
+    Sets,
+}
+
 /// One attribute a deployment plugin accepts inside a `service { ... }` body.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct AttrDecl {
@@ -202,6 +218,9 @@ pub struct OpSig {
     pub head: HeadPattern,
     pub params: Vec<Param>,
     pub clauses: Vec<ClauseDecl>,
+    /// How a step changes this observable's reading. `None` for an action,
+    /// which answers rather than being read.
+    pub moves: Option<Moves>,
     /// What this produces: an observable's reading, or the outcome an action
     /// answers with. `None` when the plugin does not say.
     pub result: Option<ValueType>,
@@ -218,18 +237,26 @@ impl OpSig {
             head,
             params,
             clauses: Vec::new(),
+            moves: None,
             result: Some(outcome),
             cmp_ops: Vec::new(),
         }
     }
 
-    /// An observer observable: yields `result`, testable with `cmp_ops`.
+    /// An observer observable: yields `result`, changed by a step as `moves`
+    /// says, and testable with `cmp_ops`.
     #[must_use]
-    pub fn observable(head: HeadPattern, result: ValueType, cmp_ops: Vec<CmpOp>) -> Self {
+    pub fn observable(
+        head: HeadPattern,
+        result: ValueType,
+        moves: Moves,
+        cmp_ops: Vec<CmpOp>,
+    ) -> Self {
         Self {
             head,
             params: Vec::new(),
             clauses: Vec::new(),
+            moves: Some(moves),
             result: Some(result),
             cmp_ops,
         }

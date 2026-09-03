@@ -1,21 +1,23 @@
 //! Faults placed at the points the fault-free run turned up.
 //!
-//! Where a plugin read an edge, it said what its moments are and what each
-//! catches. Where nothing could, all that is known is the traffic that crossed
-//! it, clustered into bursts (see
+//! Where a plugin read an edge, it said what its moments are and what breaking
+//! the fleet at each of them is. Where nothing could, all that is known is the
+//! traffic that crossed it, clustered into bursts (see
 //! [`crucible_core::proxy_log::edge_profiles_from_sessions`]).
+//!
+//! A schedule is a way of breaking the fleet at a moment. Which invariant that
+//! broke is read off the run afterwards.
 //!
 //! Every edge is faulted at one point before any edge is faulted at two, so a
 //! short budget costs depth rather than whole edges.
 
-use crucible_protocol::{Burst, Direction, Edge, EdgeProfile};
+use crucible_protocol::{Burst, Direction, Doing, Edge, EdgeProfile};
 
 use crucible_core::{
-    fault::{Anchor, By, Drive, Fault, Primitive},
+    fault::{Anchor, By, Drive, Fault},
     learned::Learned,
     plan,
     schedule::Schedule,
-    verdict::Invariant,
 };
 
 use super::{Budget, Scheduler};
@@ -31,9 +33,10 @@ struct Point<'a> {
     direction: Direction,
     mark: String,
     why: String,
-    /// What faulting here is good for. A moment a plugin named is only a moment
-    /// for the property it named it for.
-    exercises: Invariant,
+    /// What breaking the fleet here is. This is also what decides which
+    /// invariants a fault here could show, so it is the whole of what a moment
+    /// says about its own worth.
+    doing: Doing,
     /// How many packets were in the burst this came from, so a short budget
     /// keeps the busiest. A moment a plugin named came from no burst.
     packets: Option<u32>,
@@ -41,17 +44,21 @@ struct Point<'a> {
 
 impl Point<'_> {
     /// The group this point takes its turn in, so the budget is spread across
-    /// the properties and the bursts do not crowd out the named moments.
-    fn bucket(&self) -> (Invariant, bool) {
-        (self.exercises, self.packets.is_none())
+    /// the ways of breaking the fleet, and the bursts do not crowd out the
+    /// named moments.
+    ///
+    /// What a moment could show follows from how it breaks the fleet, so
+    /// grouping by that is grouping by what the campaign gets for spending it.
+    fn bucket(&self) -> (bool, Doing) {
+        (self.packets.is_none(), self.doing)
     }
 }
 
 /// Where a fault can go on `profile`, in the order the points should be spent.
 ///
-/// A plugin that read the edge has already said what its moments are and what
-/// each catches. Otherwise all that is known is what crossed it, so a fault goes
-/// by the middle of a burst first and its edges after.
+/// A plugin that read the edge has already said what its moments are and how
+/// each breaks the fleet. Otherwise all that is known is what crossed it, so a
+/// fault goes by the middle of a burst first and its edges after.
 fn points_on(profile: &EdgeProfile) -> Vec<Point<'_>> {
     if !profile.placements.is_empty() {
         return profile
@@ -62,7 +69,7 @@ fn points_on(profile: &EdgeProfile) -> Vec<Point<'_>> {
                 direction: placement.direction,
                 mark: placement.mark.clone(),
                 why: placement.why.clone(),
-                exercises: placement.exercises.into(),
+                doing: placement.doing,
                 packets: None,
             })
             .collect();
@@ -85,9 +92,9 @@ fn points_on(profile: &EdgeProfile) -> Vec<Point<'_>> {
                     direction,
                     mark: k.to_string(),
                     why: format!("{k} reads into what this edge carried"),
-                    // Nothing read this edge, so all a moment on it can say is
-                    // that the fleet was part way through something.
-                    exercises: Invariant::Durable,
+                    // Nothing read this edge, so all a moment on it can offer
+                    // is a place to hold the fleet part way through something.
+                    doing: Doing::Holding,
                     packets: Some(burst.packets),
                 });
             }
@@ -149,7 +156,7 @@ pub struct BurstScheduler {
 }
 
 /// What the campaign reaches, and what the budget cost it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Coverage {
     /// Points the fault-free run turned up, across every edge.
     pub found: usize,
@@ -185,16 +192,15 @@ impl BurstScheduler {
         fleet: &plan::Fleet,
         scenario: &plan::Scenario,
         learned: &Learned,
-        testable: &[(Invariant, Vec<Primitive>)],
         budget: Option<Budget>,
     ) -> Self {
         // One point is faulted every way the fleet can be broken there, and
         // covering those comes before covering more points, so they multiply
-        // what a point costs. A way no point can place must not be costed.
-        let ways: Vec<(Invariant, Drive)> = testable
+        // what a point costs.
+        let ways: Vec<Drive> = learned
+            .primitives
             .iter()
-            .flat_map(|(invariant, ways)| ways.iter().map(|by| (*invariant, *by)))
-            .filter_map(|(invariant, by)| Some((invariant, placeable(invariant, by)?)))
+            .filter_map(|by| Drive::try_from(*by).ok())
             .collect();
 
         // Interleaved, so an edge's second point comes after every edge's
@@ -205,17 +211,18 @@ impl BurstScheduler {
         for round in 0..on_edge.iter().map(Vec::len).max().unwrap_or(0) {
             by_edge.extend(on_edge.iter().filter_map(|edge| edge.get(round)).cloned());
         }
-        // Then by turn, so a property with few moments is covered before one
-        // with many, and the bursts take their share rather than all of it.
+        // Then by turn, so a way of breaking the fleet with few moments is
+        // covered before one with many, and the bursts take their share rather
+        // than all of it.
         let mut points = in_turn(by_edge.into_iter(), Point::bucket);
 
         // What one point costs, which is not the same everywhere: what an edge
-        // has to break depends on the edge, and a moment is only spent on what
-        // it is good for.
+        // has to break depends on the edge, and a moment can only be broken the
+        // way it says.
         let cost = |point: &Point<'_>| -> usize {
-            ways.iter()
-                .filter(|(invariant, _)| *invariant == point.exercises)
-                .map(|(_, by)| targets(*by, point.edge).len())
+            ways_at(&ways, point)
+                .into_iter()
+                .map(|by| targets(by, point.edge).len())
                 .sum()
         };
         // A moment nothing can be placed on is not a moment this campaign has.
@@ -234,21 +241,15 @@ impl BurstScheduler {
         let mut schedules: Vec<Schedule> = Vec::new();
         let mut next_id: u32 = Schedule::LEARN_ID + 1;
         for point in &points {
-            for (invariant, by) in ways.iter().filter(|(it, _)| *it == point.exercises) {
-                for taking in targets(*by, point.edge) {
+            for by in ways_at(&ways, point) {
+                for taking in targets(by, point.edge) {
                     let anchor = Anchor {
                         edge: point.edge.clone(),
                         direction: point.direction,
                         mark: point.mark.clone(),
                         why: point.why.clone(),
                     };
-                    let fault = match invariant {
-                        Invariant::Durable => Fault::Durable { anchor, by: taking },
-                        Invariant::Idempotent => Fault::Idempotent { anchor, by: taking },
-                        Invariant::Converges => Fault::Converges { anchor, by: taking },
-                        // `placeable` kept this out of `ways`.
-                        Invariant::Recovers => continue,
-                    };
+                    let fault = Fault::at(anchor, taking);
                     schedules.push(Schedule::faulted(
                         next_id,
                         fleet.clone(),
@@ -275,9 +276,25 @@ impl BurstScheduler {
 
     /// What the campaign reaches, for the runner to report.
     #[must_use]
-    pub fn coverage(&self) -> Coverage {
-        self.coverage
+    pub fn coverage(&self) -> &Coverage {
+        &self.coverage
     }
+}
+
+/// The ways this campaign can break the fleet at `point`.
+///
+/// A moment a plugin named says what breaking the fleet there is, and there is
+/// one way to do that. A burst is a count of packets, so all it can offer is a
+/// place to hold the fleet while something is taken away from outside it:
+/// changing what crosses needs something that can read what crossed.
+fn ways_at(ways: &[Drive], point: &Point<'_>) -> Vec<Drive> {
+    ways.iter()
+        .filter(|by| match point.doing {
+            Doing::Holding => matches!(by, Drive::Kill | Drive::Cut),
+            Doing::Rewriting(primitive) => Drive::try_from(primitive).is_ok_and(|own| own == **by),
+        })
+        .copied()
+        .collect()
 }
 
 /// What breaking `edge` by `losing` takes from the fleet: the services at its
@@ -297,18 +314,7 @@ fn targets(losing: Drive, edge: &Edge) -> Vec<By> {
             .collect(),
         Drive::Repeat => vec![By::Repeat(edge.clone())],
         Drive::Reorder => vec![By::Reorder(edge.clone())],
-    }
-}
-
-/// How a burst breaks the fleet to test `invariant`, if it can. Recovery
-/// degrades the fleet from the start rather than part way through, so a burst
-/// cannot test it.
-fn placeable(invariant: Invariant, by: Primitive) -> Option<Drive> {
-    match invariant {
-        Invariant::Durable | Invariant::Idempotent | Invariant::Converges => {
-            Drive::try_from(by).ok()
-        }
-        Invariant::Recovers => None,
+        Drive::Drop => vec![By::Drop(edge.clone())],
     }
 }
 
@@ -326,6 +332,7 @@ impl Scheduler for BurstScheduler {
 mod tests {
     use std::{collections::BTreeSet, time::Duration};
 
+    use crucible_core::fault::Primitive;
     use crucible_protocol::EdgeProfile;
 
     use super::*;
@@ -361,30 +368,37 @@ mod tests {
         }
     }
 
-    /// An edge a plugin read, which named `moments` on it.
-    fn named(moments: Vec<(&str, crucible_protocol::Property)>) -> EdgeProfile {
+    /// An edge a plugin read, which named `moments` on it, each a place to hold
+    /// the fleet.
+    fn named(moments: Vec<&str>) -> EdgeProfile {
+        marked(
+            moments
+                .into_iter()
+                .map(|mark| (mark, Doing::Holding))
+                .collect(),
+        )
+    }
+
+    /// An edge a plugin read, which named `moments` on it and how each breaks
+    /// the fleet.
+    fn marked(moments: Vec<(&str, Doing)>) -> EdgeProfile {
         EdgeProfile {
             placements: moments
                 .into_iter()
-                .map(|(mark, exercises)| crucible_protocol::Placement {
+                .map(|(mark, doing)| crucible_protocol::Placement {
                     direction: Direction::ClientToUpstream,
                     mark: mark.to_owned(),
                     why: format!("what {mark} catches"),
-                    exercises,
+                    doing,
                 })
                 .collect(),
             ..from(Some("api"), "broker", vec![], vec![])
         }
     }
 
-    /// An unbounded campaign against a fleet that can be killed, so durability
-    /// is on.
+    /// An unbounded campaign against a fleet that can only be killed.
     fn scheduler(profiles: &[EdgeProfile]) -> BurstScheduler {
-        driven(
-            profiles,
-            &[(Invariant::Durable, vec![Primitive::Kill])],
-            None,
-        )
+        driven(profiles, &[Primitive::Kill], None)
     }
 
     /// A budget that affords exactly `schedules` runs.
@@ -396,27 +410,22 @@ mod tests {
         }
     }
 
-    /// A campaign testing each invariant by the ways it names, fitted to a
+    /// A campaign against a fleet that can be broken in `ways`, fitted to a
     /// budget affording `capacity` schedules.
     fn driven(
         profiles: &[EdgeProfile],
-        testable: &[(Invariant, Vec<Primitive>)],
+        ways: &[Primitive],
         capacity: Option<u32>,
     ) -> BurstScheduler {
         let learned = Learned {
             profiles: profiles.to_vec(),
-            trajectory: Vec::new(),
-            primitives: testable
-                .iter()
-                .flat_map(|(_, ways)| ways)
-                .copied()
-                .collect(),
+            trajectory: crucible_core::verdict::Trajectory::default(),
+            primitives: ways.iter().copied().collect(),
         };
         BurstScheduler::new(
             &fixture::fleet(),
             &fixture::scenario(),
             &learned,
-            testable,
             capacity.map(affording),
         )
     }
@@ -437,11 +446,10 @@ mod tests {
     fn nothing_testable_yields_nothing() {
         let learned = Learned {
             profiles: vec![profile("db", vec![burst(0, 4)], vec![])],
-            trajectory: Vec::new(),
+            trajectory: crucible_core::verdict::Trajectory::default(),
             primitives: BTreeSet::new(),
         };
-        let mut s =
-            BurstScheduler::new(&fixture::fleet(), &fixture::scenario(), &learned, &[], None);
+        let mut s = BurstScheduler::new(&fixture::fleet(), &fixture::scenario(), &learned, None);
         assert_eq!(s.total(), 0);
         assert!(s.next().is_none());
     }
@@ -473,7 +481,7 @@ mod tests {
     fn every_way_of_breaking_the_fleet_gets_its_own_schedule() {
         let s = driven(
             &[from(Some("api"), "db", vec![burst(1, 4)], vec![])],
-            &[(Invariant::Durable, vec![Primitive::Kill, Primitive::Cut])],
+            &[Primitive::Kill, Primitive::Cut],
             None,
         );
         assert_eq!(s.total(), 9);
@@ -534,7 +542,7 @@ mod tests {
     fn a_kill_can_take_either_end_of_an_edge() {
         let taken = taken(driven(
             &[from(Some("inventory"), "broker", vec![burst(1, 4)], vec![])],
-            &[(Invariant::Durable, vec![Primitive::Kill])],
+            &[Primitive::Kill],
             None,
         ));
         assert!(taken.contains(&"inventory".to_string()));
@@ -545,7 +553,7 @@ mod tests {
     fn an_edge_from_outside_the_fleet_offers_only_its_upstream() {
         let taken = taken(driven(
             &[profile("api", vec![burst(1, 4)], vec![])],
-            &[(Invariant::Durable, vec![Primitive::Kill])],
+            &[Primitive::Kill],
             None,
         ));
         assert!(taken.iter().all(|target| target == "api"), "{taken:?}");
@@ -558,32 +566,25 @@ mod tests {
     fn the_edge_the_scenario_is_driven_over_is_not_cut() {
         let s = driven(
             &[profile("api", vec![burst(1, 4)], vec![])],
-            &[(Invariant::Durable, vec![Primitive::Cut])],
+            &[Primitive::Cut],
             None,
         );
         assert_eq!(s.total(), 0);
     }
 
-    /// A property with fewer moments than another must not sit behind every one
-    /// of them, or a budget spends itself before reaching it.
+    /// A way of breaking the fleet with fewer moments than another must not sit
+    /// behind every one of them, or a budget spends itself before reaching it.
     #[test]
-    fn a_budget_reaches_every_property_before_any_of_them_twice() {
-        use crucible_protocol::Property::{Durable, Idempotent};
-        let profiles = [named(vec![
-            ("publish:1", Durable),
-            ("publish:2", Durable),
-            ("redeliver:1", Idempotent),
-            ("redeliver:2", Idempotent),
-            ("redeliver:3", Idempotent),
+    fn a_budget_reaches_every_way_before_any_of_them_twice() {
+        let repeating = Doing::Rewriting(Primitive::Redeliver);
+        let profiles = [marked(vec![
+            ("publish:1", Doing::Holding),
+            ("publish:2", Doing::Holding),
+            ("redeliver:1", repeating),
+            ("redeliver:2", repeating),
+            ("redeliver:3", repeating),
         ])];
-        let mut scheduler = driven(
-            &profiles,
-            &[
-                (Invariant::Durable, vec![Primitive::Kill]),
-                (Invariant::Idempotent, vec![Primitive::Redeliver]),
-            ],
-            None,
-        );
+        let mut scheduler = driven(&profiles, &[Primitive::Kill, Primitive::Redeliver], None);
 
         let mut spent = Vec::new();
         while let Some(schedule) = scheduler.next() {
@@ -606,16 +607,11 @@ mod tests {
     /// plugin named on a quiet one are reached.
     #[test]
     fn a_busy_edge_does_not_spend_the_budget_before_a_named_moment() {
-        use crucible_protocol::Property::Durable;
         let profiles = [
             profile("db", vec![burst(1, 900), burst(2, 800)], vec![]),
-            named(vec![("publish:1", Durable)]),
+            named(vec!["publish:1"]),
         ];
-        let mut scheduler = driven(
-            &profiles,
-            &[(Invariant::Durable, vec![Primitive::Kill])],
-            None,
-        );
+        let mut scheduler = driven(&profiles, &[Primitive::Kill], None);
 
         let mut spent = Vec::new();
         while let Some(schedule) = scheduler.next() {
@@ -626,33 +622,71 @@ mod tests {
         assert_eq!(named, Some(1), "{spent:?}");
     }
 
-    /// A plugin names a moment for one property. Faulting there for another
-    /// asks it to hold the fleet somewhere it was never watching, and the run
-    /// comes back having tested nothing.
+    /// A moment says how it can be broken, and only that way is scheduled.
+    /// This one is a confirm the plugin can drop, so the campaign spends it on
+    /// dropping even though it could also kill and cut: a kill there would
+    /// freeze the fleet and take a service away, which is not what the moment
+    /// offered.
     #[test]
-    fn a_moment_is_only_spent_on_what_it_was_named_for() {
+    fn a_moment_is_broken_the_way_it_says_it_is() {
         let s = driven(
-            &[named(vec![
-                ("ack:1:before", crucible_protocol::Property::Durable),
-                ("redeliver:1", crucible_protocol::Property::Idempotent),
-            ])],
-            &[(Invariant::Durable, vec![Primitive::Kill])],
+            &[marked(vec![(
+                "confirm:1",
+                Doing::Rewriting(Primitive::Drop),
+            )])],
+            &[Primitive::Kill, Primitive::Cut, Primitive::Drop],
             None,
         );
-        let marks: Vec<String> = std::iter::from_fn({
+        assert_eq!(s.total(), 1, "one way, not three");
+        let mut s = s;
+        let only = s.next().expect("the moment is placeable");
+        assert_eq!(
+            only.fault.as_ref().map(Fault::primitive),
+            Some(Primitive::Drop)
+        );
+    }
+
+    /// A burst is a count of packets. Nothing read the edge, so nothing there
+    /// can change what crosses it, and a way that needs to must not be costed.
+    #[test]
+    fn a_burst_is_only_a_place_to_hold_the_fleet() {
+        let s = driven(
+            &[profile("db", vec![burst(1, 4)], vec![])],
+            &[Primitive::Kill, Primitive::Drop],
+            None,
+        );
+        let ways: Vec<Primitive> = std::iter::from_fn({
             let mut s = s;
             move || s.next()
         })
-        .filter_map(|schedule| schedule.fault?.anchor().map(|at| at.mark.clone()))
+        .filter_map(|schedule| schedule.fault.as_ref().map(Fault::primitive))
         .collect();
-        assert!(marks.iter().all(|mark| mark == "ack:1:before"), "{marks:?}");
+        assert!(ways.iter().all(|by| *by == Primitive::Kill), "{ways:?}");
+    }
+
+    /// A moment broken one way must not queue behind the moments of another
+    /// way, or a busy edge spends the budget before the fleet meets it.
+    #[test]
+    fn a_way_of_breaking_the_fleet_takes_its_turn_against_the_others() {
+        let profiles = [marked(vec![
+            ("publish:1:after", Doing::Holding),
+            ("publish:2:after", Doing::Holding),
+            ("confirm:1", Doing::Rewriting(Primitive::Drop)),
+        ])];
+        let mut scheduler = driven(&profiles, &[Primitive::Kill, Primitive::Drop], None);
+        let mut spent = Vec::new();
+        while let Some(schedule) = scheduler.next() {
+            spent.push(fault(&schedule).mark.clone());
+        }
+        spent.dedup();
+        assert_eq!(spent, ["publish:1:after", "confirm:1", "publish:2:after"]);
     }
 
     #[test]
     fn a_cut_takes_the_edge_itself() {
         let taken = taken(driven(
             &[from(Some("api"), "db", vec![burst(1, 4)], vec![])],
-            &[(Invariant::Durable, vec![Primitive::Cut])],
+            &[Primitive::Cut],
             None,
         ));
         assert!(
@@ -665,7 +699,7 @@ mod tests {
     fn a_budget_that_affords_one_point_takes_the_middle_of_each_burst() {
         let s = driven(
             &[profile("db", vec![burst(0, 4), burst(1, 4)], vec![])],
-            &[(Invariant::Durable, vec![Primitive::Kill])],
+            &[Primitive::Kill],
             Some(2),
         );
         assert_eq!(s.coverage().taken, 2, "one point in each burst");
@@ -685,7 +719,7 @@ mod tests {
     fn a_second_point_lands_on_the_boundary_the_service_is_on() {
         let s = driven(
             &[profile("db", vec![burst(1, 4)], vec![burst(1, 4)])],
-            &[(Invariant::Durable, vec![Primitive::Kill])],
+            &[Primitive::Kill],
             Some(4),
         );
         assert_eq!(s.coverage().taken, 4, "both points each way");
@@ -706,7 +740,7 @@ mod tests {
     fn a_budget_below_one_point_per_burst_keeps_the_busiest() {
         let s = driven(
             &[profile("db", vec![burst(0, 1), burst(1, 9)], vec![])],
-            &[(Invariant::Durable, vec![Primitive::Kill])],
+            &[Primitive::Kill],
             Some(1),
         );
         assert_eq!(s.coverage().taken, 1);
@@ -715,24 +749,16 @@ mod tests {
         assert_eq!(fault(&only).mark, burst(1, 9).mid.to_string());
     }
 
+    /// A degraded run is scheduled elsewhere and paid for off the top, so
+    /// nothing here reserves anything for it.
     #[test]
-    fn an_invariant_no_burst_can_place_costs_nothing() {
-        let learned = Learned {
-            profiles: vec![profile("db", vec![burst(1, 4), burst(2, 4)], vec![])],
-            trajectory: Vec::new(),
-            primitives: BTreeSet::from([Primitive::Kill]),
-        };
-        let s = BurstScheduler::new(
-            &fixture::fleet(),
-            &fixture::scenario(),
-            &learned,
-            &[
-                (Invariant::Durable, vec![Primitive::Kill]),
-                (Invariant::Recovers, vec![Primitive::Kill]),
-            ],
-            Some(affording(6)),
+    fn recovery_takes_no_share_of_what_the_bursts_are_fitted_to() {
+        let s = driven(
+            &[profile("db", vec![burst(1, 4), burst(2, 4)], vec![])],
+            &[Primitive::Kill],
+            Some(6),
         );
-        assert_eq!(s.coverage().taken, 6, "recovery took a share of the budget");
+        assert_eq!(s.coverage().taken, 6);
         assert_eq!(s.total(), 6);
     }
 
@@ -740,7 +766,7 @@ mod tests {
     fn covering_both_ways_of_breaking_the_fleet_comes_before_more_points() {
         let s = driven(
             &[from(Some("api"), "db", vec![burst(0, 4)], vec![])],
-            &[(Invariant::Durable, vec![Primitive::Kill, Primitive::Cut])],
+            &[Primitive::Kill, Primitive::Cut],
             Some(3),
         );
         assert_eq!(s.coverage().taken, 1, "one point, broken every way");

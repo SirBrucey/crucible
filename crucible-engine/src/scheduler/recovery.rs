@@ -5,6 +5,8 @@
 //! Drive a service degrades every edge it holds; losing one edge leaves both
 //! its ends running, so a service reachable another way carries on.
 
+use std::collections::BTreeSet;
+
 use crucible_core::{
     fault::{By, Drive, Fault},
     learned::Learned,
@@ -39,7 +41,7 @@ impl RecoveryScheduler {
                     fleet.clone(),
                     scenario.steps.clone(),
                     scenario.checks.clone(),
-                    Fault::Recovers { by },
+                    Fault::throughout(by),
                     learned.trajectory.clone(),
                     scenario.consistent_within,
                 );
@@ -96,19 +98,21 @@ fn degradations<'a>(
                 ),
                 // Changing what crosses needs something to cross, and a fleet
                 // held down from the start never sends anything.
-                Drive::Repeat | Drive::Reorder => Box::new(std::iter::empty()),
+                Drive::Repeat | Drive::Reorder | Drive::Drop => Box::new(std::iter::empty()),
             }
         })
 }
 
 /// The ways this scheduler can degrade a fleet, out of what the campaign found
-/// it could do.
+/// it could do. Recovery is shown by holding the fleet down, so only what can
+/// be held counts.
 #[must_use]
-pub fn ways(testable: &[(Invariant, Vec<crucible_core::fault::Primitive>)]) -> Vec<Drive> {
-    testable
-        .iter()
-        .filter(|(invariant, _)| *invariant == Invariant::Recovers)
-        .flat_map(|(_, ways)| ways.iter().filter_map(|by| Drive::try_from(*by).ok()))
+pub fn ways(available: &BTreeSet<crucible_core::fault::Primitive>) -> Vec<Drive> {
+    Invariant::Recovers
+        .showable(available)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|by| Drive::try_from(by).ok())
         .collect()
 }
 
@@ -139,7 +143,7 @@ mod tests {
                 .iter()
                 .map(|upstream| profile(dialled(upstream)))
                 .collect(),
-            trajectory: Vec::new(),
+            trajectory: crucible_core::verdict::Trajectory::default(),
             primitives: BTreeSet::from([Primitive::Kill, Primitive::Cut]),
         }
     }

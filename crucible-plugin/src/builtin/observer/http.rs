@@ -5,8 +5,8 @@ use std::{net::SocketAddr, time::Duration};
 use crucible_core::{
     plan,
     schema::{
-        AttrDecl, AttrSchema, ClauseDecl, ClauseShape, CmpOp, HeadPattern, OpSig, Param, ParamType,
-        ValueType,
+        AttrDecl, AttrSchema, ClauseDecl, ClauseShape, CmpOp, HeadPattern, Moves, OpSig, Param,
+        ParamType, ValueType,
     },
 };
 use reqwest::Client;
@@ -118,6 +118,9 @@ impl Observer for Http {
             OpSig::observable(
                 HeadPattern::exact("get"),
                 ValueType::Scalar,
+                // One field of an answer the fleet composes, which each step
+                // writes over rather than adds to.
+                Moves::Sets,
                 CmpOp::ALL.to_vec(),
             )
             .with_param(Param::required("path", ParamType::Path))
@@ -262,6 +265,7 @@ mod tests {
             observable: vec!["get".into()],
             args: vec![plan::Value::Str(path.into())],
             filter: None,
+            moves: Moves::Sets,
             clauses: at
                 .map(|at| {
                     [("at".to_owned(), plan::Value::Str(at.to_owned()))]
