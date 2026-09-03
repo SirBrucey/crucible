@@ -9,7 +9,7 @@ use std::{
 };
 
 use clap::Parser;
-use crucible_protocol::{Direction, Primitive};
+use crucible_protocol::{Direction, Primitive, ServiceHost};
 use tokio::{
     signal::unix::{SignalKind, signal},
     sync::watch,
@@ -35,6 +35,13 @@ struct Cli {
     /// not infected by the framework's own.
     #[arg(long = "control")]
     control: Vec<String>,
+    /// Every service in the fleet and the host its container answers at, as
+    /// `SERVICE=HOST`.
+    ///
+    /// Which edge a connection belongs to is decided from these, so every
+    /// service is named, not only the ones a pair fronts.
+    #[arg(long = "service", required = true)]
+    services: Vec<ServiceHost>,
     /// Fault anchor `CLIENT>UPSTREAM=DIRECTION=MARK` (DIRECTION is `c2u` or
     /// `u2c`): place the fault when the kind plugin reading that direction sees
     /// the moment MARK names. An empty CLIENT (`>db=c2u=publish:1:after`) is the
@@ -113,22 +120,6 @@ fn fronting<'a>(service: &str, pairs: &'a [Pair]) -> Option<&'a Pair> {
     pairs.iter().find(|pair| pair.service == service)
 }
 
-/// The service each pair fronts, and the host it forwards to, which is where
-/// that service answers.
-fn fronted(pairs: &[Pair]) -> Vec<(String, String)> {
-    pairs
-        .iter()
-        .map(|pair| {
-            // The upstream is `host:port`; only the host names the container.
-            let host = pair
-                .upstream
-                .rsplit_once(':')
-                .map_or(pair.upstream.as_str(), |(host, _)| host);
-            (pair.service.clone(), host.to_owned())
-        })
-        .collect()
-}
-
 /// An edge as `CLIENT>UPSTREAM`, where an empty CLIENT was dialled from outside
 /// the fleet.
 fn parse_edge(spec: &str) -> Result<(Option<String>, String)> {
@@ -165,10 +156,14 @@ fn parse_fault_at(spec: &str) -> Result<FaultAt> {
 ///
 /// Read as the scenario starts, when the fleet is up and its names resolve.
 /// Nothing is looked up while bytes are moving.
-async fn resolve(hosts: &[(String, String)], client: Option<&str>) -> OnEdge {
+async fn resolve(hosts: &[ServiceHost], client: Option<&str>) -> OnEdge {
     let mut fleet = HashSet::new();
     let mut theirs = HashSet::new();
-    for (service, host) in hosts {
+    for ServiceHost {
+        name: service,
+        host,
+    } in hosts
+    {
         // A host with no port does not resolve, and which port it answers on
         // does not change which container it is.
         let Ok(addrs) = tokio::net::lookup_host((host.as_str(), 0)).await else {
@@ -242,9 +237,10 @@ async fn main() -> Result<()> {
             service: upstream.clone(),
         });
     }
-    // Where each service answers, which is what names the far end of a
-    // connection. Taken before the pairs are consumed below.
-    let hosts = fronted(&pairs);
+    // Where each service answers, which is what names both ends of a
+    // connection. Every service in the fleet, not only those a pair fronts: a
+    // service that listens on nothing still dials the ones that do.
+    let hosts = cli.services.clone();
     // Which connections the fault applies to. A pair carries every client that
     // dials its upstream, and a fault is placed on one edge.
     let edge: Arc<OnceLock<OnEdge>> = Arc::new(OnceLock::new());
@@ -418,7 +414,7 @@ fn spawn_fault_control(
     pause: watch::Sender<bool>,
     sever: watch::Sender<u64>,
     edge: Arc<OnceLock<OnEdge>>,
-    hosts: Vec<(String, String)>,
+    hosts: Vec<ServiceHost>,
     client: Option<String>,
 ) {
     tokio::spawn(async move {
