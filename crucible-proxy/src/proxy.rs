@@ -10,6 +10,7 @@ use std::{
     },
 };
 
+use crucible_kind::Readers;
 use crucible_protocol::{ConnEvent, ConnId, Direction, Kind};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -474,6 +475,11 @@ async fn forward(
     };
     // A reader each way: what a client sends and what it gets back are two
     // streams, and neither says anything about where the other has got to.
+    // They are made together, since what they do agree on is this connection's.
+    let Readers {
+        client_to_upstream,
+        upstream_to_client,
+    } = upstream.kinds.connection();
     let c2u = tokio::spawn(forward_bytes(
         conn,
         Half {
@@ -483,7 +489,7 @@ async fn forward(
         },
         // Only the anchored direction watches for the moment; the other way
         // reads its traffic and forwards it.
-        upstream.kinds.reader(Direction::ClientToUpstream),
+        client_to_upstream,
         events_tx.clone(),
         gate.clone(),
         anchor_c2u,
@@ -495,7 +501,7 @@ async fn forward(
             write: client_w,
             direction: Direction::UpstreamToClient,
         },
-        upstream.kinds.reader(Direction::UpstreamToClient),
+        upstream_to_client,
         events_tx.clone(),
         gate,
         anchor_u2c,

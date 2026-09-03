@@ -614,6 +614,7 @@ dependencies = [
 name = "crucible-kind"
 version = "0.1.0"
 dependencies = [
+ "amq-protocol",
  "crucible-kind-amqp",
  "crucible-protocol",
 ]
