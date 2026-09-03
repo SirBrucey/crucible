@@ -6,4 +6,4 @@ pub mod observer;
 
 pub use deployment::Docker;
 pub use driver::Http;
-pub use observer::Mariadb;
+pub use observer::{Mariadb, http::Http as HttpObserver};

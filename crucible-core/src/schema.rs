@@ -8,6 +8,10 @@ pub enum ValueType {
     Int,
     Bool,
     Duration,
+    /// One value, of whichever kind the fleet turns out to hold, ie: a field in a
+    /// JSON body. What the scenario compares it against says which kind
+    /// was meant.
+    Scalar,
     List(Box<ValueType>),
     /// A map whose keys are names and whose values are all of one type.
     MapOf(Box<ValueType>),
@@ -133,8 +137,8 @@ pub enum ClauseShape {
     Filter,
     /// A `{ ... }` map payload, as in `body`.
     Block,
-    /// A typed value, as in `returns`.
-    Returns,
+    /// One value of the type it names, written `<keyword>: <value>`.
+    Value(ValueType),
 }
 
 /// An optional keyword clause an operation accepts, e.g. `where` or `body`.

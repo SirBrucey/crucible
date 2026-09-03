@@ -105,6 +105,9 @@ pub struct Check {
     /// The observable's positional arguments, as its plugin declared them.
     pub args: Vec<Value>,
     pub filter: Option<(String, Value)>,
+    /// The `<keyword>: <value>` clauses the check was written with, keyed by
+    /// keyword. The observer declared them, so it is the one that reads them.
+    pub clauses: BTreeMap<String, Value>,
     pub op: CmpOp,
     pub value: Value,
 }

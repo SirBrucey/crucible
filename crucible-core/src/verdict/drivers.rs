@@ -358,6 +358,7 @@ mod tests {
                 observable: vec!["writes".into(), "count".into()],
                 args: Vec::new(),
                 filter: None,
+                clauses: std::collections::BTreeMap::new(),
                 op: crate::schema::CmpOp::Eq,
                 value: plan::Value::Int(read),
             },

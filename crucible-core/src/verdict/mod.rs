@@ -300,6 +300,7 @@ mod tests {
             observable: vec!["orders".into(), "count".into()],
             args: Vec::new(),
             filter: None,
+            clauses: std::collections::BTreeMap::new(),
             op: CmpOp::Ge,
             value: Value::Int(2),
         }

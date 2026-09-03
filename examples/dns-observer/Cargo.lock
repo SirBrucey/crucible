@@ -145,7 +145,6 @@ dependencies = [
  "crucible-protocol",
  "futures-util",
  "postcard",
- "rand",
  "serde",
  "serde_json",
  "strum",
@@ -179,6 +178,7 @@ name = "crucible-protocol"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "strum",
 ]
 
 [[package]]
