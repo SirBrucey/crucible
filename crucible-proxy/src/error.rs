@@ -10,6 +10,12 @@ pub enum Error {
     MalformedFaultAt { spec: String },
     #[error("fault-at names service `{service}`, which no --pair fronts")]
     UnknownFaultService { service: String },
+    #[error("fault-at names client `{client}`, which no --service names")]
+    UnknownFaultClient { client: String },
+    #[error(
+        "service `{service}` does not resolve at `{host}`, so nothing it dials would be recognised"
+    )]
+    UnresolvedService { service: String, host: String },
     #[error("parse listen `{addr}`: {source}")]
     ParseListen {
         addr: String,
