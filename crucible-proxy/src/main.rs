@@ -120,6 +120,39 @@ fn fronting<'a>(service: &str, pairs: &'a [Pair]) -> Option<&'a Pair> {
     pairs.iter().find(|pair| pair.service == service)
 }
 
+/// Refuse an edge naming a service the fleet does not have.
+///
+/// An upstream nothing fronts has no traffic to watch, and a client no
+/// `--service` names resolves to no address, so the edge would match no
+/// connection. Either way the run reports a fault that missed rather than the
+/// mistake it is.
+fn named_edges(
+    at: Option<&FaultAt>,
+    degrade: Option<&(Option<String>, String)>,
+    pairs: &[Pair],
+    hosts: &[ServiceHost],
+) -> Result<()> {
+    if let Some((_, upstream)) = degrade
+        && fronting(upstream, pairs).is_none()
+    {
+        return Err(Error::UnknownFaultService {
+            service: upstream.clone(),
+        });
+    }
+    let clients = [
+        at.and_then(|at| at.client.as_ref()),
+        degrade.and_then(|(client, _)| client.as_ref()),
+    ];
+    for client in clients.into_iter().flatten() {
+        if !hosts.iter().any(|service| service.name == *client) {
+            return Err(Error::UnknownFaultClient {
+                client: client.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// An edge as `CLIENT>UPSTREAM`, where an empty CLIENT was dialled from outside
 /// the fleet.
 fn parse_edge(spec: &str) -> Result<(Option<String>, String)> {
@@ -156,7 +189,7 @@ fn parse_fault_at(spec: &str) -> Result<FaultAt> {
 ///
 /// Read as the scenario starts, when the fleet is up and its names resolve.
 /// Nothing is looked up while bytes are moving.
-async fn resolve(hosts: &[ServiceHost], client: Option<&str>) -> OnEdge {
+async fn resolve(hosts: &[ServiceHost], client: Option<&str>) -> Result<OnEdge> {
     let mut fleet = HashSet::new();
     let mut theirs = HashSet::new();
     for ServiceHost {
@@ -166,9 +199,13 @@ async fn resolve(hosts: &[ServiceHost], client: Option<&str>) -> OnEdge {
     {
         // A host with no port does not resolve, and which port it answers on
         // does not change which container it is.
+        // Membership is decided from these, so a name that does not answer
+        // would quietly put a service outside the fleet.
         let Ok(addrs) = tokio::net::lookup_host((host.as_str(), 0)).await else {
-            tracing::warn!(%service, %host, "did not resolve, so its traffic is not recognised");
-            continue;
+            return Err(Error::UnresolvedService {
+                service: service.clone(),
+                host: host.clone(),
+            });
         };
         for addr in addrs {
             fleet.insert(addr.ip());
@@ -185,7 +222,7 @@ async fn resolve(hosts: &[ServiceHost], client: Option<&str>) -> OnEdge {
         fleet = ?fleet,
         "resolved the anchored edge"
     );
-    OnEdge::new(theirs, fleet, client.is_none())
+    Ok(OnEdge::new(theirs, fleet, client.is_none()))
 }
 
 #[tokio::main]
@@ -230,17 +267,11 @@ async fn main() -> Result<()> {
     // Held down for the whole scenario, rather than severed on one packet.
     let (down_tx, down_rx) = watch::channel(false);
     let degrade = cli.degrade.as_deref().map(parse_edge).transpose()?;
-    if let Some((_, upstream)) = &degrade
-        && fronting(upstream, &pairs).is_none()
-    {
-        return Err(Error::UnknownFaultService {
-            service: upstream.clone(),
-        });
-    }
     // Where each service answers, which is what names both ends of a
     // connection. Every service in the fleet, not only those a pair fronts: a
     // service that listens on nothing still dials the ones that do.
     let hosts = cli.services.clone();
+    named_edges(at.as_ref(), degrade.as_ref(), &pairs, &hosts)?;
     // Which connections the fault applies to. A pair carries every client that
     // dials its upstream, and a fault is placed on one edge.
     let edge: Arc<OnceLock<OnEdge>> = Arc::new(OnceLock::new());
@@ -434,10 +465,20 @@ fn spawn_fault_control(
                 _ = arm.recv() => {
                     // The fleet answers to its names only once it is up, so the
                     // edge is resolved here rather than at bind.
-                    if edge.get().is_none()
-                        && edge.set(resolve(&hosts, client.as_deref()).await).is_err()
-                    {
-                        tracing::warn!("the edge was resolved twice, so the first stands");
+                    if edge.get().is_none() {
+                        match resolve(&hosts, client.as_deref()).await {
+                            // Resolving wrongly would leave the fault watching
+                            // connections it was never named for, so the edge
+                            // is left unresolved and the fault reports a miss.
+                            Err(e) => tracing::error!(%e, "the fleet could not be resolved"),
+                            Ok(resolved) => {
+                                if edge.set(resolved).is_err() {
+                                    tracing::warn!(
+                                        "the edge was resolved twice, so the first stands"
+                                    );
+                                }
+                            }
+                        }
                     }
                     job.arm();
                 }
@@ -535,6 +576,33 @@ fn sever_once(severings: &watch::Sender<u64>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn service(name: &str) -> ServiceHost {
+        ServiceHost {
+            name: name.to_owned(),
+            host: format!("{name}-actual"),
+        }
+    }
+
+    /// A client the fleet does not have resolves to no address, so the anchor
+    /// would watch nothing and the run would report a fault that missed. The
+    /// mistake is refused instead.
+    #[test]
+    fn an_edge_from_a_service_the_fleet_does_not_have_is_refused() {
+        let at = parse_fault_at("aip>db=c2u=ack:7:before").expect("valid spec");
+        assert!(matches!(
+            named_edges(Some(&at), None, &[], &[service("api"), service("db")]),
+            Err(Error::UnknownFaultClient { .. })
+        ));
+    }
+
+    /// The edge dialled from outside the fleet names no client, and is not a
+    /// service that has gone missing.
+    #[test]
+    fn an_edge_dialled_from_outside_the_fleet_names_no_client() {
+        let at = parse_fault_at(">db=c2u=ack:7:before").expect("valid spec");
+        assert!(named_edges(Some(&at), None, &[], &[service("db")]).is_ok());
+    }
 
     #[test]
     fn parses_a_client_to_upstream_anchor() {
