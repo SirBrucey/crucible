@@ -12,7 +12,7 @@ use crucible_core::{
 };
 
 use crate::{
-    builtin::{Docker, Http, Mariadb},
+    builtin::{Docker, Http, HttpObserver, Mariadb},
     discovery,
     error::Error,
     external::Plugin,
@@ -32,13 +32,15 @@ pub struct Registry {
 }
 
 impl Registry {
-    /// The registry of first-party plugins: docker, http, mariadb.
+    /// The registry of first-party plugins: docker, http as both a driver and an
+    /// observer, and mariadb.
     #[must_use]
     pub fn builtins() -> Self {
         let mut registry = Self::default();
         registry.add_deployment::<Docker>();
         registry.add_driver::<Http>();
         registry.add_observer::<Mariadb>();
+        registry.add_observer::<HttpObserver>();
         registry
     }
 
@@ -218,22 +220,28 @@ impl Registry {
         let mut schema = ServiceSchema { attrs: Vec::new() };
         schema.extend(name, attrs.clone())?;
         for kind in kinds {
-            if let Some((name, attrs)) = self.kind_attrs(kind) {
+            for (name, attrs) in self.kind_attrs(kind) {
                 schema.extend(&name, attrs)?;
             }
         }
         Ok(schema)
     }
 
-    /// The attributes the named kind reads of a service that speaks it, and the
-    /// name it is registered under. A kind that is not registered reads nothing:
-    /// naming it is reported where the kind itself is resolved.
-    fn kind_attrs(&self, kind: &str) -> Option<(String, AttrSchema)> {
-        if let Some((name, driver)) = self.drivers.get_key_value(kind) {
-            return Some((name.clone(), driver.attrs.clone()));
-        }
-        let (name, observer) = self.observers.get_key_value(kind)?;
-        Some((name.clone(), observer.attrs.clone()))
+    /// What every plugin registered under `kind` reads of a service.
+    ///
+    /// One name can be both a driver and an observer, since a fleet is driven
+    /// over the same protocol it is read over, and a service speaking it
+    /// declares what each of them needs.
+    fn kind_attrs(&self, kind: &str) -> Vec<(String, AttrSchema)> {
+        let driver = self
+            .drivers
+            .get_key_value(kind)
+            .map(|(name, driver)| (name.clone(), driver.attrs.clone()));
+        let observer = self
+            .observers
+            .get_key_value(kind)
+            .map(|(name, observer)| (name.clone(), observer.attrs.clone()));
+        driver.into_iter().chain(observer).collect()
     }
 
     /// Prepare each step, bound to the driver it names, in the order given.
@@ -443,11 +451,13 @@ mod tests {
 
     fn checks() -> Vec<plan::Check> {
         vec![plan::Check {
+            moves: crucible_core::schema::Moves::Counts,
             service: "db".into(),
             observer: "mariadb".into(),
             observable: vec!["orders".into(), "orders".into(), "count".into()],
             args: Vec::new(),
             filter: None,
+            clauses: std::collections::BTreeMap::new(),
             op: crucible_core::schema::CmpOp::Eq,
             value: plan::Value::Int(3),
         }]

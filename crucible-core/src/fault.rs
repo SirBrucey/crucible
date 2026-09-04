@@ -5,20 +5,16 @@ use crucible_protocol::{Direction, Edge};
 
 use crate::verdict::Invariant;
 
-/// What to break and how to drive the operation.
+/// What to break, and where in the run to break it.
+///
+/// A fault is a way of driving the fleet.
+/// Which invariant is broken is read against what the fleet did about it.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
-pub enum Fault {
-    /// Break the fleet at the anchor and read what survived.
-    Durable { anchor: Anchor, by: By },
-    /// Have the fleet do the same work twice at the anchor, and read whether
-    /// doing it twice left what doing it once would.
-    Idempotent { anchor: Anchor, by: By },
-    /// Tell the fleet things in an order it was not told them in, and read
-    /// whether it settled where it would have anyway.
-    Converges { anchor: Anchor, by: By },
-    /// Run the whole scenario degraded, then put it back and see whether the
-    /// fleet catches up on what it accepted while it was.
-    Recovers { by: By },
+pub struct Fault {
+    /// Where in the observed traffic it lands, or `None` for one imposed before
+    /// the scenario starts so the whole run meets a degraded fleet.
+    anchor: Option<Anchor>,
+    by: By,
 }
 
 /// How a fault drives the fleet, and what it drives. Narrower than
@@ -37,6 +33,9 @@ pub enum By {
     /// One edge, carrying its messages in an order the broker did not send
     /// them in, so a fleet relying on that order is asked to do without it.
     Reorder(Edge),
+    /// One edge, losing a message it carried, so whoever was waiting on that
+    /// message is left to decide what to do without it.
+    Drop(Edge),
 }
 
 impl By {
@@ -47,6 +46,7 @@ impl By {
             By::Cut(_) => Primitive::Cut,
             By::Repeat(_) => Primitive::Redeliver,
             By::Reorder(_) => Primitive::Reorder,
+            By::Drop(_) => Primitive::Drop,
         }
     }
 
@@ -55,7 +55,9 @@ impl By {
     pub fn target(&self) -> String {
         match self {
             By::Kill(service) => service.clone(),
-            By::Cut(edge) | By::Repeat(edge) | By::Reorder(edge) => edge.to_string(),
+            By::Cut(edge) | By::Repeat(edge) | By::Reorder(edge) | By::Drop(edge) => {
+                edge.to_string()
+            }
         }
     }
 }
@@ -67,6 +69,7 @@ impl std::fmt::Display for By {
             By::Cut(edge) => write!(f, "cutting {edge}"),
             By::Repeat(edge) => write!(f, "repeating a message on {edge}"),
             By::Reorder(edge) => write!(f, "reordering messages on {edge}"),
+            By::Drop(edge) => write!(f, "dropping a message on {edge}"),
         }
     }
 }
@@ -81,6 +84,7 @@ pub enum Drive {
     Cut,
     Repeat,
     Reorder,
+    Drop,
 }
 
 impl From<Drive> for Primitive {
@@ -90,6 +94,7 @@ impl From<Drive> for Primitive {
             Drive::Cut => Primitive::Cut,
             Drive::Repeat => Primitive::Redeliver,
             Drive::Reorder => Primitive::Reorder,
+            Drive::Drop => Primitive::Drop,
         }
     }
 }
@@ -104,50 +109,50 @@ impl TryFrom<Primitive> for Drive {
             Primitive::Cut => Ok(Self::Cut),
             Primitive::Redeliver => Ok(Self::Repeat),
             Primitive::Reorder => Ok(Self::Reorder),
+            Primitive::Drop => Ok(Self::Drop),
         }
     }
 }
 
 impl Fault {
-    /// The invariant this fault is meant to put under pressure, whose driver
-    /// reads the verdict.
+    /// Break the fleet at `anchor`, part way through a run.
     #[must_use]
-    pub fn invariant(&self) -> Invariant {
-        match self {
-            Fault::Durable { .. } => Invariant::Durable,
-            Fault::Idempotent { .. } => Invariant::Idempotent,
-            Fault::Converges { .. } => Invariant::Converges,
-            Fault::Recovers { .. } => Invariant::Recovers,
+    pub fn at(anchor: Anchor, by: By) -> Self {
+        Self {
+            anchor: Some(anchor),
+            by,
         }
+    }
+
+    /// Hold the fleet degraded for the whole run, then put it back.
+    #[must_use]
+    pub fn throughout(by: By) -> Self {
+        Self { anchor: None, by }
     }
 
     /// Where in the observed traffic the fault lands.
     #[must_use]
     pub fn anchor(&self) -> Option<&Anchor> {
-        match self {
-            Fault::Durable { anchor, .. }
-            | Fault::Idempotent { anchor, .. }
-            | Fault::Converges { anchor, .. } => Some(anchor),
-            // Imposed before there is any traffic to land in.
-            Fault::Recovers { .. } => None,
-        }
+        self.anchor.as_ref()
     }
 
     /// What the fault takes away.
     #[must_use]
     pub fn taking(&self) -> &By {
-        match self {
-            Fault::Durable { by, .. }
-            | Fault::Idempotent { by, .. }
-            | Fault::Converges { by, .. }
-            | Fault::Recovers { by, .. } => by,
-        }
+        &self.by
     }
 
     /// What is done to the fleet.
     #[must_use]
     pub fn primitive(&self) -> Primitive {
         self.taking().primitive()
+    }
+
+    /// The invariants this fault could show broken, a run shows at
+    /// most one.
+    #[must_use]
+    pub fn could_show(&self) -> &'static [Invariant] {
+        Invariant::could_show(self.anchor.is_none(), self.primitive())
     }
 }
 

@@ -65,6 +65,11 @@ pub enum Clause {
         keyword: Spanned<String>,
         value: Spanned<Value>,
     },
+    /// A `<keyword>: <value>` clause carrying one value.
+    Value {
+        keyword: Spanned<String>,
+        value: Spanned<Value>,
+    },
     /// A `where <column> = <value>` filter.
     Where(Filter),
 }

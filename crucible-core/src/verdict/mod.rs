@@ -1,17 +1,17 @@
-//! Invariants, observations, and drivers that produce verdicts.
+//! Invariants, observations, and the one reading that turns them into a
+//! verdict.
 
-pub mod drivers;
+mod reading;
 
 use std::{cmp::Ordering, collections::BTreeSet};
 
-pub use drivers::{Converges, Durable, Idempotent, Recovers};
 use serde::{Deserialize, Serialize};
-use strum::EnumIter;
+use strum::{EnumIter, IntoEnumIterator};
 
-use crate::{fault::Primitive, ipc::Verdict, schema::CmpOp};
+use crate::{fault::Primitive, schema::CmpOp};
 
 /// The four canonical event-driven invariants Crucible checks.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize, EnumIter)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize, EnumIter)]
 pub enum Invariant {
     Idempotent,
     Converges,
@@ -19,74 +19,99 @@ pub enum Invariant {
     Recovers,
 }
 
-impl From<crucible_protocol::Property> for Invariant {
-    fn from(property: crucible_protocol::Property) -> Self {
-        match property {
-            crucible_protocol::Property::Durable => Invariant::Durable,
-            crucible_protocol::Property::Idempotent => Invariant::Idempotent,
-            crucible_protocol::Property::Converges => Invariant::Converges,
-            crucible_protocol::Property::Recovers => Invariant::Recovers,
+/// Named as the thing a verdict says broke, so a report reads as a sentence.
+impl std::fmt::Display for Invariant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Invariant::Idempotent => f.write_str("idempotency"),
+            Invariant::Converges => f.write_str("convergence"),
+            Invariant::Durable => f.write_str("durability"),
+            Invariant::Recovers => f.write_str("recovery"),
         }
     }
 }
 
 impl Invariant {
-    /// Anything that can put this invariant under pressure. Losing a write is
-    /// losing a write, so durability and recovery do not mind whether the
-    /// service went away or only the edge to it did.
+    /// What a run held degraded from start to finish.
+    /// Nothing in the run derives this as it is settled from the start.
+    pub const DEGRADED: &'static [Invariant] = &[Invariant::Recovers];
+
+    /// What breaking the fleet this way could show.
     #[must_use]
-    pub fn driven_by(self) -> &'static [Primitive] {
-        match self {
-            Invariant::Idempotent => &[Primitive::Redeliver],
-            Invariant::Converges => &[Primitive::Reorder],
-            Invariant::Durable | Invariant::Recovers => &[Primitive::Kill, Primitive::Cut],
+    pub fn could_show(throughout: bool, by: Primitive) -> &'static [Invariant] {
+        if throughout {
+            Invariant::DEGRADED
+        } else {
+            Invariant::shown_by(by)
         }
     }
 
-    /// What a campaign against this fleet could drive this invariant with,
+    /// Making a message arrive twice can only ask whether handling it twice
+    /// leaves what handling it once would. Making messages arrive out of order
+    /// can only ask whether the order mattered. Taking something away asks
+    /// nothing so narrow: the fleet is left in doubt, and what it does about
+    /// the doubt is what decides which invariant it broke.
+    fn shown_by(primitive: Primitive) -> &'static [Invariant] {
+        match primitive {
+            Primitive::Redeliver => &[Invariant::Idempotent],
+            Primitive::Reorder => &[Invariant::Converges],
+            Primitive::Kill | Primitive::Cut | Primitive::Drop => &[
+                Invariant::Durable,
+                Invariant::Idempotent,
+                Invariant::Converges,
+            ],
+        }
+    }
+
+    /// Anything that could show this invariant broken.
+    ///
+    /// The inverse of what shows an invariant, except for recovery, which needs
+    /// a run held degraded throughout.
+    #[must_use]
+    pub fn shown_by_any(self) -> Vec<Primitive> {
+        match self {
+            Invariant::Recovers => vec![Primitive::Kill, Primitive::Cut],
+            _ => Primitive::iter()
+                .filter(|by| Invariant::shown_by(*by).contains(&self))
+                .collect(),
+        }
+    }
+
+    /// What a campaign against this fleet could show this invariant broken by,
     /// given what the loaded plugins turned out to be able to do.
     ///
+    /// This is what the campaign could show, not what it did. Which invariant
+    /// any one run showed is that run's verdict to say.
+    ///
     /// # Errors
-    /// Errors with what stands in the way of testing it at all.
-    pub fn driveable(self, available: &BTreeSet<Primitive>) -> Result<Vec<Primitive>, Unreachable> {
-        if driver_for(self).is_none() {
-            return Err(Unreachable::NoDriver);
-        }
-        let driveable: Vec<Primitive> = self
-            .driven_by()
-            .iter()
+    /// Errors if nothing can be shown.
+    pub fn showable(self, available: &BTreeSet<Primitive>) -> Result<Vec<Primitive>, Unreachable> {
+        let showable: Vec<Primitive> = self
+            .shown_by_any()
+            .into_iter()
             .filter(|by| available.contains(by))
-            .copied()
             .collect();
-        if driveable.is_empty() {
-            return Err(Unreachable::NoPrimitive(self.driven_by()));
+        if showable.is_empty() {
+            return Err(Unreachable(self.shown_by_any()));
         }
-        Ok(driveable)
+        Ok(showable)
     }
 }
 
-/// What stops a campaign testing an invariant.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Unreachable {
-    /// Nothing loaded can do any of what would put it under pressure.
-    NoPrimitive(&'static [Primitive]),
-    /// Nothing reads a verdict for it yet.
-    NoDriver,
-}
+/// Nothing the campaign loaded can prove an invariant
+/// wrong, so the campaign cannot claim to have tested it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Unreachable(pub Vec<Primitive>);
 
 impl std::fmt::Display for Unreachable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Unreachable::NoPrimitive(any_of) => {
-                let any_of: Vec<String> = any_of.iter().map(ToString::to_string).collect();
-                write!(f, "nothing loaded can {}", any_of.join(" or "))
-            }
-            Unreachable::NoDriver => f.write_str("no verdict driver"),
-        }
+        let any_of: Vec<String> = self.0.iter().map(ToString::to_string).collect();
+        write!(f, "nothing loaded can {}", any_of.join(" or "))
     }
 }
 
-/// Observations captured during schedule execution and fed to a [`Driver`].
+/// Observations captured during schedule execution, which
+/// [`Observations::verdict`] turns into a verdict.
 #[derive(Debug, Default)]
 pub struct Observations {
     pub outcomes: Vec<Outcome>,
@@ -96,10 +121,10 @@ pub struct Observations {
     /// What those checks read at each point of the run: the baseline before the
     /// first step, then one per step. A step's effects are what separates its
     /// checkpoint from the one before it.
-    pub trajectory: Vec<Checkpoint>,
+    pub trajectory: Trajectory,
     /// The fault-free run's trajectory, which this run is judged against. Empty
     /// in the fault-free run itself.
-    pub fault_free: Vec<Checkpoint>,
+    pub fault_free: Trajectory,
     /// When each step ran, in the order the scenario states them.
     pub windows: Vec<StepWindow>,
     pub sessions: Vec<crucible_protocol::Session>,
@@ -119,6 +144,63 @@ pub struct StepWindow {
 /// which under a fault is most of the point: a service that is down cannot be
 /// asked, and that is a thing to record rather than to fail on.
 pub type Checkpoint = Vec<Option<crate::plan::Value>>;
+
+/// Where the fleet stood at each point of a run: the baseline before the first
+/// step, then one per step.
+///
+/// A run is judged by reading this against what the fleet's own steps would
+/// have left, so it is the substrate every verdict rests on.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct Trajectory(Vec<Checkpoint>);
+
+impl Trajectory {
+    /// Where the fleet stood once `n` steps had landed.
+    #[must_use]
+    pub fn at(&self, n: usize) -> Option<&Checkpoint> {
+        self.0.get(n)
+    }
+
+    /// How many points it holds, which is one more than the steps driven.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn iter(&self) -> std::slice::Iter<'_, Checkpoint> {
+        self.0.iter()
+    }
+
+    /// Where the fleet stood once every step had landed.
+    #[must_use]
+    pub fn settled(&self) -> Option<&Checkpoint> {
+        self.0.last()
+    }
+
+    /// Record where the fleet stands now, which is one more step taken.
+    pub fn push(&mut self, point: Checkpoint) {
+        self.0.push(point);
+    }
+}
+
+impl FromIterator<Checkpoint> for Trajectory {
+    fn from_iter<I: IntoIterator<Item = Checkpoint>>(points: I) -> Self {
+        Self(points.into_iter().collect())
+    }
+}
+
+impl<'a> IntoIterator for &'a Trajectory {
+    type Item = &'a Checkpoint;
+    type IntoIter = std::slice::Iter<'a, Checkpoint>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
 
 /// A check and what the fleet was actually holding when it was read.
 #[derive(Debug)]
@@ -196,16 +278,6 @@ impl Observations {
     pub fn empty() -> Self {
         Self::default()
     }
-
-    /// How many driven operations the system did not take responsibility for,
-    /// whether by refusing them or by leaving the caller in doubt.
-    #[must_use]
-    pub fn undelivered(&self) -> usize {
-        self.outcomes
-            .iter()
-            .filter(|outcome| outcome.ack != Ack::Acked)
-            .count()
-    }
 }
 
 /// Whether the system took responsibility for a driven operation. The driver
@@ -224,27 +296,7 @@ pub enum Ack {
 /// driver that produced them knows how to read them.
 #[derive(Debug)]
 pub struct Outcome {
-    /// What was run, for reporting.
-    pub operation: String,
     pub ack: Ack,
-    pub request: Vec<u8>,
-    pub response: Vec<u8>,
-}
-
-/// Produces a [`Verdict`] from a set of observations for one invariant.
-pub trait Driver {
-    fn drive(&mut self, observations: &Observations) -> Verdict;
-}
-
-/// The driver that reads a verdict for an invariant, where one has been written.
-#[must_use]
-pub fn driver_for(invariant: Invariant) -> Option<Box<dyn Driver>> {
-    match invariant {
-        Invariant::Durable => Some(Box::new(Durable)),
-        Invariant::Idempotent => Some(Box::new(Idempotent)),
-        Invariant::Recovers => Some(Box::new(Recovers)),
-        Invariant::Converges => Some(Box::new(Converges)),
-    }
 }
 
 #[cfg(test)]
@@ -255,40 +307,42 @@ mod tests {
     use crate::plan::{Check, Value};
 
     #[test]
-    fn an_invariant_nothing_can_break_is_out_of_reach() {
+    fn an_invariant_nothing_can_show_is_out_of_reach() {
         let nothing = BTreeSet::new();
-        for invariant in Invariant::iter().filter(|i| driver_for(*i).is_some()) {
+        for invariant in Invariant::iter() {
             assert_eq!(
-                invariant.driveable(&nothing),
-                Err(Unreachable::NoPrimitive(invariant.driven_by())),
+                invariant.showable(&nothing),
+                Err(Unreachable(invariant.shown_by_any())),
                 "{invariant:?}"
             );
         }
     }
 
+    /// A campaign shows an invariant broken by whichever ways of breaking the
+    /// fleet it loaded and that invariant answers to. Losing a write is losing
+    /// a write, however the edge was broken, but no redelivery loses one.
     #[test]
-    fn an_invariant_nothing_reads_a_verdict_for_is_out_of_reach() {
-        let everything: BTreeSet<Primitive> = Primitive::iter().collect();
-        for invariant in Invariant::iter().filter(|i| driver_for(*i).is_none()) {
-            assert_eq!(
-                invariant.driveable(&everything),
-                Err(Unreachable::NoDriver),
-                "{invariant:?}"
-            );
-        }
-    }
-
-    /// Losing a write is losing a write, so either way of breaking the edge is
-    /// a way of testing that it was not lost.
-    #[test]
-    fn durability_is_driven_by_whichever_ways_of_breaking_the_fleet_are_loaded() {
+    fn only_the_loaded_ways_that_could_show_it_are_offered() {
         assert_eq!(
-            Invariant::Durable.driveable(&BTreeSet::from([Primitive::Kill])),
-            Ok(vec![Primitive::Kill])
+            Invariant::Durable.showable(&BTreeSet::from([Primitive::Kill, Primitive::Redeliver])),
+            Ok(vec![Primitive::Kill]),
+            "a redelivery cannot lose a write"
         );
         assert_eq!(
-            Invariant::Durable.driveable(&BTreeSet::from([Primitive::Kill, Primitive::Cut])),
+            Invariant::Durable.showable(&BTreeSet::from([Primitive::Kill, Primitive::Cut])),
             Ok(vec![Primitive::Kill, Primitive::Cut])
+        );
+    }
+
+    /// Taking something away leaves the fleet in doubt, and what it does about
+    /// the doubt could break any of them, so a fleet that can only be killed is
+    /// still a fleet idempotency can be shown broken on.
+    #[test]
+    fn taking_something_away_could_show_any_of_them() {
+        assert!(
+            Invariant::Idempotent
+                .showable(&BTreeSet::from([Primitive::Kill]))
+                .is_ok()
         );
     }
 
@@ -300,6 +354,8 @@ mod tests {
             observable: vec!["orders".into(), "count".into()],
             args: Vec::new(),
             filter: None,
+            moves: crate::schema::Moves::Counts,
+            clauses: std::collections::BTreeMap::new(),
             op: CmpOp::Ge,
             value: Value::Int(2),
         }

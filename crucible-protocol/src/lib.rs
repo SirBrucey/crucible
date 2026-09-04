@@ -14,20 +14,12 @@ pub use session::{Session, WriteRecord};
 
 use serde::{Deserialize, Serialize};
 
-/// What the framework is exercising.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-pub enum Property {
-    /// What is accepted, is kept.
-    Durable,
-    /// Doing the same thing twice leaves what doing it once would.
-    Idempotent,
-    /// Regardless of order, the fleet settles the same way.
-    Converges,
-    /// A degraded fleet catches up on what it accepted while it was down.
-    Recovers,
-}
-
 /// Where a fault can go.
+///
+/// A moment says where it is and what breaking the fleet there is. What that
+/// shows about the fleet is not the moment's to say: the same broken frame
+/// leaves one publisher retrying and another giving up, and only the run says
+/// which happened.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct Placement {
     /// Which way the traffic it watches for runs.
@@ -36,8 +28,22 @@ pub struct Placement {
     pub mark: String,
     /// What faulting here would catch.
     pub why: String,
-    /// Which property this is exercising.
-    pub exercises: Property,
+    /// What breaking the fleet here is.
+    pub doing: Doing,
+}
+
+/// What is done at a moment to break the fleet there.
+///
+/// Two sorts, and the difference is who does it. Taking something away happens
+/// outside the byte stream, so the moment is a place to hold the fleet and the
+/// framework picks what to take. Changing what crosses happens in the stream,
+/// so only the plugin reading it can do it, and it says which way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+pub enum Doing {
+    /// Hold the fleet here for something to be taken away from outside.
+    Holding,
+    /// Change what crosses as it passes, the one way this names.
+    Rewriting(Primitive),
 }
 
 /// What a plugin made of some bytes.
@@ -80,6 +86,36 @@ pub trait Kind: Send {
     /// the scenario has started, and this is the edge the schedule named.
     /// Neither is anything the bytes can say, so the framework says it.
     fn carry<'a>(&mut self, bytes: &'a [u8], placing: bool) -> Carried<'a>;
+}
+
+/// A service in the fleet and the host its container answers at.
+///
+/// The deployment writes these and the proxy reads them, so the two crates
+/// would otherwise agree on the spelling by convention. Written `NAME=HOST`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceHost {
+    pub name: String,
+    pub host: String,
+}
+
+impl std::fmt::Display for ServiceHost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}={}", self.name, self.host)
+    }
+}
+
+impl std::str::FromStr for ServiceHost {
+    type Err = String;
+
+    fn from_str(spec: &str) -> Result<Self, Self::Err> {
+        let (name, host) = spec
+            .split_once('=')
+            .ok_or_else(|| format!("`{spec}` must be in the form SERVICE=HOST"))?;
+        Ok(Self {
+            name: name.to_owned(),
+            host: host.to_owned(),
+        })
+    }
 }
 
 /// A link the proxy carries.
@@ -157,4 +193,25 @@ pub fn now_ns() -> u128 {
         .duration_since(UNIX_EPOCH)
         .expect("system clock is before Unix epoch")
         .as_nanos()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The deployment writes these and the proxy reads them, so what one says
+    /// has to be what the other takes.
+    #[test]
+    fn a_service_host_survives_being_written_and_read_back() {
+        let host = ServiceHost {
+            name: "pdns_update".to_owned(),
+            host: "pdns_update-actual".to_owned(),
+        };
+        assert_eq!(host.to_string().parse::<ServiceHost>(), Ok(host));
+    }
+
+    #[test]
+    fn a_service_without_a_host_is_refused() {
+        assert!("broker".parse::<ServiceHost>().is_err());
+    }
 }

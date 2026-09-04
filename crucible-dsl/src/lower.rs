@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use crucible_core::{
     plan,
-    schema::{CmpOp, HeadPattern, OpSig, Param, ParamType, ValueType},
+    schema::{ClauseShape, CmpOp, HeadPattern, Moves, OpSig, Param, ParamType, ValueType},
 };
 use crucible_plugin::{Registry, registry::ServiceSchema};
 
@@ -424,6 +424,10 @@ impl<'a> Lowerer<'a> {
                 .map(|a| lower_value(&a.node))
                 .collect(),
             filter: where_of(observable),
+            clauses: values_of(observable),
+            // Declared by the observable this resolved to, since the plugin
+            // answering the reading is the one that knows what it is.
+            moves: sig.moves.unwrap_or(Moves::Sets),
             op: plugin_cmp(predicate.node.op.node),
             value: lower_value(&predicate.node.right.node),
         })
@@ -483,6 +487,18 @@ impl<'a> Lowerer<'a> {
         if !sig.cmp_ops.contains(&plugin_cmp(predicate.op.node)) {
             self.error(predicate.op.span, "this comparison is not allowed here");
         }
+        // An observable that answers with whatever the fleet holds takes any
+        // comparison its plugin allows, and only some of what it can answer
+        // with sorts. A verdict cannot read `> false`, so it is refused here
+        // rather than reported as a reading that will not compare.
+        if !matches!(predicate.op.node, ast::CmpOp::Eq | ast::CmpOp::Ne)
+            && matches!(predicate.right.node, Value::Bool(_) | Value::Null)
+        {
+            self.error(
+                predicate.right.span,
+                format!("`{}` has no order to compare", spell(&predicate.right.node)),
+            );
+        }
         self.check_type(&predicate.right, result);
     }
 
@@ -492,10 +508,12 @@ impl<'a> Lowerer<'a> {
     fn check_clauses(&mut self, op: &OpCall, sig: &OpSig) {
         for clause in &op.clauses {
             let keyword = match &clause.node {
-                Clause::Block { keyword, .. } => keyword.node.as_str(),
+                Clause::Block { keyword, .. } | Clause::Value { keyword, .. } => {
+                    keyword.node.as_str()
+                }
                 Clause::Where(_) => "where",
             };
-            if !sig.clauses.iter().any(|decl| decl.keyword == keyword) {
+            let Some(decl) = sig.clauses.iter().find(|decl| decl.keyword == keyword) else {
                 let known = sorted(sig.clauses.iter().map(|decl| decl.keyword.clone()));
                 self.error_options(
                     clause.span,
@@ -504,6 +522,20 @@ impl<'a> Lowerer<'a> {
                     known,
                     "this operation takes no clauses",
                 );
+                continue;
+            };
+            // The declaration says how the clause is written, so what the
+            // author wrote is held to it here rather than by whoever reads it.
+            match (&decl.shape, &clause.node) {
+                (ClauseShape::Value(ty), Clause::Value { value, .. }) => {
+                    self.check_type(value, &ty.clone());
+                }
+                (ClauseShape::Block, Clause::Block { .. })
+                | (ClauseShape::Filter, Clause::Where(_)) => {}
+                (shape, _) => self.error(
+                    clause.span,
+                    format!("`{keyword}` is written as {}", written(keyword, shape)),
+                ),
             }
         }
     }
@@ -537,6 +569,10 @@ impl<'a> Lowerer<'a> {
                 | (ValueType::Duration, Value::Duration(_))
                 | (ValueType::Map, Value::Map(_))
                 | (ValueType::ServiceRef, Value::Ident(_))
+                | (
+                    ValueType::Scalar,
+                    Value::Str(_) | Value::Int(_) | Value::Bool(_) | Value::Null
+                )
         );
         if !matches {
             self.error(value.span, format!("expected {}", type_name(ty)));
@@ -589,7 +625,7 @@ fn blocks_of(op: &OpCall) -> BTreeMap<String, Vec<(String, plan::Value)>> {
                     _ => Vec::new(),
                 },
             )),
-            Clause::Where(_) => None,
+            Clause::Value { .. } | Clause::Where(_) => None,
         })
         .collect()
 }
@@ -599,8 +635,21 @@ fn where_of(op: &OpCall) -> Option<(String, plan::Value)> {
         Clause::Where(filter) => {
             Some((filter.column.node.clone(), lower_value(&filter.value.node)))
         }
-        Clause::Block { .. } => None,
+        Clause::Block { .. } | Clause::Value { .. } => None,
     })
+}
+
+/// The `<keyword>: <value>` clauses on `op`, keyed by keyword.
+fn values_of(op: &OpCall) -> BTreeMap<String, plan::Value> {
+    op.clauses
+        .iter()
+        .filter_map(|clause| match &clause.node {
+            Clause::Value { keyword, value } => {
+                Some((keyword.node.clone(), lower_value(&value.node)))
+            }
+            Clause::Block { .. } | Clause::Where(_) => None,
+        })
+        .collect()
 }
 
 fn sorted(names: impl IntoIterator<Item = String>) -> Vec<String> {
@@ -649,6 +698,24 @@ fn plugin_cmp(op: ast::CmpOp) -> CmpOp {
     }
 }
 
+/// A value as an error names it.
+fn spell(value: &Value) -> &'static str {
+    match value {
+        Value::Bool(_) => "a boolean",
+        Value::Null => "an absent value",
+        _ => "this",
+    }
+}
+
+/// How a clause is written, as an error spells it.
+fn written(keyword: &str, shape: &ClauseShape) -> String {
+    match shape {
+        ClauseShape::Filter => format!("`{keyword} <column> = <value>`"),
+        ClauseShape::Block => format!("`{keyword} {{ ... }}`"),
+        ClauseShape::Value(ty) => format!("`{keyword}: <value>`, taking {}", type_name(ty)),
+    }
+}
+
 fn type_name(ty: &ValueType) -> &'static str {
     match ty {
         ValueType::Str => "a string",
@@ -658,6 +725,7 @@ fn type_name(ty: &ValueType) -> &'static str {
         ValueType::List(_) => "a list",
         ValueType::MapOf(_) | ValueType::Map => "a map",
         ValueType::ServiceRef => "a service name",
+        ValueType::Scalar => "a single value",
     }
 }
 
@@ -703,6 +771,51 @@ mod tests {
           expect { db.orders.orders.count where item = "book" == 1; }
         }
     "#;
+
+    /// A clause declared as a block is not a value.
+    #[test]
+    fn a_block_clause_written_as_a_value_is_refused() {
+        let src = VALID.replace(r#"body { item: "book", quantity: 1 }"#, r#"body: "book""#);
+        let diags = diagnose(&src);
+        let diag = find(&diags, "`body` is written as");
+        assert!(diag.message.contains("body { ... }"), "{diag:?}");
+    }
+
+    /// A reading whose kind the fleet decides still has to be compared, and
+    /// neither a boolean nor an absent value sorts. Stating one against an
+    /// ordering is refused here rather than left to read as unreadable.
+    #[test]
+    fn an_ordering_against_something_with_no_order_is_refused() {
+        let src = VALID.replace(
+            r#"db.orders.orders.count where item = "book" == 1;"#,
+            r#"api.get "/orders" at: "$.ok" > false;"#,
+        );
+        let diags = diagnose(&src);
+        find(&diags, "has no order to compare");
+    }
+
+    /// The fleet can answer that a field is absent, and a scenario can state
+    /// it.
+    #[test]
+    fn a_reading_can_be_stated_absent() {
+        let src = VALID.replace(
+            r#"db.orders.orders.count where item = "book" == 1;"#,
+            r#"api.get "/orders" at: "$.gone" == null;"#,
+        );
+        assert!(diagnose(&src).is_empty(), "{:?}", diagnose(&src));
+    }
+
+    /// A filter is not a value either, and the error says how it is written.
+    #[test]
+    fn a_filter_clause_written_as_a_value_is_refused() {
+        let src = VALID.replace(r#"where item = "book""#, r#"where: "book""#);
+        let diags = diagnose(&src);
+        let diag = find(&diags, "`where` is written as");
+        assert!(
+            diag.message.contains("where <column> = <value>"),
+            "{diag:?}"
+        );
+    }
 
     #[test]
     fn the_example_shape_validates_clean() {

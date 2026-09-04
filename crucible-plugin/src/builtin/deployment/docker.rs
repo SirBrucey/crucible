@@ -191,7 +191,7 @@ fn proxy_fault_args(fault: &Fault) -> Vec<String> {
         (None, By::Cut(edge)) => vec!["--degrade".to_owned(), edge_arg(edge)],
         // A kill is done to the container, and changing what crosses needs a
         // moment to change, so an unanchored one is nothing the proxy can do.
-        (None, By::Kill(_) | By::Repeat(_) | By::Reorder(_)) => Vec::new(),
+        (None, By::Kill(_) | By::Repeat(_) | By::Reorder(_) | By::Drop(_)) => Vec::new(),
     }
 }
 
@@ -330,29 +330,24 @@ impl Docker {
         Ok(())
     }
 
-    /// Start the single proxy container fronting the whole fleet: one pair per
-    /// service (`service=0.0.0.0:port=service-actual:port`), every service name
-    /// as a network alias, and all ports published to the host. Returns each
-    /// service's published host endpoint. Every pair shares one process-wide
-    /// pause gate, so a single signal freezes the whole fleet atomically.
-    async fn start_proxy(&self) -> Result<Endpoints> {
-        ensure_image(&self.client, PROXY_IMAGE).await?;
-
-        // The proxy binds one listener per service port. Distinct ports map
-        // through unchanged; a shared port cannot be disambiguated on the single
-        // container IP, so reject it rather than misroute.
-        let mut seen = HashSet::new();
-        for service in &self.services {
-            for port in service.ports.values() {
-                if !seen.insert(*port) {
-                    return Err(Error::PortCollision(*port));
-                }
-            }
-        }
-
-        let container_name = self.proxy_container_name();
-
+    /// What the proxy is told about the fleet: every service and where it
+    /// answers, then a listener pair per port.
+    ///
+    /// The two are not the same list. A service that listens on nothing is
+    /// fronted by no pair, and is still one end of every edge it dials, so it
+    /// has to be named even though there is nothing to listen for it on.
+    fn proxy_listener_args(&self) -> Vec<String> {
         let mut cmd = Vec::new();
+        for service in &self.services {
+            cmd.push("--service".to_string());
+            cmd.push(
+                crucible_protocol::ServiceHost {
+                    name: service.name.clone(),
+                    host: Self::backing_alias(service),
+                }
+                .to_string(),
+            );
+        }
         for service in &self.services {
             // A pair per port. A fault is anchored to the service however many
             // ports its traffic arrives on, but each carries the kind it speaks,
@@ -373,6 +368,33 @@ impl Docker {
                 ));
             }
         }
+        cmd
+    }
+
+    /// Start the single proxy container fronting the whole fleet, with every
+    /// service name as a network alias and all ports published to the host.
+    /// Returns each service's published host endpoint.
+    ///
+    /// Every pair shares one process-wide pause gate, so a single signal
+    /// freezes the whole fleet atomically.
+    async fn start_proxy(&self) -> Result<Endpoints> {
+        ensure_image(&self.client, PROXY_IMAGE).await?;
+
+        // The proxy binds one listener per service port. Distinct ports map
+        // through unchanged; a shared port cannot be disambiguated on the single
+        // container IP, so reject it rather than misroute.
+        let mut seen = HashSet::new();
+        for service in &self.services {
+            for port in service.ports.values() {
+                if !seen.insert(*port) {
+                    return Err(Error::PortCollision(*port));
+                }
+            }
+        }
+
+        let container_name = self.proxy_container_name();
+
+        let mut cmd = self.proxy_listener_args();
         if let Some(fault) = &self.fault {
             cmd.extend(proxy_fault_args(fault));
         }
@@ -850,7 +872,13 @@ impl Substrate for Proxy {
 /// built.
 impl Faults for Proxy {
     fn primitives(&self) -> BTreeSet<Primitive> {
-        [Primitive::Cut, Primitive::Redeliver, Primitive::Reorder].into()
+        [
+            Primitive::Cut,
+            Primitive::Redeliver,
+            Primitive::Reorder,
+            Primitive::Drop,
+        ]
+        .into()
     }
 }
 

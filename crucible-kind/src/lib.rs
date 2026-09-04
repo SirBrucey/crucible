@@ -12,17 +12,22 @@ use crucible_protocol::{Carried, Direction, Kind};
 /// What reads one pair's traffic, watching for a moment if a schedule named
 /// one.
 ///
-/// A reader is made per connection, since what one carries says nothing about
-/// where another has got to. What they share stays here: a connection is not
-/// the unit a count of reads means anything in, because the fleet may open
-/// several.
+/// The pair's settings, and nothing a connection carries. Readers are made a
+/// connection at a time, since what one carries says nothing about where
+/// another has got to, and what a connection's two directions agree on is made
+/// along with them.
 #[derive(Clone)]
 pub struct Kinds {
     kind: String,
     /// The moment to watch for, and which way the traffic carrying it runs.
     watching: Option<(Direction, String)>,
-    /// What a pair's two directions agree on, for a kind whose readers need to.
-    consuming: crucible_kind_amqp::message::Consuming,
+}
+
+/// Both directions of one connection, read by things that agree with each
+/// other and with no other connection.
+pub struct Readers {
+    pub client_to_upstream: Box<dyn Kind>,
+    pub upstream_to_client: Box<dyn Kind>,
 }
 
 impl Kinds {
@@ -31,35 +36,35 @@ impl Kinds {
         Self {
             kind: kind.to_owned(),
             watching,
-            consuming: crucible_kind_amqp::message::Consuming::default(),
         }
     }
 
-    /// Something to read one direction of one connection with.
+    /// Something to read each direction of one connection with.
+    ///
+    /// The plugin that can read the kind makes both, since what the two
+    /// directions share is its own. A kind nothing reads gets a pair that only
+    /// counts what crosses.
     #[must_use]
-    pub fn reader(&self, direction: Direction) -> Box<dyn Kind> {
-        let mark = self
-            .watching
-            .as_ref()
-            .filter(|(way, _)| *way == direction)
-            .map(|(_, mark)| mark.clone());
-        match (self.kind.as_str(), mark) {
-            (crucible_kind_amqp::NAME, Some(mark)) => {
-                Box::new(crucible_kind_amqp::message::Reader::watching(
-                    direction,
-                    self.consuming.clone(),
-                    mark,
-                ))
-            }
-            (crucible_kind_amqp::NAME, None) => Box::new(crucible_kind_amqp::message::Reader::new(
-                direction,
-                self.consuming.clone(),
-            )),
-            // A mark on an unread kind is a count of reads, so every read is a
-            // candidate and whoever holds the count picks between them.
-            (_, mark) => Box::new(Unread {
-                watching: mark.is_some(),
-            }),
+    pub fn connection(&self) -> Readers {
+        if self.kind == crucible_kind_amqp::NAME {
+            let (client_to_upstream, upstream_to_client) =
+                crucible_kind_amqp::readers(self.watching.as_ref());
+            return Readers {
+                client_to_upstream,
+                upstream_to_client,
+            };
+        }
+        // A mark on an unread kind is a count of reads, so every read is a
+        // candidate and whoever holds the count picks between them.
+        let watching = |direction: Direction| Unread {
+            watching: self
+                .watching
+                .as_ref()
+                .is_some_and(|(way, _)| *way == direction),
+        };
+        Readers {
+            client_to_upstream: Box::new(watching(Direction::ClientToUpstream)),
+            upstream_to_client: Box::new(watching(Direction::UpstreamToClient)),
         }
     }
 }
@@ -113,11 +118,91 @@ impl Kind for Unread {
 
 #[cfg(test)]
 mod tests {
+    use amq_protocol::{
+        frame::{AMQPContentHeader, AMQPFrame, WriteContext, gen_frame},
+        protocol::{
+            AMQPClass,
+            basic::{AMQPMethod, AMQPProperties, Ack, Deliver, Qos},
+        },
+    };
+
     use super::*;
+
+    /// The channel the traffic under test runs on.
+    const CHANNEL: u16 = 1;
 
     /// An unread kind watching for a moment on the way in.
     fn watching() -> Kinds {
         Kinds::new("http", Some((Direction::ClientToUpstream, "2".to_owned())))
+    }
+
+    /// A frame as it goes on the wire.
+    fn wire(frame: &AMQPFrame) -> Vec<u8> {
+        let write = gen_frame::<Vec<u8>>(frame);
+        let (bytes, _) = write(WriteContext::from(Vec::new()))
+            .expect("a frame serialises")
+            .into_inner();
+        bytes
+    }
+
+    fn method(method: AMQPMethod) -> Vec<u8> {
+        wire(&AMQPFrame::Method(CHANNEL, AMQPClass::Basic(method)))
+    }
+
+    /// A consumer saying it will hold one delivery at a time, which leaves it
+    /// nowhere to be told things out of order.
+    fn takes_one_at_a_time() -> Vec<u8> {
+        method(AMQPMethod::Qos(Qos {
+            prefetch_count: 1,
+            global: false,
+        }))
+    }
+
+    /// A delivery the broker labelled `tag`, carrying a body.
+    fn delivery(tag: u64) -> Vec<u8> {
+        let payload = b"an order";
+        let mut bytes = method(AMQPMethod::Deliver(Deliver {
+            consumer_tag: "consumer-1".into(),
+            delivery_tag: tag,
+            redelivered: false,
+            ..Default::default()
+        }));
+        bytes.extend(wire(&AMQPFrame::Header(
+            CHANNEL,
+            AMQPContentHeader {
+                class_id: 60,
+                body_size: payload.len() as u64,
+                properties: AMQPProperties::default(),
+            },
+        )));
+        bytes.extend(wire(&AMQPFrame::Body(CHANNEL, payload.to_vec())));
+        bytes
+    }
+
+    /// A consumer finishing with the delivery the broker labelled `tag`.
+    fn finished_with(tag: u64) -> Vec<u8> {
+        method(AMQPMethod::Ack(Ack {
+            delivery_tag: tag,
+            multiple: false,
+        }))
+    }
+
+    /// Whether two deliveries down `readers` offer somewhere to reorder.
+    ///
+    /// The consumer finishes with each before the next arrives, so what it was
+    /// told it could hold is all this connection leaves behind.
+    fn offers_a_reorder(readers: &mut Readers) -> bool {
+        let mut offered = false;
+        for tag in [1, 2] {
+            offered |= readers
+                .upstream_to_client
+                .carry(&delivery(tag), false)
+                .found
+                .iter()
+                .any(|placement| placement.mark.starts_with("reorder:"));
+            readers.client_to_upstream.carry(&finished_with(tag), false);
+        }
+        offered
     }
 
     #[test]
@@ -130,7 +215,7 @@ mod tests {
     #[test]
     fn a_kind_with_no_plugin_is_carried_untouched() {
         assert!(!is_read("http"));
-        let mut reader = Kinds::new("http", None).reader(Direction::ClientToUpstream);
+        let mut reader = Kinds::new("http", None).connection().client_to_upstream;
         let carried = reader.carry(b"anything at all", false);
         assert_eq!(carried.forward.concat(), b"anything at all");
         assert_eq!(carried.freeze_after, None);
@@ -141,16 +226,47 @@ mod tests {
     /// boundary there is, so every one of them is a moment a fault could go on.
     #[test]
     fn a_kind_with_no_plugin_offers_every_read() {
-        let mut reader = watching().reader(Direction::ClientToUpstream);
+        let mut reader = watching().connection().client_to_upstream;
         assert_eq!(reader.carry(b"one", true).freeze_after, Some(1));
         assert_eq!(reader.carry(b"two", true).freeze_after, Some(1));
+    }
+
+    /// The two directions of one connection read the same traffic between
+    /// them: what the consumer told the broker on the way out settles what the
+    /// deliveries coming back are worth.
+    #[test]
+    fn the_two_directions_of_a_connection_agree() {
+        let mut readers = Kinds::new(crucible_kind_amqp::NAME, None).connection();
+        readers
+            .client_to_upstream
+            .carry(&takes_one_at_a_time(), false);
+        assert!(!offers_a_reorder(&mut readers));
+    }
+
+    /// A connection agrees with itself and with nothing else. A channel numbers
+    /// its deliveries from the connection it is on, so one connection's
+    /// bookkeeping read as another's would answer for the wrong traffic.
+    #[test]
+    fn one_connection_does_not_answer_for_another() {
+        let kinds = Kinds::new(crucible_kind_amqp::NAME, None);
+        let mut consumer = kinds.connection();
+        consumer
+            .client_to_upstream
+            .carry(&takes_one_at_a_time(), false);
+        assert!(!offers_a_reorder(&mut consumer));
+
+        let mut another = kinds.connection();
+        assert!(
+            offers_a_reorder(&mut another),
+            "this one said nothing about how many it would hold"
+        );
     }
 
     /// Only the direction a schedule named offers moments; the other way is
     /// carried and nothing more.
     #[test]
     fn the_other_direction_offers_nothing() {
-        let mut other = watching().reader(Direction::UpstreamToClient);
+        let mut other = watching().connection().upstream_to_client;
         assert_eq!(other.carry(b"reply", true).freeze_after, None);
     }
 

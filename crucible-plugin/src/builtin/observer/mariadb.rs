@@ -5,8 +5,8 @@ use std::net::SocketAddr;
 use crucible_core::{
     plan,
     schema::{
-        AttrDecl, AttrSchema, ClauseDecl, ClauseShape, CmpOp, HeadPattern, OpSig, Param, ParamType,
-        ValueType,
+        AttrDecl, AttrSchema, ClauseDecl, ClauseShape, CmpOp, HeadPattern, Moves, OpSig, Param,
+        ParamType, ValueType,
     },
 };
 use sqlx::{AssertSqlSafe, MySql, Pool, Row, mysql::MySqlRow};
@@ -119,12 +119,16 @@ impl Observer for Mariadb {
             OpSig::observable(
                 HeadPattern::wildcard(&["database", "table"], "count"),
                 ValueType::Int,
+                // Rows the fleet has written, which each step adds to.
+                Moves::Counts,
                 CmpOp::ALL.to_vec(),
             )
             .with_clause(ClauseDecl::new(WHERE, ClauseShape::Filter)),
             OpSig::observable(
                 HeadPattern::wildcard(&["database", "table"], "select"),
                 ValueType::Int,
+                // One column of one row, which each step writes over.
+                Moves::Sets,
                 CmpOp::ALL.to_vec(),
             )
             .with_param(Param::required("column", ParamType::Ident))
@@ -312,16 +316,18 @@ mod tests {
     use crate::role::Observer;
     use crucible_core::{
         plan,
-        schema::{ClauseShape, CmpOp, HeadPattern, ValueType},
+        schema::{ClauseShape, CmpOp, HeadPattern, Moves, ValueType},
     };
 
     fn check(observable: &[&str], filter: Option<(&str, plan::Value)>) -> plan::Check {
         plan::Check {
+            moves: Moves::Counts,
             service: "db".into(),
             observer: "mariadb".into(),
             observable: observable.iter().map(|s| (*s).to_string()).collect(),
             args: Vec::new(),
             filter: filter.map(|(column, value)| (column.to_string(), value)),
+            clauses: std::collections::BTreeMap::new(),
             op: CmpOp::Eq,
             value: plan::Value::Int(3),
         }

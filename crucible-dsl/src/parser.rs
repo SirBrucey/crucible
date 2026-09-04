@@ -331,6 +331,12 @@ impl Parser {
                 };
                 end = clause.span.end;
                 clauses.push(clause);
+            } else if self.at_value_clause() {
+                let Some(clause) = self.value_clause() else {
+                    break;
+                };
+                end = clause.span.end;
+                clauses.push(clause);
             } else if self.is_value_start() {
                 let Some(value) = self.value() else { break };
                 end = value.span.end;
@@ -352,11 +358,28 @@ impl Parser {
     /// Whether the cursor is on `<keyword> {`. An identifier alone is a
     /// positional argument, so the brace is what tells a clause from one.
     fn at_block_clause(&self) -> bool {
+        self.at_clause_opening(&TokenKind::LBrace)
+    }
+
+    /// Whether the cursor is on `<keyword>:`. An identifier alone is a
+    /// positional argument, and one is followed by a value as often as not, so
+    /// the colon is what tells a clause from one.
+    fn at_value_clause(&self) -> bool {
+        self.at_clause_opening(&TokenKind::Colon)
+    }
+
+    /// Whether the cursor is on an identifier that `opening` follows.
+    fn at_clause_opening(&self, opening: &TokenKind) -> bool {
         matches!(self.peek(), TokenKind::Ident(_))
-            && matches!(
-                self.tokens.get(self.pos + 1).map(|t| &t.kind),
-                Some(TokenKind::LBrace)
-            )
+            && self.tokens.get(self.pos + 1).map(|t| &t.kind) == Some(opening)
+    }
+
+    fn value_clause(&mut self) -> Option<Spanned<Clause>> {
+        let keyword = self.expect_ident("a clause keyword")?;
+        self.expect(&TokenKind::Colon, "`:`");
+        let value = self.value()?;
+        let span = Span::new(keyword.span.start, value.span.end);
+        Some(Spanned::new(Clause::Value { keyword, value }, span))
     }
 
     fn block_clause(&mut self) -> Option<Spanned<Clause>> {
@@ -420,14 +443,24 @@ impl Parser {
             head.push(segment);
         }
         let mut args = Vec::new();
-        // `where` is an identifier like any other, so it is excluded by name or
-        // it reads as an argument.
-        while !self.at_kw("where") && self.is_value_start() {
-            let Some(value) = self.value() else { break };
-            end = value.span.end;
-            args.push(value);
-        }
         let mut clauses = Vec::new();
+        // `where` is an identifier like any other, so it is excluded by name or
+        // it reads as an argument. A `keyword: value` clause says so itself.
+        loop {
+            if self.at_value_clause() {
+                let Some(clause) = self.value_clause() else {
+                    break;
+                };
+                end = clause.span.end;
+                clauses.push(clause);
+            } else if !self.at_kw("where") && self.is_value_start() {
+                let Some(value) = self.value() else { break };
+                end = value.span.end;
+                args.push(value);
+            } else {
+                break;
+            }
+        }
         if self.at_kw("where")
             && let Some(clause) = self.where_clause()
         {
@@ -472,12 +505,22 @@ impl Parser {
         Some(Spanned::new(op, span))
     }
 
+    /// A map's key: a name, or a quoted string for one that is not a name. A
+    /// header is the reason: `X-API-Key` is not an identifier in this grammar
+    /// and is not the author's to rename.
+    fn map_key(&mut self) -> Option<Spanned<String>> {
+        match self.peek() {
+            TokenKind::Str(_) => self.expect_str("an attribute name"),
+            _ => self.expect_ident("an attribute name"),
+        }
+    }
+
     fn map(&mut self) -> Spanned<Value> {
         let start = self.peek_span();
         self.expect(&TokenKind::LBrace, "`{`");
         let mut entries = Vec::new();
         while !self.at_eof() && !self.at(&TokenKind::RBrace) {
-            let Some(key) = self.expect_ident("an attribute name") else {
+            let Some(key) = self.map_key() else {
                 self.recover_to(&TokenKind::Comma);
                 self.consume(&TokenKind::Comma);
                 continue;

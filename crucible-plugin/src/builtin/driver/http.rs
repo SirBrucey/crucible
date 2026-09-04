@@ -255,8 +255,6 @@ impl Call {
     /// reported as something the fleet did.
     async fn send(&self, endpoint: SocketAddr) -> Result<Outcome, Error> {
         let request = &self.request;
-        let operation = format!("{} {}", request.method, request.path);
-        let sent = request.body.clone().unwrap_or_default();
         let url = format!("http://{endpoint}{}", request.path);
 
         let mut builder = self.client.request(request.method.clone(), url);
@@ -273,30 +271,20 @@ impl Call {
         }
 
         let outcome = match builder.send().await {
-            Ok(response) => {
-                let ack = classify(response.status(), self.request.expect);
-                let body = response.bytes().await.unwrap_or_default();
-                Outcome {
-                    operation,
-                    ack,
-                    request: sent,
-                    response: body.to_vec(),
-                }
-            }
+            Ok(response) => Outcome {
+                ack: classify(response.status(), self.request.expect),
+            },
             // Nothing was ever sent, so there is no outcome to report: saying
             // the fleet left this in doubt would count it towards a verdict.
             Err(e) if e.is_builder() => return Err(Error::Client(e)),
             // A refused connection never reached the service, so the request
             // definitively did not happen; anything else leaves it in doubt.
             Err(e) => Outcome {
-                operation,
                 ack: if e.is_connect() {
                     Ack::Rejected
                 } else {
                     Ack::Unknown
                 },
-                request: sent,
-                response: e.to_string().into_bytes(),
             },
         };
         Ok(outcome)

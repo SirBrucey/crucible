@@ -18,6 +18,7 @@ framework = [
     "dep:futures-util",
     "dep:reqwest",
     "dep:serde_json",
+    "dep:serde_json_path",
     "dep:sqlx",
     "dep:tracing",
 ]
@@ -30,6 +31,7 @@ futures-util = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true, optional = true }
+serde_json_path = { workspace = true, optional = true }
 sqlx = { workspace = true, optional = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }

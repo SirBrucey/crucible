@@ -45,8 +45,12 @@ pub enum WorkerEvent {
 pub enum Verdict {
     /// The invariant held.
     Pass,
-    /// The invariant was violated.
-    Fail { reason: String },
+    /// An invariant was violated. `invariant` is which one the outcome turned
+    /// out to name. `None` is where the fleet is unable to determine which invariant was violated.
+    Fail {
+        invariant: Option<crate::verdict::Invariant>,
+        reason: String,
+    },
     /// Neither passed nor failed within the run budget.
     Inconclusive { reason: String },
 }

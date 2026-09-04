@@ -2,7 +2,7 @@ mod error;
 mod session;
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     process::{ExitCode, Stdio},
     time::{Duration, Instant},
@@ -311,7 +311,7 @@ impl CampaignOutcome {
 #[derive(Default)]
 struct Outcomes {
     passed: usize,
-    faults: Vec<(u32, String)>,
+    faults: Vec<(u32, Option<Invariant>, String)>,
     inconclusive: usize,
     errored: usize,
 }
@@ -323,15 +323,40 @@ impl Outcomes {
                 tracing::info!(schedule_id, "pass");
                 self.passed += 1;
             }
-            Verdict::Fail { reason } => {
+            Verdict::Fail { invariant, reason } => {
                 tracing::warn!(schedule_id, %reason, "fault found");
-                self.faults.push((schedule_id, reason));
+                self.faults.push((schedule_id, invariant, reason));
             }
             Verdict::Inconclusive { reason } => {
                 tracing::info!(schedule_id, %reason, "inconclusive");
                 self.inconclusive += 1;
             }
         }
+    }
+
+    /// Which invariants the campaign showed broken, and how often.
+    ///
+    /// This is what the runs turned out to say, not what their faults could
+    /// have said. A fault that could have shown several and settled somewhere
+    /// none of them describes is counted apart, since calling it any of them
+    /// would be a claim the readings do not support.
+    fn shown(&self) -> String {
+        let mut counted: BTreeMap<Invariant, usize> = BTreeMap::new();
+        let mut unattributed = 0;
+        for (_, invariant, _) in &self.faults {
+            match invariant {
+                Some(invariant) => *counted.entry(*invariant).or_default() += 1,
+                None => unattributed += 1,
+            }
+        }
+        let mut spelled: Vec<String> = counted
+            .into_iter()
+            .map(|(invariant, times)| format!("{invariant}: {times}"))
+            .collect();
+        if unattributed > 0 {
+            spelled.push(format!("unattributed: {unattributed}"));
+        }
+        spelled.join(", ")
     }
 
     /// Record a worker that never produced a verdict. `schedule_id` is `None`
@@ -368,10 +393,12 @@ impl Outcomes {
     /// scheduler produced; `stopped` says why the rest were not run, when some
     /// were not.
     fn report(&self, total: usize, elapsed_s: u64, stopped: Stopped) {
+        let shown = self.shown();
         if self.completed() < total {
             tracing::warn!(
                 passed = self.passed,
                 faults = self.faults.len(),
+                %shown,
                 inconclusive = self.inconclusive,
                 errored = self.errored,
                 total,
@@ -382,6 +409,7 @@ impl Outcomes {
             tracing::info!(
                 passed = self.passed,
                 faults = self.faults.len(),
+                %shown,
                 inconclusive = self.inconclusive,
                 errored = self.errored,
                 total,
@@ -591,25 +619,26 @@ impl<'a> Pool<'a> {
     }
 }
 
-/// Say which invariants this fleet could be tested for and which it could not,
-/// and return the ones worth scheduling. A fleet nothing can break still runs
-/// its fault-free scenario; this is just a plain e2e test.
-fn report_reach(available: &BTreeSet<Primitive>) -> Vec<(Invariant, Vec<Primitive>)> {
-    let mut testable = Vec::new();
+/// Say which invariants a run against this fleet could show broken and which it
+/// could not, and return the ones worth scheduling. A fleet nothing can break
+/// still runs its fault-free scenario; this is just a plain e2e test.
+///
+/// Could show, not did. Most ways of breaking a fleet leave it in doubt, and
+/// what it does about the doubt is what decides which invariant it broke, so
+/// that is a reading of each run rather than anything known here.
+fn report_reach(available: &BTreeSet<Primitive>) {
     for invariant in Invariant::iter() {
-        match invariant.driveable(available) {
+        match invariant.showable(available) {
             Ok(ways) => {
                 let spelled: Vec<String> = ways.iter().map(ToString::to_string).collect();
                 tracing::info!(
-                    "{invariant:?} is testable against this fleet, by: {}",
+                    "{invariant} could be shown broken against this fleet, by: {}",
                     spelled.join(", ")
                 );
-                testable.push((invariant, ways));
             }
-            Err(why) => tracing::info!("{invariant:?} is out of reach: {why}"),
+            Err(why) => tracing::info!("{invariant} is out of reach: {why}"),
         }
     }
-    testable
 }
 
 /// Every schedule the campaign will run, in the order it will run them.
@@ -624,8 +653,8 @@ fn fit(
     cost: Duration,
     concurrency: usize,
 ) -> Chain<RecoveryScheduler, BurstScheduler> {
-    let testable = report_reach(&learned.primitives);
-    let ways = recovery::ways(&testable);
+    report_reach(&learned.primitives);
+    let ways = recovery::ways(&learned.primitives);
     let budget = scenario.budget.map(|budget| Budget {
         left: budget.saturating_sub(campaign_start.elapsed()),
         cost,
@@ -636,7 +665,6 @@ fn fit(
         &plan.fleet,
         scenario,
         learned,
-        &testable,
         budget.map(|budget| budget.after(RecoveryScheduler::count(&plan.fleet, learned, &ways))),
     );
     let degraded = RecoveryScheduler::new(
@@ -692,7 +720,7 @@ async fn drive(bus: &EventBus, plan: &plan::Plan) -> Result<CampaignOutcome> {
         );
     }
 
-    let settled = learned.trajectory.last().map_or(&[][..], Vec::as_slice);
+    let settled = learned.trajectory.settled().map_or(&[][..], Vec::as_slice);
     if let Some(unmet) = verdict::unmet(&scenario.checks, settled) {
         tracing::error!("the scenario states {unmet} in its own fault-free run");
         return Ok(CampaignOutcome::Indecisive);
@@ -995,6 +1023,7 @@ mod tests {
         outcomes.record_verdict(
             2,
             Verdict::Fail {
+                invariant: Some(Invariant::Durable),
                 reason: "acked write missing".into(),
             },
         );
@@ -1007,6 +1036,7 @@ mod tests {
         outcomes.record_verdict(
             4,
             Verdict::Fail {
+                invariant: Some(Invariant::Idempotent),
                 reason: "duplicate applied".into(),
             },
         );
@@ -1017,14 +1047,46 @@ mod tests {
         assert_eq!(outcomes.inconclusive, 1);
         assert_eq!(outcomes.errored, 2);
         assert_eq!(outcomes.completed(), 6);
-        // Faults keep their schedule id and reason, in arrival order.
+        // Faults keep their schedule id, what they showed and why, in arrival
+        // order.
         assert_eq!(
             outcomes.faults,
             vec![
-                (2, "acked write missing".to_string()),
-                (4, "duplicate applied".to_string()),
+                (
+                    2,
+                    Some(Invariant::Durable),
+                    "acked write missing".to_string()
+                ),
+                (
+                    4,
+                    Some(Invariant::Idempotent),
+                    "duplicate applied".to_string()
+                ),
             ]
         );
+    }
+
+    /// The campaign reports what its runs turned out to show, and a run whose
+    /// fault could have shown several and whose readings named none of them is
+    /// not counted as any of them.
+    #[test]
+    fn the_campaign_says_what_it_showed_and_what_it_could_not_name() {
+        let mut outcomes = Outcomes::default();
+        outcomes.record_verdict(
+            1,
+            Verdict::Fail {
+                invariant: Some(Invariant::Idempotent),
+                reason: "duplicate applied".into(),
+            },
+        );
+        outcomes.record_verdict(
+            2,
+            Verdict::Fail {
+                invariant: None,
+                reason: "settled somewhere nothing describes".into(),
+            },
+        );
+        assert_eq!(outcomes.shown(), "idempotency: 1, unattributed: 1");
     }
 
     #[test]
@@ -1038,7 +1100,13 @@ mod tests {
     fn a_fault_dominates_even_with_errors() {
         let mut outcomes = Outcomes::default();
         outcomes.record_verdict(1, Verdict::Pass);
-        outcomes.record_verdict(2, Verdict::Fail { reason: "x".into() });
+        outcomes.record_verdict(
+            2,
+            Verdict::Fail {
+                invariant: None,
+                reason: "x".into(),
+            },
+        );
         outcomes.record_error(Some(3), "boom");
         assert_eq!(outcomes.outcome(), CampaignOutcome::FaultsFound);
     }

@@ -10,5 +10,8 @@ license.workspace = true
 crucible-kind-amqp = { path = "../crucible-kind-amqp" }
 crucible-protocol = { path = "../crucible-protocol" }
 
+[dev-dependencies]
+amq-protocol = { workspace = true }
+
 [lints]
 workspace = true

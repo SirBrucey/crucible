@@ -221,7 +221,7 @@ impl Worker<Idle> {
                         worker_id = self.id,
                         schedule_id = schedule.id,
                         taking = %fault.taking(),
-                        invariant = ?fault.invariant(),
+                        could_show = ?fault.could_show(),
                         "received schedule"
                     );
                     Ok(IdleNext::Work(self.transition(Executing {

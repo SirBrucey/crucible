@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 
 use crucible_protocol::EdgeProfile;
 
-use crate::{fault::Primitive, verdict::Checkpoint};
+use crate::{fault::Primitive, verdict::Trajectory};
 
 /// Everything we know about the fleet after the fault-free run. This is all the
 /// information the scheduler has to go on.
@@ -14,7 +14,7 @@ pub struct Learned {
     pub profiles: Vec<EdgeProfile>,
     /// The state each step left behind, which every faulted run is judged
     /// against.
-    pub trajectory: Vec<Checkpoint>,
+    pub trajectory: Trajectory,
     /// What can be done to this fleet.
     pub primitives: BTreeSet<Primitive>,
 }

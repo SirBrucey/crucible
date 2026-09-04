@@ -280,7 +280,7 @@ mod tests {
             let profiles = edge_profiles_from_sessions(&sessions, 0, &HashMap::new());
             let catalogue = WorkerToRunner::SessionCatalogue(crate::learned::Learned {
                 profiles,
-                trajectory: Vec::new(),
+                trajectory: crate::verdict::Trajectory::default(),
                 primitives: std::collections::BTreeSet::new(),
             });
             let mut buf = vec![0u8; 2_000_000];
@@ -412,7 +412,7 @@ mod tests {
             direction: Direction::ClientToUpstream,
             mark: "ack:1:after".into(),
             why: "an ack the broker has taken".into(),
-            exercises: crucible_protocol::Property::Durable,
+            doing: crucible_protocol::Doing::Holding,
         }];
         let profiles = edge_profiles_from_sessions(&[session], 0, &HashMap::new());
 
