@@ -37,5 +37,8 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true, optional = true }
 
+[dev-dependencies]
+rstest = { workspace = true }
+
 [lints]
 workspace = true

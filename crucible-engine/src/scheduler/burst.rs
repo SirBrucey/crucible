@@ -11,7 +11,9 @@
 //! Every edge is faulted at one point before any edge is faulted at two, so a
 //! short budget costs depth rather than whole edges.
 
-use crucible_protocol::{Burst, Direction, Doing, Edge, EdgeProfile};
+use std::collections::BTreeSet;
+
+use crucible_protocol::{Burst, Direction, Doing, Edge, EdgeProfile, Reached, Side};
 
 use crucible_core::{
     fault::{Anchor, By, Drive, Fault},
@@ -22,15 +24,16 @@ use crucible_core::{
 
 use super::{Budget, Scheduler};
 
-/// Somewhere on an edge a fault can go.
+/// Somewhere a fault can go.
 ///
 /// An edge a plugin can read says where its own moments are and what they
 /// catch. One nothing can read offers only counts of what crossed it, which is
-/// what the bursts are for.
+/// what the bursts are for. A service that reports its own moments offers those
+/// too, and they are not on an edge.
 #[derive(Clone, Debug)]
 struct Point<'a> {
-    edge: &'a Edge,
-    direction: Direction,
+    /// What reaches this moment, which is what can be broken.
+    at: Where<'a>,
     mark: String,
     why: String,
     /// What breaking the fleet here is. This is also what decides which
@@ -42,15 +45,44 @@ struct Point<'a> {
     packets: Option<u32>,
 }
 
+/// What reaches a point, and so what a fault placed there is anchored to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Where<'a> {
+    /// Traffic crossing an edge.
+    Crossing {
+        edge: &'a Edge,
+        direction: Direction,
+    },
+    /// A service reaching a point inside itself.
+    Inside { service: &'a str },
+}
+
+impl Where<'_> {
+    /// The anchor a schedule carries for a fault placed here.
+    fn anchoring(self, mark: String, why: String) -> Anchor {
+        match self {
+            Where::Crossing { edge, direction } => {
+                Anchor::crossing(edge.clone(), direction, mark, why)
+            }
+            Where::Inside { service } => Anchor::inside(service.to_owned(), mark, why),
+        }
+    }
+}
+
 impl Point<'_> {
     /// The group this point takes its turn in, so the budget is spread across
-    /// the ways of breaking the fleet, and the bursts do not crowd out the
-    /// named moments.
+    /// the ways of breaking the fleet and neither the bursts nor the edges
+    /// crowd out the moments inside services.
     ///
-    /// What a moment could show follows from how it breaks the fleet, so
-    /// grouping by that is grouping by what the campaign gets for spending it.
-    fn bucket(&self) -> (bool, Doing) {
-        (self.packets.is_none(), self.doing)
+    /// Where a moment is counts as much as how it breaks the fleet: one inside
+    /// a service reaches a gap nothing on the wire marks, so it is not
+    /// interchangeable with an edge moment that breaks the fleet the same way.
+    fn bucket(&self) -> (bool, bool, Doing) {
+        (
+            self.packets.is_none(),
+            matches!(self.at, Where::Inside { .. }),
+            self.doing,
+        )
     }
 }
 
@@ -65,8 +97,10 @@ fn points_on(profile: &EdgeProfile) -> Vec<Point<'_>> {
             .placements
             .iter()
             .map(|placement| Point {
-                edge: &profile.edge,
-                direction: placement.direction,
+                at: Where::Crossing {
+                    edge: &profile.edge,
+                    direction: placement.direction,
+                },
                 mark: placement.mark.clone(),
                 why: placement.why.clone(),
                 doing: placement.doing,
@@ -88,8 +122,10 @@ fn points_on(profile: &EdgeProfile) -> Vec<Point<'_>> {
                     rounds.push(Vec::new());
                 }
                 rounds[round].push(Point {
-                    edge: &profile.edge,
-                    direction,
+                    at: Where::Crossing {
+                        edge: &profile.edge,
+                        direction,
+                    },
                     mark: k.to_string(),
                     why: format!("{k} reads into what this edge carried"),
                     // Nothing read this edge, so all a moment on it can offer
@@ -106,6 +142,48 @@ fn points_on(profile: &EdgeProfile) -> Vec<Point<'_>> {
         round.sort_by_key(|point| std::cmp::Reverse(point.packets));
     }
     rounds.concat()
+}
+
+/// Where inside its services a fault can go, one point per moment reported.
+///
+/// Empty unless a service is instrumented, a fleet that reports nothing is
+/// still scheduled from its edges.
+fn points_inside(reached: &[Reached]) -> Vec<Point<'_>> {
+    let mut seen: BTreeSet<(&str, String)> = BTreeSet::new();
+    let mut offered: Vec<&Reached> = reached
+        .iter()
+        .filter(|reached| seen.insert((reached.service.as_str(), reached.mark())))
+        .collect();
+    // Endings before starts, because an ending is work finished with the next
+    // not begun, which is the gap a fault wants. The first start is only the
+    // request arriving, which the edges already offer.
+    offered.sort_by_key(|reached| reached.boundary.side == Side::Started);
+    // One of every kind of moment the fleet offers before any second of one.
+    in_turn(offered.into_iter(), |reached| {
+        (
+            reached.service.as_str(),
+            reached.boundary.span.as_str(),
+            reached.boundary.side,
+        )
+    })
+    .into_iter()
+    .map(|reached| {
+        let mark = reached.mark();
+        Point {
+            at: Where::Inside {
+                service: &reached.service,
+            },
+            why: format!(
+                "{mark} holds {} part way through its own work",
+                reached.service
+            ),
+            mark,
+
+            doing: Doing::Holding,
+            packets: None,
+        }
+    })
+    .collect()
 }
 
 /// `items` reordered so one of every group comes before any group's second,
@@ -206,11 +284,13 @@ impl BurstScheduler {
         // Interleaved, so an edge's second point comes after every edge's
         // first.
         let on_edge: Vec<Vec<Point<'_>>> = learned.profiles.iter().map(points_on).collect();
-        let found: usize = on_edge.iter().map(Vec::len).sum();
+        let inside = points_inside(&learned.inside);
+        let found: usize = on_edge.iter().map(Vec::len).sum::<usize>() + inside.len();
         let mut by_edge: Vec<Point<'_>> = Vec::with_capacity(found);
         for round in 0..on_edge.iter().map(Vec::len).max().unwrap_or(0) {
             by_edge.extend(on_edge.iter().filter_map(|edge| edge.get(round)).cloned());
         }
+        by_edge.extend(inside);
         // Then by turn, so a way of breaking the fleet with few moments is
         // covered before one with many, and the bursts take their share rather
         // than all of it.
@@ -222,7 +302,7 @@ impl BurstScheduler {
         let cost = |point: &Point<'_>| -> usize {
             ways_at(&ways, point)
                 .into_iter()
-                .map(|by| targets(by, point.edge).len())
+                .map(|by| targets(by, point.at).len())
                 .sum()
         };
         // A moment nothing can be placed on is not a moment this campaign has.
@@ -242,13 +322,8 @@ impl BurstScheduler {
         let mut next_id: u32 = Schedule::LEARN_ID + 1;
         for point in &points {
             for by in ways_at(&ways, point) {
-                for taking in targets(by, point.edge) {
-                    let anchor = Anchor {
-                        edge: point.edge.clone(),
-                        direction: point.direction,
-                        mark: point.mark.clone(),
-                        why: point.why.clone(),
-                    };
+                for taking in targets(by, point.at) {
+                    let anchor = point.at.anchoring(point.mark.clone(), point.why.clone());
                     let fault = Fault::at(anchor, taking);
                     schedules.push(Schedule::faulted(
                         next_id,
@@ -297,9 +372,20 @@ fn ways_at(ways: &[Drive], point: &Point<'_>) -> Vec<Drive> {
         .collect()
 }
 
-/// What breaking `edge` by `losing` takes from the fleet: the services at its
-/// ends, or the link between them.
-fn targets(losing: Drive, edge: &Edge) -> Vec<By> {
+/// What breaking the fleet at `at` by `losing` takes from the fleet.
+/// For an edge, the services at its ends or the link between them.
+/// For a moment inside a service, that service, held where it reported reaching.
+fn targets(losing: Drive, at: Where<'_>) -> Vec<By> {
+    let edge = match at {
+        Where::Crossing { edge, .. } => edge,
+        Where::Inside { service } => {
+            return match losing {
+                Drive::Kill => vec![By::Kill(service.to_owned())],
+                // Everything else names an edge, and this moment is not on one.
+                Drive::Cut | Drive::Repeat | Drive::Reorder | Drive::Drop => Vec::new(),
+            };
+        }
+    };
     match losing {
         Drive::Kill => edge
             .client
@@ -333,12 +419,25 @@ mod tests {
     use std::{collections::BTreeSet, time::Duration};
 
     use crucible_core::fault::Primitive;
-    use crucible_protocol::EdgeProfile;
+    use crucible_core::fault::Reaches;
+    use crucible_protocol::{Boundary, EdgeProfile};
 
     use super::*;
     use crate::scheduler::fixture;
 
     /// A burst of `packets` packets, the `nth` on its edge.
+    /// A moment `service` reported reaching, as a learn run collects them.
+    fn reached(service: &str, span: &str, side: Side, nth: u32) -> Reached {
+        Reached {
+            service: service.to_owned(),
+            boundary: Boundary {
+                span: span.to_owned(),
+                side,
+                nth,
+            },
+        }
+    }
+
     fn burst(nth: u32, packets: u32) -> Burst {
         let first = nth * packets + 1;
         let last = first + packets - 1;
@@ -420,6 +519,7 @@ mod tests {
         let learned = Learned {
             profiles: profiles.to_vec(),
             trajectory: crucible_core::verdict::Trajectory::default(),
+            inside: Vec::new(),
             primitives: ways.iter().copied().collect(),
         };
         BurstScheduler::new(
@@ -440,6 +540,138 @@ mod tests {
             .expect("a burst schedule always anchors")
     }
 
+    /// The kill takes the service that reported the moment: it is held where it
+    /// said it got to, and dies there.
+    #[test]
+    fn a_service_that_reports_its_moments_is_faulted_at_them() {
+        let learned = Learned {
+            profiles: Vec::new(),
+            trajectory: crucible_core::verdict::Trajectory::default(),
+            inside: vec![
+                reached("api", "write", Side::Started, 1),
+                reached("api", "publish", Side::Started, 1),
+            ],
+            primitives: BTreeSet::from([Primitive::Kill, Primitive::Cut, Primitive::Reorder]),
+        };
+        let mut s = BurstScheduler::new(&fixture::fleet(), &fixture::scenario(), &learned, None);
+
+        let placed: Vec<_> = std::iter::from_fn(|| s.next())
+            .map(|schedule| {
+                let fault = schedule.fault.expect("a moment is faulted");
+                let anchor = fault.anchor().expect("an inside moment anchors").clone();
+                (anchor.reaches, anchor.mark, fault.taking().target().clone())
+            })
+            .collect();
+
+        assert_eq!(
+            placed,
+            vec![
+                (
+                    Reaches::Inside {
+                        service: "api".into()
+                    },
+                    "write:1:start".into(),
+                    "api".to_owned()
+                ),
+                (
+                    Reaches::Inside {
+                        service: "api".into()
+                    },
+                    "publish:1:start".into(),
+                    "api".to_owned()
+                ),
+            ],
+            "the moment is not on an edge, so only a kill reaches it"
+        );
+    }
+
+    #[test]
+    fn every_kind_of_moment_comes_before_any_second_of_one() {
+        let reported = [
+            reached("api", "write", Side::Started, 1),
+            reached("api", "write", Side::Ended, 1),
+            reached("api", "publish", Side::Started, 1),
+            reached("api", "publish", Side::Ended, 1),
+            reached("api", "write", Side::Started, 2),
+            reached("api", "publish", Side::Started, 2),
+        ];
+        let marks: Vec<_> = points_inside(&reported)
+            .into_iter()
+            .map(|point| point.mark)
+            .collect();
+
+        let second = marks
+            .iter()
+            .position(|mark| mark == "write:2:start")
+            .expect("the second write is offered");
+        let first_publish = marks
+            .iter()
+            .position(|mark| mark == "publish:1:start")
+            .expect("the first publish is offered");
+        assert!(
+            first_publish < second,
+            "the second write came before the first publish: {marks:?}"
+        );
+    }
+
+    #[test]
+    fn a_span_ending_is_spent_before_a_span_starting() {
+        let reported = [
+            reached("api", "record", Side::Started, 1),
+            reached("api", "record", Side::Ended, 1),
+            reached("api", "queue", Side::Started, 1),
+            reached("api", "queue", Side::Ended, 1),
+        ];
+
+        let marks: Vec<_> = points_inside(&reported)
+            .into_iter()
+            .map(|point| point.mark)
+            .collect();
+
+        assert_eq!(marks[0], "record:1:end", "spent first: {marks:?}");
+        assert!(
+            marks.iter().position(|m| m == "queue:1:end")
+                < marks.iter().position(|m| m == "record:1:start"),
+            "a starting boundary outranked an ending one: {marks:?}"
+        );
+    }
+
+    #[test]
+    fn a_short_budget_reaches_the_moments_inside_services() {
+        let learned = Learned {
+            profiles: vec![profile("db", vec![burst(0, 4), burst(1, 4)], vec![])],
+            trajectory: crucible_core::verdict::Trajectory::default(),
+            inside: vec![reached("api", "publish", Side::Started, 1)],
+            primitives: BTreeSet::from([Primitive::Kill]),
+        };
+        let mut s = BurstScheduler::new(
+            &fixture::fleet(),
+            &fixture::scenario(),
+            &learned,
+            Some(affording(3)),
+        );
+
+        let marks: Vec<_> = std::iter::from_fn(|| s.next())
+            .map(|schedule| fault(&schedule).mark.clone())
+            .collect();
+        assert!(
+            marks.contains(&"publish:1:start".to_owned()),
+            "the budget was spent on edges alone: {marks:?}"
+        );
+    }
+
+    #[test]
+    fn a_fleet_that_reports_nothing_is_still_scheduled_from_its_edges() {
+        let learned = Learned {
+            profiles: vec![profile("db", vec![burst(0, 4)], vec![])],
+            trajectory: crucible_core::verdict::Trajectory::default(),
+            inside: Vec::new(),
+            primitives: BTreeSet::from([Primitive::Kill]),
+        };
+        let s = BurstScheduler::new(&fixture::fleet(), &fixture::scenario(), &learned, None);
+        assert!(s.total() > 0);
+    }
+
     /// A fleet whose loaded plugins cannot break anything cannot schedule any
     /// faults, so the campaign is a fault-free run only.
     #[test]
@@ -447,6 +679,7 @@ mod tests {
         let learned = Learned {
             profiles: vec![profile("db", vec![burst(0, 4)], vec![])],
             trajectory: crucible_core::verdict::Trajectory::default(),
+            inside: Vec::new(),
             primitives: BTreeSet::new(),
         };
         let mut s = BurstScheduler::new(&fixture::fleet(), &fixture::scenario(), &learned, None);
@@ -497,11 +730,11 @@ mod tests {
         .collect();
         assert!(
             all.iter()
-                .any(|s| fault(s).direction == Direction::ClientToUpstream)
+                .any(|s| fault(s).reaches.direction() == Some(Direction::ClientToUpstream))
         );
         assert!(
             all.iter()
-                .any(|s| fault(s).direction == Direction::UpstreamToClient)
+                .any(|s| fault(s).reaches.direction() == Some(Direction::UpstreamToClient))
         );
     }
 
@@ -516,7 +749,7 @@ mod tests {
             move || s.next()
         })
         .take(2)
-        .map(|s| fault(&s).edge.upstream.clone())
+        .filter_map(|s| fault(&s).reaches.edge().map(|e| e.upstream.clone()))
         .collect();
         assert!(first_two.contains(&"api".to_string()));
         assert!(first_two.contains(&"db".to_string()));
@@ -723,17 +956,17 @@ mod tests {
             Some(4),
         );
         assert_eq!(s.coverage().taken, 4, "both points each way");
-        let placed: Vec<(Direction, String)> = std::iter::from_fn({
+        let placed: Vec<(Option<Direction>, String)> = std::iter::from_fn({
             let mut s = s;
             move || s.next()
         })
-        .map(|s| (fault(&s).direction, fault(&s).mark.clone()))
+        .map(|s| (fault(&s).reaches.direction(), fault(&s).mark.clone()))
         .collect();
         let burst = burst(1, 4);
         // Receiving, so the start: it has taken delivery and not yet acted.
-        assert!(placed.contains(&(Direction::ClientToUpstream, burst.start.to_string())));
+        assert!(placed.contains(&(Some(Direction::ClientToUpstream), burst.start.to_string())));
         // Sending, so the end: it has emitted everything and owes a write.
-        assert!(placed.contains(&(Direction::UpstreamToClient, burst.end.to_string())));
+        assert!(placed.contains(&(Some(Direction::UpstreamToClient), burst.end.to_string())));
     }
 
     #[test]

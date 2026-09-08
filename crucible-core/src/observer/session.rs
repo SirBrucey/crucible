@@ -128,14 +128,20 @@ impl EventIndex {
         self.last_ts
     }
 
-    /// Correlate every recorded event into `Session` records.
+    /// Correlate every recorded event into the sessions they belong to.
     #[must_use]
-    pub fn sessions(&self) -> Vec<Session> {
+    pub fn catalogue(&self) -> Sessions {
         let mut sessions = Sessions::new();
         for (service, event) in &self.events {
             sessions.accept_event(service, event.clone());
         }
-        sessions.into_iter().collect()
+        sessions
+    }
+
+    /// Correlate every recorded event into `Session` records.
+    #[must_use]
+    pub fn sessions(&self) -> Vec<Session> {
+        self.catalogue().into_iter().collect()
     }
 }
 
@@ -177,14 +183,18 @@ impl SessionObserver {
         }
     }
 
-    /// Snapshot every event the observer has recorded so far, correlate them
-    /// into `Session` records, and place the result in `observations.sessions`.
+    /// Snapshot every event the observer has recorded so far and correlate
+    /// them.
+    /// Sessions from what crossed the wire and the moments services
+    /// reported from inside themselves.
     pub fn observe(&self, observations: &mut Observations) {
-        observations.sessions = self
+        let catalogue = self
             .index
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .sessions();
+            .catalogue();
+        observations.inside = catalogue.inside().to_vec();
+        observations.sessions = catalogue.into_iter().collect();
     }
 
     /// Block until the proxy reports the fleet has frozen (the fault anchor

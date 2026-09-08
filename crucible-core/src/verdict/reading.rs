@@ -591,7 +591,7 @@ mod tests {
             "db",
             how,
             At::Moment {
-                direction: crucible_protocol::Direction::ClientToUpstream,
+                direction: Some(crucible_protocol::Direction::ClientToUpstream),
                 mark: "publish:1:after".to_owned(),
                 why: "a publish the broker has not confirmed".to_owned(),
                 offset_ns: at_ns,

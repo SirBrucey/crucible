@@ -100,6 +100,15 @@ impl ConnEvent {
     }
 
     #[must_use]
+    pub fn reached(id: ConnId, boundary: crate::Boundary) -> Self {
+        Self {
+            id,
+            ts_ns: now_ns(),
+            kind: ConnEventKind::Reached { boundary },
+        }
+    }
+
+    #[must_use]
     pub fn did(id: ConnId, did: crate::Did) -> Self {
         Self {
             id,
@@ -156,10 +165,42 @@ pub enum ConnEventKind {
     Did {
         did: crate::Did,
     },
+    /// A moment inside a service, reported by the service itself.
+    Reached {
+        boundary: crate::Boundary,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 pub enum Direction {
     ClientToUpstream,
     UpstreamToClient,
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use super::*;
+
+    fn boundary() -> crate::Boundary {
+        crate::Boundary {
+            span: "publish".to_owned(),
+            side: crate::Side::Started,
+            nth: 1,
+        }
+    }
+
+    #[rstest]
+    #[case(ConnEvent::opened(1, "10.0.0.4:5672".parse().expect("an address")))]
+    #[case(ConnEvent::wrote(1, Direction::ClientToUpstream, 512))]
+    #[case(ConnEvent::froze(1, "publish:1:start".to_owned()))]
+    #[case(ConnEvent::reached(0, boundary()))]
+    fn event_serialisation_roundtrip(#[case] event: ConnEvent) {
+        let written = serde_json::to_string(&event).expect("written");
+        let read: ConnEvent = serde_json::from_str(&written)
+            .unwrap_or_else(|e| panic!("{written} could not be read back: {e}"));
+
+        assert_eq!(read, event);
+    }
 }

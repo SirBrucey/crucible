@@ -309,14 +309,14 @@ fn expected_status(stated: Option<&plan::Value>) -> Result<Option<StatusCode>, E
 /// A step that states its status is held to that one, so a request written to
 /// be refused counts as delivered when it is refused, and as a failure when it
 /// succeeds. Without a stated status the step is held to the protocol: a
-/// success delivers, a client error does not, and a server error leaves the
-/// caller unable to tell.
+/// success delivers and an error does not. A server error is the service
+/// saying its own side failed, so the work did not propagate.
 fn classify(status: StatusCode, stated: Option<StatusCode>) -> Ack {
     match stated {
         Some(stated) if stated == status => Ack::Acked,
         Some(_) => Ack::Rejected,
         None if status.is_success() => Ack::Acked,
-        None if status.is_client_error() => Ack::Rejected,
+        None if status.is_client_error() || status.is_server_error() => Ack::Rejected,
         None => Ack::Unknown,
     }
 }
@@ -324,6 +324,7 @@ fn classify(status: StatusCode, stated: Option<StatusCode>) -> Ack {
 #[cfg(test)]
 mod tests {
     use super::{Ack, Error, Http, Request, StatusCode, classify};
+    use rstest::rstest;
 
     use crate::role::Driver;
     use crucible_core::{
@@ -380,11 +381,14 @@ mod tests {
         assert!(matches!(Http::bind(&step), Err(Error::Status(_))));
     }
 
-    #[test]
-    fn an_unstated_status_is_held_to_the_protocol() {
-        assert_eq!(classify(StatusCode::CREATED, None), Ack::Acked);
-        assert_eq!(classify(StatusCode::CONFLICT, None), Ack::Rejected);
-        assert_eq!(classify(StatusCode::BAD_GATEWAY, None), Ack::Unknown);
+    #[rstest]
+    #[case(StatusCode::CREATED, Ack::Acked)]
+    #[case(StatusCode::CONFLICT, Ack::Rejected)]
+    #[case(StatusCode::INTERNAL_SERVER_ERROR, Ack::Rejected)]
+    #[case(StatusCode::SERVICE_UNAVAILABLE, Ack::Rejected)]
+    #[case(StatusCode::CONTINUE, Ack::Unknown)]
+    fn an_unstated_status_is_held_to_the_protocol(#[case] status: StatusCode, #[case] ack: Ack) {
+        assert_eq!(classify(status, None), ack);
     }
 
     #[test]

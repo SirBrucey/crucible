@@ -144,6 +144,7 @@ mod tests {
                 .map(|upstream| profile(dialled(upstream)))
                 .collect(),
             trajectory: crucible_core::verdict::Trajectory::default(),
+            inside: Vec::new(),
             primitives: BTreeSet::from([Primitive::Kill, Primitive::Cut]),
         }
     }

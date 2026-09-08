@@ -47,6 +47,9 @@ pub struct Anchor {
     /// The edge the mark is watched on, so another client's traffic to the same
     /// upstream cannot fire a fault the schedule never named.
     edge: Arc<OnceLock<OnEdge>>,
+    /// The service the moment is inside.
+    /// A mark is unique only within a service.
+    inside: Option<String>,
 }
 
 /// Which connections a fault applies to: those carrying the edge it names.
@@ -229,6 +232,29 @@ impl Anchor {
             pause,
             trip,
             edge,
+            inside: None,
+        }
+    }
+
+    /// An anchor on a moment inside `service`.
+    /// It is not on an edge, so no pair counts toward it or can fire it.
+    #[must_use]
+    pub fn inside(
+        service: String,
+        mark: String,
+        pause: watch::Sender<bool>,
+        trip: watch::Sender<bool>,
+    ) -> Self {
+        Self {
+            inside: Some(service),
+            ..Self::new(
+                Direction::ClientToUpstream,
+                mark,
+                1,
+                pause,
+                trip,
+                Arc::new(OnceLock::new()),
+            )
         }
     }
 
@@ -290,6 +316,17 @@ impl Anchor {
             return false;
         }
         if self.seen.fetch_add(1, Ordering::SeqCst) + 1 != self.nth {
+            return false;
+        }
+        self.fire();
+        true
+    }
+
+    /// The moment was reached inside `service`, which said so itself: there is
+    /// no edge to recognise and nothing to count.
+    #[must_use]
+    pub fn reached_inside(&self, service: &str) -> bool {
+        if !self.active.load(Ordering::SeqCst) || self.inside.as_deref() != Some(service) {
             return false;
         }
         self.fire();
@@ -790,6 +827,9 @@ mod tests {
                 }
                 ConnEventKind::Did { did } => {
                     panic!("an unread kind changed nothing: {did:?}")
+                }
+                ConnEventKind::Reached { boundary } => {
+                    panic!("nothing inside a service reported here: {boundary:?}")
                 }
                 ConnEventKind::Closed {
                     bytes_client_to_upstream,

@@ -181,15 +181,15 @@ mod tests {
                 vec![step()],
                 vec![check()],
                 crate::fault::Fault::at(
-                    crate::fault::Anchor {
-                        edge: crucible_protocol::Edge {
+                    crate::fault::Anchor::crossing(
+                        crucible_protocol::Edge {
                             client: Some("api".into()),
                             upstream: "db".into(),
                         },
-                        direction: Direction::ClientToUpstream,
-                        mark: "ack:7:before".into(),
-                        why: "an ack the consumer has sent and the broker has not seen".into(),
-                    },
+                        Direction::ClientToUpstream,
+                        "ack:7:before".into(),
+                        "an ack the consumer has sent and the broker has not seen".into(),
+                    ),
                     crate::fault::By::Kill("db".into()),
                 ),
                 [

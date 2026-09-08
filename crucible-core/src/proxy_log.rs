@@ -6,8 +6,8 @@ use std::{
 };
 
 use crucible_protocol::{
-    Burst, ConnEvent, ConnEventKind, ConnId, Direction, Edge, EdgeProfile, Placement, Session,
-    WriteRecord,
+    Burst, ConnEvent, ConnEventKind, ConnId, Direction, Edge, EdgeProfile, Placement, Reached,
+    Session, WriteRecord,
 };
 
 struct Pending {
@@ -22,12 +22,20 @@ struct Pending {
 pub struct Sessions {
     opened: HashMap<(String, ConnId), Pending>,
     finished: Vec<Session>,
+    /// Moments inside services.
+    inside: Vec<Reached>,
 }
 
 impl Sessions {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The moments services reported from inside themselves.
+    #[must_use]
+    pub fn inside(&self) -> &[Reached] {
+        &self.inside
     }
 
     pub fn accept_event(&mut self, service: &str, event: ConnEvent) {
@@ -69,6 +77,10 @@ impl Sessions {
             ConnEventKind::Failed { .. } => {
                 self.opened.remove(&(service.to_string(), id));
             }
+            ConnEventKind::Reached { boundary } => self.inside.push(Reached {
+                service: service.to_string(),
+                boundary,
+            }),
             ConnEventKind::Placeable { placement } => {
                 if let Some(pending) = self.opened.get_mut(&(service.to_string(), id)) {
                     pending.placements.push(placement);
@@ -281,6 +293,7 @@ mod tests {
             let catalogue = WorkerToRunner::SessionCatalogue(crate::learned::Learned {
                 profiles,
                 trajectory: crate::verdict::Trajectory::default(),
+                inside: Vec::new(),
                 primitives: std::collections::BTreeSet::new(),
             });
             let mut buf = vec![0u8; 2_000_000];

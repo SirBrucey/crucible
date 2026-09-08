@@ -1,5 +1,7 @@
 mod error;
+mod fleet;
 mod proxy;
+mod span;
 
 use std::{
     collections::HashSet,
@@ -53,6 +55,15 @@ struct Cli {
     /// the connection between the proxy and the two services.
     #[arg(long = "fault", default_value = "kill")]
     fault: Primitive,
+    /// Where instrumented services report the moments inside them, and where
+    /// one is held if `--inside` names it.
+    #[arg(long = "span-listen", default_value = "0.0.0.0:4145")]
+    span_listen: String,
+    /// The moment inside a service to hold at, as `SERVICE=MARK`
+    /// (`api=publish:1:start`). Absent, every boundary is reported and none is
+    /// held.
+    #[arg(long = "inside")]
+    inside: Option<String>,
     /// Hold the edge `CLIENT>UPSTREAM` down from scenario start until released,
     /// so the fleet runs degraded rather than meeting one instantaneous fault.
     #[arg(long = "degrade")]
@@ -165,6 +176,30 @@ fn parse_edge(spec: &str) -> Result<(Option<String>, String)> {
     ))
 }
 
+/// A parsed `--inside` anchor: hold `service` when it reports reaching `mark`.
+struct Inside {
+    service: String,
+    mark: String,
+}
+
+/// Parse `SERVICE=MARK`.
+///
+/// # Errors
+/// Errors if either half is missing.
+fn parse_inside(spec: &str) -> Result<Inside> {
+    let malformed = || Error::MalformedInside { spec: spec.into() };
+    let Some((service, mark)) = spec.split_once('=') else {
+        return Err(malformed());
+    };
+    if service.is_empty() || mark.is_empty() {
+        return Err(malformed());
+    }
+    Ok(Inside {
+        service: service.to_owned(),
+        mark: mark.to_owned(),
+    })
+}
+
 fn parse_fault_at(spec: &str) -> Result<FaultAt> {
     let malformed = || Error::MalformedFaultAt { spec: spec.into() };
     let mut parts = spec.splitn(3, '=');
@@ -185,10 +220,6 @@ fn parse_fault_at(spec: &str) -> Result<FaultAt> {
     })
 }
 
-/// Every address the fleet's services answer at, and those of `client` alone.
-///
-/// Read as the scenario starts, when the fleet is up and its names resolve.
-/// Nothing is looked up while bytes are moving.
 async fn resolve(hosts: &[ServiceHost], client: Option<&str>) -> Result<OnEdge> {
     let mut fleet = HashSet::new();
     let mut theirs = HashSet::new();
@@ -275,51 +306,35 @@ async fn main() -> Result<()> {
     // Which connections the fault applies to. A pair carries every client that
     // dials its upstream, and a fault is placed on one edge.
     let edge: Arc<OnceLock<OnEdge>> = Arc::new(OnceLock::new());
-    let job = match &at {
-        Some(at) => Job::Anchored {
-            anchor: Anchor::new(
-                at.direction,
-                at.mark.clone(),
-                nth,
-                pause_tx.clone(),
-                trip_tx,
-                Arc::clone(&edge),
-            ),
+    let inside = cli.inside.as_deref().map(parse_inside).transpose()?;
+    let job = job_for(
+        Anchoring {
+            at: at.as_ref(),
+            inside: inside.as_ref(),
+            degraded: degrade.is_some(),
+            nth,
             fault,
         },
-        None if degrade.is_some() => Job::Degrade {
-            down: down_tx.clone(),
-        },
-        None => Job::Observe,
-    };
-    let anchor = match &job {
-        Job::Anchored { anchor, .. } => Some(anchor.clone()),
-        Job::Observe | Job::Degrade { .. } => None,
-    };
+        pause_tx.clone(),
+        trip_tx,
+        down_tx.clone(),
+        &edge,
+    );
+    let anchor = job.anchor();
 
-    for pair in pairs {
-        // Only the pairs fronting the anchored service count toward the fault,
-        // and only they can be severed by it.
-        let anchored = at.as_ref().is_some_and(|at| at.upstream == pair.service);
-        let degraded = degrade
-            .as_ref()
-            .is_some_and(|(_, upstream)| *upstream == pair.service);
-        let gate = Gate::new(
-            pause_rx.clone(),
-            if anchored {
-                sever_rx.clone()
-            } else {
-                watch::channel(0u64).1
-            },
-            if degraded {
-                down_rx.clone()
-            } else {
-                watch::channel(false).1
-            },
-            Arc::clone(&edge),
-        );
-        serve(pair, gate, anchored.then(|| anchor.clone()).flatten()).await?;
-    }
+    serve_pairs(
+        pairs,
+        Gates {
+            at: at.as_ref(),
+            degrade: degrade.as_ref(),
+            anchor: anchor.as_ref(),
+            pause: &pause_rx,
+            sever: &sever_rx,
+            down: &down_rx,
+            edge: &edge,
+        },
+    )
+    .await?;
 
     // Whichever of the two placed a fault named the edge it applies to.
     let client = at
@@ -327,7 +342,20 @@ async fn main() -> Result<()> {
         .map(|at| at.client.clone())
         .or_else(|| degrade.as_ref().map(|(client, _)| client.clone()))
         .flatten();
-    spawn_fault_control(job, trip_rx, pause_tx, sever_tx, edge, hosts, client);
+    let named = Arc::new(fleet::Named::new(hosts));
+    named.warm();
+    serve_spans(&cli, anchor.clone(), pause_rx.clone(), Arc::clone(&named)).await?;
+    spawn_fault_control(
+        job,
+        trip_rx,
+        pause_tx,
+        sever_tx,
+        Fleet {
+            named,
+            client,
+            edge,
+        },
+    );
 
     for spec in cli.control {
         // A control pair carries the framework's own traffic, which is not
@@ -434,6 +462,149 @@ async fn serve(pair: Pair, gate: Gate, anchor: Option<Anchor>) -> Result<()> {
     Ok(())
 }
 
+/// Listen for the moments instrumented services report, holding at the one
+/// `inside` names.
+///
+/// Reported on the same stream a pair's events go out on, tagged with the
+/// service that reported it.
+async fn serve_spans(
+    cli: &Cli,
+    anchor: Option<Anchor>,
+    pause: watch::Receiver<bool>,
+    named: Arc<fleet::Named>,
+) -> Result<()> {
+    let (events_tx, mut events) = tokio::sync::mpsc::unbounded_channel();
+    let watching = match cli.inside.as_deref().map(parse_inside).transpose()? {
+        Some(inside) => crucible_protocol::Watching::Holding {
+            at: vec![inside.mark],
+        },
+        None => crucible_protocol::Watching::Reporting,
+    };
+    let spans = std::sync::Arc::new(span::Spans::new(watching, anchor, pause, events_tx, named));
+    let at = span::listen(spans, &cli.span_listen).await?;
+    tracing::info!(%at, "listening for the moments inside services");
+    tokio::spawn(async move {
+        while let Some((service, event)) = events.recv().await {
+            match serde_json::to_string(&event) {
+                Ok(line) => {
+                    println!("{service}\t{line}");
+                    let _ = std::io::stdout().flush();
+                }
+                Err(e) => tracing::error!(?e, "serialize conn event"),
+            }
+        }
+    });
+    Ok(())
+}
+
+/// What this run was told to place, which is what decides the proxy's job.
+#[derive(Clone, Copy)]
+struct Anchoring<'a> {
+    at: Option<&'a FaultAt>,
+    inside: Option<&'a Inside>,
+    /// Whether an edge is to be held down for the whole scenario.
+    degraded: bool,
+    /// How many of the anchored edge's moments to let pass first.
+    nth: u32,
+    fault: Fault,
+}
+
+/// What the proxy is for this run: place a fault at a moment, hold an edge
+/// down, or watch.
+fn job_for(
+    anchoring: Anchoring<'_>,
+    pause: watch::Sender<bool>,
+    trip: watch::Sender<bool>,
+    down: watch::Sender<bool>,
+    edge: &Arc<OnceLock<OnEdge>>,
+) -> Job {
+    let Anchoring {
+        at,
+        inside,
+        degraded,
+        nth,
+        fault,
+    } = anchoring;
+    match (at, inside) {
+        (Some(at), _) => Job::Anchored {
+            anchor: Anchor::new(
+                at.direction,
+                at.mark.clone(),
+                nth,
+                pause,
+                trip,
+                Arc::clone(edge),
+            ),
+            fault,
+        },
+        // The moment is not on an edge, so nothing crossing a pair places this
+        // fault, the service reports reaching it and is held there.
+        (None, Some(inside)) => Job::Anchored {
+            anchor: Anchor::inside(inside.service.clone(), inside.mark.clone(), pause, trip),
+            fault,
+        },
+        (None, None) if degraded => Job::Degrade { down },
+        (None, None) => Job::Observe,
+    }
+}
+
+/// What every pair is subject to, which differs only by whether the pair
+/// fronts the service a fault names.
+struct Gates<'a> {
+    at: Option<&'a FaultAt>,
+    degrade: Option<&'a (Option<String>, String)>,
+    anchor: Option<&'a Anchor>,
+    pause: &'a watch::Receiver<bool>,
+    sever: &'a watch::Receiver<u64>,
+    down: &'a watch::Receiver<bool>,
+    edge: &'a Arc<OnceLock<OnEdge>>,
+}
+
+/// Bring every pair up, each gated by whether a fault names the service it
+/// fronts.
+///
+/// # Errors
+/// Errors if a pair cannot bind.
+async fn serve_pairs(pairs: Vec<Pair>, gates: Gates<'_>) -> Result<()> {
+    for pair in pairs {
+        // Only the pairs fronting the anchored service count toward the fault
+        // and only they can be severed by it.
+        let anchored = gates.at.is_some_and(|at| at.upstream == pair.service);
+        let degraded = gates
+            .degrade
+            .is_some_and(|(_, upstream)| *upstream == pair.service);
+        let gate = Gate::new(
+            gates.pause.clone(),
+            if anchored {
+                gates.sever.clone()
+            } else {
+                watch::channel(0u64).1
+            },
+            if degraded {
+                gates.down.clone()
+            } else {
+                watch::channel(false).1
+            },
+            Arc::clone(gates.edge),
+        );
+        serve(
+            pair,
+            gate,
+            anchored.then(|| gates.anchor.cloned()).flatten(),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// What the proxy has to work out once the fleet is up, because a name only answers
+/// then.
+struct Fleet {
+    named: Arc<fleet::Named>,
+    client: Option<String>,
+    edge: Arc<OnceLock<OnEdge>>,
+}
+
 /// Do this proxy's job for the lifetime of the process: impose it when the
 /// scenario starts (SIGUSR1), and lift it when told the run is over (SIGUSR2)
 /// or that nothing was placed (SIGHUP).
@@ -444,9 +615,7 @@ fn spawn_fault_control(
     mut trip: watch::Receiver<bool>,
     pause: watch::Sender<bool>,
     sever: watch::Sender<u64>,
-    edge: Arc<OnceLock<OnEdge>>,
-    hosts: Vec<ServiceHost>,
-    client: Option<String>,
+    fleet: Fleet,
 ) {
     tokio::spawn(async move {
         let (mut arm, mut proceed, mut abandon) = match (
@@ -465,14 +634,14 @@ fn spawn_fault_control(
                 _ = arm.recv() => {
                     // The fleet answers to its names only once it is up, so the
                     // edge is resolved here rather than at bind.
-                    if edge.get().is_none() {
-                        match resolve(&hosts, client.as_deref()).await {
+                    if fleet.edge.get().is_none() {
+                        match resolve(fleet.named.hosts(), fleet.client.as_deref()).await {
                             // Resolving wrongly would leave the fault watching
                             // connections it was never named for, so the edge
                             // is left unresolved and the fault reports a miss.
                             Err(e) => tracing::error!(%e, "the fleet could not be resolved"),
                             Ok(resolved) => {
-                                if edge.set(resolved).is_err() {
+                                if fleet.edge.set(resolved).is_err() {
                                     tracing::warn!(
                                         "the edge was resolved twice, so the first stands"
                                     );
@@ -526,6 +695,16 @@ enum Job {
     Anchored { anchor: Anchor, fault: Fault },
     /// Hold a service's pairs down from scenario start until released.
     Degrade { down: watch::Sender<bool> },
+}
+
+impl Job {
+    /// The moment this job waits for, if it waits for one.
+    fn anchor(&self) -> Option<Anchor> {
+        match self {
+            Job::Anchored { anchor, .. } => Some(anchor.clone()),
+            Job::Observe | Job::Degrade { .. } => None,
+        }
+    }
 }
 
 impl Job {

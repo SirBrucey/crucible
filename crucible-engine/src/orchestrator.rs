@@ -256,6 +256,7 @@ impl Orchestrator<Ready> {
                 &addresses,
             ),
             trajectory: observations.trajectory,
+            inside: observations.inside,
             primitives,
         };
         let done = Orchestrator {
@@ -783,7 +784,7 @@ async fn place(
         fault.taking().target(),
         fault.primitive(),
         At::Moment {
-            direction: anchor.direction,
+            direction: anchor.reaches.direction(),
             mark: anchor.mark.clone(),
             why: anchor.why.clone(),
             offset_ns: placed_at_ns.saturating_sub(scenario_start_ns),
@@ -865,15 +866,15 @@ mod tests {
     /// A kill of `db`, anchored in what `api` was saying to it.
     fn fault() -> Fault {
         Fault::at(
-            crucible_core::fault::Anchor {
-                edge: crucible_protocol::Edge {
+            crucible_core::fault::Anchor::crossing(
+                crucible_protocol::Edge {
                     client: Some("api".into()),
                     upstream: "db".into(),
                 },
-                direction: Direction::ClientToUpstream,
-                mark: "ack:7:before".into(),
-                why: "an ack the consumer has sent and the broker has not seen".into(),
-            },
+                Direction::ClientToUpstream,
+                "ack:7:before".into(),
+                "an ack the consumer has sent and the broker has not seen".into(),
+            ),
             By::Kill("db".into()),
         )
     }

@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 
-use crucible_protocol::EdgeProfile;
+use crucible_protocol::{EdgeProfile, Reached};
 
 use crate::{fault::Primitive, verdict::Trajectory};
 
@@ -15,6 +15,10 @@ pub struct Learned {
     /// The state each step left behind, which every faulted run is judged
     /// against.
     pub trajectory: Trajectory,
+    /// The moments services offered from inside themselves.
+    /// Empty unless a service is instrumented.
+    /// A fleet that offers none is still scheduled from its edges.
+    pub inside: Vec<Reached>,
     /// What can be done to this fleet.
     pub primitives: BTreeSet<Primitive>,
 }

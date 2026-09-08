@@ -128,6 +128,8 @@ pub struct Observations {
     /// When each step ran, in the order the scenario states them.
     pub windows: Vec<StepWindow>,
     pub sessions: Vec<crucible_protocol::Session>,
+    /// The moments services reported from inside themselves.
+    pub inside: Vec<crucible_protocol::Reached>,
     pub fault: Option<crucible_protocol::FaultReport>,
 }
 

@@ -110,6 +110,23 @@ jobs:
           dpkg-deb -c examples/dns-observer/target/debian/crucible-observer-dns_*_amd64.deb | tee contents
           grep -q ' ./usr/lib/crucible/plugins/crucible-observer-dns$' contents
 
+  python:
+    name: python
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install ./python[dev]
+      - run: flake8 crucible_span_py tests
+        working-directory: python
+      - run: mypy crucible_span_py tests
+        working-directory: python
+      - run: pytest tests
+        working-directory: python
+
   machete:
     name: machete
     runs-on: ubuntu-latest
