@@ -1,13 +1,5 @@
 //! Faults placed at the points the fault-free run turned up.
 //!
-//! Where a plugin read an edge, it said what its moments are and what breaking
-//! the fleet at each of them is. Where nothing could, all that is known is the
-//! traffic that crossed it, clustered into bursts (see
-//! [`crucible_core::proxy_log::edge_profiles_from_sessions`]).
-//!
-//! A schedule is a way of breaking the fleet at a moment. Which invariant that
-//! broke is read off the run afterwards.
-//!
 //! Every edge is faulted at one point before any edge is faulted at two, so a
 //! short budget costs depth rather than whole edges.
 
@@ -26,10 +18,8 @@ use super::{Budget, Scheduler};
 
 /// Somewhere a fault can go.
 ///
-/// An edge a plugin can read says where its own moments are and what they
-/// catch. One nothing can read offers only counts of what crossed it, which is
-/// what the bursts are for. A service that reports its own moments offers those
-/// too, and they are not on an edge.
+/// An edge a plugin can read says where its own moments are. One nothing can
+/// read offers only counts of what crossed it.
 #[derive(Clone, Debug)]
 struct Point<'a> {
     /// What reaches this moment, which is what can be broken.
@@ -71,12 +61,9 @@ impl Where<'_> {
 
 impl Point<'_> {
     /// The group this point takes its turn in, so the budget is spread across
-    /// the ways of breaking the fleet and neither the bursts nor the edges
-    /// crowd out the moments inside services.
+    /// the ways of breaking the fleet.
     ///
-    /// Where a moment is counts as much as how it breaks the fleet: one inside
-    /// a service reaches a gap nothing on the wire marks, so it is not
-    /// interchangeable with an edge moment that breaks the fleet the same way.
+    /// A moment inside a service reaches a gap nothing on the wire marks.
     fn bucket(&self) -> (bool, bool, Doing) {
         (
             self.packets.is_none(),
@@ -88,9 +75,8 @@ impl Point<'_> {
 
 /// Where a fault can go on `profile`, in the order the points should be spent.
 ///
-/// A plugin that read the edge has already said what its moments are and how
-/// each breaks the fleet. Otherwise all that is known is what crossed it, so a
-/// fault goes by the middle of a burst first and its edges after.
+/// Where nothing read the edge, a fault goes by the middle of a burst first
+/// and its edges after.
 fn points_on(profile: &EdgeProfile) -> Vec<Point<'_>> {
     if !profile.placements.is_empty() {
         return profile
@@ -146,8 +132,7 @@ fn points_on(profile: &EdgeProfile) -> Vec<Point<'_>> {
 
 /// Where inside its services a fault can go, one point per moment reported.
 ///
-/// Empty unless a service is instrumented, a fleet that reports nothing is
-/// still scheduled from its edges.
+/// Empty unless a service is instrumented.
 fn points_inside(reached: &[Reached]) -> Vec<Point<'_>> {
     let mut seen: BTreeSet<(&str, String)> = BTreeSet::new();
     let mut offered: Vec<&Reached> = reached
@@ -210,12 +195,8 @@ fn in_turn<T, K: PartialEq>(items: impl Iterator<Item = T>, group: impl Fn(&T) -
 
 /// Where in `burst` a fault can go, from the middle outwards.
 ///
-/// The outer point is the boundary the service is on: it is the source of an
-/// outbound burst, so the end is where it has emitted everything and is about
-/// to write it down; it is the target of an inbound one, so the start is where
-/// it has taken delivery and not yet acted. A `start` of zero is not placeable,
-/// since freezing there kills the service before the scenario has driven
-/// anything across the edge.
+/// A `start` of zero is not placeable, since freezing there kills the service
+/// before anything has crossed the edge.
 fn points_in(burst: Burst, direction: Direction) -> Vec<u32> {
     let outer = match direction {
         Direction::UpstreamToClient => [burst.end, burst.start],
@@ -258,13 +239,10 @@ impl std::fmt::Display for Coverage {
 }
 
 impl BurstScheduler {
-    /// Fit the bursts the learn pass found into `budget`. Every burst on every
-    /// edge is faulted before any is faulted harder, so what a short budget
-    /// costs is resolution within a burst rather than whole edges.
+    /// Fit the bursts the learn pass found into `budget`.
     ///
-    /// No budget places every point in every burst. Each schedule carries the
-    /// work to run as well as the fault, so a worker needs nothing else to run
-    /// it.
+    /// Every burst on every edge is faulted before any is faulted harder, so a
+    /// short budget costs resolution within a burst rather than whole edges.
     #[must_use]
     pub fn new(
         fleet: &plan::Fleet,
@@ -331,7 +309,7 @@ impl BurstScheduler {
                         scenario.steps.clone(),
                         scenario.checks.clone(),
                         fault,
-                        learned.trajectory.clone(),
+                        learned.fault_free.clone(),
                         scenario.consistent_within,
                     ));
                     next_id += 1;
@@ -358,10 +336,8 @@ impl BurstScheduler {
 
 /// The ways this campaign can break the fleet at `point`.
 ///
-/// A moment a plugin named says what breaking the fleet there is, and there is
-/// one way to do that. A burst is a count of packets, so all it can offer is a
-/// place to hold the fleet while something is taken away from outside it:
-/// changing what crosses needs something that can read what crossed.
+/// A burst is only a count of packets, so all it offers is a place to hold the
+/// fleet.
 fn ways_at(ways: &[Drive], point: &Point<'_>) -> Vec<Drive> {
     ways.iter()
         .filter(|by| match point.doing {
@@ -518,7 +494,7 @@ mod tests {
     ) -> BurstScheduler {
         let learned = Learned {
             profiles: profiles.to_vec(),
-            trajectory: crucible_core::verdict::Trajectory::default(),
+            fault_free: crucible_core::verdict::Baseline::default(),
             inside: Vec::new(),
             primitives: ways.iter().copied().collect(),
         };
@@ -533,8 +509,7 @@ mod tests {
     /// Where a burst schedule's fault lands.
     fn fault(schedule: &Schedule) -> &Anchor {
         schedule
-            .fault
-            .as_ref()
+            .fault()
             .expect("a burst schedule always faults")
             .anchor()
             .expect("a burst schedule always anchors")
@@ -546,7 +521,7 @@ mod tests {
     fn a_service_that_reports_its_moments_is_faulted_at_them() {
         let learned = Learned {
             profiles: Vec::new(),
-            trajectory: crucible_core::verdict::Trajectory::default(),
+            fault_free: crucible_core::verdict::Baseline::default(),
             inside: vec![
                 reached("api", "write", Side::Started, 1),
                 reached("api", "publish", Side::Started, 1),
@@ -557,7 +532,7 @@ mod tests {
 
         let placed: Vec<_> = std::iter::from_fn(|| s.next())
             .map(|schedule| {
-                let fault = schedule.fault.expect("a moment is faulted");
+                let fault = schedule.fault().expect("a moment is faulted").clone();
                 let anchor = fault.anchor().expect("an inside moment anchors").clone();
                 (anchor.reaches, anchor.mark, fault.taking().target().clone())
             })
@@ -640,7 +615,7 @@ mod tests {
     fn a_short_budget_reaches_the_moments_inside_services() {
         let learned = Learned {
             profiles: vec![profile("db", vec![burst(0, 4), burst(1, 4)], vec![])],
-            trajectory: crucible_core::verdict::Trajectory::default(),
+            fault_free: crucible_core::verdict::Baseline::default(),
             inside: vec![reached("api", "publish", Side::Started, 1)],
             primitives: BTreeSet::from([Primitive::Kill]),
         };
@@ -664,7 +639,7 @@ mod tests {
     fn a_fleet_that_reports_nothing_is_still_scheduled_from_its_edges() {
         let learned = Learned {
             profiles: vec![profile("db", vec![burst(0, 4)], vec![])],
-            trajectory: crucible_core::verdict::Trajectory::default(),
+            fault_free: crucible_core::verdict::Baseline::default(),
             inside: Vec::new(),
             primitives: BTreeSet::from([Primitive::Kill]),
         };
@@ -678,7 +653,7 @@ mod tests {
     fn nothing_testable_yields_nothing() {
         let learned = Learned {
             profiles: vec![profile("db", vec![burst(0, 4)], vec![])],
-            trajectory: crucible_core::verdict::Trajectory::default(),
+            fault_free: crucible_core::verdict::Baseline::default(),
             inside: Vec::new(),
             primitives: BTreeSet::new(),
         };
@@ -762,8 +737,7 @@ mod tests {
             move || s.next()
         })
         .map(|s| {
-            s.fault
-                .as_ref()
+            s.fault()
                 .expect("a burst schedule always faults")
                 .taking()
                 .target()
@@ -873,10 +847,7 @@ mod tests {
         assert_eq!(s.total(), 1, "one way, not three");
         let mut s = s;
         let only = s.next().expect("the moment is placeable");
-        assert_eq!(
-            only.fault.as_ref().map(Fault::primitive),
-            Some(Primitive::Drop)
-        );
+        assert_eq!(only.fault().map(Fault::primitive), Some(Primitive::Drop));
     }
 
     /// A burst is a count of packets. Nothing read the edge, so nothing there
@@ -892,7 +863,7 @@ mod tests {
             let mut s = s;
             move || s.next()
         })
-        .filter_map(|schedule| schedule.fault.as_ref().map(Fault::primitive))
+        .filter_map(|schedule| schedule.fault().map(Fault::primitive))
         .collect();
         assert!(ways.iter().all(|by| *by == Primitive::Kill), "{ways:?}");
     }

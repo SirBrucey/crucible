@@ -10,11 +10,10 @@ use crucible_protocol::{At, Did, FaultMissReason, FaultReport, FaultResult, now_
 
 use crucible_core::{
     fault::{By, Fault, Primitive},
-    ipc::Verdict,
     learned::Learned,
     observer::{Reported, SessionObserver},
     proxy_log::edge_profiles_from_sessions,
-    verdict::{Checkpoint, Observations, Observed, StepWindow, Trajectory},
+    verdict::{Baseline, Checkpoint, Observations, Observed, Readings, StepWindow},
 };
 use crucible_plugin::{
     Action, DeploymentRuntime, Kill, Substrate, Targeted, registry::PreparedCheck,
@@ -30,10 +29,6 @@ const LEARN_SETTLE: Duration = Duration::from_millis(100);
 /// have finished with one, so work a step starts after answering its caller has
 /// begun before anything looks for it.
 const STEP_SETTLE: Duration = Duration::from_millis(100);
-/// How long a step's effects have to settle before the next one starts. A fleet
-/// still working after this is one the scenario has outrun, which is a result
-/// rather than something to keep waiting on.
-const STEP_BUDGET: Duration = Duration::from_secs(15);
 /// Consider the fleet quiescent once no sidecar has forwarded traffic for this
 /// long. Comfortably larger than a DB write plus docker-log delivery latency.
 const QUIESCENCE_IDLE: Duration = Duration::from_secs(1);
@@ -41,25 +36,22 @@ const QUIESCENCE_IDLE: Duration = Duration::from_secs(1);
 /// stop waiting. In practice the scenario ending fires first (a shorter path to
 /// the same "missed" outcome); this only guards a pathological hang.
 const ANCHOR_TIMEOUT: Duration = Duration::from_mins(1);
-/// A freeze is observed through the docker log stream, which batches, so it can
-/// arrive well after the traffic that caused it. Once the fleet is quiet, wait
-/// this long for one to appear before concluding the anchor was missed.
+/// How long to wait for a freeze once the fleet is quiet, before concluding
+/// the anchor was missed.
 ///
-/// Only ever paid on the way to reporting a miss, so it costs a run that found
-/// its fault nothing. Reporting a fault that fired as one that never did is
-/// worth more than the seconds this spends.
+/// The docker log stream batches, so one can arrive well after the traffic
+/// that caused it.
 const FREEZE_GRACE: Duration = Duration::from_secs(5);
 /// A fault the proxy places itself is reported over the same stream, so what it
 /// says arrives after it happened. Wait this long for it before concluding
 /// nothing was placed.
 const PLACED_GRACE: Duration = Duration::from_secs(5);
 
-/// Per-worker orchestrator that owns the replica lifecycle around one scenario,
-/// modelled as a typestate so a phase can only reach for what earlier phases
-/// produced. `New` holds the deployment and the actions to run; [`setup`] brings up
-/// the fleet and its session observer to reach [`Ready`], from which the replica
-/// runs exactly one scenario, fault-free via [`learn`] or with a fault via
-/// [`execute`], leaving the orchestrator [`Done`] with only teardown remaining.
+/// Owns the replica lifecycle around one scenario, as a typestate so a phase
+/// can only reach for what earlier phases produced.
+///
+/// [`setup`] brings up the fleet to reach [`Ready`], which runs one scenario
+/// via [`learn`] or [`execute`], leaving it [`Done`].
 ///
 /// [`setup`]: Orchestrator::<New>::setup
 /// [`learn`]: Orchestrator::<Ready>::learn
@@ -99,13 +91,12 @@ impl Orchestrator<New> {
         }
     }
 
-    /// Bring up the fleet, start streaming its session observer, and resolve
-    /// where every action's target is reachable. Tears the replica down on any
-    /// failure so a half-built fleet does not leak.
+    /// Bring up the fleet, start its session observer, and resolve where every
+    /// action's target is reachable. Tears the replica down on any failure.
     ///
     /// # Errors
-    /// Errors if the fleet fails to come up or become ready, or if it publishes
-    /// no endpoint for a service an action targets.
+    /// Errors if the fleet fails to come up or become ready, or if it
+    /// publishes no endpoint for a service an action targets.
     pub async fn setup(mut self) -> Result<Orchestrator<Ready>, crucible_plugin::Error> {
         if let Err(e) = self.deployment.setup().await {
             let _ = self.deployment.teardown().await;
@@ -198,9 +189,58 @@ impl Orchestrator<Ready> {
         self.deployment.as_ref()
     }
 
-    /// Run the scenario fault-free, returning per-service profiles for the
-    /// scheduler to cluster into bursts, and the state each step left behind
-    /// for every other run to be judged against.
+    /// Drive the actions this orchestrator holds with nothing broken, and read
+    /// what they left.
+    ///
+    /// # Errors
+    /// Errors if the scenario cannot be driven or the checks cannot be read.
+    pub async fn reference(
+        self,
+        queries: &[PreparedCheck],
+        consistent_within: Duration,
+    ) -> Result<(Readings, Orchestrator<Done>), crucible_plugin::Error> {
+        let Orchestrator {
+            deployment,
+            state: Ready {
+                session_observer,
+                actions,
+            },
+        } = self;
+        let driving = Driving {
+            actions: &actions,
+            queries,
+            session_observer: &session_observer,
+            consistent_within,
+        };
+        let outcome: Result<Readings, crucible_plugin::Error> = async {
+            let mut observations =
+                run_actions(deployment.as_ref(), driving, Instant::now()).await?;
+            session_observer
+                .wait_for_quiescence(LEARN_SETTLE, QUIESCENCE_IDLE, consistent_within)
+                .await;
+            observations.readings.checks = read_checks(deployment.as_ref(), queries).await?;
+            session_observer.observe(&mut observations);
+            Ok(observations.readings)
+        }
+        .await;
+
+        match outcome {
+            Ok(readings) => {
+                let done = Orchestrator {
+                    deployment,
+                    state: Done { session_observer },
+                };
+                Ok((readings, done))
+            }
+            Err(e) => {
+                let _ = teardown_replica(deployment, session_observer).await;
+                Err(e)
+            }
+        }
+    }
+
+    /// Run the scenario fault-free, returning per-service profiles and the
+    /// state each step left behind.
     ///
     /// # Errors
     /// Errors if the scenario fails to run against the fleet, or if a check
@@ -218,15 +258,14 @@ impl Orchestrator<Ready> {
                 actions,
             },
         } = self;
-        let scenario_start_ns = now_ns();
-        let mut observations = match run_actions(
-            deployment.as_ref(),
-            &actions,
+        let driving = Driving {
+            actions: &actions,
             queries,
-            &session_observer,
-            Instant::now(),
-        )
-        .await
+            session_observer: &session_observer,
+            consistent_within,
+        };
+        let scenario_start_ns = now_ns();
+        let mut observations = match run_actions(deployment.as_ref(), driving, Instant::now()).await
         {
             Ok(observations) => observations,
             Err(e) => {
@@ -245,17 +284,36 @@ impl Orchestrator<Ready> {
         session_observer
             .wait_for_quiescence(LEARN_SETTLE, QUIESCENCE_IDLE, consistent_within)
             .await;
+        // Read again now the fleet has had the whole settling time, not just
+        // the step's share of it. Every run this one answers for is read that
+        // way, so the two are comparable only if this one is too. This still
+        // owns the replica, so a failure tears it down rather than dropping the
+        // only handle to it.
+        match read_checks(deployment.as_ref(), queries).await {
+            Ok(checks) => observations.readings.checks = checks,
+            Err(e) => {
+                let _ = teardown_replica(deployment, session_observer).await;
+                return Err(e);
+            }
+        }
         session_observer.observe(&mut observations);
         // Read before teardown, while every service is still up and holding the
-        // address its traffic came from.
-        let addresses = deployment.addresses().await?;
+        // address its traffic came from. A failure here still owns the replica,
+        // so it tears down rather than dropping the only handle to it.
+        let addresses = match deployment.addresses().await {
+            Ok(addresses) => addresses,
+            Err(e) => {
+                let _ = teardown_replica(deployment, session_observer).await;
+                return Err(e);
+            }
+        };
         let learned = Learned {
             profiles: edge_profiles_from_sessions(
                 &observations.sessions,
                 scenario_start_ns,
                 &addresses,
             ),
-            trajectory: observations.trajectory,
+            fault_free: observations.readings.baseline(),
             inside: observations.inside,
             primitives,
         };
@@ -266,14 +324,12 @@ impl Orchestrator<Ready> {
         Ok((learned, done))
     }
 
-    /// Run the scenario; the proxy self-freezes the fleet once `fault`'s target
-    /// has forwarded its Kth packet on its direction, then the kill lands
-    /// against that held flow. The scenario's checks read what the fleet settled
-    /// on. Produce a verdict and report, leaving the orchestrator [`Done`].
+    /// Run the scenario with `fault` placed in it, and read what the fleet
+    /// settled on.
     ///
     /// # Errors
-    /// Errors if arming, resuming, killing, or restarting the fleet fails, if the
-    /// scenario fails to run, or if a check cannot be read.
+    /// Errors if arming, resuming, killing, or restarting the fleet fails, if
+    /// the scenario fails to run, or if a check cannot be read.
     // Every worker's log goes to the one place, so what a line is about is only
     // clear if it says which run it came from.
     #[tracing::instrument(skip_all, fields(schedule = schedule_id))]
@@ -282,9 +338,9 @@ impl Orchestrator<Ready> {
         schedule_id: u32,
         fault: &Fault,
         queries: Vec<PreparedCheck>,
-        fault_free: Trajectory,
+        fault_free: Baseline,
         consistent_within: Duration,
-    ) -> Result<((Verdict, FaultReport), Orchestrator<Done>), crucible_plugin::Error> {
+    ) -> Result<((Readings, FaultReport), Orchestrator<Done>), crucible_plugin::Error> {
         let Orchestrator {
             deployment,
             state: Ready {
@@ -300,39 +356,29 @@ impl Orchestrator<Ready> {
         // outcome we still own them afterwards: on success they move into `Done`
         // for the caller to tear down, on error we tear down here rather than
         // dropping the only handle to the replica and its observer tasks.
-        let outcome: Result<(Verdict, FaultReport), crucible_plugin::Error> = async {
+        let driving = Driving {
+            actions: &actions,
+            queries: &queries,
+            session_observer: &session_observer,
+            consistent_within,
+        };
+        let outcome: Result<(Readings, FaultReport), crucible_plugin::Error> = async {
             let (mut observations, fault_report) = match fault.anchor() {
                 // Placed on one moment, so the scenario is in flight when it
                 // lands and the two run together.
                 Some(_) => {
-                    anchored_run(
-                        deployment.as_ref(),
-                        placement,
-                        &actions,
-                        &queries,
-                        &session_observer,
-                        schedule_id,
-                        fault,
-                    )
-                    .await?
+                    anchored_run(deployment.as_ref(), placement, driving, schedule_id, fault)
+                        .await?
                 }
                 // Imposed before the scenario and lifted after it, so the fleet
                 // is degraded throughout and put back with something to catch
                 // up on.
                 None => {
-                    degraded_run(
-                        deployment.as_ref(),
-                        placement,
-                        &actions,
-                        &queries,
-                        &session_observer,
-                        schedule_id,
-                        fault,
-                    )
-                    .await?
+                    degraded_run(deployment.as_ref(), placement, driving, schedule_id, fault)
+                        .await?
                 }
             };
-            observations.fault = Some(fault_report.clone());
+            observations.readings.fault = Some(fault_report.clone());
 
             if matches!(fault_report.result, FaultResult::Fired { .. }) {
                 // The target was restarted concurrently with the scenario; just wait
@@ -343,21 +389,20 @@ impl Orchestrator<Ready> {
                     .await;
             }
 
-            observations.checks = read_checks(deployment.as_ref(), &queries).await?;
-            observations.fault_free = fault_free;
+            observations.readings.checks = read_checks(deployment.as_ref(), &queries).await?;
+            observations.readings.fault_free = fault_free;
             session_observer.observe(&mut observations);
-            let verdict = observations.verdict();
-            Ok((verdict, fault_report))
+            Ok((observations.readings, fault_report))
         }
         .await;
 
         match outcome {
-            Ok((verdict, fault_report)) => {
+            Ok((readings, fault_report)) => {
                 let done = Orchestrator {
                     deployment,
                     state: Done { session_observer },
                 };
-                Ok(((verdict, fault_report), done))
+                Ok(((readings, fault_report), done))
             }
             Err(e) => {
                 let _ = teardown_replica(deployment, session_observer).await;
@@ -457,24 +502,42 @@ async fn read_checkpoint(
     checkpoint
 }
 
+/// What driving the scenario once needs, apart from what is done to it while
+/// it runs.
+#[derive(Clone, Copy)]
+struct Driving<'a> {
+    actions: &'a [TargetedAction],
+    queries: &'a [PreparedCheck],
+    session_observer: &'a SessionObserver,
+    /// How long a step's effects have to settle before the next one starts,
+    /// which is the whole time the scenario allows.
+    ///
+    /// Both sides of the comparison have to wait the same, or it means
+    /// nothing.
+    consistent_within: Duration,
+}
+
 /// Run the scenario's steps one at a time, each starting only once the fleet
 /// has stopped working on the one before.
 ///
-/// A step's effects outlast its response: the caller is answered before a
-/// consumer has read what the step published. Overlapping steps therefore leave
-/// a state no one step accounts for, and the traffic a fault is anchored in
-/// belongs to whichever step happened to be in flight.
+/// A step's effects outlast its response, so overlapping steps would leave a
+/// state no one step accounts for.
 async fn run_actions(
     deployment: &dyn DeploymentRuntime,
-    actions: &[TargetedAction],
-    queries: &[PreparedCheck],
-    session_observer: &SessionObserver,
+    driving: Driving<'_>,
     scenario_start: Instant,
 ) -> Result<Observations, crucible_plugin::Error> {
+    let Driving {
+        actions,
+        queries,
+        session_observer,
+        consistent_within,
+    } = driving;
     let mut observations = Observations::empty();
     // The state before anything ran, so a step that changed nothing has a
     // checkpoint equal to the one before it rather than no checkpoint at all.
     observations
+        .readings
         .trajectory
         .push(read_checkpoint(deployment, queries).await);
     for (step, (action, endpoint)) in actions.iter().enumerate() {
@@ -483,19 +546,20 @@ async fn run_actions(
         tracing::debug!(step, kind = action.kind(), %endpoint, "driving");
         let outcome = action.run(*endpoint).await?;
         tracing::debug!(step, ack = ?outcome.ack, "answered; settling");
-        observations.outcomes.push(outcome);
+        observations.readings.outcomes.push(outcome);
         session_observer
-            .wait_for_quiescence(STEP_SETTLE, QUIESCENCE_IDLE, STEP_BUDGET)
+            .wait_for_quiescence(STEP_SETTLE, QUIESCENCE_IDLE, consistent_within)
             .await;
         // The step is only over once the fleet has stopped working on it, so a
         // fault that lands on the consumer's half of the step is still that
         // step's.
-        observations.windows.push(StepWindow {
+        observations.readings.windows.push(StepWindow {
             start_ns,
             end_ns: scenario_start.elapsed().as_nanos(),
         });
         tracing::debug!(step, "settled; reading state");
         observations
+            .readings
             .trajectory
             .push(read_checkpoint(deployment, queries).await);
     }
@@ -555,12 +619,11 @@ impl<'a> Placement<'a> {
 async fn anchored_run(
     deployment: &dyn DeploymentRuntime,
     placement: Placement<'_>,
-    actions: &[TargetedAction],
-    queries: &[PreparedCheck],
-    session_observer: &SessionObserver,
+    driving: Driving<'_>,
     id: u32,
     fault: &Fault,
 ) -> Result<(Observations, FaultReport), crucible_plugin::Error> {
+    let session_observer = driving.session_observer;
     // Arm as the scenario starts: the proxy counts scenario packets from here,
     // and the freeze baseline is taken at the same moment, so both share the
     // scenario-start origin. A failed arm means nothing will ever freeze.
@@ -572,14 +635,7 @@ async fn anchored_run(
     // against a wall-clock origin rather than against when this side noticed.
     let scenario_start_ns = now_ns();
     let scenario_fut = async {
-        let result = run_actions(
-            deployment,
-            actions,
-            queries,
-            session_observer,
-            Instant::now(),
-        )
-        .await;
+        let result = run_actions(deployment, driving, Instant::now()).await;
         let _ = scenario_end_tx.send(());
         result
     };
@@ -659,9 +715,7 @@ async fn anchored_run(
 async fn degraded_run(
     deployment: &dyn DeploymentRuntime,
     placement: Placement<'_>,
-    actions: &[TargetedAction],
-    queries: &[PreparedCheck],
-    session_observer: &SessionObserver,
+    driving: Driving<'_>,
     id: u32,
     fault: &Fault,
 ) -> Result<(Observations, FaultReport), crucible_plugin::Error> {
@@ -676,28 +730,14 @@ async fn degraded_run(
             // Nothing is down, so the run would meet an undegraded fleet.
             Err(e) => {
                 return Ok((
-                    run_actions(
-                        deployment,
-                        actions,
-                        queries,
-                        session_observer,
-                        Instant::now(),
-                    )
-                    .await?,
+                    run_actions(deployment, driving, Instant::now()).await?,
                     missed(id, fault, FaultMissReason::Failed(e.to_string())),
                 ));
             }
         },
     };
 
-    let observations = run_actions(
-        deployment,
-        actions,
-        queries,
-        session_observer,
-        Instant::now(),
-    )
-    .await?;
+    let observations = run_actions(deployment, driving, Instant::now()).await?;
 
     match placement {
         Placement::Cut | Placement::Rewritten => deployment.substrate().proceed().await?,
@@ -735,10 +775,8 @@ fn unplaced(said: Option<Reported>) -> String {
 
 /// Place the fault against the already-frozen fleet and report it.
 ///
-/// The kill releases the flow and restarts concurrently, so the scenario meets
-/// the dead-then-recovering service in real time. Both must succeed or the fleet
-/// is left wedged and the verdict would be meaningless, so they error. A failed
-/// kill is a miss, not an error.
+/// The kill releases the flow and restarts concurrently. A failed kill is a
+/// miss, not an error.
 async fn place(
     fault: &Fault,
     placement: Placement<'_>,

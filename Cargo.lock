@@ -664,7 +664,9 @@ dependencies = [
  "crucible-dsl",
  "crucible-engine",
  "crucible-plugin",
+ "crucible-protocol",
  "libc",
+ "rstest",
  "strum",
  "thiserror",
  "tokio",
@@ -696,6 +698,7 @@ dependencies = [
  "ariadne",
  "crucible-core",
  "crucible-plugin",
+ "rstest",
 ]
 
 [[package]]

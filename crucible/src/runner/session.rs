@@ -1,16 +1,16 @@
 //! Typestate machine driving the runner's side of one worker session.
 //!
-//! `Session<S>` carries the IPC stream across states; `state: S` holds what
-//! changes. Transitions consume `self` and return the next `Session<_>`; illegal
-//! sequences are compile errors.
+//! `Session<S>` carries the IPC stream across states. Transitions consume
+//! `self`, so illegal sequences are compile errors.
 
 use crucible_core::{
     ipc::{
-        HEARTBEAT_TIMEOUT, RunnerToWorker, Verdict, WorkerToRunner,
+        HEARTBEAT_TIMEOUT, RunnerToWorker, WorkerToRunner,
         codec::{read_frame, write_frame},
     },
     learned::Learned,
     schedule::Schedule,
+    verdict::Readings,
 };
 use crucible_engine::event_bus::{EventBus, RunnerEvent};
 use tokio::{net::UnixStream, time::timeout};
@@ -106,11 +106,11 @@ impl Session<Dispatching> {
         Ok(())
     }
 
-    /// Drive the fault-free run: the same schedule shape as any other, with
-    /// nothing to break, so what it observes describes the workload the faulted
-    /// runs perform. Reads frames until the catalogue arrives, journalling every
-    /// intervening `Event(_)` as [`Session::<AwaitingResult>::await_result`]
-    /// does.
+    /// Drive the fault-free run, which has the same schedule shape as any
+    /// other with nothing to break.
+    ///
+    /// Reads frames until the catalogue arrives, journalling every intervening
+    /// `Event(_)`.
     pub async fn learn(mut self, bus: &EventBus, schedule: Schedule) -> Result<Learned> {
         self.read_ready(bus, "Learning").await?;
 
@@ -160,11 +160,11 @@ impl Session<AwaitingResult> {
     /// that sends nothing for [`HEARTBEAT_TIMEOUT`] is deemed unresponsive; an
     /// ill-behaved worker streaming frames forever is still bounded by the
     /// per-schedule deadline (see [`crate::wait_worker`]).
-    pub async fn await_result(mut self, bus: &EventBus) -> Result<Verdict> {
+    pub async fn await_result(mut self, bus: &EventBus) -> Result<Readings> {
         loop {
             let msg = read_live(&mut self.stream).await?;
-            let verdict = match &msg {
-                WorkerToRunner::RunResult { verdict, .. } => Some(verdict.clone()),
+            let readings = match &msg {
+                WorkerToRunner::RunResult { readings, .. } => Some(readings.clone()),
                 WorkerToRunner::Event(_) => None,
                 other => {
                     return Err(Error::UnexpectedMessage {
@@ -175,8 +175,8 @@ impl Session<AwaitingResult> {
                 }
             };
             journal_in(bus, self.state.worker_id, msg).await;
-            if let Some(v) = verdict {
-                return Ok(v);
+            if let Some(readings) = readings {
+                return Ok(*readings);
             }
         }
     }

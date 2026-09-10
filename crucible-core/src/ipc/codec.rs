@@ -8,13 +8,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 /// Maximum size of a single frame. Anything larger is refused as malformed.
 ///
 /// A bound on what a peer may claim to be sending, not on what a message may
-/// say. The largest messages carry a whole fleet
-/// ([`RunnerToWorker::Run`](crate::ipc::RunnerToWorker::Run)) and everything a
-/// learn run saw of it
-/// ([`WorkerToRunner::SessionCatalogue`](crate::ipc::WorkerToRunner::SessionCatalogue)),
-/// so both grow with the fleet under test and neither has a natural ceiling.
-/// This sits far enough above them that how much a run has to report is decided
-/// where the reporting happens.
+/// say.
 pub(crate) const MAX_FRAME_SIZE: usize = 16 << 20;
 
 // The frame header stores the payload length as a big-endian u32, so the cap
@@ -37,13 +31,10 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 /// Serialize `message` with postcard and write it as a length-prefixed frame.
 ///
-/// The frame is a 4-byte big-endian length header followed by the postcard
-/// payload, encoded into a buffer the size of the message.
-///
 /// # Errors
 /// Returns `Error::TooLarge` if the encoded message exceeds `MAX_FRAME_SIZE`,
 /// `Error::Postcard` for any other serialization failure, and `Error::Io` if
-/// writing the length header or payload to `writer` fails.
+/// writing to `writer` fails.
 pub async fn write_frame<T, W>(writer: &mut W, message: &T) -> Result<()>
 where
     T: Serialize,
@@ -99,7 +90,7 @@ mod tests {
     use super::*;
     use crucible_protocol::Direction;
 
-    use crate::ipc::{RunnerToWorker, Verdict, WorkerEvent, WorkerToRunner};
+    use crate::ipc::{RunnerToWorker, WorkerEvent, WorkerToRunner};
 
     /// Encode `msg`, decode it, and assert the decoded value equals the original.
     async fn roundtrip<T>(msg: T)
@@ -192,12 +183,10 @@ mod tests {
                     ),
                     crate::fault::By::Kill("db".into()),
                 ),
-                [
+                crate::verdict::Baseline::unsettled([
                     vec![Some(crate::plan::Value::Int(0))],
                     vec![Some(crate::plan::Value::Int(3))],
-                ]
-                .into_iter()
-                .collect(),
+                ]),
                 std::time::Duration::from_secs(15),
             ),
         )))
@@ -208,19 +197,26 @@ mod tests {
     async fn roundtrips_run_result() {
         roundtrip(WorkerToRunner::RunResult {
             schedule_id: 7,
-            verdict: Verdict::Pass,
+            readings: Box::default(),
         })
         .await;
     }
 
     #[tokio::test]
-    async fn roundtrips_run_result_with_fail_reason() {
+    async fn roundtrips_run_result_with_readings() {
+        let mut readings = crate::verdict::Readings::empty();
+        readings.outcomes = vec![crate::verdict::Outcome {
+            ack: crate::verdict::Ack::Acked,
+        }];
+        readings.windows = vec![crate::verdict::StepWindow {
+            start_ns: 1_788_943_890_682_389_587,
+            end_ns: 1_788_943_890_682_389_999,
+        }];
+        readings.fault_free =
+            crate::verdict::Baseline::unsettled([vec![Some(crate::plan::Value::Int(3))]]);
         roundtrip(WorkerToRunner::RunResult {
             schedule_id: 7,
-            verdict: Verdict::Fail {
-                invariant: Some(crate::verdict::Invariant::Durable),
-                reason: "acked order 3 (book x4) is absent from persisted state after heal".into(),
-            },
+            readings: Box::new(readings),
         })
         .await;
     }

@@ -11,5 +11,8 @@ ariadne = { workspace = true }
 crucible-core = { path = "../crucible-core" }
 crucible-plugin = { path = "../crucible-plugin", features = ["framework"] }
 
+[dev-dependencies]
+rstest = { workspace = true }
+
 [lints]
 workspace = true

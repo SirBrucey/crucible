@@ -14,12 +14,13 @@ pub enum WorkerToRunner {
     },
     /// Worker signals it is ready for the runner to send work.
     Ready,
-    /// Worker reports the outcome of executing a schedule.
+    /// Worker reports what executing a schedule read. The runner turns it into
+    /// a verdict.
     RunResult {
         /// Correlation id, matching the [`Schedule`] this result is for.
         schedule_id: u32,
-        /// Outcome of the run, carrying the driver's explanation.
-        verdict: Verdict,
+        /// What the run read.
+        readings: Box<crate::verdict::Readings>,
     },
     /// Worker returns what the fault-free run found out about the fleet.
     SessionCatalogue(Learned),
@@ -64,8 +65,9 @@ pub enum RunnerToWorker {
         /// Version of the runner
         runner_version: String,
     },
-    /// Runner sends a schedule for the worker to run. A schedule with no faults
-    /// is the fault-free run, which answers with a `SessionCatalogue`; any other
-    /// answers with a `RunResult`.
+    /// Runner sends a schedule for the worker to run. A
+    /// [`crate::schedule::Purpose::Learn`] schedule answers with
+    /// [`WorkerToRunner::SessionCatalogue`]; every other purpose answers with
+    /// [`WorkerToRunner::RunResult`].
     Run(Box<Schedule>),
 }

@@ -1,11 +1,7 @@
 //! Typestate machine driving the worker's side of the runner IPC protocol.
 //!
-//! `Worker<S>` carries per-worker identity and the IPC connection across states;
-//! `state: S` holds what changes. Transitions consume `self` and return the
-//! next `Worker<_>`; illegal sequences are compile errors.
-//!
 //! The fleet is brought up only after the worker knows its work, so a schedule
-//! can arm the proxy's fault anchor on its command line at startup.
+//! can arm the proxy's fault anchor at startup.
 
 use std::{collections::BTreeSet, sync::Arc};
 
@@ -15,7 +11,7 @@ use crucible_core::{
         HEARTBEAT_INTERVAL, RunnerToWorker, WorkerEvent, WorkerToRunner,
         codec::{read_frame, write_frame},
     },
-    schedule::Schedule,
+    schedule::{Purpose, Schedule},
 };
 use crucible_engine::orchestrator::{Done, Orchestrator, Ready};
 use crucible_plugin::Registry;
@@ -127,6 +123,11 @@ pub struct Learning {
     schedule: Schedule,
 }
 
+/// A subset of the steps, driven with nothing broken.
+pub struct Referencing {
+    schedule: Schedule,
+}
+
 /// The fault is lifted out of the schedule on the way in, so reaching this
 /// state is what proves there is one to inject.
 pub struct Executing {
@@ -140,6 +141,7 @@ pub struct ShuttingDown {
 
 pub enum IdleNext {
     Learn(Worker<Learning>),
+    Reference(Worker<Referencing>),
     Work(Worker<Executing>),
 }
 
@@ -152,7 +154,8 @@ async fn bring_up(
     worker_id: u32,
     schedule: &Schedule,
 ) -> Result<Orchestrator<Ready>> {
-    let deployment = registry.deployment_for(&schedule.fleet, worker_id, schedule.fault.clone())?;
+    let deployment =
+        registry.deployment_for(&schedule.fleet, worker_id, schedule.fault().cloned())?;
     let actions = registry.actions_for(&schedule.steps)?;
     let orchestrator = Orchestrator::new(deployment, actions).setup().await?;
     Ok(orchestrator)
@@ -203,10 +206,8 @@ impl Worker<Idle> {
         tracing::debug!(worker_id = self.id, "sent READY");
 
         match self.conn.recv().await? {
-            RunnerToWorker::Run(schedule) => match schedule.fault.clone() {
-                // A schedule with no fault is the fault-free run every other
-                // schedule is judged against.
-                None => {
+            RunnerToWorker::Run(schedule) => match schedule.purpose.clone() {
+                Purpose::Learn => {
                     tracing::info!(
                         worker_id = self.id,
                         schedule_id = schedule.id,
@@ -216,7 +217,18 @@ impl Worker<Idle> {
                         schedule: *schedule,
                     })))
                 }
-                Some(fault) => {
+                Purpose::Reference { landed } => {
+                    tracing::info!(
+                        worker_id = self.id,
+                        schedule_id = schedule.id,
+                        ?landed,
+                        "received reference"
+                    );
+                    Ok(IdleNext::Reference(self.transition(Referencing {
+                        schedule: *schedule,
+                    })))
+                }
+                Purpose::Break(fault) => {
                     tracing::info!(
                         worker_id = self.id,
                         schedule_id = schedule.id,
@@ -226,7 +238,7 @@ impl Worker<Idle> {
                     );
                     Ok(IdleNext::Work(self.transition(Executing {
                         schedule: *schedule,
-                        fault,
+                        fault: *fault,
                     })))
                 }
             },
@@ -280,6 +292,41 @@ impl Worker<Learning> {
     }
 }
 
+impl Worker<Referencing> {
+    pub async fn execute_reference(self) -> Result<Worker<ShuttingDown>> {
+        let schedule = &self.state.schedule;
+        let schedule_id = schedule.id;
+        let registry = Registry::load().await;
+        let heartbeat = self.conn.start_heartbeat();
+        let orchestrator = bring_up(&registry, self.id, schedule).await?;
+        let queries = match registry
+            .queries_for(&schedule.fleet, &schedule.checks)
+            .await
+        {
+            Ok(queries) => queries,
+            Err(e) => {
+                let _ = orchestrator.teardown().await;
+                return Err(e.into());
+            }
+        };
+        let (readings, orchestrator) = orchestrator
+            .reference(&queries, schedule.consistent_within)
+            .await
+            .inspect_err(
+                |e| tracing::error!(worker_id = self.id, schedule_id, error = %e, "reference failed"),
+            )?;
+        drop(heartbeat);
+        self.conn
+            .send(&WorkerToRunner::RunResult {
+                schedule_id,
+                readings: Box::new(readings),
+            })
+            .await?;
+        tracing::info!(worker_id = self.id, schedule_id, "sent reference");
+        Ok(self.transition(ShuttingDown { orchestrator }))
+    }
+}
+
 impl Worker<Executing> {
     pub async fn execute_and_report(self) -> Result<Worker<ShuttingDown>> {
         let schedule = &self.state.schedule;
@@ -304,12 +351,12 @@ impl Worker<Executing> {
             }
         };
 
-        let ((verdict, fault_report), orchestrator) = orchestrator
+        let ((readings, fault_report), orchestrator) = orchestrator
             .execute(
                 schedule_id,
                 &self.state.fault,
                 queries,
-                schedule.trajectory.clone(),
+                schedule.fault_free.clone(),
                 schedule.consistent_within,
             )
             .await
@@ -328,18 +375,14 @@ impl Worker<Executing> {
             ?fault_report,
             "sent fault event"
         );
+        let steps = readings.outcomes.len();
         self.conn
             .send(&WorkerToRunner::RunResult {
                 schedule_id,
-                verdict: verdict.clone(),
+                readings: Box::new(readings),
             })
             .await?;
-        tracing::info!(
-            worker_id = self.id,
-            schedule_id,
-            ?verdict,
-            "sent run result"
-        );
+        tracing::info!(worker_id = self.id, schedule_id, steps, "sent run result");
         Ok(self.transition(ShuttingDown { orchestrator }))
     }
 }
