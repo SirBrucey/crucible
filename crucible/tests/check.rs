@@ -4,6 +4,8 @@
 
 use std::process::{Command, Output};
 
+use rstest::rstest;
+
 fn check(path: &str) -> Output {
     Command::new(env!("CARGO_BIN_EXE_crucible"))
         .args(["check", path])
@@ -11,11 +13,14 @@ fn check(path: &str) -> Output {
         .expect("run crucible check")
 }
 
-#[test]
-fn the_example_scenario_checks_cleanly() {
-    let out = check(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../examples/orders/orders.cru"
+#[rstest]
+#[case("orders/1_base/orders.cru")]
+#[case("orders/2_outbox/orders.cru")]
+#[case("orders/3_local_first/orders.cru")]
+fn an_example_scenario_checks_cleanly(#[case] scenario: &str) {
+    let out = check(&format!(
+        "{}/../examples/{scenario}",
+        env!("CARGO_MANIFEST_DIR")
     ));
     assert!(
         out.status.success(),

@@ -8,7 +8,7 @@ fleet "orders" {
 
   service api {
     kinds: [http],
-    image: "crucible-example/orders-api:0.1",
+    image: "crucible-example/orders-base-api:0.1",
     ports: { http: 8080 },
     env: [
       "DATABASE_URL=mysql://root@db:3306/orders",
@@ -47,7 +47,7 @@ fleet "orders" {
   // only port it answers on is the one its healthcheck asks.
   service inventory {
     kinds: [http],
-    image: "crucible-example/orders-inventory:0.1",
+    image: "crucible-example/orders-base-inventory:0.1",
     ports: { http: 8081 },
     env: [
       "DATABASE_URL=mysql://root@db:3306/orders",
@@ -77,6 +77,10 @@ scenario "orders_durability" {
   // hearing about it. Stock starts at book 100, pen 500, mug 250.
   expect {
     db.orders.orders.count == 3;
+    // One row per event the consumer acted on, so five steps owe five. This is
+    // what separates an event lost from one applied twice: the levels alone
+    // cannot say which.
+    db.orders.applied.count == 5;
     db.orders.stock.select level where item = "book" == 98;
     db.orders.stock.select level where item = "pen" == 490;
     db.orders.stock.select level where item = "mug" == 249;

@@ -1,0 +1,91 @@
+// The `orders` fleet with a transactional outbox: the API writes the order and
+// the event to announce it in one transaction, and a relay announces what the
+// outbox holds and then takes it away. The steps are the ones `1_base` drives,
+// with one check added for the outbox, so the two campaigns can be compared.
+
+fleet "orders" {
+  deployment: docker;
+
+  service api {
+    kinds: [http],
+    image: "crucible-example/orders-outbox-api:0.1",
+    ports: { http: 8080 },
+    env: [
+      "DATABASE_URL=mysql://root@db:3306/orders",
+      "BROKER_URL=amqp://broker:5672",
+      "RUST_LOG=info"
+    ],
+    healthcheck: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/healthz"]
+  };
+
+  service broker {
+    kinds: [amqp],
+    image: "rabbitmq:3.13-management",
+    ports: { amqp: 5672 },
+    // Probe the AMQP port rather than run `rabbitmq-diagnostics`. That command
+    // starts an Erlang node, and Docker runs healthchecks as the image's default
+    // user (root here), so under a slow concurrent boot a probe can create a
+    // root-owned /var/lib/rabbitmq/.erlang.cookie before the broker (running as
+    // rabbitmq) writes its own; the broker then cannot read the cookie and dies
+    // with `.erlang.cookie: eacces`. A bare TCP connect touches no cookie and
+    // still gates on the listener.
+    healthcheck: ["CMD", "bash", "-c", ": < /dev/tcp/127.0.0.1/5672"]
+  };
+
+  service db {
+    kinds: [mariadb],
+    image: "mariadb:11.4",
+    ports: { mariadb: 3306 },
+    env: [
+      "MARIADB_ALLOW_EMPTY_ROOT_PASSWORD=yes",
+      "MARIADB_DATABASE=orders"
+    ],
+    healthcheck: ["CMD", "mariadb-admin", "ping", "-h", "127.0.0.1"]
+  };
+
+  // It consumes from the broker rather than being reached over AMQP, so the
+  // only port it answers on is the one its healthcheck asks.
+  service inventory {
+    kinds: [http],
+    image: "crucible-example/orders-outbox-inventory:0.1",
+    ports: { http: 8081 },
+    env: [
+      "DATABASE_URL=mysql://root@db:3306/orders",
+      "BROKER_URL=amqp://broker:5672",
+      "RUST_LOG=info"
+    ],
+    healthcheck: ["CMD", "curl", "-fsS", "http://127.0.0.1:8081/healthz"]
+  };
+}
+
+scenario "orders_durability" {
+  // Drop this line to run every schedule the scheduler produces.
+  budget: 5m;
+  consistent_within: 15s;
+
+  do { http POST api "/orders" body { id: 1, item: "book", quantity: 4 } };
+  do { http POST api "/orders" body { id: 2, item: "pen", quantity: 10 } };
+  do { http POST api "/orders" body { id: 3, item: "mug", quantity: 1 } };
+
+  // The customer changes their mind twice about the same order. Told these the
+  // other way round, the fleet keeps the earlier amendment.
+  do { http PUT api "/orders/1" body { quantity: 6 } };
+  do { http PUT api "/orders/1" body { quantity: 2 } };
+
+  // The orders are what the API wrote down; the levels are what the consumer
+  // did about them, which is the half a fault can lose without the API ever
+  // hearing about it. Stock starts at book 100, pen 500, mug 250.
+  expect {
+    db.orders.orders.count == 3;
+    // One row per event the consumer acted on, so five steps owe five. This is
+    // what separates an event lost from one applied twice: the levels alone
+    // cannot say which.
+    db.orders.applied.count == 5;
+    // Everything the API accepted has been announced and taken away.
+    db.orders.outbox.count == 0;
+    db.orders.stock.select level where item = "book" == 98;
+    db.orders.stock.select level where item = "pen" == 490;
+    db.orders.stock.select level where item = "mug" == 249;
+    db.orders.orders.select quantity where id = 1 == 2;
+  }
+}
