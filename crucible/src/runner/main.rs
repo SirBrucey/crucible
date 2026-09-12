@@ -32,6 +32,7 @@ use tokio::{
     task::{Id as TaskId, JoinError, JoinHandle, JoinSet},
     time::timeout,
 };
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     bench::{Bench, Taking},
@@ -60,6 +61,9 @@ const MAX_ATTEMPTS: u32 = 3;
 /// If this many schedules fail every attempt back to back, the campaign gives
 /// up: something is systemically wrong (e.g. Docker is unavailable).
 const GIVE_UP_AFTER: u32 = 3;
+/// How long an interrupt waits for the cancelled runs to report the schedules
+/// that were cancelled before force sweeping.
+const INTERRUPT_DRAIN: Duration = Duration::from_secs(30);
 
 /// Number of schedule workers (each with its own fleet replica) to run at once.
 /// Overridable with `CRUCIBLE_CONCURRENCY`.
@@ -317,6 +321,8 @@ struct Outcomes {
     faults: Vec<(u32, Option<Invariant>, String)>,
     inconclusive: usize,
     errored: usize,
+    /// Ids of interrupted schedules.
+    abandoned: Vec<u32>,
 }
 
 impl Outcomes {
@@ -395,12 +401,16 @@ impl Outcomes {
     fn report(&self, total: usize, elapsed_s: u64, stopped: Stopped) {
         let shown = self.shown();
         if self.completed() < total {
+            let mut stopped_ids = self.abandoned.clone();
+            stopped_ids.sort_unstable();
+            let abandoned = spelled_ids(&stopped_ids);
             tracing::warn!(
                 passed = self.passed,
                 faults = self.faults.len(),
                 %shown,
                 inconclusive = self.inconclusive,
                 errored = self.errored,
+                %abandoned,
                 total,
                 elapsed_s,
                 "{stopped}, so the remaining schedules were skipped"
@@ -419,12 +429,29 @@ impl Outcomes {
         }
     }
 }
+/// Schedule ids as a report says them, or `none` for an empty set.
+fn spelled_ids(ids: &[u32]) -> String {
+    let spelled: Vec<String> = ids.iter().map(ToString::to_string).collect();
+    match spelled.split_last() {
+        Some((last, [])) => last.clone(),
+        Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
+        None => "none".to_owned(),
+    }
+}
+
 /// Why a campaign stopped dispatching with schedules left.
 #[derive(Clone, Copy, Debug)]
 enum Stopped {
     Budget,
     GaveUp,
-    Interrupted,
+    Interrupted(Phase),
+}
+
+/// Which part of a campaign an interrupt arrived in.
+#[derive(Clone, Copy, Debug)]
+enum Phase {
+    Learning,
+    Dispatching,
 }
 
 impl std::fmt::Display for Stopped {
@@ -432,7 +459,10 @@ impl std::fmt::Display for Stopped {
         match self {
             Stopped::Budget => f.write_str("the campaign ran out of wall-clock budget"),
             Stopped::GaveUp => f.write_str("too many schedules failed in a row"),
-            Stopped::Interrupted => f.write_str("the campaign was interrupted"),
+            Stopped::Interrupted(Phase::Learning) => {
+                f.write_str("the campaign was interrupted during its fault-free run")
+            }
+            Stopped::Interrupted(Phase::Dispatching) => f.write_str("the campaign was interrupted"),
         }
     }
 }
@@ -498,18 +528,36 @@ struct Pool<'a> {
     max_inflight: usize,
     exhausted: bool,
     gave_up: bool,
+    /// Cancelled when the campaign is interrupted, so an in-flight run stops
+    /// and reports the schedule it was on rather than being aborted.
+    interrupt: CancellationToken,
+}
+
+/// What a pool needs to start dispatching.
+struct Dispatch<'a> {
+    bus: &'a EventBus,
+    fleet: &'a plan::Fleet,
+    scenario: &'a plan::Scenario,
+    /// The first id not spent on the fault-free run.
+    worker_id: u32,
+    schedule_budget: Duration,
+    campaign_start: Instant,
+    max_inflight: usize,
+    interrupt: CancellationToken,
 }
 
 impl<'a> Pool<'a> {
-    fn new(
-        bus: &'a EventBus,
-        fleet: &'a plan::Fleet,
-        scenario: &'a plan::Scenario,
-        worker_id: u32,
-        schedule_budget: Duration,
-        campaign_start: Instant,
-        max_inflight: usize,
-    ) -> Self {
+    fn new(dispatch: Dispatch<'a>) -> Self {
+        let Dispatch {
+            bus,
+            fleet,
+            scenario,
+            worker_id,
+            schedule_budget,
+            campaign_start,
+            max_inflight,
+            interrupt,
+        } = dispatch;
         Self {
             bus,
             fleet,
@@ -525,6 +573,7 @@ impl<'a> Pool<'a> {
             max_inflight,
             exhausted: false,
             gave_up: false,
+            interrupt,
         }
     }
 
@@ -555,6 +604,7 @@ impl<'a> Pool<'a> {
             schedule,
             attempt,
             self.schedule_budget,
+            self.interrupt.clone(),
         ));
         // A panicked task comes back without its schedule, so what it was for
         // is written down here while there is still something to read it from.
@@ -615,6 +665,12 @@ impl<'a> Pool<'a> {
                 self.recovery.reset();
                 let judged = self.bench.judge(schedule.id, readings);
                 self.record_judged(judged);
+            }
+            // An interrupt stopped this run, so it says nothing about the fleet.
+            // Kept apart from the errors, which is what the stop report reads to
+            // name the schedules it abandoned.
+            Err(Error::Interrupted) => {
+                self.outcomes.abandoned.push(schedule.id);
             }
             // A worker that outran its budget did not crash; we simply have no
             // verdict in the time allowed. Record it inconclusive rather than
@@ -690,10 +746,27 @@ impl<'a> Pool<'a> {
         }
     }
 
-    /// Stop the in-flight tasks and force-reclaim every replica spawned this run.
-    /// Reclaiming an already-torn-down id is a no-op, so this covers the
-    /// still-running workers without tracking which are which.
+    /// Take in the cancelled runs, then force-reclaim every replica spawned this
+    /// run.
+    ///
+    /// A cancelled run returns the schedule it was on, so draining is what lets
+    /// the campaign say which schedules it abandoned. Bounded, so one wedged
+    /// worker cannot hold up an interrupt, and the sweep afterwards covers
+    /// whatever did not come back. Reclaiming an already-torn-down id is a
+    /// no-op.
     async fn reclaim_all(&mut self) {
+        let drained = tokio::time::timeout(INTERRUPT_DRAIN, async {
+            while let Some(joined) = self.inflight.join_next_with_id().await {
+                self.record(joined);
+            }
+        })
+        .await;
+        if drained.is_err() {
+            tracing::warn!(
+                after = ?INTERRUPT_DRAIN,
+                "some workers did not stop in time; abandoning them"
+            );
+        }
         self.inflight.shutdown().await;
         for id in 0..self.worker_id {
             reclaim_fleet(id, self.fleet).await;
@@ -768,6 +841,28 @@ fn fit(
     Chain(degraded, bursts)
 }
 
+/// A token cancelled by the first SIGINT or SIGTERM to arrive.
+///
+/// Cancellation reaches a phase as an outcome rather than a dropped future, so
+/// each one runs the teardown it already has and says what it was doing.
+///
+/// # Errors
+/// Errors if either signal handler cannot be installed.
+fn interrupt_token() -> Result<CancellationToken> {
+    let mut sigint = signal(SignalKind::interrupt())?;
+    let mut sigterm = signal(SignalKind::terminate())?;
+    let token = CancellationToken::new();
+    let cancel = token.clone();
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = sigint.recv() => {}
+            _ = sigterm.recv() => {}
+        }
+        cancel.cancel();
+    });
+    Ok(token)
+}
+
 async fn drive(bus: &EventBus, plan: &plan::Plan) -> Result<CampaignOutcome> {
     let campaign_start = Instant::now();
     let mut worker_id: u32 = 0;
@@ -778,8 +873,21 @@ async fn drive(bus: &EventBus, plan: &plan::Plan) -> Result<CampaignOutcome> {
         .first()
         .expect("the grammar requires a scenario, so a lowered plan states one");
 
+    // Interrupting a campaign must not orphan a replica.
+    let interrupt = interrupt_token()?;
+
     // Learn is a barrier: schedules derive from its observed traffic profiles.
-    let (learned, cycle_cost) = run_learn(bus, &mut worker_id, &plan.fleet, scenario).await?;
+    let (learned, cycle_cost) =
+        match run_learn(bus, &mut worker_id, &plan.fleet, scenario, &interrupt).await {
+            Ok(learned) => learned,
+            // run_learn reclaims its replica on the way out, so there is nothing
+            // left to take down here.
+            Err(Error::Interrupted) => {
+                tracing::warn!("{}", Stopped::Interrupted(Phase::Learning));
+                return Ok(CampaignOutcome::Indecisive);
+            }
+            Err(e) => return Err(e),
+        };
     let readings = learned.fault_free.trail.iter().flatten();
     tracing::info!(
         edges = learned.profiles.len(),
@@ -810,28 +918,23 @@ async fn drive(bus: &EventBus, plan: &plan::Plan) -> Result<CampaignOutcome> {
     let cost = cycle_cost + scenario.consistent_within;
 
     let mut scheduler = fit(plan, scenario, &learned, campaign_start, cost, concurrency);
-    let mut pool = Pool::new(
+    let mut pool = Pool::new(Dispatch {
         bus,
-        &plan.fleet,
+        fleet: &plan.fleet,
         scenario,
         worker_id,
-        cost + SCHEDULE_MARGIN,
+        schedule_budget: cost + SCHEDULE_MARGIN,
         campaign_start,
-        concurrency,
-    );
+        max_inflight: concurrency,
+        interrupt: interrupt.clone(),
+    });
 
-    // Interrupting a run must not orphan its in-flight replicas or sockets, so
-    // catch SIGINT/SIGTERM, stop dispatching, and reclaim on the way out rather
-    // than letting the default handler kill the runner mid-campaign.
-    let mut sigint = signal(SignalKind::interrupt())?;
-    let mut sigterm = signal(SignalKind::terminate())?;
     let mut interrupted = false;
     loop {
         pool.fill(&mut scheduler);
         tokio::select! {
             biased;
-            _ = sigint.recv() => { interrupted = true; break; }
-            _ = sigterm.recv() => { interrupted = true; break; }
+            () = interrupt.cancelled() => { interrupted = true; break; }
             joined = pool.inflight.join_next_with_id() => {
                 let Some(joined) = joined else {
                     break;
@@ -850,7 +953,7 @@ async fn drive(bus: &EventBus, plan: &plan::Plan) -> Result<CampaignOutcome> {
     pool.settle_parked();
 
     let stopped = if interrupted {
-        Stopped::Interrupted
+        Stopped::Interrupted(Phase::Dispatching)
     } else if pool.gave_up {
         Stopped::GaveUp
     } else {
@@ -874,6 +977,7 @@ async fn run_learn(
     worker_id: &mut u32,
     fleet: &plan::Fleet,
     scenario: &plan::Scenario,
+    interrupt: &CancellationToken,
 ) -> Result<(Learned, Duration)> {
     let mut attempt = 1;
     loop {
@@ -888,7 +992,7 @@ async fn run_learn(
         // Timed around the reclaim as well as the run: every schedule brings a
         // replica up and takes it down again, so that is what one costs.
         let cycle = Instant::now();
-        let outcome = execute_learn(bus, id, schedule).await;
+        let outcome = execute_learn(bus, id, schedule, interrupt).await;
         reclaim_fleet(id, fleet).await;
         match outcome {
             Ok((learned, _)) => return Ok((learned, cycle.elapsed())),
@@ -909,6 +1013,7 @@ async fn execute_learn(
     bus: &EventBus,
     worker_id: u32,
     schedule: Schedule,
+    interrupt: &CancellationToken,
 ) -> Result<(Learned, Duration)> {
     let (socket_path, listener) = bind_worker_listener(worker_id).await?;
     let (mut child, stderr_relay) = spawn_worker(&socket_path, worker_id)?;
@@ -918,8 +1023,16 @@ async fn execute_learn(
         let learned = session.learn(bus, schedule).await?;
         Ok::<_, Error>((learned, learn_start.elapsed()))
     };
-    match tokio::time::timeout(LEARN_BUDGET, pipeline).await {
-        Ok(Ok((learned, run_cost))) => {
+    let raced = tokio::select! {
+        biased;
+        () = interrupt.cancelled() => Err(Error::Interrupted),
+        outcome = tokio::time::timeout(LEARN_BUDGET, pipeline) => match outcome {
+            Ok(learned) => learned,
+            Err(_) => Err(Error::WorkerTimeout(LEARN_BUDGET)),
+        },
+    };
+    match raced {
+        Ok((learned, run_cost)) => {
             // The catalogue is in hand; a failure while the worker finishes
             // teardown must not discard it. wait_worker has already reaped the
             // child on every error path, so here we only log and keep it.
@@ -932,13 +1045,9 @@ async fn execute_learn(
             }
             Ok((learned, run_cost))
         }
-        Ok(Err(e)) => {
+        Err(e) => {
             reap_worker(&mut child, stderr_relay).await;
             Err(e)
-        }
-        Err(_) => {
-            reap_worker(&mut child, stderr_relay).await;
-            Err(Error::WorkerTimeout(LEARN_BUDGET))
         }
     }
 }
@@ -953,8 +1062,16 @@ async fn run_one_schedule(
     schedule: Schedule,
     attempt: u32,
     schedule_budget: Duration,
+    interrupt: CancellationToken,
 ) -> Ran {
-    let readings = run_worker(&bus, worker_id, schedule.clone(), schedule_budget).await;
+    let readings = run_worker(
+        &bus,
+        worker_id,
+        schedule.clone(),
+        schedule_budget,
+        &interrupt,
+    )
+    .await;
     reclaim_fleet(worker_id, &schedule.fleet).await;
     (schedule, attempt, readings)
 }
@@ -967,6 +1084,7 @@ async fn run_worker(
     worker_id: u32,
     schedule: Schedule,
     schedule_budget: Duration,
+    interrupt: &CancellationToken,
 ) -> Result<Readings> {
     let (socket_path, listener) = bind_worker_listener(worker_id).await?;
     let (mut child, stderr_relay) = spawn_worker(&socket_path, worker_id)?;
@@ -978,8 +1096,16 @@ async fn run_worker(
             .await_result(bus)
             .await
     };
-    match tokio::time::timeout(schedule_budget, pipeline).await {
-        Ok(Ok(readings)) => {
+    let raced = tokio::select! {
+        biased;
+        () = interrupt.cancelled() => Err(Error::Interrupted),
+        outcome = tokio::time::timeout(schedule_budget, pipeline) => match outcome {
+            Ok(readings) => readings,
+            Err(_) => Err(Error::WorkerTimeout(schedule_budget)),
+        },
+    };
+    match raced {
+        Ok(readings) => {
             // The worker already delivered its readings; a failure while it
             // finishes teardown must not discard them, or a found fault would be
             // mis-tallied as an error and flip the campaign's exit code. A
@@ -997,13 +1123,9 @@ async fn run_worker(
             }
             Ok(readings)
         }
-        Ok(Err(e)) => {
+        Err(e) => {
             reap_worker(&mut child, stderr_relay).await;
             Err(e)
-        }
-        Err(_) => {
-            reap_worker(&mut child, stderr_relay).await;
-            Err(Error::WorkerTimeout(schedule_budget))
         }
     }
 }
@@ -1147,6 +1269,30 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn an_interrupted_schedule_is_abandoned_rather_than_errored() {
+        let mut outcomes = Outcomes::default();
+        outcomes.record_verdict(1, Verdict::Pass);
+        outcomes.abandoned.push(2);
+        outcomes.abandoned.push(3);
+
+        assert_eq!(outcomes.errored, 0);
+        assert_eq!(outcomes.completed(), 1);
+        assert_eq!(outcomes.outcome(), CampaignOutcome::Clean);
+    }
+
+    #[test]
+    fn a_stop_report_names_the_schedules_it_abandoned() {
+        assert_eq!(spelled_ids(&[]), "none");
+        assert_eq!(spelled_ids(&[4]), "4");
+        assert_eq!(spelled_ids(&[1, 2, 3, 4, 5]), "1, 2, 3, 4 and 5");
+    }
+
+    #[test]
+    fn an_interrupt_is_not_transient() {
+        assert!(!Error::Interrupted.is_transient());
     }
 
     /// The campaign reports what its runs turned out to show, and a run whose

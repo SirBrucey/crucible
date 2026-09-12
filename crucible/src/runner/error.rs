@@ -36,6 +36,8 @@ pub enum Error {
     WorkerUnresponsive(Duration),
     #[error("version mismatch: runner is `{ours}` but worker is `{theirs}`")]
     VersionMismatch { ours: String, theirs: String },
+    #[error("the campaign was interrupted")]
+    Interrupted,
     #[error("runner session in state `{state}` expected `{expected}`, got `{got}`")]
     UnexpectedMessage {
         state: &'static str,
@@ -58,6 +60,7 @@ impl Error {
                 | Error::ScenarioUnreadable { .. }
                 | Error::ScenarioRejected(_)
                 | Error::VersionMismatch { .. }
+                | Error::Interrupted
         )
     }
 }
