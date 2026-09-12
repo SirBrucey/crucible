@@ -11,6 +11,7 @@ use std::{
     future::Future,
     net::{IpAddr, SocketAddr},
     pin::Pin,
+    time::Duration,
 };
 
 use crucible_core::{
@@ -56,6 +57,13 @@ pub trait Substrate: Faults {
     fn proceed(&self) -> BoxFuture<'_, Result<(), Error>>;
     /// Nothing was placed. Disarm and let the fleet go, wherever it had got to.
     fn abandon(&self) -> BoxFuture<'_, Result<(), Error>>;
+
+    /// How many times this replica has been held still, waiting up to `within`
+    /// for a count above `since`.
+    ///
+    /// A substrate that cannot answer says so, rather than saying it never
+    /// froze.
+    fn froze(&self, since: u32, within: Duration) -> BoxFuture<'_, Result<u32, Error>>;
 }
 
 /// What a plugin can do to a fleet beyond driving it. Each accessor answers with
@@ -212,4 +220,18 @@ pub trait ObserverRuntime: Send + Sync {
 /// observed; the framework compares that against what the check expects.
 pub trait Query: Targeted + Send + Sync {
     fn read(&self, endpoint: SocketAddr) -> BoxFuture<'_, Result<plan::Value, Error>>;
+}
+
+#[cfg(all(test, feature = "framework"))]
+mod tests {
+    /// A deployment plugin names its wire capture through this crate alone, so
+    /// one can be written without depending on the framework's internals.
+    ///
+    /// The stream is the deployment's own, so what runs the substrate decides
+    /// where the proxy's lines come from.
+    #[test]
+    fn a_deployment_builds_its_wire_capture_from_any_stream() {
+        type WireCapture = crate::observer::SessionObserver;
+        let _: fn(futures_util::stream::Empty<Vec<u8>>) -> WireCapture = WireCapture::start;
+    }
 }

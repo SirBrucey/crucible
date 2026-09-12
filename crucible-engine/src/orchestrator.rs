@@ -36,12 +36,6 @@ const QUIESCENCE_IDLE: Duration = Duration::from_secs(1);
 /// stop waiting. In practice the scenario ending fires first (a shorter path to
 /// the same "missed" outcome); this only guards a pathological hang.
 const ANCHOR_TIMEOUT: Duration = Duration::from_mins(1);
-/// How long to wait for a freeze once the fleet is quiet, before concluding
-/// the anchor was missed.
-///
-/// The docker log stream batches, so one can arrive well after the traffic
-/// that caused it.
-const FREEZE_GRACE: Duration = Duration::from_secs(5);
 /// A fault the proxy places itself is reported over the same stream, so what it
 /// says arrives after it happened. Wait this long for it before concluding
 /// nothing was placed.
@@ -627,7 +621,7 @@ async fn anchored_run(
     // Arm as the scenario starts: the proxy counts scenario packets from here,
     // and the freeze baseline is taken at the same moment, so both share the
     // scenario-start origin. A failed arm means nothing will ever freeze.
-    let baseline = session_observer.freeze_count();
+    let baseline = deployment.substrate().froze(0, Duration::ZERO).await?;
     deployment.substrate().arm_anchor().await?;
 
     let (scenario_end_tx, mut scenario_end_rx) = tokio::sync::oneshot::channel::<()>();
@@ -659,9 +653,10 @@ async fn anchored_run(
             )
             .await;
         }
+        let substrate = deployment.substrate();
         let frozen = tokio::select! {
             biased;
-            frozen = session_observer.wait_for_freeze(baseline, ANCHOR_TIMEOUT) => frozen,
+            froze = substrate.froze(baseline, ANCHOR_TIMEOUT) => froze? > baseline,
             // The scenario finished before a freeze was seen, which does not
             // mean the anchored packet is not coming: a consumer's edges carry
             // traffic the scenario never waited for. Wait for the fleet to stop
@@ -670,16 +665,14 @@ async fn anchored_run(
             _ = &mut scenario_end_rx => {
                 tokio::select! {
                     biased;
-                    frozen = session_observer.wait_for_freeze(baseline, ANCHOR_TIMEOUT) => frozen,
+                    froze = substrate.froze(baseline, ANCHOR_TIMEOUT) => froze? > baseline,
                     () = session_observer.wait_for_quiescence(
                         LEARN_SETTLE,
                         QUIESCENCE_IDLE,
                         ANCHOR_TIMEOUT,
                     ) => {
-                        // Quiet, so nothing more is coming. The freeze is read
-                        // through the docker log stream, which lags the traffic
-                        // that caused it, so give a last one time to appear.
-                        session_observer.wait_for_freeze(baseline, FREEZE_GRACE).await
+                        // Quiet, so nothing more is coming.
+                        substrate.froze(baseline, Duration::ZERO).await? > baseline
                     }
                 }
             }
@@ -845,6 +838,8 @@ mod tests {
         kill_fails: bool,
         resume_fails: bool,
         restart_fails: bool,
+        /// What the substrate says it has held still.
+        freezes: u32,
     }
 
     impl crucible_plugin::Faults for FakeDeployment {}
@@ -872,6 +867,14 @@ mod tests {
                     Ok(())
                 }
             })
+        }
+
+        fn froze(
+            &self,
+            _since: u32,
+            _within: Duration,
+        ) -> BoxFuture<'_, Result<u32, crucible_plugin::Error>> {
+            Box::pin(async move { Ok(self.freezes) })
         }
     }
 

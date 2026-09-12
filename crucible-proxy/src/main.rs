@@ -11,7 +11,7 @@ use std::{
 };
 
 use clap::Parser;
-use crucible_protocol::{Direction, Primitive, ServiceHost};
+use crucible_protocol::{ConnEvent, ConnEventKind, Direction, Primitive, ServiceHost};
 use tokio::{
     signal::unix::{SignalKind, signal},
     sync::watch,
@@ -321,6 +321,9 @@ async fn main() -> Result<()> {
         &edge,
     );
     let anchor = job.anchor();
+    // Every pair and every instrumented service counts here, so one number
+    // answers for the whole fleet.
+    let freezes = watch::Sender::new(0u32);
 
     serve_pairs(
         pairs,
@@ -332,6 +335,7 @@ async fn main() -> Result<()> {
             sever: &sever_rx,
             down: &down_rx,
             edge: &edge,
+            freezes: &freezes,
         },
     )
     .await?;
@@ -344,7 +348,14 @@ async fn main() -> Result<()> {
         .flatten();
     let named = Arc::new(fleet::Named::new(hosts));
     named.warm();
-    serve_spans(&cli, anchor.clone(), pause_rx.clone(), Arc::clone(&named)).await?;
+    serve_spans(
+        &cli,
+        anchor.clone(),
+        pause_rx.clone(),
+        Arc::clone(&named),
+        freezes,
+    )
+    .await?;
     spawn_fault_control(
         job,
         trip_rx,
@@ -413,7 +424,12 @@ impl Pair {
 
 /// Bring one pair up and report what crosses it, for the lifetime of the
 /// process.
-async fn serve(pair: Pair, gate: Gate, anchor: Option<Anchor>) -> Result<()> {
+async fn serve(
+    pair: Pair,
+    gate: Gate,
+    anchor: Option<Anchor>,
+    freezes: watch::Sender<u32>,
+) -> Result<()> {
     let Pair {
         service,
         kind,
@@ -450,16 +466,26 @@ async fn serve(pair: Pair, gate: Gate, anchor: Option<Anchor>) -> Result<()> {
     // its service; the runner attributes the interleaved stream by that tag.
     tokio::spawn(async move {
         while let Some(event) = events.recv().await {
-            match serde_json::to_string(&event) {
-                Ok(line) => {
-                    println!("{service}\t{line}");
-                    let _ = std::io::stdout().flush();
-                }
-                Err(e) => tracing::error!(?e, "serialize conn event"),
-            }
+            report(&freezes, &service, &event);
         }
     });
     Ok(())
+}
+
+/// Write one event out, counting it if it says the fleet was held still.
+///
+/// The count is what answers a caller waiting on a freeze.
+fn report(freezes: &watch::Sender<u32>, service: &str, event: &ConnEvent) {
+    if matches!(event.kind, ConnEventKind::Froze { .. }) {
+        freezes.send_modify(|count| *count += 1);
+    }
+    match serde_json::to_string(event) {
+        Ok(line) => {
+            println!("{service}\t{line}");
+            let _ = std::io::stdout().flush();
+        }
+        Err(e) => tracing::error!(?e, "serialize conn event"),
+    }
 }
 
 /// Listen for the moments instrumented services report, holding at the one
@@ -472,6 +498,7 @@ async fn serve_spans(
     anchor: Option<Anchor>,
     pause: watch::Receiver<bool>,
     named: Arc<fleet::Named>,
+    freezes: watch::Sender<u32>,
 ) -> Result<()> {
     let (events_tx, mut events) = tokio::sync::mpsc::unbounded_channel();
     let watching = match cli.inside.as_deref().map(parse_inside).transpose()? {
@@ -481,17 +508,11 @@ async fn serve_spans(
         None => crucible_protocol::Watching::Reporting,
     };
     let spans = std::sync::Arc::new(span::Spans::new(watching, anchor, pause, events_tx, named));
-    let at = span::listen(spans, &cli.span_listen).await?;
+    let at = span::listen(spans, freezes.subscribe(), &cli.span_listen).await?;
     tracing::info!(%at, "listening for the moments inside services");
     tokio::spawn(async move {
         while let Some((service, event)) = events.recv().await {
-            match serde_json::to_string(&event) {
-                Ok(line) => {
-                    println!("{service}\t{line}");
-                    let _ = std::io::stdout().flush();
-                }
-                Err(e) => tracing::error!(?e, "serialize conn event"),
-            }
+            report(&freezes, &service, &event);
         }
     });
     Ok(())
@@ -558,6 +579,8 @@ struct Gates<'a> {
     sever: &'a watch::Receiver<u64>,
     down: &'a watch::Receiver<bool>,
     edge: &'a Arc<OnceLock<OnEdge>>,
+    /// Counted as each pair reports a freeze.
+    freezes: &'a watch::Sender<u32>,
 }
 
 /// Bring every pair up, each gated by whether a fault names the service it
@@ -591,6 +614,7 @@ async fn serve_pairs(pairs: Vec<Pair>, gates: Gates<'_>) -> Result<()> {
             pair,
             gate,
             anchored.then(|| gates.anchor.cloned()).flatten(),
+            gates.freezes.clone(),
         )
         .await?;
     }

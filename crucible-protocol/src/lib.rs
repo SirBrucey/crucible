@@ -10,7 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub use fault::{At, FaultMissReason, FaultReport, FaultResult};
 pub use primitive::Primitive;
-pub use proxy::{ConnEvent, ConnEventKind, ConnId, Direction};
+pub use proxy::{ConnEvent, ConnEventKind, ConnId, Direction, Freezes, Waiting};
 pub use session::{Session, WriteRecord};
 pub use tier::{Boundary, Reached, Released, Side, Watching};
 

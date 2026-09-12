@@ -6,6 +6,30 @@ use crate::now_ns;
 
 pub type ConnId = u64;
 
+/// A wait for the fleet to be held still.
+///
+/// `since` is the count the caller last saw, so a freeze it has already been
+/// told about does not answer a later wait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+pub struct Waiting {
+    pub since: u32,
+    pub within_ms: u64,
+}
+
+impl Waiting {
+    /// As a query string.
+    #[must_use]
+    pub fn query(&self) -> String {
+        format!("since={}&within_ms={}", self.since, self.within_ms)
+    }
+}
+
+/// How many times the proxy has held the fleet still.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+pub struct Freezes {
+    pub count: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct ConnEvent {
     pub id: ConnId,
