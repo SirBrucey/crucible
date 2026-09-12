@@ -8,14 +8,17 @@
 use std::{
     net::{IpAddr, SocketAddr},
     sync::Arc,
+    time::Duration,
 };
 
 use axum::{
     Json, Router,
-    extract::{ConnectInfo, State},
+    extract::{ConnectInfo, Query, State},
     routing::{get, post},
 };
-use crucible_protocol::{Boundary, ConnEvent, ConnId, Released, Watching, now_ns};
+use crucible_protocol::{
+    Boundary, ConnEvent, ConnId, Freezes, Released, Waiting, Watching, now_ns,
+};
 use tokio::{
     net::TcpListener,
     sync::{mpsc, watch},
@@ -109,22 +112,55 @@ async fn reached(
     Json(spans.reached(peer.ip(), boundary).await)
 }
 
-/// Everything an instrumented service needs to talk to.
-fn routes(spans: Arc<Spans>) -> Router {
+/// Everything an instrumented service needs to talk to, and how the framework
+/// asks whether the fleet has been held still.
+fn routes(spans: Arc<Spans>, freezes: watch::Receiver<u32>) -> Router {
     Router::new()
         .route("/watching", get(watching))
         .route("/boundary", post(reached))
         .with_state(spans)
+        .merge(
+            Router::new()
+                .route("/froze", get(froze))
+                .with_state(freezes),
+        )
+}
+
+/// Answer once the fleet has been held still more times than the caller has
+/// been told about, or when its wait runs out.
+///
+/// The count only ever rises, so a caller that asks again with what it last
+/// saw is answered by a freeze that arrived in between.
+async fn froze(
+    State(mut freezes): State<watch::Receiver<u32>>,
+    Query(ask): Query<Waiting>,
+) -> Json<Freezes> {
+    let wait = Duration::from_millis(ask.within_ms);
+    let _ = tokio::time::timeout(wait, async {
+        while *freezes.borrow_and_update() <= ask.since {
+            if freezes.changed().await.is_err() {
+                return;
+            }
+        }
+    })
+    .await;
+    Json(Freezes {
+        count: *freezes.borrow(),
+    })
 }
 
 /// Listen for the moments services report, and say where.
 ///
 /// # Errors
 /// Errors if the address cannot be bound.
-pub async fn listen(spans: Arc<Spans>, addr: &str) -> std::io::Result<std::net::SocketAddr> {
+pub async fn listen(
+    spans: Arc<Spans>,
+    freezes: watch::Receiver<u32>,
+    addr: &str,
+) -> std::io::Result<std::net::SocketAddr> {
     let listener = TcpListener::bind(addr).await?;
     let bound = listener.local_addr()?;
-    let routes = routes(spans).into_make_service_with_connect_info::<SocketAddr>();
+    let routes = routes(spans, freezes).into_make_service_with_connect_info::<SocketAddr>();
     tokio::spawn(async move {
         if let Err(e) = axum::serve(listener, routes).await {
             tracing::error!(%e, "stopped listening for the moments inside services");
@@ -145,6 +181,57 @@ mod tests {
     const REPORTER: IpAddr = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
     /// Another service the fleet names, which reaches the same marks.
     const OTHER: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 4));
+
+    /// A run asks twice whether the fault fired, once while the scenario runs
+    /// and again once it ends. A second ask that started counting from scratch
+    /// would miss a freeze that had already arrived, and the run would report a
+    /// fault that fired as one that never did.
+    #[tokio::test]
+    async fn a_freeze_already_counted_answers_a_later_wait() {
+        let freezes = watch::Sender::new(0u32);
+        freezes.send_modify(|count| *count += 1);
+        let brief = Duration::from_secs(1);
+
+        let first = froze(
+            State(freezes.subscribe()),
+            Query(Waiting {
+                since: 0,
+                within_ms: 1_000,
+            }),
+        )
+        .await;
+        assert_eq!(first.count, 1);
+
+        let again = tokio::time::timeout(
+            brief,
+            froze(
+                State(freezes.subscribe()),
+                Query(Waiting {
+                    since: 0,
+                    within_ms: 1_000,
+                }),
+            ),
+        )
+        .await
+        .expect("the same freeze answers at once rather than waiting out the ask");
+        assert_eq!(again.count, 1);
+    }
+
+    /// Asked about a freeze that has not happened, the wait runs out and says
+    /// what it has.
+    #[tokio::test]
+    async fn a_wait_for_a_freeze_that_never_comes_says_what_it_has() {
+        let freezes = watch::Sender::new(3u32);
+        let answered = froze(
+            State(freezes.subscribe()),
+            Query(Waiting {
+                since: 3,
+                within_ms: 20,
+            }),
+        )
+        .await;
+        assert_eq!(answered.count, 3);
+    }
 
     fn boundary(span: &str, nth: u32) -> Boundary {
         Boundary {

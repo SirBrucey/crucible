@@ -11,6 +11,7 @@ use std::{
     future::Future,
     net::{IpAddr, SocketAddr},
     pin::Pin,
+    time::Duration,
 };
 
 use crucible_core::{
@@ -56,6 +57,13 @@ pub trait Substrate: Faults {
     fn proceed(&self) -> BoxFuture<'_, Result<(), Error>>;
     /// Nothing was placed. Disarm and let the fleet go, wherever it had got to.
     fn abandon(&self) -> BoxFuture<'_, Result<(), Error>>;
+
+    /// How many times this replica has been held still, waiting up to `within`
+    /// for a count above `since`.
+    ///
+    /// A substrate that cannot answer says so, rather than saying it never
+    /// froze.
+    fn froze(&self, since: u32, within: Duration) -> BoxFuture<'_, Result<u32, Error>>;
 }
 
 /// What a plugin can do to a fleet beyond driving it. Each accessor answers with

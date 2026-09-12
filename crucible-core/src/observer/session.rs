@@ -49,9 +49,6 @@ impl DirectionCounts {
 pub struct EventIndex {
     events: Vec<(String, ConnEvent)>,
     packet_counts: HashMap<String, DirectionCounts>,
-    freezes: u32,
-    /// When the proxy last held the fleet, which is also when the fault landed.
-    froze_at: Option<u128>,
     /// What the fault has said of itself, since a fault nothing can be seen to
     /// have met is one the run cannot be judged on.
     placed: Vec<Reported>,
@@ -80,10 +77,6 @@ impl EventIndex {
                 .or_default()
                 .increment(direction);
         }
-        if matches!(event.kind, ConnEventKind::Froze { .. }) {
-            self.freezes += 1;
-            self.froze_at = Some(event.ts_ns);
-        }
         if let ConnEventKind::Did { did } = &event.kind {
             self.placed.push(Reported {
                 did: did.clone(),
@@ -105,20 +98,6 @@ impl EventIndex {
         self.packet_counts
             .get(service)
             .map_or(0, |counts| counts.get(direction))
-    }
-
-    /// How many times the proxy has reported the fleet freezing (the fault
-    /// anchor tripping) so far. O(1).
-    #[must_use]
-    pub fn freeze_count(&self) -> u32 {
-        self.freezes
-    }
-
-    /// Wall-clock nanoseconds of the last freeze, or `None` if the fleet has not
-    /// been held. O(1).
-    #[must_use]
-    pub fn froze_at_ns(&self) -> Option<u128> {
-        self.froze_at
     }
 
     /// Wall-clock nanoseconds of the most recent event, or `None` if nothing has
@@ -197,31 +176,6 @@ impl SessionObserver {
         observations.sessions = catalogue.into_iter().collect();
     }
 
-    /// Block until the proxy reports the fleet has frozen (the fault anchor
-    /// tripped) since `baseline`, or until `timeout` elapses; returns whether
-    /// the freeze was observed.
-    ///
-    /// The caller takes `baseline` from [`Self::freeze_count`] when it arms the
-    /// anchor, and passes the same one to every wait. Taking a fresh one per
-    /// call would hide a freeze that had already arrived, and the run would go
-    /// looking for a second that is never coming.
-    ///
-    /// A freeze that the proxy itself releases may already be over by the time
-    /// it is seen here, so this says the fault was placed, not that the fleet is
-    /// still held. Use [`Self::froze_at_ns`] for when it landed.
-    pub async fn wait_for_freeze(&self, baseline: u32, timeout: Duration) -> bool {
-        let deadline = tokio::time::Instant::now() + timeout;
-        loop {
-            if self.freeze_count() > baseline {
-                return true;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                return false;
-            }
-            tokio::time::sleep(ANCHOR_POLL).await;
-        }
-    }
-
     /// Block until the fault is seen to have been placed, or until `timeout`
     /// elapses. Returns what it last said of itself, which is `None` if it said
     /// nothing at all.
@@ -255,26 +209,6 @@ impl SessionObserver {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .placed()
             .to_vec()
-    }
-
-    /// Freezes seen so far, which a caller takes as the baseline for its waits.
-    #[must_use]
-    pub fn freeze_count(&self) -> u32 {
-        self.index
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .freeze_count()
-    }
-
-    /// When the proxy last held the fleet, by its own clock. What reads this
-    /// stream sees the freeze later than that, so a fault is timed by the proxy
-    /// rather than by whoever noticed.
-    #[must_use]
-    pub fn froze_at_ns(&self) -> Option<u128> {
-        self.index
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .froze_at_ns()
     }
 
     /// Wall-clock nanoseconds of the most recent event the observer has
@@ -391,52 +325,6 @@ mod tests {
         index.record("db".into(), ConnEvent::closed_at(0, 15, 0, 0));
         assert_eq!(index.packet_count("db", Direction::ClientToUpstream), 0);
         assert_eq!(index.packet_count("db", Direction::UpstreamToClient), 0);
-    }
-
-    #[test]
-    fn freeze_count_tracks_only_froze_events() {
-        let mut index = EventIndex::default();
-        assert_eq!(index.freeze_count(), 0);
-        // Traffic is not a freeze.
-        index.record(
-            "db".into(),
-            ConnEvent::wrote_at(0, 10, Direction::ClientToUpstream, 1),
-        );
-        assert_eq!(index.freeze_count(), 0);
-        index.record(
-            "db".into(),
-            ConnEvent::froze_at(0, 20, "publish:1:after".to_owned()),
-        );
-        assert_eq!(index.freeze_count(), 1);
-        index.record(
-            "db".into(),
-            ConnEvent::froze_at(0, 30, "publish:2:after".to_owned()),
-        );
-        assert_eq!(index.freeze_count(), 2);
-    }
-
-    /// We ask twice whether the fault fired, once while the scenario runs and
-    /// again once it ends. If the second ask started counting from scratch it
-    /// would miss a freeze that had already arrived, and we would report a fault
-    /// that fired as one that never did.
-    #[tokio::test]
-    async fn a_freeze_stays_seen_by_every_wait_that_shares_a_baseline() {
-        let line = format!(
-            "db\t{}\n",
-            serde_json::to_string(&ConnEvent::froze_at(0, 20, "publish:1:after".to_owned()))
-                .expect("an event serializes")
-        );
-        let observer = SessionObserver::start(
-            futures_util::stream::iter([line.into_bytes()])
-                .chain(futures_util::stream::pending::<Vec<u8>>()),
-        );
-        let baseline = 0;
-        let brief = Duration::from_secs(1);
-        assert!(observer.wait_for_freeze(baseline, brief).await);
-        assert!(
-            observer.wait_for_freeze(baseline, brief).await,
-            "the same freeze answers a later wait"
-        );
     }
 
     #[test]

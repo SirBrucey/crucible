@@ -19,7 +19,7 @@ use bollard::{
         LogsOptionsBuilder, RemoveContainerOptionsBuilder, StartContainerOptions,
     },
 };
-use crucible_protocol::{Direction, Edge, now_ns};
+use crucible_protocol::{Direction, Edge, Freezes, Waiting, now_ns};
 use futures_util::{StreamExt, TryStreamExt};
 use tokio::time::sleep;
 
@@ -55,11 +55,16 @@ const PROXY_ALIAS: &str = "crucible-proxy";
 const SPAN_ENV: &str = "CRUCIBLE_SPAN";
 /// The port the proxy listens for those moments on.
 const SPAN_PORT: u16 = 4145;
+/// Added to a freeze query's timeout, so the proxy's own wait runs out first
+/// and answers, rather than this side giving up on a reply already on its way.
+const FREEZE_REPLY_MARGIN: Duration = Duration::from_secs(2);
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error(transparent)]
     Docker(#[from] bollard::errors::Error),
+    #[error("could not ask the proxy what it has held still: {0}")]
+    Froze(#[source] reqwest::Error),
     #[error("service `{name}` did not publish port {port}")]
     MissingPort { name: String, port: u16 },
     #[error("service `{name}` did not become ready within {timeout:?}")]
@@ -427,6 +432,7 @@ impl Docker {
                     format!("{}/tcp", control_port(*port)),
                 ]
             })
+            .chain(std::iter::once(format!("{SPAN_PORT}/tcp")))
             .collect();
 
         let mut aliases: Vec<String> = self.services.iter().map(|s| s.name.clone()).collect();
@@ -884,6 +890,30 @@ impl Substrate for Proxy {
     /// will never be told about would take one for the other.
     fn abandon(&self) -> BoxFuture<'_, Result<(), PluginError>> {
         Box::pin(async move { self.signal("SIGHUP").await.map_err(PluginError::from) })
+    }
+
+    /// Ask the proxy over the port it serves its spans on.
+    fn froze(&self, since: u32, within: Duration) -> BoxFuture<'_, Result<u32, PluginError>> {
+        Box::pin(async move { self.freezes(since, within).await.map_err(PluginError::from) })
+    }
+}
+
+impl Proxy {
+    /// How many freezes the proxy has counted, waiting for one past `since`.
+    async fn freezes(&self, since: u32, within: Duration) -> Result<u32> {
+        let port = published_port(&self.client, &self.container, SPAN_PORT).await?;
+        let waiting = Waiting {
+            since,
+            within_ms: u64::try_from(within.as_millis()).unwrap_or(u64::MAX),
+        };
+        let asked = reqwest::Client::new()
+            .get(format!("http://{}/froze?{}", local(port), waiting.query()))
+            .timeout(within + FREEZE_REPLY_MARGIN)
+            .send()
+            .await
+            .map_err(Error::Froze)?;
+        let freezes: Freezes = asked.json().await.map_err(Error::Froze)?;
+        Ok(freezes.count)
     }
 }
 
