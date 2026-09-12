@@ -92,19 +92,20 @@ async fn create_record(
         })?
         .get("id");
 
-    let result =
-        sqlx::query("INSERT INTO records (domain_id, name, type, content, ttl) VALUES (?, ?, ?, ?, ?)")
-            .bind(domain_id)
-            .bind(&req.name)
-            .bind(&req.record_type)
-            .bind(&req.value)
-            .bind(TTL)
-            .execute(&state.db)
-            .await
-            .map_err(|e| {
-                tracing::warn!(?e, "insert failed");
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
+    let result = sqlx::query(
+        "INSERT INTO records (domain_id, name, type, content, ttl) VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(domain_id)
+    .bind(&req.name)
+    .bind(&req.record_type)
+    .bind(&req.value)
+    .bind(TTL)
+    .execute(&state.db)
+    .await
+    .map_err(|e| {
+        tracing::warn!(?e, "insert failed");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     tracing::info!(name = %req.name, record_type = %req.record_type, "record created");
     Ok(Json(RecordResponse {

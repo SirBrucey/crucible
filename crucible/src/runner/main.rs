@@ -1,3 +1,4 @@
+mod bench;
 mod error;
 mod session;
 
@@ -15,7 +16,7 @@ use crucible_core::{
     learned::Learned,
     plan,
     schedule::Schedule,
-    verdict::{self, Invariant},
+    verdict::{self, Invariant, Readings},
 };
 use crucible_engine::{
     event_bus::EventBus,
@@ -28,11 +29,12 @@ use tokio::{
     net::UnixListener,
     process::{Child, Command},
     signal::unix::{SignalKind, signal},
-    task::{JoinError, JoinHandle, JoinSet},
+    task::{Id as TaskId, JoinError, JoinHandle, JoinSet},
     time::timeout,
 };
 
 use crate::{
+    bench::{Bench, Taking},
     error::{Error, Result},
     session::{Dispatching, Session},
 };
@@ -58,6 +60,7 @@ const MAX_ATTEMPTS: u32 = 3;
 /// If this many schedules fail every attempt back to back, the campaign gives
 /// up: something is systemically wrong (e.g. Docker is unavailable).
 const GIVE_UP_AFTER: u32 = 3;
+
 /// Number of schedule workers (each with its own fleet replica) to run at once.
 /// Overridable with `CRUCIBLE_CONCURRENCY`.
 const DEFAULT_CONCURRENCY: usize = 3;
@@ -336,10 +339,7 @@ impl Outcomes {
 
     /// Which invariants the campaign showed broken, and how often.
     ///
-    /// This is what the runs turned out to say, not what their faults could
-    /// have said. A fault that could have shown several and settled somewhere
-    /// none of them describes is counted apart, since calling it any of them
-    /// would be a claim the readings do not support.
+    /// A run that settled where none of them describes is counted apart.
     fn shown(&self) -> String {
         let mut counted: BTreeMap<Invariant, usize> = BTreeMap::new();
         let mut unattributed = 0;
@@ -419,7 +419,6 @@ impl Outcomes {
         }
     }
 }
-
 /// Why a campaign stopped dispatching with schedules left.
 #[derive(Clone, Copy, Debug)]
 enum Stopped {
@@ -453,7 +452,7 @@ impl Recovery {
         attempt < MAX_ATTEMPTS
     }
 
-    /// A schedule produced a verdict; the failure streak resets.
+    /// A schedule came back with something to read; the failure streak resets.
     fn reset(&mut self) {
         self.consecutive_failures = 0;
     }
@@ -469,6 +468,10 @@ impl Recovery {
     }
 }
 
+/// One finished worker. The schedule it ran, which attempt it was, and what the
+/// run read.
+type Ran = (Schedule, u32, Result<Readings>);
+
 /// The schedule dispatch pool: the in-flight schedule workers, kept filled up to
 /// the concurrency cap, plus the running tally and the counters that respawn and
 /// give-up decisions read. Each schedule runs on its own isolated fleet replica,
@@ -479,12 +482,17 @@ struct Pool<'a> {
     /// The fleet every replica of this campaign runs, so one can be reclaimed
     /// without the worker that owned it.
     fleet: &'a plan::Fleet,
-    inflight: JoinSet<(Schedule, u32, Result<Verdict>)>,
+    /// Judges what each run read, fetching the reference runs it needs.
+    bench: Bench<'a>,
+    /// What each in-flight task is running, so a panicked one can still be
+    /// told from a schedule the campaign is judged on.
+    drove: BTreeMap<TaskId, Option<Vec<usize>>>,
+    inflight: JoinSet<Ran>,
     outcomes: Outcomes,
     recovery: Recovery,
-    worker_id: u32,
-    /// How long the whole campaign may dispatch for.
+    /// How long the whole campaign may take work on for.
     campaign_budget: Option<Duration>,
+    worker_id: u32,
     schedule_budget: Duration,
     campaign_start: Instant,
     max_inflight: usize,
@@ -496,8 +504,8 @@ impl<'a> Pool<'a> {
     fn new(
         bus: &'a EventBus,
         fleet: &'a plan::Fleet,
+        scenario: &'a plan::Scenario,
         worker_id: u32,
-        campaign_budget: Option<Duration>,
         schedule_budget: Duration,
         campaign_start: Instant,
         max_inflight: usize,
@@ -505,11 +513,13 @@ impl<'a> Pool<'a> {
         Self {
             bus,
             fleet,
+            bench: Bench::new(fleet, scenario, max_inflight),
+            drove: BTreeMap::new(),
             inflight: JoinSet::new(),
             outcomes: Outcomes::default(),
             recovery: Recovery::default(),
+            campaign_budget: scenario.budget,
             worker_id,
-            campaign_budget,
             schedule_budget,
             campaign_start,
             max_inflight,
@@ -525,26 +535,47 @@ impl<'a> Pool<'a> {
             .is_none_or(|budget| self.campaign_start.elapsed() < budget)
     }
 
+    /// How much more work the campaign will take on.
+    fn taking(&self) -> Taking {
+        if self.gave_up {
+            Taking::Nothing
+        } else if self.within_budget() {
+            Taking::More
+        } else {
+            Taking::Finishing
+        }
+    }
+
     /// Spawn one schedule attempt on the next worker id and its own replica.
     fn spawn(&mut self, schedule: Schedule, attempt: u32) {
-        self.inflight.spawn(run_one_schedule(
+        let landed = schedule.landed().map(<[usize]>::to_vec);
+        let task = self.inflight.spawn(run_one_schedule(
             self.bus.clone(),
             self.worker_id,
             schedule,
             attempt,
             self.schedule_budget,
         ));
+        // A panicked task comes back without its schedule, so what it was for
+        // is written down here while there is still something to read it from.
+        self.drove.insert(task.id(), landed);
         self.worker_id += 1;
     }
 
     /// Fill the in-flight set up to the concurrency cap, until the scheduler
-    /// drains, the campaign gives up, or the wall-clock budget runs out.
+    /// drains or the campaign stops taking work on.
     fn fill(&mut self, scheduler: &mut dyn Scheduler) {
-        while self.inflight.len() < self.max_inflight
-            && !self.exhausted
-            && !self.gave_up
-            && self.within_budget()
-        {
+        while self.inflight.len() < self.max_inflight {
+            let taking = self.taking();
+            // A parked run is holding its result on one of these, so they go
+            // before work that could only add more.
+            if let Some(reference) = self.bench.wanted(taking) {
+                self.spawn(reference, 1);
+                continue;
+            }
+            if taking != Taking::More || self.exhausted {
+                break;
+            }
             match scheduler.next() {
                 Some(schedule) => self.spawn(schedule, 1),
                 None => self.exhausted = true,
@@ -552,19 +583,43 @@ impl<'a> Pool<'a> {
         }
     }
 
-    /// Record one completed (or panicked) schedule: tally its verdict, retry a
-    /// transient failure on a fresh replica while attempts and budget remain, or
-    /// record it errored. Enough failures back to back give the campaign up.
-    fn record(&mut self, joined: std::result::Result<(Schedule, u32, Result<Verdict>), JoinError>) {
-        match joined {
-            Ok((schedule, _attempt, Ok(verdict))) => {
+    /// Record what the bench has decided, which is nothing until a run has
+    /// every state it answers to.
+    fn record_judged(&mut self, judged: impl IntoIterator<Item = (u32, Verdict)>) {
+        for (schedule_id, verdict) in judged {
+            self.outcomes.record_verdict(schedule_id, verdict);
+        }
+    }
+
+    /// Take in a reference run. Where it left the fleet, or its failure to
+    /// say.
+    ///
+    /// It is never respawned. Whether the set is worth another run is the
+    /// bench's to decide.
+    fn reference_done(&mut self, landed: &[usize], result: Result<Readings>) {
+        match result {
+            Ok(readings) => {
+                let judged = self.bench.arrived(landed, &readings);
+                self.record_judged(judged);
+            }
+            Err(e) => self.bench.failed(landed, &e),
+        }
+    }
+
+    /// Take in a run the campaign is judged on. Its verdict, a retry on a
+    /// fresh replica while attempts and appetite remain, or the error that
+    /// ends it.
+    fn schedule_done(&mut self, schedule: Schedule, attempt: u32, result: Result<Readings>) {
+        match result {
+            Ok(readings) => {
                 self.recovery.reset();
-                self.outcomes.record_verdict(schedule.id, verdict);
+                let judged = self.bench.judge(schedule.id, readings);
+                self.record_judged(judged);
             }
             // A worker that outran its budget did not crash; we simply have no
             // verdict in the time allowed. Record it inconclusive rather than
             // retrying into the campaign's hard cap.
-            Ok((schedule, _attempt, Err(Error::WorkerTimeout(budget)))) => {
+            Err(Error::WorkerTimeout(budget)) => {
                 self.recovery.reset();
                 self.outcomes.record_verdict(
                     schedule.id,
@@ -573,10 +628,9 @@ impl<'a> Pool<'a> {
                     },
                 );
             }
-            Ok((schedule, attempt, Err(e)))
+            Err(e)
                 if e.is_transient()
-                    && !self.gave_up
-                    && self.within_budget()
+                    && self.taking() == Taking::More
                     && Recovery::may_respawn(attempt) =>
             {
                 tracing::warn!(
@@ -587,16 +641,44 @@ impl<'a> Pool<'a> {
                 );
                 self.spawn(schedule, attempt + 1);
             }
-            Ok((schedule, attempt, Err(e))) => {
+            Err(e) => {
                 let schedule_id = schedule.id;
                 tracing::warn!(schedule_id, attempts = attempt, error = %e, "worker failed and will not be retried");
                 self.outcomes.record_error(Some(schedule_id), e);
                 self.recovery.record_failure();
             }
+        }
+    }
+
+    /// Record what every run still waiting on a reference run settles for.
+    fn settle_parked(&mut self) {
+        let settled = self.bench.settle();
+        self.record_judged(settled);
+    }
+
+    /// Record one completed (or panicked) run.
+    ///
+    /// A reference run answers a question the campaign asked itself, and never
+    /// counts as a result of the campaign.
+    fn record(&mut self, joined: std::result::Result<(TaskId, Ran), JoinError>) {
+        match joined {
+            Ok((task, (schedule, attempt, result))) => {
+                self.drove.remove(&task);
+                match schedule.landed() {
+                    Some(landed) => self.reference_done(landed, result),
+                    None => self.schedule_done(schedule, attempt, result),
+                }
+            }
             Err(join_err) => {
-                // A panicked task loses its schedule, so it cannot be respawned.
-                self.outcomes.record_error(None, join_err);
-                self.recovery.record_failure();
+                // A reference run that panicked is still not a result of the
+                // campaign. It cannot be respawned, so the set has spent a run
+                // and the bench decides whether it is worth another.
+                if let Some(landed) = self.drove.remove(&join_err.id()).flatten() {
+                    self.bench.failed(&landed, &join_err);
+                } else {
+                    self.outcomes.record_error(None, join_err);
+                    self.recovery.record_failure();
+                }
             }
         }
         if self.recovery.is_exhausted() && !self.gave_up {
@@ -619,13 +701,10 @@ impl<'a> Pool<'a> {
     }
 }
 
-/// Say which invariants a run against this fleet could show broken and which it
-/// could not, and return the ones worth scheduling. A fleet nothing can break
-/// still runs its fault-free scenario; this is just a plain e2e test.
+/// Say which invariants a run against this fleet could show broken, and return
+/// the ones worth scheduling.
 ///
-/// Could show, not did. Most ways of breaking a fleet leave it in doubt, and
-/// what it does about the doubt is what decides which invariant it broke, so
-/// that is a reading of each run rather than anything known here.
+/// Could show, not did.
 fn report_reach(available: &BTreeSet<Primitive>) {
     for invariant in Invariant::iter() {
         match invariant.showable(available) {
@@ -643,8 +722,7 @@ fn report_reach(available: &BTreeSet<Primitive>) {
 
 /// Every schedule the campaign will run, in the order it will run them.
 ///
-/// Recovery is one schedule per service, so its cost is known before it is
-/// built and comes off the top. The bursts take what is left.
+/// Recovery comes off the top. The bursts take what is left.
 fn fit(
     plan: &plan::Plan,
     scenario: &plan::Scenario,
@@ -702,10 +780,10 @@ async fn drive(bus: &EventBus, plan: &plan::Plan) -> Result<CampaignOutcome> {
 
     // Learn is a barrier: schedules derive from its observed traffic profiles.
     let (learned, cycle_cost) = run_learn(bus, &mut worker_id, &plan.fleet, scenario).await?;
-    let readings = learned.trajectory.iter().flatten();
+    let readings = learned.fault_free.trail.iter().flatten();
     tracing::info!(
         edges = learned.profiles.len(),
-        checkpoints = learned.trajectory.len(),
+        checkpoints = learned.fault_free.trail.len(),
         read = readings.clone().filter(|r| r.is_some()).count(),
         unread = readings.filter(|r| r.is_none()).count(),
         cycle_cost_ms = cycle_cost.as_millis(),
@@ -720,7 +798,9 @@ async fn drive(bus: &EventBus, plan: &plan::Plan) -> Result<CampaignOutcome> {
         );
     }
 
-    let settled = learned.trajectory.settled().map_or(&[][..], Vec::as_slice);
+    // The scenario is held to where the fleet settled, which is the reading
+    // taken once it had the whole of `consistent_within` to go quiet in.
+    let settled = learned.fault_free.settled.as_slice();
     if let Some(unmet) = verdict::unmet(&scenario.checks, settled) {
         tracing::error!("the scenario states {unmet} in its own fault-free run");
         return Ok(CampaignOutcome::Indecisive);
@@ -733,8 +813,8 @@ async fn drive(bus: &EventBus, plan: &plan::Plan) -> Result<CampaignOutcome> {
     let mut pool = Pool::new(
         bus,
         &plan.fleet,
+        scenario,
         worker_id,
-        scenario.budget,
         cost + SCHEDULE_MARGIN,
         campaign_start,
         concurrency,
@@ -752,7 +832,7 @@ async fn drive(bus: &EventBus, plan: &plan::Plan) -> Result<CampaignOutcome> {
             biased;
             _ = sigint.recv() => { interrupted = true; break; }
             _ = sigterm.recv() => { interrupted = true; break; }
-            joined = pool.inflight.join_next() => {
+            joined = pool.inflight.join_next_with_id() => {
                 let Some(joined) = joined else {
                     break;
                 };
@@ -765,6 +845,9 @@ async fn drive(bus: &EventBus, plan: &plan::Plan) -> Result<CampaignOutcome> {
         tracing::warn!("interrupted; stopping dispatch and reclaiming replicas");
         pool.reclaim_all().await;
     }
+    // Whatever stopped the campaign, a run still waiting on a reference has to
+    // answer with what it has.
+    pool.settle_parked();
 
     let stopped = if interrupted {
         Stopped::Interrupted
@@ -870,10 +953,10 @@ async fn run_one_schedule(
     schedule: Schedule,
     attempt: u32,
     schedule_budget: Duration,
-) -> (Schedule, u32, Result<Verdict>) {
-    let verdict = run_worker(&bus, worker_id, schedule.clone(), schedule_budget).await;
+) -> Ran {
+    let readings = run_worker(&bus, worker_id, schedule.clone(), schedule_budget).await;
     reclaim_fleet(worker_id, &schedule.fleet).await;
-    (schedule, attempt, verdict)
+    (schedule, attempt, readings)
 }
 
 /// Bring up a worker on its own socket and fleet replica, run the schedule, and
@@ -884,7 +967,7 @@ async fn run_worker(
     worker_id: u32,
     schedule: Schedule,
     schedule_budget: Duration,
-) -> Result<Verdict> {
+) -> Result<Readings> {
     let (socket_path, listener) = bind_worker_listener(worker_id).await?;
     let (mut child, stderr_relay) = spawn_worker(&socket_path, worker_id)?;
     let pipeline = async {
@@ -896,9 +979,9 @@ async fn run_worker(
             .await
     };
     match tokio::time::timeout(schedule_budget, pipeline).await {
-        Ok(Ok(verdict)) => {
-            // The worker already delivered its verdict; a failure while it
-            // finishes teardown must not discard it, or a found fault would be
+        Ok(Ok(readings)) => {
+            // The worker already delivered its readings; a failure while it
+            // finishes teardown must not discard them, or a found fault would be
             // mis-tallied as an error and flip the campaign's exit code. A
             // fault-perturbed fleet is also the most likely to hit a docker
             // teardown race, so this correlates with exactly the runs that found
@@ -909,10 +992,10 @@ async fn run_worker(
                 tracing::warn!(
                     worker_id,
                     error = %e,
-                    "worker teardown failed after delivering its verdict; keeping the verdict"
+                    "worker teardown failed after delivering its readings; keeping them"
                 );
             }
-            Ok(verdict)
+            Ok(readings)
         }
         Ok(Err(e)) => {
             reap_worker(&mut child, stderr_relay).await;

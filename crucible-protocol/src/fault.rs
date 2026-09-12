@@ -60,8 +60,9 @@ pub enum FaultResult {
 pub enum At {
     /// On one moment in the traffic, so it caught whatever was in flight.
     Moment {
-        /// Which way the traffic it was placed on runs.
-        direction: Direction,
+        /// Which way the traffic it was placed on runs, for a moment traffic
+        /// reached. A moment inside a service is on no edge and runs no way.
+        direction: Option<Direction>,
         /// What the moment was, in the terms of whatever read that edge.
         mark: String,
         /// What faulting there catches.

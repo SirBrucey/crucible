@@ -1,26 +1,19 @@
 # orders
 
-An example fleet demonstrating a real event-driven flow:
+One fleet, written three times. Each directory is the one before it, changed in
+response to what its campaign found. Read them in order.
 
-- **api**: HTTP service. `POST /orders {item, quantity}` inserts an order row and publishes `order.created` to the `orders` topic exchange.
-- **broker**: rabbitmq with a topic exchange `orders`.
-- **db**: mariadb.
-- **inventory**: consumer bound to `orders/order.*`. Decrements `stock.level` per order.
+1. [`1_base`](1_base): an event-driven fleet written without accounting for the
+   problems a distributed system has.
+2. [`2_outbox`](2_outbox): the textbook fix for what `1_base` loses. It closes
+   that gap and opens another.
+3. [`3_local_first`](3_local_first): the fix for what made `2_outbox` fragile
+   under a partition, which undoes the guarantee `2_outbox` depended on.
 
-## Build
+Each README says what changed, quotes the campaign output that motivated the
+change, and reports what the change fixed, what it did not, and what it
+introduced. `diff -r 1_base 2_outbox` is the change itself.
 
-```
-./examples/orders/build.sh
-```
-
-Produces two local images:
-- `crucible-example/orders-api:0.1`
-- `crucible-example/orders-inventory:0.1`
-
-## Run
-
-`orders.cru` describes the fleet and the scenario to drive against it. Running it brings the whole fleet up per worker, executes schedules, and tears it down:
-
-```
-cargo run -p crucible -- run examples/orders/orders.cru
-```
+They quote verdicts, not tallies. How many schedules a five minute budget fits
+depends on how fast the machine brought containers up that day, so the totals
+move between runs while the verdicts do not.

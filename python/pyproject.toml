@@ -1,0 +1,29 @@
+[project]
+name = "crucible-span-py"
+version = "0.1.0"
+description = "Crucible's Python adapter: offers the moments inside a service"
+requires-python = ">=3.13"
+dependencies = [
+    "opentelemetry-api>=1.44,<2",
+    "opentelemetry-sdk>=1.44,<2",
+    "requests>=2.34",
+]
+
+[project.optional-dependencies]
+dev = ["flake8>=7.3", "mypy>=2.3", "pytest>=9", "types-requests>=2.33"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["crucible_span_py*"]
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+
+[[tool.mypy.overrides]]
+# The SDK ships no stubs.
+module = "opentelemetry.*"
+ignore_missing_imports = true

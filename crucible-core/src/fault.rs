@@ -160,15 +160,67 @@ impl Fault {
 /// Anchoring to observed traffic rather than a wall clock is what makes a
 /// schedule reproducible across replicas.
 ///
-/// The edge supplies the moment, not the target. A kill on either of its ends
+/// What supplies the moment is not the target. A kill on either end of an edge
 /// takes that whole service, every other edge it holds included.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct Anchor {
-    pub edge: Edge,
-    pub direction: Direction,
-    /// The moment to place it at, in the terms of whatever reads this edge. A
-    /// plugin names what the moment is; an edge nothing can read counts reads.
+    /// What reaches the moment, which is either traffic crossing an edge or a
+    /// service saying it got there.
+    pub reaches: Reaches,
+    /// The moment to place it at, in the terms of whatever reaches it. A plugin
+    /// names what the moment is; an edge nothing can read only counts reads.
     pub mark: String,
     /// What faulting here catches, for a report to say why it was worth doing.
     pub why: String,
+}
+
+/// What reaches a moment, and what has to recognise it.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub enum Reaches {
+    /// Traffic on an edge.
+    Crossing { edge: Edge, direction: Direction },
+    /// A point inside a service.
+    Inside { service: String },
+}
+
+impl Anchor {
+    /// A moment traffic crossing an edge reaches.
+    #[must_use]
+    pub fn crossing(edge: Edge, direction: Direction, mark: String, why: String) -> Self {
+        Self {
+            reaches: Reaches::Crossing { edge, direction },
+            mark,
+            why,
+        }
+    }
+
+    /// A moment inside a service.
+    #[must_use]
+    pub fn inside(service: String, mark: String, why: String) -> Self {
+        Self {
+            reaches: Reaches::Inside { service },
+            mark,
+            why,
+        }
+    }
+}
+
+impl Reaches {
+    /// The edge this is on.
+    #[must_use]
+    pub fn edge(&self) -> Option<&Edge> {
+        match self {
+            Reaches::Crossing { edge, .. } => Some(edge),
+            Reaches::Inside { .. } => None,
+        }
+    }
+
+    /// Direction of the traffic.
+    #[must_use]
+    pub fn direction(&self) -> Option<Direction> {
+        match self {
+            Reaches::Crossing { direction, .. } => Some(*direction),
+            Reaches::Inside { .. } => None,
+        }
+    }
 }

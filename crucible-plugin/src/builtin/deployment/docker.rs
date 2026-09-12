@@ -24,7 +24,7 @@ use futures_util::{StreamExt, TryStreamExt};
 use tokio::time::sleep;
 
 use crucible_core::{
-    fault::{By, Fault, Primitive},
+    fault::{By, Fault, Primitive, Reaches},
     observer::SessionObserver,
     plan,
     schema::{AttrDecl, AttrSchema, ValueType},
@@ -47,6 +47,14 @@ const PROXY_LOG: &str = "CRUCIBLE_PROXY_LOG";
 const CONTROL_BASE: u16 = 40000;
 const PROXY_SUFFIX: &str = "proxy";
 const BACKING_SUFFIX: &str = "actual";
+/// What the proxy answers to for the moments services report, so a service has
+/// one address it can be given at bring-up.
+const PROXY_ALIAS: &str = "crucible-proxy";
+/// Where a service reports the moments inside it. Set on every service: one
+/// that loaded no adapter ignores it.
+const SPAN_ENV: &str = "CRUCIBLE_SPAN";
+/// The port the proxy listens for those moments on.
+const SPAN_PORT: u16 = 4145;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -176,18 +184,25 @@ struct Endpoints {
 /// the one placing it. A kill is done to the container either way.
 fn proxy_fault_args(fault: &Fault) -> Vec<String> {
     match (fault.anchor(), fault.taking()) {
-        (Some(anchor), by) => {
-            let direction = match anchor.direction {
-                Direction::ClientToUpstream => "c2u",
-                Direction::UpstreamToClient => "u2c",
-            };
-            vec![
-                "--fault-at".to_owned(),
-                format!("{}={}={}", edge_arg(&anchor.edge), direction, anchor.mark),
-                "--fault".to_owned(),
-                by.primitive().to_string(),
-            ]
-        }
+        (Some(anchor), by) => match &anchor.reaches {
+            Reaches::Crossing { edge, direction } => {
+                let direction = match direction {
+                    Direction::ClientToUpstream => "c2u",
+                    Direction::UpstreamToClient => "u2c",
+                };
+                vec![
+                    "--fault-at".to_owned(),
+                    format!("{}={}={}", edge_arg(edge), direction, anchor.mark),
+                    "--fault".to_owned(),
+                    by.primitive().to_string(),
+                ]
+            }
+            // The moment crosses no pair: the service reports reaching it and
+            // is held there while the fault is placed.
+            Reaches::Inside { service } => {
+                vec!["--inside".to_owned(), format!("{service}={}", anchor.mark)]
+            }
+        },
         (None, By::Cut(edge)) => vec!["--degrade".to_owned(), edge_arg(edge)],
         // A kill is done to the container, and changing what crosses needs a
         // moment to change, so an unanchored one is nothing the proxy can do.
@@ -302,10 +317,13 @@ impl Docker {
             ..Default::default()
         });
 
+        let mut env = service.env.clone();
+        env.push(format!("{SPAN_ENV}=http://{PROXY_ALIAS}:{SPAN_PORT}"));
+
         let config = ContainerCreateBody {
             image: Some(service.image.clone()),
             exposed_ports: Some(exposed),
-            env: (!service.env.is_empty()).then(|| service.env.clone()),
+            env: Some(env),
             healthcheck,
             networking_config: Some(NetworkingConfig {
                 endpoints_config: Some(endpoints_config),
@@ -411,7 +429,10 @@ impl Docker {
             })
             .collect();
 
-        let aliases: Vec<String> = self.services.iter().map(|s| s.name.clone()).collect();
+        let mut aliases: Vec<String> = self.services.iter().map(|s| s.name.clone()).collect();
+        // A service is not told the fleet's shape, so the proxy answers to a
+        // name of its own for the moments they report.
+        aliases.push(PROXY_ALIAS.to_owned());
         let mut endpoints_config = HashMap::new();
         endpoints_config.insert(
             self.network.clone(),
@@ -1254,5 +1275,45 @@ mod tests {
         .expect("binds");
 
         assert!(bound.ports.is_empty());
+    }
+
+    /// The proxy places a moment on an edge by reading that edge, and one
+    /// inside a service by being told the service got there.
+    #[test]
+    fn where_a_moment_is_decides_what_the_proxy_is_told() {
+        let inside = Fault::at(
+            crucible_core::fault::Anchor::inside(
+                "api".into(),
+                "publish:1:start".into(),
+                "the order is written down and nothing has been said about it".into(),
+            ),
+            By::Kill("api".into()),
+        );
+        assert_eq!(
+            proxy_fault_args(&inside),
+            vec!["--inside".to_owned(), "api=publish:1:start".to_owned()]
+        );
+
+        let crossing = Fault::at(
+            crucible_core::fault::Anchor::crossing(
+                Edge {
+                    client: Some("api".into()),
+                    upstream: "db".into(),
+                },
+                Direction::ClientToUpstream,
+                "3".into(),
+                "3 reads into what this edge carried".into(),
+            ),
+            By::Kill("db".into()),
+        );
+        assert_eq!(
+            proxy_fault_args(&crossing),
+            vec![
+                "--fault-at".to_owned(),
+                "api>db=c2u=3".to_owned(),
+                "--fault".to_owned(),
+                "kill".to_owned(),
+            ]
+        );
     }
 }

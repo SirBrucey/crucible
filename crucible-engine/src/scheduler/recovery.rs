@@ -1,9 +1,8 @@
-//! Recovery scheduler: one schedule per way of degrading the fleet, held for the
-//! whole scenario and put back afterwards, so what it accepted while down is
-//! what it has to have caught up on.
+//! One schedule per way of degrading the fleet, held for the whole scenario
+//! and put back afterwards.
 //!
-//! Drive a service degrades every edge it holds; losing one edge leaves both
-//! its ends running, so a service reachable another way carries on.
+//! Losing one edge leaves both its ends running, so a service reachable
+//! another way carries on.
 
 use std::collections::BTreeSet;
 
@@ -42,7 +41,7 @@ impl RecoveryScheduler {
                     scenario.steps.clone(),
                     scenario.checks.clone(),
                     Fault::throughout(by),
-                    learned.trajectory.clone(),
+                    learned.fault_free.clone(),
                     scenario.consistent_within,
                 );
                 next_id += 1;
@@ -143,7 +142,8 @@ mod tests {
                 .iter()
                 .map(|upstream| profile(dialled(upstream)))
                 .collect(),
-            trajectory: crucible_core::verdict::Trajectory::default(),
+            fault_free: crucible_core::verdict::Baseline::default(),
+            inside: Vec::new(),
             primitives: BTreeSet::from([Primitive::Kill, Primitive::Cut]),
         }
     }
@@ -182,8 +182,7 @@ mod tests {
             .iter()
             .map(|schedule| {
                 schedule
-                    .fault
-                    .as_ref()
+                    .fault()
                     .expect("a recovery run faults")
                     .taking()
                     .target()
@@ -224,7 +223,7 @@ mod tests {
         let cut: Vec<String> = std::iter::from_fn(move || s.next())
             .map(|schedule| {
                 schedule
-                    .fault
+                    .fault()
                     .expect("a recovery run faults")
                     .taking()
                     .target()
@@ -244,7 +243,7 @@ mod tests {
     #[test]
     fn a_recovery_schedule_is_not_anchored_to_a_packet() {
         let schedules = schedules(&[Drive::Kill], &[]);
-        let fault = schedules[0].fault.as_ref().expect("a recovery run faults");
+        let fault = schedules[0].fault().expect("a recovery run faults");
         assert_eq!(fault.anchor(), None);
     }
 }

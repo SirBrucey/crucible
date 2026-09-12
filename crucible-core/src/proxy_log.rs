@@ -6,8 +6,8 @@ use std::{
 };
 
 use crucible_protocol::{
-    Burst, ConnEvent, ConnEventKind, ConnId, Direction, Edge, EdgeProfile, Placement, Session,
-    WriteRecord,
+    Burst, ConnEvent, ConnEventKind, ConnId, Direction, Edge, EdgeProfile, Placement, Reached,
+    Session, WriteRecord,
 };
 
 struct Pending {
@@ -22,12 +22,20 @@ struct Pending {
 pub struct Sessions {
     opened: HashMap<(String, ConnId), Pending>,
     finished: Vec<Session>,
+    /// Moments inside services.
+    inside: Vec<Reached>,
 }
 
 impl Sessions {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The moments services reported from inside themselves.
+    #[must_use]
+    pub fn inside(&self) -> &[Reached] {
+        &self.inside
     }
 
     pub fn accept_event(&mut self, service: &str, event: ConnEvent) {
@@ -69,6 +77,10 @@ impl Sessions {
             ConnEventKind::Failed { .. } => {
                 self.opened.remove(&(service.to_string(), id));
             }
+            ConnEventKind::Reached { boundary } => self.inside.push(Reached {
+                service: service.to_string(),
+                boundary,
+            }),
             ConnEventKind::Placeable { placement } => {
                 if let Some(pending) = self.opened.get_mut(&(service.to_string(), id)) {
                     pending.placements.push(placement);
@@ -84,13 +96,11 @@ impl Sessions {
 /// Consecutive packets more than this far apart start a new burst.
 const BURST_GAP_NS: u128 = 20_000_000; // 20 ms
 
-/// Derive per-edge bursts from a session catalogue, split by direction and made
-/// scenario-relative to `scenario_start_ns` (writes before scenario start are
-/// ignored). Each direction's packets are clustered into bursts.
+/// Derive per-edge bursts from a session catalogue, split by direction and
+/// made scenario-relative to `scenario_start_ns`.
 ///
-/// `addresses` names the service behind a peer, so an edge carries both the
-/// service that dialled and the one it reached. A peer it does not name came
-/// from outside the fleet.
+/// `addresses` names the service behind a peer. One it does not name came from
+/// outside the fleet.
 #[must_use]
 pub fn edge_profiles_from_sessions<S: std::hash::BuildHasher>(
     sessions: &[Session],
@@ -266,13 +276,8 @@ mod tests {
     }
 
     proptest! {
-        /// Nothing trims the catalogue to fit the frame, so the frame has to be
-        /// wide enough for a run far busier than a real one.
-        ///
-        /// The session count and name length reach well past a small fleet's. A
-        /// real one runs more services, under longer names, and opens a
-        /// connection per publish, and it was a fleet of that shape that first
-        /// overran the frame this asserts against while the test still passed.
+        /// Nothing trims the catalogue to fit the frame, so the frame has to
+        /// be wide enough for a run far busier than a real one.
         #[test]
         fn a_busy_runs_catalogue_fits_the_frame(
             sessions in prop::collection::vec(a_session(), 0..64),
@@ -280,7 +285,8 @@ mod tests {
             let profiles = edge_profiles_from_sessions(&sessions, 0, &HashMap::new());
             let catalogue = WorkerToRunner::SessionCatalogue(crate::learned::Learned {
                 profiles,
-                trajectory: crate::verdict::Trajectory::default(),
+                fault_free: crate::verdict::Baseline::default(),
+                inside: Vec::new(),
                 primitives: std::collections::BTreeSet::new(),
             });
             let mut buf = vec![0u8; 2_000_000];

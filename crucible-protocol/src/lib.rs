@@ -4,6 +4,7 @@ mod fault;
 mod primitive;
 mod proxy;
 mod session;
+mod tier;
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -11,6 +12,7 @@ pub use fault::{At, FaultMissReason, FaultReport, FaultResult};
 pub use primitive::Primitive;
 pub use proxy::{ConnEvent, ConnEventKind, ConnId, Direction};
 pub use session::{Session, WriteRecord};
+pub use tier::{Boundary, Reached, Released, Side, Watching};
 
 use serde::{Deserialize, Serialize};
 

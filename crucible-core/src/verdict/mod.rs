@@ -78,10 +78,7 @@ impl Invariant {
     }
 
     /// What a campaign against this fleet could show this invariant broken by,
-    /// given what the loaded plugins turned out to be able to do.
-    ///
-    /// This is what the campaign could show, not what it did. Which invariant
-    /// any one run showed is that run's verdict to say.
+    /// given what the loaded plugins can do.
     ///
     /// # Errors
     /// Errors if nothing can be shown.
@@ -98,8 +95,7 @@ impl Invariant {
     }
 }
 
-/// Nothing the campaign loaded can prove an invariant
-/// wrong, so the campaign cannot claim to have tested it.
+/// Nothing the campaign loaded can prove this invariant wrong.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Unreachable(pub Vec<Primitive>);
 
@@ -110,46 +106,92 @@ impl std::fmt::Display for Unreachable {
     }
 }
 
-/// Observations captured during schedule execution, which
-/// [`Observations::verdict`] turns into a verdict.
-#[derive(Debug, Default)]
-pub struct Observations {
+/// Where a run of one set of steps left the fleet, and where it stood after
+/// each step on the way.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct Baseline {
+    /// Where the fleet stood after each step, starting from before the first.
+    pub trail: Trajectory,
+    /// Where the fleet settled once it went quiet, after a longer wait than any
+    /// point of the trail.
+    pub settled: Checkpoint,
+}
+
+impl Baseline {
+    /// A run that was not read again after its last step.
+    #[must_use]
+    pub fn unsettled<I: IntoIterator<Item = Checkpoint>>(points: I) -> Self {
+        let trail: Trajectory = points.into_iter().collect();
+        let settled = trail.settled().cloned().unwrap_or_default();
+        Self { trail, settled }
+    }
+
+    /// Where the fleet stood having taken the first `n` of these steps.
+    ///
+    /// At the end of the run this is the settled reading, not the trail point.
+    #[must_use]
+    pub fn at(&self, n: usize) -> Option<&Checkpoint> {
+        if n + 1 == self.trail.len() {
+            return Some(&self.settled);
+        }
+        self.trail.at(n)
+    }
+}
+
+/// What a run of each set of steps found, keyed on the steps that landed.
+///
+/// A prefix needs no entry. The fault-free run recorded the end of those.
+pub type References = std::collections::BTreeMap<Vec<usize>, Baseline>;
+
+/// What reading a run came to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Judged {
+    /// The run can be judged, and this is what it says.
+    Now(crate::ipc::Verdict),
+    /// Not until each of these landed sets has a reference run of its own.
+    Pending(Vec<Vec<usize>>),
+}
+
+/// What a run read, which is everything a verdict is made of.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct Readings {
     pub outcomes: Vec<Outcome>,
-    /// What the scenario's checks read once the fleet settled, in the order the
-    /// scenario states them.
+    /// What the scenario's checks read once the fleet settled.
     pub checks: Vec<Observed>,
-    /// What those checks read at each point of the run: the baseline before the
-    /// first step, then one per step. A step's effects are what separates its
-    /// checkpoint from the one before it.
+    /// What those checks read at each point of the run, starting from before
+    /// the first step.
     pub trajectory: Trajectory,
-    /// The fault-free run's trajectory, which this run is judged against. Empty
-    /// in the fault-free run itself.
-    pub fault_free: Trajectory,
+    /// What the fault-free run found, which this run is judged against.
+    pub fault_free: Baseline,
     /// When each step ran, in the order the scenario states them.
     pub windows: Vec<StepWindow>,
-    pub sessions: Vec<crucible_protocol::Session>,
     pub fault: Option<crucible_protocol::FaultReport>,
 }
 
-/// When a step ran, as nanoseconds from scenario start. The fault records the
-/// same origin, so a verdict can say which steps it landed among.
-#[derive(Clone, Copy, Debug)]
+/// Everything a worker gathered while running a schedule. What a verdict is
+/// made of, and what only the worker itself needs.
+#[derive(Debug, Default)]
+pub struct Observations {
+    pub readings: Readings,
+    pub sessions: Vec<crucible_protocol::Session>,
+    /// The moments services reported from inside themselves.
+    pub inside: Vec<crucible_protocol::Reached>,
+}
+
+/// When a step ran, as nanoseconds from scenario start.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct StepWindow {
     pub start_ns: u128,
     pub end_ns: u128,
 }
 
-/// What every check the scenario states read at one point in a run, in the
-/// order the scenario states them. `None` where the reading could not be taken,
-/// which under a fault is most of the point: a service that is down cannot be
-/// asked, and that is a thing to record rather than to fail on.
+/// What every check the scenario states read at one point in a run.
+///
+/// `None` where the reading could not be taken.
 pub type Checkpoint = Vec<Option<crate::plan::Value>>;
 
-/// Where the fleet stood at each point of a run: the baseline before the first
-/// step, then one per step.
-///
-/// A run is judged by reading this against what the fleet's own steps would
-/// have left, so it is the substrate every verdict rests on.
+/// Where the fleet stood at each point of a run, starting from before the
+/// first step.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct Trajectory(Vec<Checkpoint>);
 
@@ -160,7 +202,7 @@ impl Trajectory {
         self.0.get(n)
     }
 
-    /// How many points it holds, which is one more than the steps driven.
+    /// How many points it holds, one more than the steps driven.
     #[must_use]
     pub fn len(&self) -> usize {
         self.0.len()
@@ -203,19 +245,16 @@ impl<'a> IntoIterator for &'a Trajectory {
 }
 
 /// A check and what the fleet was actually holding when it was read.
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct Observed {
     pub check: crate::plan::Check,
     /// What the fleet was holding, or `None` where there was nothing to read.
-    /// A fault can leave a fleet with no row to answer from, which is a
-    /// reading of the fleet rather than a failure to take one.
     pub value: Option<crate::plan::Value>,
 }
 
 impl Observed {
     /// Whether the reading satisfies the check it answers, or `None` when the
-    /// two cannot be compared: a reading of a different shape from the one the
-    /// check states, or an ordering asked of values that have none.
+    /// two cannot be compared.
     #[must_use]
     pub fn holds(&self) -> Option<bool> {
         let (reading, stated) = (self.value.as_ref()?, &self.check.value);
@@ -238,8 +277,7 @@ impl Observed {
 
 /// Why a fault-free run missed what the scenario stated.
 ///
-/// If the fault-free run cannot satisfy its predicate then it is mis-authored.
-/// We cannot judge a faulted run against a non-deterministic result.
+/// A fault-free run that cannot satisfy its own predicate is mis-authored.
 #[must_use]
 pub fn unmet(
     checks: &[crate::plan::Check],
@@ -280,9 +318,34 @@ impl Observations {
     }
 }
 
+impl Readings {
+    #[must_use]
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    /// What this run found, for the runs it answers for.
+    #[must_use]
+    pub fn baseline(&self) -> Baseline {
+        Baseline {
+            trail: self.trajectory.clone(),
+            settled: self.settled(),
+        }
+    }
+
+    /// Where the fleet settled, as one checkpoint.
+    #[must_use]
+    pub fn settled(&self) -> Checkpoint {
+        self.checks
+            .iter()
+            .map(|observed| observed.value.clone())
+            .collect()
+    }
+}
+
 /// Whether the system took responsibility for a driven operation. The driver
 /// that ran the operation decides, by the rules of the protocol it speaks.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub enum Ack {
     /// Acknowledged: the system accepted responsibility for the write.
     Acked,
@@ -294,7 +357,7 @@ pub enum Ack {
 
 /// The result of one operation a driver ran. The payloads are opaque; only the
 /// driver that produced them knows how to read them.
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct Outcome {
     pub ack: Ack,
 }

@@ -8,6 +8,8 @@ pub enum Error {
     MalformedPair { pair: String },
     #[error("fault-at `{spec}` must be in the form SERVICE=DIRECTION=K (DIRECTION is c2u or u2c)")]
     MalformedFaultAt { spec: String },
+    #[error("inside `{spec}` must be in the form SERVICE=MARK")]
+    MalformedInside { spec: String },
     #[error("fault-at names service `{service}`, which no --pair fronts")]
     UnknownFaultService { service: String },
     #[error("fault-at names client `{client}`, which no --service names")]

@@ -44,6 +44,7 @@ async fn run() -> Result<()> {
 
     let shutting_down = match worker.await_work().await? {
         IdleNext::Learn(worker) => worker.execute_learn().await?,
+        IdleNext::Reference(worker) => worker.execute_reference().await?,
         IdleNext::Work(worker) => worker.execute_and_report().await?,
     };
     shutting_down.teardown().await?;
