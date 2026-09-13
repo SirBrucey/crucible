@@ -32,9 +32,17 @@ impl std::fmt::Display for Invariant {
 }
 
 impl Invariant {
-    /// What a run held degraded from start to finish.
-    /// Nothing in the run derives this as it is settled from the start.
-    pub const DEGRADED: &'static [Invariant] = &[Invariant::Recovers];
+    /// What a run held degraded from start to finish can show.
+    ///
+    /// Recovery is what a fleet that accepted work while down and never caught
+    /// up has broken. A fleet that accepted nothing had nothing to catch up on,
+    /// so what it kept, repeated or resequenced is still read off the run.
+    pub const DEGRADED: &'static [Invariant] = &[
+        Invariant::Recovers,
+        Invariant::Durable,
+        Invariant::Idempotent,
+        Invariant::Converges,
+    ];
 
     /// What breaking the fleet this way could show.
     #[must_use]

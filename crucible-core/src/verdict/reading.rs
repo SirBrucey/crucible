@@ -256,6 +256,9 @@ enum Went {
     Twice,
     /// It settled where one of its steps arriving last would have left it.
     OutOfOrder,
+    /// It holds more than every state the run admits, and no step taken twice
+    /// puts it there, so it kept work it turned away.
+    Kept,
     /// None of those describes where it ended up.
     Elsewhere,
     /// The readings cannot say.
@@ -292,7 +295,7 @@ impl Went {
             for at in 0..admits.landed.len() {
                 match trail
                     .twice(after, at)
-                    .and_then(|doubled| says(&doubled, settled))
+                    .and_then(|doubled| says(&doubled, after, settled))
                 {
                     Some(true) => return Went::Twice,
                     Some(false) => {}
@@ -304,9 +307,23 @@ impl Went {
             for at in 0..admits.landed.len().saturating_sub(1) {
                 match trail
                     .reordered(after, at)
-                    .and_then(|other| says(&other, settled))
+                    .and_then(|other| says(&other, after, settled))
                 {
                     Some(true) => return Went::OutOfOrder,
+                    Some(false) => {}
+                    None => readable = false,
+                }
+            }
+        }
+        // A run says which steps the fleet took responsibility for. Settling
+        // where driving more of them would have left it is work it did for
+        // steps it turned away, which is the other half of durability: what was
+        // not acknowledged must leave nothing behind.
+        for admits in admissible {
+            let (trail, after) = (admits.trail, admits.settled);
+            for more in (admits.landed.len() + 1)..trail.len() {
+                match trail.at(more).and_then(|kept| says(kept, after, settled)) {
+                    Some(true) => return Went::Kept,
                     Some(false) => {}
                     None => readable = false,
                 }
@@ -321,9 +338,13 @@ impl Went {
 
     /// Which invariant this breaks, or `None` where nothing about the settled
     /// state names one.
-    fn shows(self) -> Option<Invariant> {
+    fn shows(self, degraded: bool) -> Option<Invariant> {
         match self {
-            Went::Lost => Some(Invariant::Durable),
+            // Work the fleet took on while it was down and does not hold once
+            // it is back is work it never caught up on, which is recovery. The
+            // same reading under a fault placed at a moment is work lost.
+            Went::Lost if degraded => Some(Invariant::Recovers),
+            Went::Lost | Went::Kept => Some(Invariant::Durable),
             Went::Twice => Some(Invariant::Idempotent),
             Went::OutOfOrder => Some(Invariant::Converges),
             Went::Elsewhere | Went::Unreadable => None,
@@ -567,8 +588,16 @@ impl Placed<'_> {
     fn broke(self, went: Went) -> Option<Invariant> {
         match self.could_show() {
             [only] => Some(*only),
-            could => went.shows().filter(|shown| could.contains(shown)),
+            could => went
+                .shows(self.degraded())
+                .filter(|shown| could.contains(shown)),
         }
+    }
+
+    /// Whether the fleet was held down for the whole run rather than broken at
+    /// a moment in it.
+    fn degraded(self) -> bool {
+        matches!(self.at, At::Throughout)
     }
 
     /// What the run says broke, and the evidence for saying it.
@@ -577,12 +606,27 @@ impl Placed<'_> {
     /// evidence. Anything broader is read off where the fleet settled.
     fn told(self, went: Went, settled: &Value, admissible: &[Admissible<'_>], at: usize) -> String {
         if let [only] = self.could_show() {
-            return format!(
-                ". Breaking the fleet this way can show nothing but {only}, so that is what broke"
-            );
+            // The fault asks one question, so the answer is what broke. Where
+            // the fleet settled is not what decides it, but a reader is owed
+            // whether it agrees.
+            return match went.shows(self.degraded()) {
+                Some(shown) if shown == *only => format!(
+                    ". Breaking the fleet this way can show nothing but {only}, and where it \
+                     settled says the same, so that is what broke"
+                ),
+                _ => format!(
+                    ". Breaking the fleet this way can show nothing but {only}, so that is what \
+                     broke, though where it settled does not say so"
+                ),
+            };
         }
         let could = spelled(self.could_show());
         match went {
+            Went::Lost if self.degraded() => {
+                ". It took work on while it was down and does not hold it now it is back, so it \
+                 never caught up, which is recovery"
+                    .to_owned()
+            }
             Went::Lost => ". It settled where fewer steps would have left it, so work was lost, which \
                            is durability"
                 .to_owned(),
@@ -597,6 +641,10 @@ impl Placed<'_> {
                  convergence"
                     .to_owned()
             }
+            Went::Kept => ". It holds more than the steps it took responsibility for owed, and no \
+                            step taken twice puts it there, so it kept work it turned away, which \
+                            is durability"
+                .to_owned(),
             Went::Elsewhere => format!(
                 "{}. It settled where losing a step, taking one twice and taking one out of order \
                  would all have left it somewhere else, so which of {could} broke cannot be read from \
@@ -645,18 +693,40 @@ fn short_count(settled: &Checkpoint, admissible: &[Admissible<'_>]) -> Option<us
 /// Whether `projected` describes where the fleet settled, or `None` where a
 /// reading it rests on could not be projected.
 ///
+/// A fault reaches some of what a scenario watches and not the rest, so every
+/// reading is either where this way would put it or where the run owed it, and
+/// at least one has moved.
+///
 /// A reading nobody could work out leaves the verdict up in the air rather
-/// than answered.
-fn says(projected: &Checkpoint, settled: &Checkpoint) -> Option<bool> {
+/// than answered, unless another has already answered it.
+fn says(projected: &Checkpoint, owed: &Checkpoint, settled: &Checkpoint) -> Option<bool> {
     let mut asked = true;
-    for (projected, settled) in projected.iter().zip(settled) {
-        match (projected, settled) {
-            (Some(projected), Some(settled)) if projected != settled => return Some(false),
-            (None, Some(_)) => asked = false,
-            _ => {}
+    let mut moved = false;
+    for ((projected, owed), settled) in projected.iter().zip(owed).zip(settled) {
+        let Some(settled) = settled.as_ref() else {
+            continue;
+        };
+        match projected.as_ref() {
+            // Where this way would put it. Worth saying only if that is
+            // somewhere other than where the run already owed it.
+            Some(projected) if projected == settled => moved |= Some(projected) != owed.as_ref(),
+            // Not where this way would put it, so it has to be where it was
+            // owed. A fault that reached one reading and not another leaves the
+            // rest alone; one that left a reading somewhere else entirely is
+            // not this way.
+            Some(_) => {
+                if owed.as_ref() != Some(settled) {
+                    return Some(false);
+                }
+            }
+            None => asked = false,
         }
     }
-    asked.then_some(true)
+    // A reading nobody could work out only leaves the question open while
+    // nothing else has answered it. One that moved to where this way puts it,
+    // with nothing contradicting, says the fleet went this way whatever the
+    // rest could not say.
+    if moved || asked { Some(moved) } else { None }
 }
 
 /// A list of invariants, as a verdict says them.
@@ -1410,6 +1480,107 @@ mod tests {
             },
         );
         assert_eq!(broke, None);
+    }
+
+    /// A fault that asks one question answers it, and says whether where the
+    /// fleet settled agrees. A reader who cannot see the corroboration cannot
+    /// tell a fleet that failed the question from one that failed elsewhere.
+    #[test]
+    fn a_fault_that_asks_one_question_says_whether_the_state_agrees() {
+        let doubled = broken_by(
+            placed(Primitive::Redeliver, 0),
+            &[Ack::Acked, Ack::Acked],
+            &[0, 1, 2],
+            3,
+        );
+        let (broke, why) = showed(doubled);
+        assert_eq!(broke, Some(Invariant::Idempotent));
+        assert!(why.contains("where it settled says the same"), "{why}");
+
+        // Short of what it owed, which a redelivery does not explain.
+        let short = broken_by(
+            placed(Primitive::Redeliver, 0),
+            &[Ack::Acked, Ack::Acked],
+            &[0, 1, 2],
+            1,
+        );
+        let (broke, why) = showed(short);
+        assert_eq!(broke, Some(Invariant::Idempotent));
+        assert!(why.contains("does not say so"), "{why}");
+    }
+
+    /// A fleet held down all run that accepted nothing had nothing to catch up
+    /// on, so what it kept is durability rather than recovery.
+    #[test]
+    fn a_degraded_run_that_accepted_nothing_did_not_fail_to_recover() {
+        let mut run = run_of(
+            fired_fault(),
+            &[Ack::Rejected, Ack::Rejected, Ack::Rejected],
+            &[0, 1, 2, 3],
+            3,
+        );
+        run.fault = Some(FaultReport::fired(
+            0,
+            "db",
+            Primitive::Kill,
+            At::Throughout,
+            0,
+        ));
+        let (broke, why) = showed(run.verdict());
+        assert_eq!(broke, Some(Invariant::Durable));
+        assert!(why.contains("kept work it turned away"), "{why}");
+    }
+
+    /// One held down all run that took work on and does not hold it once it is
+    /// back never caught up, which is what recovery is.
+    #[test]
+    fn a_degraded_run_that_never_caught_up_shows_recovery() {
+        let mut run = run_of(
+            fired_fault(),
+            &[Ack::Acked, Ack::Acked, Ack::Acked],
+            &[0, 1, 2, 3],
+            0,
+        );
+        run.fault = Some(FaultReport::fired(
+            0,
+            "db",
+            Primitive::Kill,
+            At::Throughout,
+            0,
+        ));
+        let (broke, why) = showed(run.verdict());
+        assert_eq!(broke, Some(Invariant::Recovers));
+        assert!(why.contains("never caught up"), "{why}");
+    }
+
+    /// A fleet that wrote a row down and then failed the caller holds work for
+    /// a step it turned away. Nothing was lost and nothing was done twice, so
+    /// only what the fleet kept says what broke.
+    #[test]
+    fn keeping_what_it_refused_is_durability() {
+        // One step acknowledged of three driven, and the fleet sits where all
+        // three would have left it.
+        let run = run_of(
+            fired_fault(),
+            &[Ack::Acked, Ack::Rejected, Ack::Rejected],
+            &[0, 1, 2, 3],
+            3,
+        );
+        let (broke, why) = showed(run.verdict());
+        assert_eq!(broke, Some(Invariant::Durable));
+        assert!(why.contains("kept work it turned away"), "{why}");
+    }
+
+    /// Holding more than it owed is only kept work where driving the steps it
+    /// refused would have put it there. Anywhere else names nothing.
+    #[test]
+    fn holding_more_than_any_run_would_leave_is_not_kept_work() {
+        let (broke, why) = showed(judged(&[Ack::Acked, Ack::Acked], &[0, 1, 2], 7));
+        assert_eq!(broke, None);
+        assert!(
+            why.contains("would all have left it somewhere else"),
+            "{why}"
+        );
     }
 
     /// The verdict for a way that was asked and ruled out is worded
