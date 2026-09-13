@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use crucible_core::{
     plan,
-    schema::{ClauseShape, CmpOp, HeadPattern, Moves, OpSig, Param, ParamType, ValueType},
+    schema::{ClauseShape, CmpOp, HeadPattern, OpSig, Param, ParamType, ValueType},
 };
 use crucible_plugin::{Registry, registry::ServiceSchema};
 
@@ -425,9 +425,6 @@ impl<'a> Lowerer<'a> {
                 .collect(),
             filter: where_of(observable),
             clauses: values_of(observable),
-            // Declared by the observable this resolved to, since the plugin
-            // answering the reading is the one that knows what it is.
-            moves: sig.moves.unwrap_or(Moves::Sets),
             op: plugin_cmp(predicate.node.op.node),
             value: lower_value(&predicate.node.right.node),
         })
@@ -965,14 +962,14 @@ mod tests {
     #[test]
     fn an_unknown_observable_suggests_the_observables() {
         let src = r#"fleet "f" { deployment: docker; service db { kinds: [mariadb], image: "x", ports: { mariadb: 80 } } }
-                     scenario "s" { consistent_within: 1s; expect { db.orders.rows == 1; } }"#;
+                     scenario "s" { consistent_within: 1s; expect { db.orders.total == 1; } }"#;
         let diags = diagnose(src);
-        let diag = find(&diags, "no observable `orders.rows`");
+        let diag = find(&diags, "no observable `orders.total`");
         assert_eq!(
             diag.help.as_ref().unwrap().suggestions,
             ["<database>.<table>.count", "<database>.<table>.select"],
         );
         // The span covers the observable path, not the valid `db` service.
-        assert_eq!(&src[diag.span.start..diag.span.end], "orders.rows");
+        assert_eq!(&src[diag.span.start..diag.span.end], "orders.total");
     }
 }

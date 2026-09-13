@@ -8,7 +8,7 @@ use std::net::SocketAddr;
 
 use crucible_plugin::{
     BoxFuture, Error as PluginError, Observer, ObserverRuntime, Query, Targeted, plan,
-    schema::{CmpOp, HeadPattern, Moves, OpSig, Param, ParamType, ValueType},
+    schema::{CmpOp, HeadPattern, OpSig, Param, ParamType, ValueType},
 };
 use hickory_resolver::{
     Resolver,
@@ -51,8 +51,6 @@ impl Observer for Dns {
             OpSig::observable(
                 HeadPattern::exact("resolve"),
                 ValueType::Str,
-                // What the nameserver answers now, which each step replaces.
-                Moves::Sets,
                 CmpOp::ALL.to_vec(),
             )
             .with_param(Param::required("host", ParamType::Str)),

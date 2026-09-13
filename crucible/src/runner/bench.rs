@@ -291,7 +291,6 @@ mod tests {
             observable: vec!["writes".into(), "count".into()],
             args: Vec::new(),
             filter: None,
-            moves: crucible_core::schema::Moves::Counts,
             clauses: std::collections::BTreeMap::new(),
             op: crucible_core::schema::CmpOp::Eq,
             value: Value::Int(2),

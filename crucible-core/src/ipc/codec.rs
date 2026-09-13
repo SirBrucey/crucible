@@ -156,7 +156,6 @@ mod tests {
             observable: vec!["orders".into(), "count".into()],
             args: Vec::new(),
             filter: None,
-            moves: crate::schema::Moves::Counts,
             clauses: std::collections::BTreeMap::new(),
             op: crate::schema::CmpOp::Eq,
             value: crate::plan::Value::Int(3),
