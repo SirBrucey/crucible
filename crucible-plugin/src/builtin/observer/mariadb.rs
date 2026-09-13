@@ -299,6 +299,11 @@ fn value_of(row: &MySqlRow, name: &str) -> Result<plan::Value, Error> {
     if let Ok(n) = row.try_get::<i64, _>(ALIAS) {
         return Ok(plan::Value::Int(n));
     }
+    if let Ok(n) = row.try_get::<u64, _>(ALIAS) {
+        return i64::try_from(n)
+            .map(plan::Value::Int)
+            .map_err(|_| Error::Unreadable(name.to_owned()));
+    }
     if let Ok(s) = row.try_get::<String, _>(ALIAS) {
         return Ok(plan::Value::Str(s));
     }
