@@ -90,10 +90,8 @@ The gap the shared transaction used to close:
 
 > `api` was killed during step 1, on `record:1:end` holds api part way through
 > its own work. The fleet took 5 steps which left `orders.orders.count` at `2`,
-> expected value `3`. It settled where losing a step, taking one twice and
-> taking one out of order would all have left it somewhere else, so which of
-> durability, idempotency or convergence broke cannot be read from where it
-> settled.
+> expected value `3`. It settled where fewer steps would have left it, so work
+> was lost, which is durability. It first differed after step 1.
 
 The API recorded the order and died before queueing its announcement. It came
 back and served the rest of the run, so its own store holds all three orders.
@@ -110,19 +108,19 @@ The run reads both stores and the outbox between them:
 An outbox holding nothing is the whole problem. There is no retry to wait for,
 because the write that would have queued one never happened.
 
-The verdict names no invariant, and it says why rather than shrugging. The API's
-reply to step 1 never arrived, so the fleet may have accepted that step or
-refused it, and the campaign ran a reference run of steps 2 to 5 on a clean
-fleet to find out where landing only those leaves it. That is enough to be
-certain this fleet is somewhere neither answer allows.
+The verdict names durability, and it is `orders.applied.count` that says so.
+Steps 4 and 5 amend order 1. The API holds that order, so it accepted both; the
+consumer was never told the order exists, so it applied neither. Two steps the
+fleet took on and never made good is work lost.
 
-It is not enough to name the invariant, and the reference run is what lets the
-campaign say so with a reason. It drove steps 2 to 5 on a clean fleet and
-recorded where the fleet stood after each, so all three questions could be put:
-stopping short of those steps, taking one of them twice, taking one of them
-last. None of the three leaves the API holding more than the consumer. Its API
-holds an order its consumer will never hear about, and that is not work lost,
-done twice, or done out of order. It is one fleet holding two answers.
+Getting there needs the reference run. The API's reply to step 1 never arrived,
+so the fleet may have accepted that step or refused it, and the campaign drove
+steps 2 to 5 on a clean fleet to find where landing only those leaves it. That
+bounds what the fleet owed without having to guess at step 1, and no run of
+these steps leaves the API holding an order the consumer never heard about.
+
+One fleet holding two answers is the shape of it. What it costs is the work the
+API went on accepting against the half the rest of the fleet cannot see.
 
 That verdict is only reachable because the API says where it is. Every other
 fault placed at a moment in this campaign is anchored to a packet. This one is
@@ -135,7 +133,8 @@ The consumer still applies whatever it is handed:
 
 > `inventory -> broker` was redelivered to during step 1 ... left
 > `orders.applied.count` at `6`, expected value `5`. Breaking the fleet this way
-> can show nothing but idempotency, so that is what broke.
+> can show nothing but idempotency, and where it settled says the same, so that
+> is what broke.
 
 Three examples in, and the one defect that has survived every change is the one
 nobody has addressed.

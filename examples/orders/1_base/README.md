@@ -44,7 +44,7 @@ cargo run -p crucible -- run examples/orders/1_base/orders.cru
 
 ## What the campaign finds
 
-A campaign against this fleet finds four things worth showing. Each is quoted
+A campaign against this fleet finds five things worth showing. Each is quoted
 below from the run that produced it.
 
 ### Applied twice
@@ -55,7 +55,8 @@ happens when an ack is lost.
 > `inventory -> broker` was redelivered to during step 1, on a message the
 > consumer finished with, delivered to it again. The fleet took 5 steps which
 > left `orders.applied.count` at `6`, expected value `5`. Breaking the fleet
-> this way can show nothing but idempotency, so that is what broke.
+> this way can show nothing but idempotency, and where it settled says the
+> same, so that is what broke.
 
 Five steps, six applications. Every request returned `2xx`. The consumer adjusts
 stock on each delivery without asking whether it has seen the message before.
@@ -69,7 +70,8 @@ failed. Cutting the API off from the broker at the publish:
 > `api -> broker` was cut off during step 1, on a publish the sender has
 > committed to and the broker has not seen. The fleet took 1 step which left
 > `orders.applied.count` at `0`, expected value `1`. It settled where fewer
-> steps would have left it, so work was lost, which is durability.
+> steps would have left it, so work was lost, which is durability. It first
+> differed after step 1.
 
 One request accepted, nothing acted on. Killing the broker outright at the same
 point reads the same way.
@@ -81,7 +83,8 @@ Cut the consumer off from the broker instead, and the messages survive:
 > `inventory -> broker` was cut off during step 1, on a delivery the broker has
 > released and the consumer has not seen. The fleet took 5 steps which left
 > `orders.applied.count` at `0`, expected value `5`. It settled where fewer
-> steps would have left it, so work was lost, which is durability.
+> steps would have left it, so work was lost, which is durability. It first
+> differed after step 1.
 
 Five requests acknowledged to the caller, none of them acted on. The broker
 never died here, so it had all five and, with nothing left to consume them,
@@ -96,44 +99,37 @@ Cutting that edge for the whole run instead of for a moment leaves the fleet in
 exactly the same place:
 
 > `inventory -> broker` was cut off for the whole run. The fleet took 5 steps
-> which left `orders.applied.count` at `0`, expected value `5`. Breaking the
-> fleet this way can show nothing but recovery, so that is what broke.
+> which left `orders.applied.count` at `0`, expected value `5`. It took work on
+> while it was down and does not hold it now it is back, so it never caught up,
+> which is recovery. It first differed after step 1.
 
-Same edge, same reading, same number, and a different invariant. Nothing about
-where the fleet settled decided that: a fault held from start to finish leaves a
-fleet that was degraded for the whole run, and the only thing such a run can ask
-is whether it comes back, so recovery is the only thing that verdict can name.
-A fault held for a moment heals, so the fleet has the rest of the run to catch
-up, and what it still owes when it stops is read off where it settled.
+Same edge, same reading, same number, and a different invariant. A fault held
+for a moment heals, so the fleet has the rest of the run to catch up, and work
+it still owes when it stops is work it lost. A fault held from start to finish
+leaves a fleet that was down throughout, so the same empty reading says it took
+work on while it was down and never came back for it.
 
 Which invariant a campaign names is decided as much by how a fault is held as by
 what the fault does.
 
 ### Kept what it refused
 
-One run names nothing:
+A fleet can break durability by holding too much as well as too little:
 
 > `broker` was killed during step 1, on a delivery the broker has released and
 > the consumer has not seen. The fleet took 1 step which left
-> `orders.orders.count` at `3`, expected value `1`. It held more than it owed on
-> any reading, one of which is a point the fault-free run passed through rather
-> than where it stopped. It settled where losing a step, taking one twice and
-> taking one out of order would all have left it somewhere else, so which of
-> durability, idempotency or convergence broke cannot be read from where it
-> settled.
+> `orders.orders.count` at `3`, expected value `1`. It holds more than the steps
+> it took responsibility for owed, and no step taken twice puts it there, so it
+> kept work it turned away, which is durability.
 
 The order row is written before the announcement is attempted, so a publish that
 fails leaves the row behind and the caller still gets a `500`. Three orders on
 the books, one of them acknowledged and two of them refused.
 
-The campaign put every question it could and none of them describes this. Losing
-a step leaves less than was owed and this fleet has more. Taking its one
-accepted step twice would leave two orders, and the fleet holds three; with one
-step accepted there is nothing to take out of order. Two of the three rows were
-written for callers the fleet then told it had failed, and nothing it does to
-work it took on will account for work it said it refused. Holding what you
-refused is none of the three, so the campaign says so rather than picking the
-nearest.
+Losing a step leaves less than was owed, and this fleet has more. Taking its one
+accepted step twice would leave two orders, and the fleet holds three. What is
+left is work written down for callers the fleet then told had failed, which is
+the half of durability that asks what a fleet holds for work it never took on.
 
 ## What this budget does not reach
 

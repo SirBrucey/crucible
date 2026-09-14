@@ -14,9 +14,9 @@ announces:
 And what the same fleet does when the broker dies with a delivery in flight:
 
 > `broker` was killed during step 1 ... The fleet took 1 step which left
-> `orders.orders.count` at `3`, expected value `1`. It held more than it owed on
-> any reading, one of which is a point the fault-free run passed through rather
-> than where it stopped.
+> `orders.orders.count` at `3`, expected value `1`. It holds more than the steps
+> it took responsibility for owed, and no step taken twice puts it there, so it
+> kept work it turned away, which is durability.
 
 One request accepted and nothing done about it, while three order rows sit on
 the books, two of which the fleet told its callers it had refused. This is the
@@ -65,7 +65,8 @@ What it did not do is make the announcement durable:
 > `api -> broker` was cut off during step 1, on a publish the sender has
 > committed to and the broker has not seen. The fleet took 5 steps which left
 > `orders.applied.count` at `4`, expected value `5`. It settled where fewer
-> steps would have left it, so work was lost, which is durability.
+> steps would have left it, so work was lost, which is durability. It first
+> differed after step 1.
 
 Four of five, where `1_base` managed none of one. The one that got away is worth
 understanding: `basic_publish` returns as soon as the frame is written to the
@@ -97,23 +98,20 @@ Kill the API at the same moment and the number moves the other way:
 
 > `api` was killed during step 1, on a publish the sender has committed to and
 > the broker has not seen. The fleet took 5 steps which left
-> `orders.applied.count` at `6`, expected value `5`. It held more than it owed
-> on any reading. It settled where losing a step, taking one twice and taking
-> one out of order would all have left it somewhere else, so which of
-> durability, idempotency or convergence broke cannot be read from where it
-> settled.
+> `orders.applied.count` at `6`, expected value `5`. It settled where the steps
+> it took would have left it had one of them been taken twice, so work was done
+> twice, which is idempotency. It first differed after step 1.
 
-The campaign does not name it. Six applications for five steps is exactly where
-one step taken twice leaves the count. What does not fit is the stock: doubling any one of the
-five leaves `stock.book` at `98`, and the fleet holds `94`. The scenario
-declares the stock level as something a step sets, so a repeat sets it to the
-same thing again, and here the repeated create took four off it a second time.
-The count says a step was doubled and the stock says something the scenario told
-the campaign not to expect, so it names neither.
+Six applications for five steps is where one step taken twice leaves the count,
+and the stock says the same. Step 1 took eight off `stock.book` where the
+fault-free run took four, and appended two rows to `applied` where it appended
+one. Both are that step applied exactly twice. The book never makes the four
+back, so it settles at `94` against the `98` the scenario expects, which is why
+reading what each step did names this where comparing end states did not.
 
-What happened is not in doubt. The relay announced the event, was killed before
-it could delete the row, and announced it again when it came back. The consumer
-adjusts stock on every delivery, so the order was counted twice.
+The relay announced the event, was killed before it could delete the row, and
+announced it again when it came back. The consumer adjusts stock on every
+delivery, so the order was counted twice.
 
 The fault did not go away, it turned over. In `1_base` a fault in this window
 lost an event; here the same fault duplicates one. That is what the outbox
@@ -128,7 +126,8 @@ the redelivery case is exactly as it was, because it was never about the API:
 
 > `inventory -> broker` was redelivered to during step 1 ... left
 > `orders.applied.count` at `6`, expected value `5`. Breaking the fleet this way
-> can show nothing but idempotency, so that is what broke.
+> can show nothing but idempotency, and where it settled says the same, so that
+> is what broke.
 
 ## Build and run
 
