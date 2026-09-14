@@ -313,12 +313,13 @@ fn is_bare_name(s: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{Error, Filter, Mariadb, Selection, Take, Value};
-    use crate::role::Observer;
     use crucible_core::{
         plan,
         schema::{ClauseShape, CmpOp, HeadPattern, ValueType},
     };
+
+    use super::{Error, Filter, Mariadb, Selection, Take, Value};
+    use crate::role::Observer;
 
     fn check(observable: &[&str], filter: Option<(&str, plan::Value)>) -> plan::Check {
         plan::Check {

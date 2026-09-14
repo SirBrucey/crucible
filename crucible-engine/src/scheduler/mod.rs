@@ -6,12 +6,11 @@ pub mod recovery;
 #[cfg(test)]
 mod fixture;
 
-pub use burst::BurstScheduler;
-pub use recovery::RecoveryScheduler;
-
 use std::time::Duration;
 
+pub use burst::BurstScheduler;
 use crucible_core::schedule::Schedule;
+pub use recovery::RecoveryScheduler;
 
 /// What a campaign has left to spend, and what one schedule costs it.
 ///

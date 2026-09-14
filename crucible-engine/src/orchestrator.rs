@@ -6,8 +6,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crucible_protocol::{At, Did, FaultMissReason, FaultReport, FaultResult, now_ns};
-
 use crucible_core::{
     fault::{By, Fault, Primitive},
     learned::Learned,
@@ -18,6 +16,7 @@ use crucible_core::{
 use crucible_plugin::{
     Action, DeploymentRuntime, Kill, Substrate, Targeted, registry::PreparedCheck,
 };
+use crucible_protocol::{At, Did, FaultMissReason, FaultReport, FaultResult, now_ns};
 
 /// After a restart, wait this long before judging the fleet quiescent, so
 /// recovery traffic has a chance to start.

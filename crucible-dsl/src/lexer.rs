@@ -286,8 +286,9 @@ fn duration_from(digits: &str, unit: &str) -> Option<Duration> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Span, TokenKind as T, lex};
     use std::time::Duration;
+
+    use super::{Span, TokenKind as T, lex};
 
     fn kinds(src: &str) -> Vec<T> {
         let (tokens, errors) = lex(src);

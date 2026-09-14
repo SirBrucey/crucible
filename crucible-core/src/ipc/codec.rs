@@ -85,11 +85,10 @@ where
 
 #[cfg(test)]
 mod tests {
+    use crucible_protocol::Direction;
     use tokio::io::AsyncWriteExt;
 
     use super::*;
-    use crucible_protocol::Direction;
-
     use crate::ipc::{RunnerToWorker, WorkerEvent, WorkerToRunner};
 
     /// Encode `msg`, decode it, and assert the decoded value equals the original.

@@ -19,16 +19,15 @@ use bollard::{
         LogsOptionsBuilder, RemoveContainerOptionsBuilder, StartContainerOptions,
     },
 };
-use crucible_protocol::{Direction, Edge, Freezes, Waiting, now_ns};
-use futures_util::{StreamExt, TryStreamExt};
-use tokio::time::sleep;
-
 use crucible_core::{
     fault::{By, Fault, Primitive, Reaches},
     observer::SessionObserver,
     plan,
     schema::{AttrDecl, AttrSchema, ValueType},
 };
+use crucible_protocol::{Direction, Edge, Freezes, Waiting, now_ns};
+use futures_util::{StreamExt, TryStreamExt};
+use tokio::time::sleep;
 
 use crate::{
     error::Error as PluginError,

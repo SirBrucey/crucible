@@ -5,9 +5,8 @@
 
 use std::sync::Arc;
 
-use tokio::sync::{broadcast, mpsc};
-
 use crucible_core::ipc::{RunnerToWorker, WorkerToRunner};
+use tokio::sync::{broadcast, mpsc};
 
 /// Capacity of the mpsc journal channel.
 const MPSC_CAPACITY: usize = 1024;
@@ -81,8 +80,9 @@ impl EventBus {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crucible_core::ipc::WorkerToRunner;
+
+    use super::*;
 
     #[tokio::test]
     async fn journal_receives_published_event() {

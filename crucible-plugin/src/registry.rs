@@ -416,9 +416,9 @@ fn bind_services<D: Deployment>(planned: &plan::Fleet) -> Result<Vec<D::Config>,
 
 #[cfg(test)]
 mod tests {
-    use super::Registry;
-
     use crucible_core::plan;
+
+    use super::Registry;
 
     fn service(name: &str, kind: &str) -> plan::Service {
         plan::Service {

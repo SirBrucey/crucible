@@ -730,10 +730,11 @@ fn type_name(ty: &ValueType) -> &'static str {
 mod tests {
     use std::time::Duration;
 
-    use super::{lower, validate};
-    use crate::{ast, diagnostics::Diag, lexer::lex, parser::parse};
     use crucible_core::plan;
     use crucible_plugin::Registry;
+
+    use super::{lower, validate};
+    use crate::{ast, diagnostics::Diag, lexer::lex, parser::parse};
 
     fn parse_file(src: &str) -> ast::File {
         let (tokens, lex_errors) = lex(src);
