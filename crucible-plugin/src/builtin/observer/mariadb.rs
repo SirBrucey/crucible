@@ -5,8 +5,8 @@ use std::net::SocketAddr;
 use crucible_core::{
     plan,
     schema::{
-        AttrDecl, AttrSchema, ClauseDecl, ClauseShape, CmpOp, HeadPattern, Moves, OpSig, Param,
-        ParamType, ValueType,
+        AttrDecl, AttrSchema, ClauseDecl, ClauseShape, CmpOp, HeadPattern, OpSig, Param, ParamType,
+        ValueType,
     },
 };
 use sqlx::{AssertSqlSafe, MySql, Pool, Row, mysql::MySqlRow};
@@ -119,16 +119,12 @@ impl Observer for Mariadb {
             OpSig::observable(
                 HeadPattern::wildcard(&["database", "table"], "count"),
                 ValueType::Int,
-                // Rows the fleet has written, which each step adds to.
-                Moves::Counts,
                 CmpOp::ALL.to_vec(),
             )
             .with_clause(ClauseDecl::new(WHERE, ClauseShape::Filter)),
             OpSig::observable(
                 HeadPattern::wildcard(&["database", "table"], "select"),
                 ValueType::Int,
-                // One column of one row, which each step writes over.
-                Moves::Sets,
                 CmpOp::ALL.to_vec(),
             )
             .with_param(Param::required("column", ParamType::Ident))
@@ -299,6 +295,11 @@ fn value_of(row: &MySqlRow, name: &str) -> Result<plan::Value, Error> {
     if let Ok(n) = row.try_get::<i64, _>(ALIAS) {
         return Ok(plan::Value::Int(n));
     }
+    if let Ok(n) = row.try_get::<u64, _>(ALIAS) {
+        return i64::try_from(n)
+            .map(plan::Value::Int)
+            .map_err(|_| Error::Unreadable(name.to_owned()));
+    }
     if let Ok(s) = row.try_get::<String, _>(ALIAS) {
         return Ok(plan::Value::Str(s));
     }
@@ -312,16 +313,16 @@ fn is_bare_name(s: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{Error, Filter, Mariadb, Selection, Take, Value};
-    use crate::role::Observer;
     use crucible_core::{
         plan,
-        schema::{ClauseShape, CmpOp, HeadPattern, Moves, ValueType},
+        schema::{ClauseShape, CmpOp, HeadPattern, ValueType},
     };
+
+    use super::{Error, Filter, Mariadb, Selection, Take, Value};
+    use crate::role::Observer;
 
     fn check(observable: &[&str], filter: Option<(&str, plan::Value)>) -> plan::Check {
         plan::Check {
-            moves: Moves::Counts,
             service: "db".into(),
             observer: "mariadb".into(),
             observable: observable.iter().map(|s| (*s).to_string()).collect(),

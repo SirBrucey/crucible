@@ -85,11 +85,10 @@ where
 
 #[cfg(test)]
 mod tests {
+    use crucible_protocol::Direction;
     use tokio::io::AsyncWriteExt;
 
     use super::*;
-    use crucible_protocol::Direction;
-
     use crate::ipc::{RunnerToWorker, WorkerEvent, WorkerToRunner};
 
     /// Encode `msg`, decode it, and assert the decoded value equals the original.
@@ -156,7 +155,6 @@ mod tests {
             observable: vec!["orders".into(), "count".into()],
             args: Vec::new(),
             filter: None,
-            moves: crate::schema::Moves::Counts,
             clauses: std::collections::BTreeMap::new(),
             op: crate::schema::CmpOp::Eq,
             value: crate::plan::Value::Int(3),

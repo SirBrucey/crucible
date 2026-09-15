@@ -5,14 +5,13 @@
 
 use std::collections::BTreeSet;
 
-use crucible_protocol::{Burst, Direction, Doing, Edge, EdgeProfile, Reached, Side};
-
 use crucible_core::{
     fault::{Anchor, By, Drive, Fault},
     learned::Learned,
     plan,
     schedule::Schedule,
 };
+use crucible_protocol::{Burst, Direction, Doing, Edge, EdgeProfile, Reached, Side};
 
 use super::{Budget, Scheduler};
 
@@ -394,8 +393,7 @@ impl Scheduler for BurstScheduler {
 mod tests {
     use std::{collections::BTreeSet, time::Duration};
 
-    use crucible_core::fault::Primitive;
-    use crucible_core::fault::Reaches;
+    use crucible_core::fault::{Primitive, Reaches};
     use crucible_protocol::{Boundary, EdgeProfile};
 
     use super::*;

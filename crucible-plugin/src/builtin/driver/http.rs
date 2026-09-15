@@ -323,16 +323,17 @@ fn classify(status: StatusCode, stated: Option<StatusCode>) -> Ack {
 
 #[cfg(test)]
 mod tests {
-    use super::{Ack, Error, Http, Request, StatusCode, classify};
-    use rstest::rstest;
+    use std::collections::BTreeMap;
 
-    use crate::role::Driver;
     use crucible_core::{
         plan,
         schema::{ClauseShape, HeadPattern},
     };
     use reqwest::Method;
-    use std::collections::BTreeMap;
+    use rstest::rstest;
+
+    use super::{Ack, Error, Http, Request, StatusCode, classify};
+    use crate::role::Driver;
 
     fn step(operation: &str, args: Vec<plan::Value>) -> plan::Step {
         plan::Step {
