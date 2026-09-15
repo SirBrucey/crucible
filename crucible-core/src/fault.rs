@@ -1,7 +1,7 @@
 //! Where a fault lands, in terms of what the fleet has been observed to do.
 
-pub use crucible_protocol::Primitive;
-use crucible_protocol::{Direction, Edge};
+use crucible_protocol::Direction;
+pub use crucible_protocol::{Edge, Primitive};
 
 use crate::verdict::Invariant;
 

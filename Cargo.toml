@@ -27,6 +27,7 @@ clap = { version = "4", features = ["derive", "env"] }
 futures-util = "0.3"
 libc = "0.2"
 postcard = { version = "1", default-features = false }
+ratatui = "0.30"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
 rstest = "0.26"
 serde = { version = "1", features = ["derive"] }

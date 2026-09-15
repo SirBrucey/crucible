@@ -1,6 +1,7 @@
 mod bench;
 mod error;
 mod session;
+mod tui;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -127,6 +128,9 @@ enum Cmd {
     Run {
         /// Path to the scenario file.
         file: PathBuf,
+        /// Stream the campaign's diagnostic log instead of the TUI.
+        #[arg(long)]
+        debug: bool,
     },
     /// Parse and check a `.cru` scenario file, reporting diagnostics.
     Check {
@@ -139,7 +143,14 @@ enum Cmd {
 async fn main() -> ExitCode {
     match Cli::parse().command {
         Cmd::Check { file } => run_check(&file).await,
-        Cmd::Run { file } => run_campaign(&file).await,
+        Cmd::Run { file, debug } if debug => run_campaign(&file).await,
+        Cmd::Run { .. } => match tui::preview() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("crucible: {e}");
+                ExitCode::FAILURE
+            }
+        },
     }
 }
 

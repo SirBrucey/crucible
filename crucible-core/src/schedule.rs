@@ -40,6 +40,21 @@ pub enum Purpose {
     Break(Box<Fault>),
 }
 
+/// How far through a run a worker is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub enum Phase {
+    /// Bringing the replica up.
+    Setup,
+    /// Driving the scenario's steps.
+    Driving,
+    /// Waiting for the fleet to come to rest.
+    Healing,
+    /// Reading where the fleet settled.
+    Observing,
+    /// Taking the replica down.
+    Tearing,
+}
+
 impl Schedule {
     /// The steps this run drove on their own, if it is a reference run.
     #[must_use]
