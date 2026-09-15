@@ -89,6 +89,21 @@ impl Http {
     }
 }
 
+/// The service's headers and the step's together, the step's taking the place
+/// of the service's under the same name, matched the way HTTP matches one.
+fn merged(service: Vec<(String, String)>, step: Vec<(String, String)>) -> Vec<(String, String)> {
+    let mut headers: Vec<(String, String)> = service
+        .into_iter()
+        .filter(|(name, _)| {
+            !step
+                .iter()
+                .any(|(stated, _)| stated.eq_ignore_ascii_case(name))
+        })
+        .collect();
+    headers.extend(step);
+    headers
+}
+
 /// Headers are authored as plan values and sent as text, so anything that is
 /// not text is refused rather than given a spelling of its own.
 fn headers(fields: &[(String, plan::Value)]) -> Result<Vec<(String, String)>, Error> {
@@ -161,7 +176,7 @@ impl Driver for Http {
         ]
     }
 
-    fn bind(step: &plan::Step) -> Result<Self::Action, Self::Error> {
+    fn bind(step: &plan::Step, described: &plan::Service) -> Result<Self::Action, Self::Error> {
         // Exactly the operations `signatures` advertises, so this driver never
         // runs something it did not offer.
         let method = match step.operation.as_str() {
@@ -191,20 +206,26 @@ impl Driver for Http {
             service: service.to_owned(),
             path: path.to_owned(),
             body: body.map(encode).transpose()?,
-            headers: step
-                .block(HEADERS)
-                .map(headers)
-                .transpose()?
-                .unwrap_or_default(),
+            headers: merged(
+                crate::builtin::http_headers(described),
+                step.block(HEADERS)
+                    .map(headers)
+                    .transpose()?
+                    .unwrap_or_default(),
+            ),
             expect: expected_status(step.expect.as_ref())?,
         })
     }
 }
 
 impl DriverRuntime for Http {
-    fn prepare(&self, step: &plan::Step) -> Result<Box<dyn Action>, PluginError> {
+    fn prepare(
+        &self,
+        step: &plan::Step,
+        service: &plan::Service,
+    ) -> Result<Box<dyn Action>, PluginError> {
         Ok(Box::new(Call {
-            request: Http::bind(step)?,
+            request: Http::bind(step, service)?,
             client: self.client.clone(),
         }))
     }
@@ -365,6 +386,15 @@ mod tests {
         )
     }
 
+    /// A service declaring the given attributes.
+    fn service(attrs: Vec<(String, plan::Value)>) -> plan::Service {
+        plan::Service {
+            name: "api".into(),
+            kinds: vec!["http".into()],
+            attrs,
+        }
+    }
+
     #[test]
     fn a_stated_status_is_what_the_step_is_held_to() {
         let stated = Some(StatusCode::CONFLICT);
@@ -376,10 +406,16 @@ mod tests {
     fn an_outcome_that_is_not_a_status_is_refused() {
         let mut step = post_to("api", "/orders");
         step.expect = Some(plan::Value::Str("banana".into()));
-        assert!(matches!(Http::bind(&step), Err(Error::Status(_))));
+        assert!(matches!(
+            Http::bind(&step, &service(vec![])),
+            Err(Error::Status(_))
+        ));
 
         step.expect = Some(plan::Value::Int(7));
-        assert!(matches!(Http::bind(&step), Err(Error::Status(_))));
+        assert!(matches!(
+            Http::bind(&step, &service(vec![])),
+            Err(Error::Status(_))
+        ));
     }
 
     #[rstest]
@@ -424,10 +460,52 @@ mod tests {
             "headers",
             vec![("Authorization".into(), plan::Value::Str("token:abc".into()))],
         );
-        let bound = Http::bind(&step).expect("binds");
+        let bound = Http::bind(&step, &service(vec![])).expect("binds");
         assert_eq!(
             bound.headers,
             [("Authorization".to_owned(), "token:abc".to_owned())],
+        );
+    }
+
+    #[test]
+    fn a_service_that_declares_headers_carries_them_on_every_request() {
+        let service = service(vec![(
+            "headers".into(),
+            plan::Value::Map(vec![(
+                "Authorization".into(),
+                plan::Value::Str("token:operator".into()),
+            )]),
+        )]);
+        let bound = Http::bind(&post_to("api", "/orders"), &service).expect("binds");
+        assert_eq!(
+            bound.headers,
+            [("Authorization".to_owned(), "token:operator".to_owned())],
+            "a write carries what the service declares",
+        );
+    }
+
+    #[test]
+    fn a_step_header_overrides_the_service_under_the_same_name() {
+        let service = service(vec![(
+            "headers".into(),
+            plan::Value::Map(vec![(
+                "Authorization".into(),
+                plan::Value::Str("token:service".into()),
+            )]),
+        )]);
+        let step = with_block(
+            post_to("api", "/orders"),
+            "headers",
+            vec![(
+                "authorization".into(),
+                plan::Value::Str("token:step".into()),
+            )],
+        );
+        let bound = Http::bind(&step, &service).expect("binds");
+        assert_eq!(
+            bound.headers,
+            [("authorization".to_owned(), "token:step".to_owned())],
+            "the step's header takes the place of the service's, matched without case",
         );
     }
 
@@ -440,7 +518,10 @@ mod tests {
             "headers",
             vec![("Retry-After".into(), plan::Value::Int(30))],
         );
-        assert!(matches!(Http::bind(&step), Err(Error::Header { .. })));
+        assert!(matches!(
+            Http::bind(&step, &service(vec![])),
+            Err(Error::Header { .. })
+        ));
     }
 
     /// The default content type is only supplied where the step did not name
@@ -452,13 +533,13 @@ mod tests {
             "headers",
             vec![("Content-Type".into(), plan::Value::Str("text/plain".into()))],
         );
-        let bound = Http::bind(&step).expect("binds");
+        let bound = Http::bind(&step, &service(vec![])).expect("binds");
         assert!(bound.states("content-type"));
     }
 
     #[test]
     fn a_step_binds_to_a_request() {
-        let bound = Http::bind(&post_to("api", "/orders")).expect("binds");
+        let bound = Http::bind(&post_to("api", "/orders"), &service(vec![])).expect("binds");
         assert_eq!(
             bound,
             Request {
@@ -482,7 +563,7 @@ mod tests {
                 ("quantity".into(), plan::Value::Int(4)),
             ],
         );
-        let bound = Http::bind(&step).expect("binds");
+        let bound = Http::bind(&step, &service(vec![])).expect("binds");
         let body = bound.body.expect("a body was authored");
         let sent: serde_json::Value = serde_json::from_slice(&body).expect("valid json");
         assert_eq!(sent["item"], "book");
@@ -491,7 +572,10 @@ mod tests {
 
     #[test]
     fn an_operation_that_is_not_a_method_is_rejected() {
-        let bound = Http::bind(&step("SEND", vec![plan::Value::Ident("api".into())]));
+        let bound = Http::bind(
+            &step("SEND", vec![plan::Value::Ident("api".into())]),
+            &service(vec![]),
+        );
         assert!(matches!(bound, Err(Error::Method(_))));
     }
 
@@ -508,20 +592,26 @@ mod tests {
             "body",
             vec![("item".into(), plan::Value::Str("book".into()))],
         );
-        assert!(matches!(Http::bind(&step), Err(Error::Body(_))));
+        assert!(matches!(
+            Http::bind(&step, &service(vec![])),
+            Err(Error::Body(_))
+        ));
     }
 
     #[test]
     fn a_relative_path_is_rejected() {
         // It would concatenate onto the address, addressing some other port,
         // and the failure would look like the fleet leaving a write in doubt.
-        let bound = Http::bind(&post_to("api", "orders"));
+        let bound = Http::bind(&post_to("api", "orders"), &service(vec![]));
         assert!(matches!(bound, Err(Error::Path(_))));
     }
 
     #[test]
     fn a_request_without_a_path_is_rejected() {
-        let bound = Http::bind(&step("GET", vec![plan::Value::Ident("api".into())]));
+        let bound = Http::bind(
+            &step("GET", vec![plan::Value::Ident("api".into())]),
+            &service(vec![]),
+        );
         assert!(matches!(bound, Err(Error::Arguments)));
     }
 }

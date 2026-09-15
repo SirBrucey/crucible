@@ -139,21 +139,23 @@ pub trait Driver {
         AttrSchema::new(Vec::new())
     }
 
-    /// Bind a step to an action this driver can run.
+    /// Bind a step to an action this driver can run, against the service it
+    /// names.
     ///
     /// # Errors
     /// Errors if the step names an operation this driver does not run, or
     /// carries arguments it cannot use.
-    fn bind(step: &plan::Step) -> Result<Self::Action, Self::Error>;
+    fn bind(step: &plan::Step, service: &plan::Service) -> Result<Self::Action, Self::Error>;
 }
 
 /// A driver, ready to run steps.
 pub trait DriverRuntime: Send + Sync {
-    /// Bind a step to a runnable action, without a live fleet.
+    /// Bind a step to a runnable action, against the service it names.
     ///
     /// # Errors
     /// Errors if the step does not bind to an operation this driver runs.
-    fn prepare(&self, step: &plan::Step) -> Result<Box<dyn Action>, Error>;
+    fn prepare(&self, step: &plan::Step, service: &plan::Service)
+    -> Result<Box<dyn Action>, Error>;
 }
 
 /// Something bound to one service of the fleet, speaking one of the kinds that

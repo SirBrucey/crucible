@@ -156,7 +156,7 @@ async fn bring_up(
 ) -> Result<Orchestrator<Ready>> {
     let deployment =
         registry.deployment_for(&schedule.fleet, worker_id, schedule.fault().cloned())?;
-    let actions = registry.actions_for(&schedule.steps)?;
+    let actions = registry.actions_for(&schedule.fleet, &schedule.steps)?;
     let orchestrator = Orchestrator::new(deployment, actions).setup().await?;
     Ok(orchestrator)
 }
