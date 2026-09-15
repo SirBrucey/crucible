@@ -392,6 +392,19 @@ impl Delta {
         self.by == Some(0)
     }
 
+    /// Whether the fleet moved a reading less far than `owed`, the way `owed`
+    /// went.
+    ///
+    /// Steps taken while the observer was out of service are measured together,
+    /// so the fleet can land some of that work and lose the rest. Moving none of
+    /// what it owed and moving some of it are both work that did not land.
+    fn is_short_of(&self, owed: &Delta) -> bool {
+        let (Some(ours), Some(owed)) = (self.by, owed.by) else {
+            return false;
+        };
+        owed != 0 && ours.signum() != -owed.signum() && ours.abs() < owed.abs()
+    }
+
     /// Whether two runs' steps did the same thing.
     ///
     /// How far a reading moved, where that can be read, since the two runs sit
@@ -516,7 +529,7 @@ impl Went {
             }
             went = went.or(if span.drove.is_twice(&span.learned) {
                 Went::Twice
-            } else if span.drove.is_nothing() {
+            } else if span.drove.is_short_of(&span.learned) {
                 Went::Lost
             } else {
                 Went::Elsewhere
@@ -1480,6 +1493,28 @@ mod tests {
         assert_eq!(broke, Some(Invariant::Durable));
         assert!(why.contains("`writes.count` at `0`"), "{why}");
         assert!(!why.contains("orders.count"), "{why}");
+    }
+
+    /// Steps taken while the observer was out of service are measured together,
+    /// so the fleet can land some of that work and lose the rest.
+    #[test]
+    fn work_partly_landed_while_the_observer_was_down_is_lost() {
+        let mut obs = Readings::empty();
+        obs.fault = Some(placed(Primitive::Kill, 3));
+        obs.outcomes = [Ack::Acked; 5].into_iter().map(outcome).collect();
+        obs.checks = vec![reading(4)];
+        // Read for three steps, then out for the two the kill landed on. One of
+        // those two landed and the other did not.
+        obs.trajectory = [Some(0), Some(1), Some(2), Some(3), None, None]
+            .into_iter()
+            .map(|applied| vec![applied.map(plan::Value::Int)])
+            .collect();
+        obs.fault_free =
+            Baseline::unsettled((0..=5).map(|applied| vec![Some(plan::Value::Int(applied))]));
+
+        let (broke, why) = showed(obs.verdict());
+        assert_eq!(broke, Some(Invariant::Durable));
+        assert!(why.contains("work was lost"), "{why}");
     }
 
     /// A reading that went unread still has both ends of what it covered, and
