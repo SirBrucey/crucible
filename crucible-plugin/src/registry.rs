@@ -249,7 +249,11 @@ impl Registry {
     /// # Errors
     /// Errors if a step names a driver this registry does not hold, or does not
     /// bind to an operation that driver runs.
-    pub fn actions_for(&self, steps: &[plan::Step]) -> Result<Vec<Box<dyn Action>>, Error> {
+    pub fn actions_for(
+        &self,
+        fleet: &plan::Fleet,
+        steps: &[plan::Step],
+    ) -> Result<Vec<Box<dyn Action>>, Error> {
         let mut drivers: HashMap<&str, Box<dyn DriverRuntime>> = HashMap::new();
         let mut actions = Vec::with_capacity(steps.len());
         for step in steps {
@@ -257,7 +261,21 @@ impl Registry {
                 Entry::Occupied(driver) => driver.into_mut(),
                 Entry::Vacant(slot) => slot.insert(self.driver_runtime(&step.driver)?),
             };
-            actions.push(driver.prepare(step)?);
+            // The service the step drives, refused if the fleet does not
+            // describe it.
+            let named = step.args.first().and_then(plan::Value::as_service_ref);
+            let service = named
+                .and_then(|name| fleet.services.iter().find(|service| service.name == name))
+                .ok_or_else(|| {
+                    Error::new(
+                        "registry",
+                        format!(
+                            "the fleet has no service named `{}`",
+                            named.unwrap_or_default()
+                        ),
+                    )
+                })?;
+            actions.push(driver.prepare(step, service)?);
         }
         Ok(actions)
     }
@@ -481,7 +499,7 @@ mod tests {
     #[test]
     fn a_step_prepares_against_the_service_it_names() {
         let actions = Registry::builtins()
-            .actions_for(&steps())
+            .actions_for(&fleet(), &steps())
             .expect("every step binds to its driver");
         let targets: Vec<&str> = actions.iter().map(|action| action.target()).collect();
         assert_eq!(targets, ["api"]);
@@ -513,7 +531,14 @@ mod tests {
     fn a_step_naming_an_unregistered_driver_is_rejected() {
         let mut steps = steps();
         steps[0].driver = "grpc".into();
-        assert!(Registry::builtins().actions_for(&steps).is_err());
+        assert!(Registry::builtins().actions_for(&fleet(), &steps).is_err());
+    }
+
+    #[test]
+    fn a_step_naming_a_service_the_fleet_lacks_is_rejected() {
+        let mut steps = steps();
+        steps[0].args[0] = plan::Value::Ident("ledger".into());
+        assert!(Registry::builtins().actions_for(&fleet(), &steps).is_err());
     }
 
     #[test]

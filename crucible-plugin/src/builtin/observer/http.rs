@@ -94,18 +94,7 @@ impl Observer for Http {
                 .timeout(REQUEST_TIMEOUT)
                 .build()
                 .expect("a client with only a timeout set builds"),
-            headers: service
-                .attr("headers")
-                .and_then(plan::Value::as_map)
-                .map(|entries| {
-                    entries
-                        .iter()
-                        .filter_map(|(name, value)| {
-                            Some((name.clone(), value.as_str()?.to_owned()))
-                        })
-                        .collect()
-                })
-                .unwrap_or_default(),
+            headers: crate::builtin::http_headers(service),
         }
     }
 
