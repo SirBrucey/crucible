@@ -202,13 +202,14 @@ impl Registry {
     pub fn deployment_for(
         &self,
         planned: &plan::Fleet,
+        run_id: u32,
         worker_id: u32,
         fault: Option<Fault>,
     ) -> Result<Box<dyn DeploymentRuntime>, Error> {
         match planned.deployment.as_str() {
             Docker::NAME if self.deployments.contains_key(Docker::NAME) => {
                 let services = bind_services::<Docker>(planned)?;
-                Ok(Box::new(Docker::new(worker_id, services, fault)?))
+                Ok(Box::new(Docker::new(run_id, worker_id, services, fault)?))
             }
             other => Err(Error::new(
                 "registry",
@@ -564,6 +565,6 @@ mod tests {
         // that reports a plugin absent must not then hand one out.
         let registry = Registry::default();
         assert!(registry.deployment("docker").is_none());
-        assert!(registry.deployment_for(&fleet(), 0, None).is_err());
+        assert!(registry.deployment_for(&fleet(), 0, 0, None).is_err());
     }
 }

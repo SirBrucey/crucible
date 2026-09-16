@@ -245,11 +245,19 @@ impl Docker {
     /// Connect to the local Docker daemon and prepare a per-worker deployment
     /// handle (nothing is created until [`Docker::setup`]).
     ///
+    /// `run_id` names the runner invocation this replica belongs to, so runs
+    /// sharing a host do not name the same containers and network.
+    ///
     /// # Errors
     /// Errors if connecting to the Docker daemon socket fails.
-    pub fn new(worker_id: u32, services: Vec<ServiceConfig>, fault: Option<Fault>) -> Result<Self> {
+    pub fn new(
+        run_id: u32,
+        worker_id: u32,
+        services: Vec<ServiceConfig>,
+        fault: Option<Fault>,
+    ) -> Result<Self> {
         let client = DockerClient::connect_with_socket_defaults()?;
-        let network = format!("crucible-{worker_id}");
+        let network = format!("crucible-{run_id}-{worker_id}");
         Ok(Self {
             // Both act on the daemon, and the handle is shared rather than a
             // second connection.
@@ -1128,7 +1136,7 @@ mod tests {
         // Driven through the trait, which is how the framework reaches a
         // deployment, so a delegation wired to the wrong method fails here.
         let mut deployment: Box<dyn DeploymentRuntime> =
-            Box::new(Docker::new(worker_id, fleet.clone(), None).expect("connect to docker"));
+            Box::new(Docker::new(0, worker_id, fleet.clone(), None).expect("connect to docker"));
 
         let setup_outcome = deployment.setup().await;
         for service in &fleet {
@@ -1190,7 +1198,7 @@ mod tests {
             .expect("plant orphan");
 
         let mut docker =
-            Docker::new(worker_id, orphan_test_fleet(), None).expect("connect to docker");
+            Docker::new(0, worker_id, orphan_test_fleet(), None).expect("connect to docker");
         let setup_outcome = docker.create_replica().await;
         let teardown_outcome = docker.destroy_replica().await;
 

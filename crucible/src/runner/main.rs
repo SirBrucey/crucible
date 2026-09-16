@@ -338,14 +338,18 @@ async fn reclaim_fleet(worker_id: u32, fleet: &plan::Fleet) {
 }
 
 /// Remove a worker's replica without any live worker state: the containers are
-/// named from the worker id and the fleet's services, and removing one already
-/// gone is a no-op.
+/// named from this run's id, the worker id and the fleet's services.
+/// Removing one already gone is a no-op.
 async fn reclaim(
     worker_id: u32,
     fleet: &plan::Fleet,
 ) -> std::result::Result<(), crucible_plugin::Error> {
-    let mut deployment =
-        crucible_plugin::Registry::builtins().deployment_for(fleet, worker_id, None)?;
+    let mut deployment = crucible_plugin::Registry::builtins().deployment_for(
+        fleet,
+        std::process::id(),
+        worker_id,
+        None,
+    )?;
     deployment.teardown().await
 }
 
@@ -1341,6 +1345,9 @@ fn spawn_worker(socket_path: &Path, worker_id: u32) -> Result<(Child, JoinHandle
         .arg(socket_path)
         .arg("--worker-id")
         .arg(worker_id.to_string())
+        // The runner's pid names this invocation.
+        .arg("--run-id")
+        .arg(std::process::id().to_string())
         // Inherited, a worker writes over the screen the runner is drawing.
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
