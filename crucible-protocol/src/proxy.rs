@@ -125,9 +125,16 @@ impl ConnEvent {
 
     #[must_use]
     pub fn reached(id: ConnId, boundary: crate::Boundary) -> Self {
+        Self::reached_at(id, now_ns(), boundary)
+    }
+
+    /// A boundary reached at the time the service recorded, rather than
+    /// the proxy, so that the moment lines up with the traffic.
+    #[must_use]
+    pub fn reached_at(id: ConnId, ts_ns: u128, boundary: crate::Boundary) -> Self {
         Self {
             id,
-            ts_ns: now_ns(),
+            ts_ns,
             kind: ConnEventKind::Reached { boundary },
         }
     }

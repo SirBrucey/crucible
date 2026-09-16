@@ -417,6 +417,8 @@ mod tests {
                 side,
                 nth,
             },
+            at_ns: 0,
+            edges: Vec::new(),
         }
     }
 

@@ -80,6 +80,8 @@ impl Sessions {
             ConnEventKind::Reached { boundary } => self.inside.push(Reached {
                 service: service.to_string(),
                 boundary,
+                at_ns: ts_ns,
+                edges: Vec::new(),
             }),
             ConnEventKind::Placeable { placement } => {
                 if let Some(pending) = self.opened.get_mut(&(service.to_string(), id)) {
