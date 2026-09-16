@@ -10,7 +10,7 @@ use crucible_core::{
     fault::{By, Fault, Primitive},
     learned::Learned,
     observer::{Reported, SessionObserver},
-    proxy_log::edge_profiles_from_sessions,
+    proxy_log::{Timing, edge_profiles_from_sessions},
     schedule::{Phase, Step},
     verdict::{Baseline, Checkpoint, Observations, Observed, Readings, StepWindow},
 };
@@ -32,6 +32,10 @@ const STEP_SETTLE: Duration = Duration::from_millis(100);
 /// Consider the fleet quiescent once no sidecar has forwarded traffic for this
 /// long. Comfortably larger than a DB write plus docker-log delivery latency.
 const QUIESCENCE_IDLE: Duration = Duration::from_secs(1);
+/// Watch the fleet at rest after it is healthy but before the scenario drives
+/// anything for this long. What crosses an edge here is resting noise, the
+/// floor a burst has to clear to count as work.
+const REST_OBSERVE: Duration = Duration::from_secs(3);
 /// Backstop for the fault anchor: if the target never reaches its Kth packet,
 /// stop waiting. In practice the scenario ending fires first (a shorter path to
 /// the same "missed" outcome); this only guards a pathological hang.
@@ -262,6 +266,10 @@ impl Orchestrator<Ready> {
             session_observer: &session_observer,
             consistent_within,
         };
+        // Watch the healthy fleet idle before driving it, so its resting noise
+        // can be differentiated from the traffic the scenario causes.
+        let rest_start_ns = now_ns();
+        tokio::time::sleep(REST_OBSERVE).await;
         let scenario_start_ns = now_ns();
         let mut observations = match run_actions(deployment.as_ref(), driving, Instant::now()).await
         {
@@ -282,6 +290,7 @@ impl Orchestrator<Ready> {
         session_observer
             .wait_for_quiescence(LEARN_SETTLE, QUIESCENCE_IDLE, consistent_within)
             .await;
+        let steps_settled_ns = now_ns();
         // Read again now the fleet has had the whole settling time, not just
         // the step's share of it. Every run this one answers for is read that
         // way, so the two are comparable only if this one is too. This still
@@ -305,11 +314,24 @@ impl Orchestrator<Ready> {
                 return Err(e);
             }
         };
+        // Record on each span the edges its host dials during it and get the
+        // windows the spans held their hosts open, so writes inside them give
+        // way to the spans rather than standing on packet count.
+        let covered = crucible_core::proxy_log::cover_edges(
+            &observations.sessions,
+            &mut observations.inside,
+            &addresses,
+        );
         let learned = Learned {
             profiles: edge_profiles_from_sessions(
                 &observations.sessions,
-                scenario_start_ns,
+                Timing {
+                    rest_start_ns,
+                    scenario_start_ns,
+                    steps_settled_ns,
+                },
                 &addresses,
+                &covered,
             ),
             fault_free: observations.readings.baseline(),
             inside: observations.inside,
