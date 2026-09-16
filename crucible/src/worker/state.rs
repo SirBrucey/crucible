@@ -11,9 +11,9 @@ use crucible_core::{
         HEARTBEAT_INTERVAL, RunnerToWorker, WorkerEvent, WorkerToRunner,
         codec::{read_frame, write_frame},
     },
-    schedule::{Purpose, Schedule},
+    schedule::{Phase, Purpose, Schedule},
 };
-use crucible_engine::orchestrator::{Done, Orchestrator, Ready};
+use crucible_engine::orchestrator::{Doing, Done, Orchestrator, Ready};
 use crucible_plugin::Registry;
 use tokio::{
     net::{
@@ -80,6 +80,50 @@ impl Conn {
             }
         });
         Heartbeat { stop }
+    }
+
+    /// Start relaying the run's progress to the runner. The returned handle
+    /// stops the task when dropped.
+    fn start_reporting(&self) -> (Doing, Reporting) {
+        let write = self.write.clone();
+        let (telling, mut heard) = tokio::sync::mpsc::unbounded_channel();
+        let stop = Arc::new(Notify::new());
+        let signal = stop.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    // Drain what is queued before taking the stop.
+                    biased;
+                    Some((phase, step)) = heard.recv() => {
+                        let mut write = write.lock().await;
+                        if write_frame(
+                            &mut *write,
+                            &WorkerToRunner::Event(WorkerEvent::Doing { phase, step }),
+                        )
+                        .await
+                        .is_err()
+                        {
+                            // The runner has gone.
+                            break;
+                        }
+                    }
+                    () = signal.notified() => break,
+                }
+            }
+        });
+        (Doing::to(telling), Reporting { stop })
+    }
+}
+
+/// Stops reporting task when dropped.
+// Signals rather than aborts, same as [`Heartbeat`].
+struct Reporting {
+    stop: Arc<Notify>,
+}
+
+impl Drop for Reporting {
+    fn drop(&mut self) {
+        self.stop.notify_one();
     }
 }
 
@@ -255,6 +299,8 @@ impl Worker<Learning> {
     pub async fn execute_learn(self) -> Result<Worker<ShuttingDown>> {
         let registry = Registry::load().await;
         let heartbeat = self.conn.start_heartbeat();
+        let (doing, _reporting) = self.conn.start_reporting();
+        doing.at(Phase::Setup, None);
         let orchestrator = bring_up(&registry, self.id, &self.state.schedule).await?;
         let schedule = &self.state.schedule;
         // The checks are read at every step, so the fault-free run says what
@@ -279,7 +325,7 @@ impl Worker<Learning> {
             .copied()
             .collect();
         let (learned, orchestrator) = orchestrator
-            .learn(&queries, primitives, schedule.consistent_within)
+            .learn(&doing, &queries, primitives, schedule.consistent_within)
             .await
             .inspect_err(|e| tracing::error!(worker_id = self.id, error = %e, "learn failed"))?;
         drop(heartbeat);
@@ -288,6 +334,7 @@ impl Worker<Learning> {
             .send(&WorkerToRunner::SessionCatalogue(learned))
             .await?;
         tracing::info!(worker_id = self.id, count, "sent session catalogue");
+        doing.at(Phase::Tearing, None);
         Ok(self.transition(ShuttingDown { orchestrator }))
     }
 }
@@ -298,6 +345,8 @@ impl Worker<Referencing> {
         let schedule_id = schedule.id;
         let registry = Registry::load().await;
         let heartbeat = self.conn.start_heartbeat();
+        let (doing, _reporting) = self.conn.start_reporting();
+        doing.at(Phase::Setup, None);
         let orchestrator = bring_up(&registry, self.id, schedule).await?;
         let queries = match registry
             .queries_for(&schedule.fleet, &schedule.checks)
@@ -310,7 +359,7 @@ impl Worker<Referencing> {
             }
         };
         let (readings, orchestrator) = orchestrator
-            .reference(&queries, schedule.consistent_within)
+            .reference(&doing, &queries, schedule.consistent_within)
             .await
             .inspect_err(
                 |e| tracing::error!(worker_id = self.id, schedule_id, error = %e, "reference failed"),
@@ -323,6 +372,7 @@ impl Worker<Referencing> {
             })
             .await?;
         tracing::info!(worker_id = self.id, schedule_id, "sent reference");
+        doing.at(Phase::Tearing, None);
         Ok(self.transition(ShuttingDown { orchestrator }))
     }
 }
@@ -333,6 +383,8 @@ impl Worker<Executing> {
         let schedule_id = schedule.id;
         let registry = Registry::load().await;
         let heartbeat = self.conn.start_heartbeat();
+        let (doing, _reporting) = self.conn.start_reporting();
+        doing.at(Phase::Setup, None);
         let orchestrator = bring_up(&registry, self.id, schedule).await?;
 
         // A check reads through the proxy's stable host port: it survives the
@@ -353,6 +405,7 @@ impl Worker<Executing> {
 
         let ((readings, fault_report), orchestrator) = orchestrator
             .execute(
+                &doing,
                 schedule_id,
                 &self.state.fault,
                 queries,
@@ -383,6 +436,7 @@ impl Worker<Executing> {
             })
             .await?;
         tracing::info!(worker_id = self.id, schedule_id, steps, "sent run result");
+        doing.at(Phase::Tearing, None);
         Ok(self.transition(ShuttingDown { orchestrator }))
     }
 }

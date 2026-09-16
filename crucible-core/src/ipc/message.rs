@@ -38,6 +38,11 @@ pub enum WorkerEvent {
     Log(String),
     /// What a schedule's fault did to the fleet.
     Fault(FaultReport),
+    /// How far through its run the worker is.
+    Doing {
+        phase: crate::schedule::Phase,
+        step: Option<crate::schedule::Step>,
+    },
 }
 
 /// Outcome of running a schedule. Non-`Pass` verdicts carry the reason the

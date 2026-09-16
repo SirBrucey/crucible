@@ -12,6 +12,7 @@
 
 use std::{io, path::PathBuf, sync::Arc};
 
+use crucible_core::schedule::Progress;
 use tokio::{
     fs::OpenOptions,
     io::{AsyncWriteExt, BufWriter},
@@ -43,6 +44,60 @@ pub async fn run(mut rx: mpsc::Receiver<Arc<RunnerEvent>>, path: PathBuf) -> io:
         writer.flush().await?;
     }
     Ok(())
+}
+
+/// What the journal recorded about one schedule.
+///
+/// # Errors
+/// Returns an [`io::Error`] if the journal cannot be read.
+pub async fn about(path: &std::path::Path, schedule: u32) -> io::Result<Vec<RunnerEvent>> {
+    let journal = tokio::fs::read_to_string(path).await?;
+    let lines: Vec<&str> = journal.lines().collect();
+    let last = lines.len().saturating_sub(1);
+    let mut unreadable = 0usize;
+    let everything: Vec<RunnerEvent> = lines
+        .iter()
+        .enumerate()
+        .filter_map(
+            |(at, line)| match serde_json::from_str::<RunnerEvent>(line) {
+                Ok(event) => Some(event),
+                Err(_) if at == last => None,
+                Err(e) => {
+                    tracing::warn!(line = at + 1, error = %e, "cannot read a line of the journal");
+                    unreadable += 1;
+                    None
+                }
+            },
+        )
+        .collect();
+    if unreadable > 0 {
+        tracing::warn!(
+            unreadable,
+            "the journal holds entries this build cannot read; what it shows is incomplete"
+        );
+    }
+    // A run waiting on a counterexample is not complete. The verdict will settle after the counterexample.
+    let answering: Vec<&Vec<usize>> = everything
+        .iter()
+        .filter(|event| event.about() == Some(schedule))
+        .filter_map(|event| match event {
+            RunnerEvent::Moved {
+                to: Progress::CounterExample { wants },
+                ..
+            } => Some(wants),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    let keeping: Vec<bool> = everything
+        .iter()
+        .map(|event| event.about() == Some(schedule) || event.answers(&answering))
+        .collect();
+    Ok(everything
+        .into_iter()
+        .zip(keeping)
+        .filter_map(|(event, keep)| keep.then_some(event))
+        .collect())
 }
 
 /// Default journal path under `$XDG_STATE_HOME/crucible/logs/{pid}/journal.ndjson`,

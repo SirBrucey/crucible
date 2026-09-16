@@ -11,6 +11,7 @@ use crucible_core::{
     learned::Learned,
     observer::{Reported, SessionObserver},
     proxy_log::edge_profiles_from_sessions,
+    schedule::{Phase, Step},
     verdict::{Baseline, Checkpoint, Observations, Observed, Readings, StepWindow},
 };
 use crucible_plugin::{
@@ -189,6 +190,7 @@ impl Orchestrator<Ready> {
     /// Errors if the scenario cannot be driven or the checks cannot be read.
     pub async fn reference(
         self,
+        doing: &Doing,
         queries: &[PreparedCheck],
         consistent_within: Duration,
     ) -> Result<(Readings, Orchestrator<Done>), crucible_plugin::Error> {
@@ -200,6 +202,7 @@ impl Orchestrator<Ready> {
             },
         } = self;
         let driving = Driving {
+            doing,
             actions: &actions,
             queries,
             session_observer: &session_observer,
@@ -240,6 +243,7 @@ impl Orchestrator<Ready> {
     /// cannot be read.
     pub async fn learn(
         self,
+        doing: &Doing,
         queries: &[PreparedCheck],
         primitives: BTreeSet<Primitive>,
         consistent_within: Duration,
@@ -252,6 +256,7 @@ impl Orchestrator<Ready> {
             },
         } = self;
         let driving = Driving {
+            doing,
             actions: &actions,
             queries,
             session_observer: &session_observer,
@@ -328,6 +333,7 @@ impl Orchestrator<Ready> {
     #[tracing::instrument(skip_all, fields(schedule = schedule_id))]
     pub async fn execute(
         self,
+        doing: &Doing,
         schedule_id: u32,
         fault: &Fault,
         queries: Vec<PreparedCheck>,
@@ -350,6 +356,7 @@ impl Orchestrator<Ready> {
         // for the caller to tear down, on error we tear down here rather than
         // dropping the only handle to the replica and its observer tasks.
         let driving = Driving {
+            doing,
             actions: &actions,
             queries: &queries,
             session_observer: &session_observer,
@@ -495,10 +502,33 @@ async fn read_checkpoint(
     checkpoint
 }
 
+/// Where a run reports its progress.
+///
+/// Defaults to reporting nowhere.
+#[derive(Clone, Default)]
+pub struct Doing(Option<tokio::sync::mpsc::UnboundedSender<(Phase, Option<Step>)>>);
+
+impl Doing {
+    /// Report to the holder of `telling`.
+    #[must_use]
+    pub fn to(telling: tokio::sync::mpsc::UnboundedSender<(Phase, Option<Step>)>) -> Self {
+        Self(Some(telling))
+    }
+
+    /// Report the phase the run is in, and the step it is on.
+    pub fn at(&self, phase: Phase, step: Option<Step>) {
+        if let Some(telling) = &self.0 {
+            // The listener goes away when the run ends.
+            let _ = telling.send((phase, step));
+        }
+    }
+}
+
 /// What driving the scenario once needs, apart from what is done to it while
 /// it runs.
 #[derive(Clone, Copy)]
 struct Driving<'a> {
+    doing: &'a Doing,
     actions: &'a [TargetedAction],
     queries: &'a [PreparedCheck],
     session_observer: &'a SessionObserver,
@@ -521,6 +551,7 @@ async fn run_actions(
     scenario_start: Instant,
 ) -> Result<Observations, crucible_plugin::Error> {
     let Driving {
+        doing,
         actions,
         queries,
         session_observer,
@@ -534,12 +565,28 @@ async fn run_actions(
         .trajectory
         .push(read_checkpoint(deployment, queries).await);
     for (step, (action, endpoint)) in actions.iter().enumerate() {
+        doing.at(
+            Phase::Driving,
+            Some(Step {
+                taken: step + 1,
+                of: actions.len(),
+            }),
+        );
         let start_ns = scenario_start.elapsed().as_nanos();
         // How far a run got, which is what says where one that stopped stopped.
         tracing::debug!(step, kind = action.kind(), %endpoint, "driving");
         let outcome = action.run(*endpoint).await?;
         tracing::debug!(step, ack = ?outcome.ack, "answered; settling");
         observations.readings.outcomes.push(outcome);
+        // Still the step it just drove, since that is what the run is waiting
+        // to settle.
+        doing.at(
+            Phase::Healing,
+            Some(Step {
+                taken: step + 1,
+                of: actions.len(),
+            }),
+        );
         session_observer
             .wait_for_quiescence(STEP_SETTLE, QUIESCENCE_IDLE, consistent_within)
             .await;
@@ -551,6 +598,13 @@ async fn run_actions(
             end_ns: scenario_start.elapsed().as_nanos(),
         });
         tracing::debug!(step, "settled; reading state");
+        doing.at(
+            Phase::Observing,
+            Some(Step {
+                taken: step + 1,
+                of: actions.len(),
+            }),
+        );
         observations
             .readings
             .trajectory

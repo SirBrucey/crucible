@@ -10,7 +10,7 @@ use crucible_core::{
     fault::{By, Drive, Fault},
     learned::Learned,
     plan,
-    schedule::Schedule,
+    schedule::{Purpose, Schedule},
     verdict::Invariant,
 };
 
@@ -65,6 +65,14 @@ impl RecoveryScheduler {
 impl Scheduler for RecoveryScheduler {
     fn next(&mut self) -> Option<Schedule> {
         self.schedules.next()
+    }
+
+    fn manifest(&self) -> Vec<(u32, Purpose)> {
+        self.schedules
+            .as_slice()
+            .iter()
+            .map(|schedule| (schedule.id, schedule.purpose.clone()))
+            .collect()
     }
 
     fn total(&self) -> usize {

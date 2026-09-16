@@ -9,7 +9,7 @@ use crucible_core::{
     fault::{Anchor, By, Drive, Fault},
     learned::Learned,
     plan,
-    schedule::Schedule,
+    schedule::{Purpose, Schedule},
 };
 use crucible_protocol::{Burst, Direction, Doing, Edge, EdgeProfile, Reached, Side};
 
@@ -382,6 +382,14 @@ fn targets(losing: Drive, at: Where<'_>) -> Vec<By> {
 impl Scheduler for BurstScheduler {
     fn next(&mut self) -> Option<Schedule> {
         self.schedules.next()
+    }
+
+    fn manifest(&self) -> Vec<(u32, Purpose)> {
+        self.schedules
+            .as_slice()
+            .iter()
+            .map(|schedule| (schedule.id, schedule.purpose.clone()))
+            .collect()
     }
 
     fn total(&self) -> usize {
