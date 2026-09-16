@@ -42,8 +42,9 @@ enum Where<'a> {
         edge: &'a Edge,
         direction: Direction,
     },
-    /// A service reaching a point inside itself.
-    Inside { service: &'a str },
+    /// A service reaching a point inside itself, and the edges it was
+    /// communicating on.
+    Inside { service: &'a str, edges: &'a [Edge] },
 }
 
 impl Where<'_> {
@@ -53,7 +54,7 @@ impl Where<'_> {
             Where::Crossing { edge, direction } => {
                 Anchor::crossing(edge.clone(), direction, mark, why)
             }
-            Where::Inside { service } => Anchor::inside(service.to_owned(), mark, why),
+            Where::Inside { service, .. } => Anchor::inside(service.to_owned(), mark, why),
         }
     }
 }
@@ -156,6 +157,7 @@ fn points_inside(reached: &[Reached]) -> Vec<Point<'_>> {
         Point {
             at: Where::Inside {
                 service: &reached.service,
+                edges: &reached.edges,
             },
             why: format!(
                 "{mark} holds {} part way through its own work",
@@ -273,13 +275,20 @@ impl BurstScheduler {
         // than all of it.
         let mut points = in_turn(by_edge.into_iter(), Point::bucket);
 
+        // The services that report their own boundaries.
+        let instrumented: BTreeSet<String> = learned
+            .inside
+            .iter()
+            .map(|reached| reached.service.clone())
+            .collect();
+
         // What one point costs, which is not the same everywhere: what an edge
         // has to break depends on the edge, and a moment can only be broken the
         // way it says.
         let cost = |point: &Point<'_>| -> usize {
             ways_at(&ways, point)
                 .into_iter()
-                .map(|by| targets(by, point.at).len())
+                .map(|by| targets(by, point.at, &instrumented).len())
                 .sum()
         };
         // A moment nothing can be placed on is not a moment this campaign has.
@@ -299,7 +308,7 @@ impl BurstScheduler {
         let mut next_id: u32 = Schedule::LEARN_ID + 1;
         for point in &points {
             for by in ways_at(&ways, point) {
-                for taking in targets(by, point.at) {
+                for taking in targets(by, point.at, &instrumented) {
                     let anchor = point.at.anchoring(point.mark.clone(), point.why.clone());
                     let fault = Fault::at(anchor, taking);
                     schedules.push(Schedule::faulted(
@@ -350,14 +359,31 @@ fn ways_at(ways: &[Drive], point: &Point<'_>) -> Vec<Drive> {
 /// What breaking the fleet at `at` by `losing` takes from the fleet.
 /// For an edge, the services at its ends or the link between them.
 /// For a moment inside a service, that service, held where it reported reaching.
-fn targets(losing: Drive, at: Where<'_>) -> Vec<By> {
+///
+/// A service in `instrumented` is killed only at its own span boundaries.
+fn targets(losing: Drive, at: Where<'_>, instrumented: &BTreeSet<String>) -> Vec<By> {
+    let killable = |service: &str| !instrumented.contains(service);
     let edge = match at {
         Where::Crossing { edge, .. } => edge,
-        Where::Inside { service } => {
+        Where::Inside { service, edges } => {
             return match losing {
-                Drive::Kill => vec![By::Kill(service.to_owned())],
-                // Everything else names an edge, and this moment is not on one.
-                Drive::Cut | Drive::Repeat | Drive::Reorder | Drive::Drop => Vec::new(),
+                Drive::Kill => {
+                    let mut services = vec![service.to_owned()];
+                    for edge in edges {
+                        for end in edge.client.iter().chain(std::iter::once(&edge.upstream)) {
+                            if !services.contains(end) && killable(end) {
+                                services.push(end.clone());
+                            }
+                        }
+                    }
+                    services.into_iter().map(By::Kill).collect()
+                }
+                Drive::Cut => edges
+                    .iter()
+                    .filter(|edge| edge.within_fleet())
+                    .map(|edge| By::Cut(edge.clone()))
+                    .collect(),
+                Drive::Repeat | Drive::Reorder | Drive::Drop => Vec::new(),
             };
         }
     };
@@ -366,6 +392,7 @@ fn targets(losing: Drive, at: Where<'_>) -> Vec<By> {
             .client
             .iter()
             .chain(std::iter::once(&edge.upstream))
+            .filter(|service| killable(service))
             .map(|service| By::Kill(service.clone()))
             .collect(),
         Drive::Cut => edge
@@ -420,6 +447,92 @@ mod tests {
             at_ns: 0,
             edges: Vec::new(),
         }
+    }
+
+    #[test]
+    fn a_moment_on_an_edge_can_break_that_edge() {
+        let edges = [Edge {
+            client: Some("api".to_owned()),
+            upstream: "db".to_owned(),
+        }];
+        let at = Where::Inside {
+            service: "api",
+            edges: &edges,
+        };
+        assert_eq!(
+            targets(Drive::Cut, at, &BTreeSet::new()),
+            vec![By::Cut(edges[0].clone())]
+        );
+        assert_eq!(
+            targets(Drive::Kill, at, &BTreeSet::new()),
+            vec![By::Kill("api".to_owned()), By::Kill("db".to_owned())],
+        );
+    }
+
+    #[test]
+    fn a_moment_on_two_edges_breaks_each_and_kills_each_service_once() {
+        let edges = [
+            Edge {
+                client: Some("api".to_owned()),
+                upstream: "db".to_owned(),
+            },
+            Edge {
+                client: Some("api".to_owned()),
+                upstream: "broker".to_owned(),
+            },
+        ];
+        let at = Where::Inside {
+            service: "api",
+            edges: &edges,
+        };
+        assert_eq!(
+            targets(Drive::Cut, at, &BTreeSet::new()),
+            vec![By::Cut(edges[0].clone()), By::Cut(edges[1].clone())],
+        );
+        assert_eq!(
+            targets(Drive::Kill, at, &BTreeSet::new()),
+            vec![
+                By::Kill("api".to_owned()),
+                By::Kill("db".to_owned()),
+                By::Kill("broker".to_owned()),
+            ],
+        );
+    }
+
+    #[test]
+    fn a_moment_on_no_edge_only_takes_its_service() {
+        let at = Where::Inside {
+            service: "api",
+            edges: &[],
+        };
+        assert_eq!(targets(Drive::Cut, at, &BTreeSet::new()), Vec::new());
+        assert_eq!(
+            targets(Drive::Kill, at, &BTreeSet::new()),
+            vec![By::Kill("api".to_owned())]
+        );
+    }
+
+    #[test]
+    fn an_instrumented_service_is_not_killed_on_the_wire() {
+        let edge = Edge {
+            client: Some("api".to_owned()),
+            upstream: "db".to_owned(),
+        };
+        let at = Where::Crossing {
+            edge: &edge,
+            direction: Direction::ClientToUpstream,
+        };
+        let instrumented = BTreeSet::from(["api".to_owned()]);
+        assert_eq!(
+            targets(Drive::Kill, at, &instrumented),
+            vec![By::Kill("db".to_owned())],
+            "api is killed at its spans, not here; db has none, so it is taken"
+        );
+        assert_eq!(
+            targets(Drive::Cut, at, &instrumented),
+            vec![By::Cut(edge.clone())],
+            "the link is still cut whoever is on it",
+        );
     }
 
     fn burst(nth: u32, packets: u32) -> Burst {
