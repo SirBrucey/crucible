@@ -202,10 +202,17 @@ fn proxy_fault_args(fault: &Fault) -> Vec<String> {
                 ]
             }
             // The moment crosses no pair: the service reports reaching it and
-            // is held there while the fault is placed.
-            Reaches::Inside { service } => {
-                vec!["--inside".to_owned(), format!("{service}={}", anchor.mark)]
-            }
+            // is held there while the fault is placed. A cut breaks the edge
+            // the fault carries; a kill is done to a container.
+            Reaches::Inside { service } => match by {
+                By::Cut(edge) => vec![
+                    "--inside".to_owned(),
+                    format!("{service}={}={}", anchor.mark, edge_arg(edge)),
+                    "--fault".to_owned(),
+                    by.primitive().to_string(),
+                ],
+                _ => vec!["--inside".to_owned(), format!("{service}={}", anchor.mark)],
+            },
         },
         (None, By::Cut(edge)) => vec!["--degrade".to_owned(), edge_arg(edge)],
         // A kill is done to the container, and changing what crosses needs a

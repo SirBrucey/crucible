@@ -180,6 +180,9 @@ fn parse_edge(spec: &str) -> Result<(Option<String>, String)> {
 struct Inside {
     service: String,
     mark: String,
+    /// The edge to break when the service reaches the mark. `None` when the
+    /// moment only takes the service down.
+    edge: Option<(Option<String>, String)>,
 }
 
 /// Parse `SERVICE=MARK`.
@@ -188,15 +191,20 @@ struct Inside {
 /// Errors if either half is missing.
 fn parse_inside(spec: &str) -> Result<Inside> {
     let malformed = || Error::MalformedInside { spec: spec.into() };
-    let Some((service, mark)) = spec.split_once('=') else {
+    // `SERVICE=MARK`, or `SERVICE=MARK=CLIENT>UPSTREAM` to also break that edge.
+    // A mark is `span:nth:side` and an edge carries `>`.
+    let mut parts = spec.splitn(3, '=');
+    let (Some(service), Some(mark)) = (parts.next(), parts.next()) else {
         return Err(malformed());
     };
     if service.is_empty() || mark.is_empty() {
         return Err(malformed());
     }
+    let edge = parts.next().map(parse_edge).transpose()?;
     Ok(Inside {
         service: service.to_owned(),
         mark: mark.to_owned(),
+        edge,
     })
 }
 
@@ -330,6 +338,10 @@ async fn main() -> Result<()> {
         Gates {
             at: at.as_ref(),
             degrade: degrade.as_ref(),
+            inside_upstream: inside
+                .as_ref()
+                .and_then(|inside| inside.edge.as_ref())
+                .map(|(_, upstream)| upstream.as_str()),
             anchor: anchor.as_ref(),
             pause: &pause_rx,
             sever: &sever_rx,
@@ -345,7 +357,13 @@ async fn main() -> Result<()> {
         .as_ref()
         .map(|at| at.client.clone())
         .or_else(|| degrade.as_ref().map(|(client, _)| client.clone()))
-        .flatten();
+        .flatten()
+        .or_else(|| {
+            inside
+                .as_ref()
+                .and_then(|inside| inside.edge.as_ref())
+                .and_then(|(client, _)| client.clone())
+        });
     let named = Arc::new(fleet::Named::new(hosts));
     named.warm();
     serve_spans(
@@ -574,6 +592,8 @@ fn job_for(
 struct Gates<'a> {
     at: Option<&'a FaultAt>,
     degrade: Option<&'a (Option<String>, String)>,
+    /// The upstream of the edge an inside fault breaks.
+    inside_upstream: Option<&'a str>,
     anchor: Option<&'a Anchor>,
     pause: &'a watch::Receiver<bool>,
     sever: &'a watch::Receiver<u64>,
@@ -592,7 +612,8 @@ async fn serve_pairs(pairs: Vec<Pair>, gates: Gates<'_>) -> Result<()> {
     for pair in pairs {
         // Only the pairs fronting the anchored service count toward the fault
         // and only they can be severed by it.
-        let anchored = gates.at.is_some_and(|at| at.upstream == pair.service);
+        let anchored = gates.at.is_some_and(|at| at.upstream == pair.service)
+            || gates.inside_upstream == Some(pair.service.as_str());
         let degraded = gates
             .degrade
             .is_some_and(|(_, upstream)| *upstream == pair.service);
@@ -785,6 +806,24 @@ mod tests {
             name: name.to_owned(),
             host: format!("{name}-actual"),
         }
+    }
+
+    #[test]
+    fn an_inside_hold_carries_no_edge() {
+        let inside = parse_inside("api=publish:1:start").expect("valid spec");
+        assert_eq!(inside.service, "api");
+        assert_eq!(inside.mark, "publish:1:start");
+        assert_eq!(inside.edge, None);
+    }
+
+    #[test]
+    fn an_inside_cut_carries_the_edge_to_break() {
+        let inside = parse_inside("api=publish:1:start=api>broker").expect("valid spec");
+        assert_eq!(inside.mark, "publish:1:start");
+        assert_eq!(
+            inside.edge,
+            Some((Some("api".to_owned()), "broker".to_owned())),
+        );
     }
 
     /// A client the fleet does not have resolves to no address, so the anchor
