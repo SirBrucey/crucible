@@ -398,11 +398,17 @@ impl Delta {
     /// Steps taken while the observer was out of service are measured together,
     /// so the fleet can land some of that work and lose the rest. Moving none of
     /// what it owed and moving some of it are both work that did not land.
+    ///
+    /// A reading that is not a number has no distance to fall short by, and no
+    /// order to read one value as less than another. Falling short there is
+    /// holding still where `owed` moved.
     fn is_short_of(&self, owed: &Delta) -> bool {
-        let (Some(ours), Some(owed)) = (self.by, owed.by) else {
-            return false;
-        };
-        owed != 0 && ours.signum() != -owed.signum() && ours.abs() < owed.abs()
+        match (self.by, owed.by) {
+            (Some(ours), Some(owed)) => {
+                owed != 0 && ours.signum() != -owed.signum() && ours.abs() < owed.abs()
+            }
+            _ => self.is_nothing() && !owed.is_nothing(),
+        }
     }
 
     /// Whether two runs' steps did the same thing.
@@ -1781,6 +1787,21 @@ mod tests {
         ));
         assert_eq!(broke, Some(Invariant::Converges));
         assert!(why.contains("arrived after the rest"), "{why}");
+    }
+
+    /// A reading the fleet advances by overwriting, rather than by counting,
+    /// still says work was lost when it stalls.
+    #[test]
+    fn a_reading_stalled_at_an_earlier_value_shows_durability() {
+        let (broke, why) = showed(ordered_trail(
+            placed(Primitive::Kill, 0),
+            &[Ack::Acked, Ack::Acked, Ack::Acked],
+            &[(0, "none"), (1, "one"), (2, "two"), (3, "three")],
+            &[(0, "none"), (1, "one"), (2, "one"), (3, "one")],
+            (3, "one"),
+        ));
+        assert_eq!(broke, Some(Invariant::Durable));
+        assert!(why.contains("work was lost"), "{why}");
     }
 
     /// A count reaches the same total whichever order its steps arrive in.
