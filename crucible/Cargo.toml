@@ -23,6 +23,7 @@ crucible-core = { path = "../crucible-core" }
 crucible-dsl = { path = "../crucible-dsl" }
 crucible-engine = { path = "../crucible-engine" }
 crucible-plugin = { path = "../crucible-plugin", features = ["framework"] }
+crucible-protocol = { path = "../crucible-protocol" }
 libc = { workspace = true }
 ratatui = { workspace = true }
 strum = { workspace = true }
@@ -33,7 +34,6 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
-crucible-protocol = { path = "../crucible-protocol" }
 rstest = { workspace = true }
 
 [lints]

@@ -1,4 +1,5 @@
 mod bench;
+mod controls;
 mod error;
 mod session;
 mod tui;
@@ -16,11 +17,11 @@ use crucible_core::{
     ipc::Verdict,
     learned::Learned,
     plan,
-    schedule::Schedule,
+    schedule::{Progress, Schedule},
     verdict::{self, Invariant, Readings},
 };
 use crucible_engine::{
-    event_bus::EventBus,
+    event_bus::{EventBus, RunnerEvent},
     journal,
     scheduler::{self, Budget, BurstScheduler, Chain, RecoveryScheduler, Scheduler, recovery},
 };
@@ -36,7 +37,8 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    bench::{Bench, Taking},
+    bench::{Bench, Decided, Taking},
+    controls::Controls,
     error::{Error, Result},
     session::{Dispatching, Session},
 };
@@ -65,6 +67,8 @@ const GIVE_UP_AFTER: u32 = 3;
 /// How long an interrupt waits for the cancelled runs to report the schedules
 /// that were cancelled before force sweeping.
 const INTERRUPT_DRAIN: Duration = Duration::from_secs(30);
+/// How often a paused campaign with nothing running checks for input.
+const HELD_POLL: Duration = Duration::from_millis(100);
 
 /// Number of schedule workers (each with its own fleet replica) to run at once.
 /// Overridable with `CRUCIBLE_CONCURRENCY`.
@@ -143,26 +147,30 @@ enum Cmd {
 async fn main() -> ExitCode {
     match Cli::parse().command {
         Cmd::Check { file } => run_check(&file).await,
-        Cmd::Run { file, debug } if debug => run_campaign(&file).await,
-        Cmd::Run { .. } => match tui::preview() {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(e) => {
-                eprintln!("crucible: {e}");
-                ExitCode::FAILURE
-            }
-        },
+        Cmd::Run { file, debug } => run_campaign(&file, !debug).await,
     }
 }
 
 /// Initialise logging and run a fault-injection campaign to completion.
-async fn run_campaign(file: &Path) -> ExitCode {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .with_writer(std::io::stderr)
-        .init();
+///
+/// A run that draws a screen writes its log to a file beside the journal
+/// rather than to the terminal.
+async fn run_campaign(file: &Path, screen: bool) -> ExitCode {
+    let logging = tracing_subscriber::fmt().with_env_filter(
+        tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+    );
+    if screen {
+        match log_file() {
+            Ok(to) => logging.with_ansi(false).with_writer(to).init(),
+            Err(e) => {
+                eprintln!("crucible: cannot open a log file: {e}");
+                return ExitCode::from(2);
+            }
+        }
+    } else {
+        logging.with_writer(std::io::stderr).init();
+    }
 
     let plan = match load(file).await {
         Ok(plan) => plan,
@@ -174,7 +182,8 @@ async fn run_campaign(file: &Path) -> ExitCode {
         }
     };
 
-    match run(&plan).await {
+    let registry = crucible_plugin::Registry::load().await;
+    match run(&plan, screen, &registry).await {
         Ok(outcome) => outcome.exit_code(),
         Err(e) => {
             tracing::error!(error = %e, "runner exiting with error");
@@ -230,12 +239,18 @@ async fn run_check(file: &Path) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-async fn run(plan: &plan::Plan) -> Result<CampaignOutcome> {
+async fn run(
+    plan: &plan::Plan,
+    screen: bool,
+    registry: &crucible_plugin::Registry,
+) -> Result<CampaignOutcome> {
     let (bus, journal_rx) = EventBus::new();
+    let interrupt = interrupt_token()?;
+    let controls = Controls::default();
 
     let journal_path = journal::default_path(std::process::id());
     tracing::info!(path = %journal_path.display(), "journal ready");
-    let journal_task = tokio::spawn(journal::run(journal_rx, journal_path));
+    let journal_task = tokio::spawn(journal::run(journal_rx, journal_path.clone()));
 
     let mut observer_rx = bus.subscribe();
     let observer_task = tokio::spawn(async move {
@@ -253,14 +268,40 @@ async fn run(plan: &plan::Plan) -> Result<CampaignOutcome> {
         }
     });
 
-    let workload = drive(&bus, plan).await;
+    // Closing the screen stops the campaign, same as interrupting it.
+    let screen = plan.scenarios.first().filter(|_| screen).map(|scenario| {
+        tokio::spawn(tui::live(
+            tui::watching(plan, scenario, registry),
+            bus.subscribe(),
+            interrupt.clone(),
+            controls.clone(),
+            journal_path.clone(),
+        ))
+    });
+
+    let workload = drive(&bus, plan, &interrupt, &controls).await;
 
     drop(bus);
+    if let Some(screen) = screen {
+        // A panicked screen leaves the terminal in raw mode.
+        if let Err(e) = screen.await {
+            tracing::error!(error = %e, "the screen stopped badly; the terminal may need a reset");
+        }
+    }
     journal_task.await.expect("journal task should not panic")?;
     let _ = observer_task.await;
     cleanup_sockets();
 
     workload
+}
+
+/// Where a run that draws a screen writes its diagnostic log.
+fn log_file() -> std::io::Result<std::sync::Mutex<std::fs::File>> {
+    let path = journal::default_path(std::process::id()).with_file_name("run.log");
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    Ok(std::sync::Mutex::new(std::fs::File::create(path)?))
 }
 
 /// Force-remove a worker's fleet by id, best-effort. On the happy path the
@@ -332,8 +373,9 @@ struct Outcomes {
     faults: Vec<(u32, Option<Invariant>, String)>,
     inconclusive: usize,
     errored: usize,
-    /// Ids of interrupted schedules.
-    abandoned: Vec<u32>,
+    /// Schedules the user stopped, by skipping or interrupting the
+    /// campaign. These are not outcomes, so they say nothing about the fleet.
+    incomplete: Vec<u32>,
 }
 
 impl Outcomes {
@@ -412,16 +454,16 @@ impl Outcomes {
     fn report(&self, total: usize, elapsed_s: u64, stopped: Stopped) {
         let shown = self.shown();
         if self.completed() < total {
-            let mut stopped_ids = self.abandoned.clone();
+            let mut stopped_ids = self.incomplete.clone();
             stopped_ids.sort_unstable();
-            let abandoned = spelled_ids(&stopped_ids);
+            let incomplete = spelled_ids(&stopped_ids);
             tracing::warn!(
                 passed = self.passed,
                 faults = self.faults.len(),
                 %shown,
                 inconclusive = self.inconclusive,
                 errored = self.errored,
-                %abandoned,
+                %incomplete,
                 total,
                 elapsed_s,
                 "{stopped}, so the remaining schedules were skipped"
@@ -455,6 +497,8 @@ fn spelled_ids(ids: &[u32]) -> String {
 enum Stopped {
     Budget,
     GaveUp,
+    /// The user asked for the report.
+    Asked,
     Interrupted(Phase),
 }
 
@@ -470,6 +514,7 @@ impl std::fmt::Display for Stopped {
         match self {
             Stopped::Budget => f.write_str("the campaign ran out of wall-clock budget"),
             Stopped::GaveUp => f.write_str("too many schedules failed in a row"),
+            Stopped::Asked => f.write_str("the campaign was asked to report on what it had"),
             Stopped::Interrupted(Phase::Learning) => {
                 f.write_str("the campaign was interrupted during its fault-free run")
             }
@@ -542,6 +587,14 @@ struct Pool<'a> {
     /// Cancelled when the campaign is interrupted, so an in-flight run stops
     /// and reports the schedule it was on rather than being aborted.
     interrupt: CancellationToken,
+    /// What the screen can ask of the campaign.
+    controls: Controls,
+    /// A cancellation token per run in flight, so individual runs can be skipped.
+    running: BTreeMap<u32, CancellationToken>,
+    /// Schedules the user skipped. These are dropped rather than run.
+    skipped: BTreeSet<u32>,
+    /// Schedules that have changed state since the last publish.
+    moved: Vec<(u32, Progress)>,
 }
 
 /// What a pool needs to start dispatching.
@@ -555,6 +608,7 @@ struct Dispatch<'a> {
     campaign_start: Instant,
     max_inflight: usize,
     interrupt: CancellationToken,
+    controls: Controls,
 }
 
 impl<'a> Pool<'a> {
@@ -568,6 +622,7 @@ impl<'a> Pool<'a> {
             campaign_start,
             max_inflight,
             interrupt,
+            controls,
         } = dispatch;
         Self {
             bus,
@@ -585,6 +640,35 @@ impl<'a> Pool<'a> {
             exhausted: false,
             gave_up: false,
             interrupt,
+            controls,
+            running: BTreeMap::new(),
+            skipped: BTreeSet::new(),
+            moved: Vec::new(),
+        }
+    }
+
+    /// Record a schedule's new state, to publish on the next pass.
+    fn moved(&mut self, schedule: u32, to: Progress) {
+        self.moved.push((schedule, to));
+    }
+
+    /// Give up on the schedules the user skipped, cancelling any that a worker
+    /// has picked up.
+    fn take_skips(&mut self) {
+        for schedule in self.controls.skipping() {
+            if let Some(leave) = self.running.get(&schedule) {
+                leave.cancel();
+            }
+            self.skipped.insert(schedule);
+        }
+    }
+
+    /// Publish the state changes recorded since this was last called.
+    async fn publish(&mut self) {
+        for (schedule, to) in self.moved.drain(..) {
+            if let Err(e) = self.bus.publish(RunnerEvent::Moved { schedule, to }).await {
+                tracing::warn!(error = %e, "cannot report what a schedule did");
+            }
         }
     }
 
@@ -599,7 +683,7 @@ impl<'a> Pool<'a> {
     fn taking(&self) -> Taking {
         if self.gave_up {
             Taking::Nothing
-        } else if self.within_budget() {
+        } else if self.within_budget() && !self.controls.finishing() {
             Taking::More
         } else {
             Taking::Finishing
@@ -609,13 +693,26 @@ impl<'a> Pool<'a> {
     /// Spawn one schedule attempt on the next worker id and its own replica.
     fn spawn(&mut self, schedule: Schedule, attempt: u32) {
         let landed = schedule.landed().map(<[usize]>::to_vec);
+        if landed.is_none() {
+            self.moved(
+                schedule.id,
+                Progress::Running {
+                    worker: self.worker_id,
+                },
+            );
+        }
+        // Its own token, so this run can be skipped without stopping the
+        // campaign. An interrupt will still reach it, since cancelling the parent
+        // cancels every child.
+        let leave = self.interrupt.child_token();
+        self.running.insert(schedule.id, leave.clone());
         let task = self.inflight.spawn(run_one_schedule(
             self.bus.clone(),
             self.worker_id,
             schedule,
             attempt,
             self.schedule_budget,
-            self.interrupt.clone(),
+            leave,
         ));
         // A panicked task comes back without its schedule, so what it was for
         // is written down here while there is still something to read it from.
@@ -623,10 +720,22 @@ impl<'a> Pool<'a> {
         self.worker_id += 1;
     }
 
+    /// Whether the campaign is taking work off the scheduler.
+    fn dispatching(&self) -> bool {
+        !self.controls.paused() || self.controls.finishing()
+    }
+
     /// Fill the in-flight set up to the concurrency cap, until the scheduler
     /// drains or the campaign stops taking work on.
+    ///
+    /// A paused campaign picks up nothing new, and lets what is running
+    /// finish so no replica is left half torn down. One that is wrapping up
+    /// can still send out reference runs, as parked runs need them to reach a
+    /// verdict.
+    // Wrapping up overrides a pause. Both stop new schedules, so holding as
+    // well would leave the campaign waiting for a report it can already make.
     fn fill(&mut self, scheduler: &mut dyn Scheduler) {
-        while self.inflight.len() < self.max_inflight {
+        while self.dispatching() && self.inflight.len() < self.max_inflight {
             let taking = self.taking();
             // A parked run is holding its result on one of these, so they go
             // before work that could only add more.
@@ -638,6 +747,11 @@ impl<'a> Pool<'a> {
                 break;
             }
             match scheduler.next() {
+                // Skipped before a worker took it, so it never runs.
+                Some(schedule) if self.skipped.remove(&schedule.id) => {
+                    self.moved(schedule.id, Progress::Skipped);
+                    self.outcomes.incomplete.push(schedule.id);
+                }
                 Some(schedule) => self.spawn(schedule, 1),
                 None => self.exhausted = true,
             }
@@ -648,6 +762,7 @@ impl<'a> Pool<'a> {
     /// every state it answers to.
     fn record_judged(&mut self, judged: impl IntoIterator<Item = (u32, Verdict)>) {
         for (schedule_id, verdict) in judged {
+            self.moved(schedule_id, Progress::Complete(verdict.clone()));
             self.outcomes.record_verdict(schedule_id, verdict);
         }
     }
@@ -671,29 +786,41 @@ impl<'a> Pool<'a> {
     /// fresh replica while attempts and appetite remain, or the error that
     /// ends it.
     fn schedule_done(&mut self, schedule: Schedule, attempt: u32, result: Result<Readings>) {
+        // Taken here, so a run that beat its own cancellation keeps the verdict it reached.
+        let gave_up = self.skipped.remove(&schedule.id);
         match result {
             Ok(readings) => {
                 self.recovery.reset();
-                let judged = self.bench.judge(schedule.id, readings);
-                self.record_judged(judged);
+                match self.bench.judge(schedule.id, readings) {
+                    Decided::Now(judged) => self.record_judged([judged]),
+                    // Parked until a reference run says what its steps owed.
+                    Decided::Waiting(wants) => {
+                        self.moved(schedule.id, Progress::CounterExample { wants });
+                    }
+                }
             }
-            // An interrupt stopped this run, so it says nothing about the fleet.
-            // Kept apart from the errors, which is what the stop report reads to
-            // name the schedules it abandoned.
+            // A run that stopped short says nothing about the fleet, so these
+            // are kept apart from the errors. Skipped means the user gave up on
+            // this run, abandoned means they stopped the whole campaign.
+            Err(_) if gave_up => {
+                self.moved(schedule.id, Progress::Skipped);
+                self.outcomes.incomplete.push(schedule.id);
+            }
             Err(Error::Interrupted) => {
-                self.outcomes.abandoned.push(schedule.id);
+                self.moved(schedule.id, Progress::Abandoned);
+                self.outcomes.incomplete.push(schedule.id);
             }
             // A worker that outran its budget did not crash; we simply have no
             // verdict in the time allowed. Record it inconclusive rather than
             // retrying into the campaign's hard cap.
             Err(Error::WorkerTimeout(budget)) => {
                 self.recovery.reset();
-                self.outcomes.record_verdict(
+                self.record_judged([(
                     schedule.id,
                     Verdict::Inconclusive {
                         reason: format!("worker exceeded its {budget:?} budget"),
                     },
-                );
+                )]);
             }
             Err(e)
                 if e.is_transient()
@@ -706,11 +833,13 @@ impl<'a> Pool<'a> {
                     error = %e,
                     "worker failed; respawning on a fresh replica"
                 );
+                self.moved(schedule.id, Progress::Requeued);
                 self.spawn(schedule, attempt + 1);
             }
             Err(e) => {
                 let schedule_id = schedule.id;
                 tracing::warn!(schedule_id, attempts = attempt, error = %e, "worker failed and will not be retried");
+                self.moved(schedule_id, Progress::Errored);
                 self.outcomes.record_error(Some(schedule_id), e);
                 self.recovery.record_failure();
             }
@@ -731,6 +860,8 @@ impl<'a> Pool<'a> {
         match joined {
             Ok((task, (schedule, attempt, result))) => {
                 self.drove.remove(&task);
+                // Its token dies with the run. A respawn takes a fresh one.
+                self.running.remove(&schedule.id);
                 match schedule.landed() {
                     Some(landed) => self.reference_done(landed, result),
                     None => self.schedule_done(schedule, attempt, result),
@@ -760,11 +891,9 @@ impl<'a> Pool<'a> {
     /// Take in the cancelled runs, then force-reclaim every replica spawned this
     /// run.
     ///
-    /// A cancelled run returns the schedule it was on, so draining is what lets
-    /// the campaign say which schedules it abandoned. Bounded, so one wedged
-    /// worker cannot hold up an interrupt, and the sweep afterwards covers
-    /// whatever did not come back. Reclaiming an already-torn-down id is a
-    /// no-op.
+    /// A cancelled run returns the schedule it was on, so we can name the schedules that never finished.
+    /// Draining is bounded and the sweep afterwards covers whatever did not come back.
+    /// Reclaiming a replica that is already down is a no-op.
     async fn reclaim_all(&mut self) {
         let drained = tokio::time::timeout(INTERRUPT_DRAIN, async {
             while let Some(joined) = self.inflight.join_next_with_id().await {
@@ -874,7 +1003,12 @@ fn interrupt_token() -> Result<CancellationToken> {
     Ok(token)
 }
 
-async fn drive(bus: &EventBus, plan: &plan::Plan) -> Result<CampaignOutcome> {
+async fn drive(
+    bus: &EventBus,
+    plan: &plan::Plan,
+    interrupt: &CancellationToken,
+    controls: &Controls,
+) -> Result<CampaignOutcome> {
     let campaign_start = Instant::now();
     let mut worker_id: u32 = 0;
 
@@ -885,7 +1019,7 @@ async fn drive(bus: &EventBus, plan: &plan::Plan) -> Result<CampaignOutcome> {
         .expect("the grammar requires a scenario, so a lowered plan states one");
 
     // Interrupting a campaign must not orphan a replica.
-    let interrupt = interrupt_token()?;
+    let interrupt = interrupt.clone();
 
     // Learn is a barrier: schedules derive from its observed traffic profiles.
     let (learned, cycle_cost) =
@@ -938,11 +1072,32 @@ async fn drive(bus: &EventBus, plan: &plan::Plan) -> Result<CampaignOutcome> {
         campaign_start,
         max_inflight: concurrency,
         interrupt: interrupt.clone(),
+        controls: controls.clone(),
     });
+
+    if let Err(e) = bus
+        .publish(RunnerEvent::Fitted {
+            schedules: scheduler.manifest(),
+            eta: scheduler::runtime(scheduler.total(), cost, concurrency),
+            workers: concurrency,
+        })
+        .await
+    {
+        tracing::warn!(error = %e, "cannot report the campaign the fit produced");
+    }
 
     let mut interrupted = false;
     loop {
+        pool.take_skips();
         pool.fill(&mut scheduler);
+        pool.publish().await;
+        // Paused with nothing running.
+        if !pool.dispatching() && pool.inflight.is_empty() {
+            tokio::select! {
+                () = interrupt.cancelled() => { interrupted = true; break; }
+                () = tokio::time::sleep(HELD_POLL) => continue,
+            }
+        }
         tokio::select! {
             biased;
             () = interrupt.cancelled() => { interrupted = true; break; }
@@ -952,6 +1107,9 @@ async fn drive(bus: &EventBus, plan: &plan::Plan) -> Result<CampaignOutcome> {
                 };
                 pool.record(joined);
             }
+            // Nothing else wakes this loop when the user skips a run and the
+            // run they skipped is usually the one it is waiting on.
+            () = tokio::time::sleep(HELD_POLL) => {}
         }
     }
 
@@ -962,11 +1120,16 @@ async fn drive(bus: &EventBus, plan: &plan::Plan) -> Result<CampaignOutcome> {
     // Whatever stopped the campaign, a run still waiting on a reference has to
     // answer with what it has.
     pool.settle_parked();
+    // The last verdicts are reached after the loop that publishes them, so
+    // publish again here. Otherwise the counts and the journal disagree.
+    pool.publish().await;
 
     let stopped = if interrupted {
         Stopped::Interrupted(Phase::Dispatching)
     } else if pool.gave_up {
         Stopped::GaveUp
+    } else if controls.finishing() {
+        Stopped::Asked
     } else {
         Stopped::Budget
     };
@@ -1312,11 +1475,11 @@ mod tests {
     }
 
     #[test]
-    fn an_interrupted_schedule_is_abandoned_rather_than_errored() {
+    fn an_interrupted_schedule_is_incomplete_rather_than_errored() {
         let mut outcomes = Outcomes::default();
         outcomes.record_verdict(1, Verdict::Pass);
-        outcomes.abandoned.push(2);
-        outcomes.abandoned.push(3);
+        outcomes.incomplete.push(2);
+        outcomes.incomplete.push(3);
 
         assert_eq!(outcomes.errored, 0);
         assert_eq!(outcomes.completed(), 1);
@@ -1324,7 +1487,7 @@ mod tests {
     }
 
     #[test]
-    fn a_stop_report_names_the_schedules_it_abandoned() {
+    fn a_stop_report_names_the_schedules_that_never_finished() {
         assert_eq!(spelled_ids(&[]), "none");
         assert_eq!(spelled_ids(&[4]), "4");
         assert_eq!(spelled_ids(&[1, 2, 3, 4, 5]), "1, 2, 3, 4 and 5");
