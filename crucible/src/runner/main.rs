@@ -1156,7 +1156,8 @@ fn spawn_worker(socket_path: &Path, worker_id: u32) -> Result<(Child, JoinHandle
         .arg(socket_path)
         .arg("--worker-id")
         .arg(worker_id.to_string())
-        .stdout(Stdio::inherit())
+        // Inherited, a worker writes over the screen the runner is drawing.
+        .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     // SAFETY: `pre_exec` runs after `fork()` and before `exec()` in the child.
     // `prctl(PR_SET_PDEATHSIG, SIGKILL)` sets a per-process flag with no aliasing
@@ -1180,14 +1181,42 @@ fn spawn_worker(socket_path: &Path, worker_id: u32) -> Result<(Child, JoinHandle
         .stderr
         .take()
         .expect("stderr set to piped so child has one");
-    let stderr_relay = tokio::spawn(async move {
-        let mut lines = BufReader::new(worker_stderr).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            eprintln!("{line}");
+    let worker_stdout = child
+        .stdout
+        .take()
+        .expect("stdout set to piped so child has one");
+    let relay = tokio::spawn(async move {
+        let said = |worker_id, line: String| tracing::info!(target: "worker", worker_id, "{line}");
+        // A worker's stderr carries what went wrong, so it is relayed at a
+        // level that survives the log filter.
+        let warned =
+            |worker_id, line: String| tracing::warn!(target: "worker", worker_id, "{line}");
+        let mut out = BufReader::new(worker_stdout).lines();
+        let mut err = BufReader::new(worker_stderr).lines();
+        let (mut out_dry, mut err_dry) = (false, false);
+        while !(out_dry && err_dry) {
+            tokio::select! {
+                line = out.next_line(), if !out_dry => match line {
+                    Ok(Some(line)) => said(worker_id, line),
+                    Ok(None) => out_dry = true,
+                    Err(e) => {
+                        tracing::warn!(worker_id, error = %e, "cannot read a worker's output");
+                        out_dry = true;
+                    }
+                },
+                line = err.next_line(), if !err_dry => match line {
+                    Ok(Some(line)) => warned(worker_id, line),
+                    Ok(None) => err_dry = true,
+                    Err(e) => {
+                        tracing::warn!(worker_id, error = %e, "cannot read a worker's errors");
+                        err_dry = true;
+                    }
+                },
+            }
         }
     });
 
-    Ok((child, stderr_relay))
+    Ok((child, relay))
 }
 
 async fn accept_and_handshake(
