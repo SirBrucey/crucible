@@ -124,7 +124,7 @@ impl Observer for Mariadb {
             .with_clause(ClauseDecl::new(WHERE, ClauseShape::Filter)),
             OpSig::observable(
                 HeadPattern::wildcard(&["database", "table"], "select"),
-                ValueType::Int,
+                ValueType::Scalar,
                 CmpOp::ALL.to_vec(),
             )
             .with_param(Param::required("column", ParamType::Ident))
