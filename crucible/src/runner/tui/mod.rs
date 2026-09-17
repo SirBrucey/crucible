@@ -17,7 +17,7 @@ use crucible_protocol::{At, FaultResult};
 use panels::Short;
 use ratatui::{
     Frame,
-    crossterm::event::{self, Event, KeyCode, KeyEvent},
+    crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
     layout::{Constraint, Layout},
     text::Line,
 };
@@ -44,6 +44,11 @@ pub async fn live(
     let mut terminal = ratatui::init();
     let mut screen = Screen::Learning(watching);
     loop {
+        // Watch the token directly. Cancelled tasks may still hold the bus
+        // open, so waiting for it to close could hang here.
+        if interrupt.is_cancelled() {
+            break;
+        }
         screen.ran(started.elapsed(), controls.paused());
         if let Err(e) = terminal.draw(|frame| screen.render(frame)) {
             tracing::error!(error = %e, "cannot draw the screen; leaving it");
@@ -77,10 +82,20 @@ pub async fn live(
             Ok(false) => {}
             Ok(true) => match event::read() {
                 Ok(Event::Key(key)) if key.is_press() => {
-                    if matches!(key.code, KeyCode::Enter | KeyCode::Esc) {
+                    // Raw mode swallows the terminal's own interrupt, so
+                    // handle it here.
+                    if matches!(key.code, KeyCode::Char('c' | 'C'))
+                        && key.modifiers.contains(KeyModifiers::CONTROL)
+                    {
+                        break;
+                    }
+                    if key.code == KeyCode::Esc {
+                        screen.close_top();
+                    } else if key.code == KeyCode::Enter {
                         screen.toggle_journal(&journal).await;
-                    } else if screen.reading() {
-                        // The journal is over the screen; nothing under it moves.
+                    } else if screen.reading() && !matches!(key.code, KeyCode::Char('q' | 'Q')) {
+                        // The journal is open, so keys do not reach the screen
+                        // under it. Quitting is always allowed.
                     } else if screen.on_press(key, &controls) {
                         break;
                     }
@@ -328,6 +343,18 @@ impl Screen {
         }
     }
 
+    /// Close whatever is open over the screen, innermost first.
+    fn close_top(&mut self) {
+        let Screen::Dispatching(state) = self else {
+            return;
+        };
+        if state.evidence().is_some() {
+            state.close();
+        } else {
+            state.stage.helping = false;
+        }
+    }
+
     /// Toggle what the journal recorded about the row.
     async fn toggle_journal(&mut self, journal: &std::path::Path) {
         let Screen::Dispatching(state) = self else {
@@ -351,10 +378,13 @@ impl Screen {
         if let Screen::Dispatching(state) = &mut *self {
             // The help is open, so it takes the keys.
             if state.stage.helping {
-                if matches!(key.code, KeyCode::Char('?' | 'q' | 'Q') | KeyCode::Esc) {
+                if key.code == KeyCode::Char('?') {
                     state.stage.helping = false;
+                    return false;
                 }
-                return false;
+                if !matches!(key.code, KeyCode::Char('q' | 'Q')) {
+                    return false;
+                }
             }
             if key.code == KeyCode::Char('?') {
                 state.stage.helping = true;
@@ -472,6 +502,7 @@ mod tests {
         layout::Rect,
         widgets::Widget,
     };
+    use rstest::rstest;
 
     use super::*;
 
@@ -600,6 +631,26 @@ mod tests {
         assert!(
             state.queued().iter().all(|row| row.schedule != 179),
             "a settled schedule is no longer waiting"
+        );
+    }
+
+    #[rstest]
+    #[case::help(true, false)]
+    #[case::journal(false, true)]
+    fn leaving_works_from_under_whatever_is_over_the_screen(
+        #[case] helping: bool,
+        #[case] reading: bool,
+    ) {
+        let mut state = example();
+        state.stage.helping = helping;
+        if reading {
+            state.read(179, vec!["what the journal said".to_owned()]);
+        }
+        let mut screen = Screen::Dispatching(state);
+
+        assert!(
+            screen.on_press(KeyEvent::from(KeyCode::Char('q')), &Controls::default()),
+            "q asks to leave whatever is on top of the screen"
         );
     }
 
