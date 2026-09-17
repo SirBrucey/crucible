@@ -106,12 +106,18 @@ impl Readings {
         Judged::Now(match differing(&settled, expected) {
             Ok(None) => Verdict::Pass,
             Ok(Some(at)) => {
-                let went = Went::of(
+                let mut went = Went::of(
                     &points(&self.trajectory, &settled),
                     &points(&self.fault_free.trail, &self.fault_free.settled),
                     &self.outcomes.iter().map(|o| o.ack).collect::<Vec<_>>(),
                     matches!(fault.at, At::Throughout),
                 );
+                // A run can settle below every state admitted without any one
+                // step reading short. The work it took reaches its checkpoints
+                // and is then lost in the tail.
+                if fault.broke(went).is_none() && short_count(&settled, &admissible).is_some() {
+                    went = Went::Lost;
+                }
                 // The reading that says work was lost is the one to quote, and
                 // it need not be the first the two runs disagree on. A fleet
                 // can keep what it refused and lose what it accepted at once.
@@ -1800,6 +1806,23 @@ mod tests {
             &[(0, "none"), (1, "one"), (2, "one"), (3, "one")],
             (3, "one"),
         ));
+        assert_eq!(broke, Some(Invariant::Durable));
+        assert!(why.contains("work was lost"), "{why}");
+    }
+
+    #[test]
+    fn a_reading_lost_in_the_tail_shows_durability() {
+        let mut obs = Readings::empty();
+        obs.fault = Some(fired_fault());
+        obs.outcomes = vec![outcome(Ack::Acked), outcome(Ack::Acked)];
+        obs.checks = vec![reading(8)];
+        // Both steps landed; only the settled reading fell back.
+        obs.trajectory = [7, 8, 9].into_iter().map(checkpoint).collect();
+        obs.fault_free = Baseline {
+            trail: [7, 8, 9].into_iter().map(checkpoint).collect(),
+            settled: checkpoint(9),
+        };
+        let (broke, why) = showed(obs.verdict());
         assert_eq!(broke, Some(Invariant::Durable));
         assert!(why.contains("work was lost"), "{why}");
     }
