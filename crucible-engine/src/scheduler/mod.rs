@@ -9,7 +9,7 @@ mod fixture;
 use std::time::Duration;
 
 pub use burst::BurstScheduler;
-use crucible_core::schedule::Schedule;
+use crucible_core::schedule::{Purpose, Schedule};
 pub use recovery::RecoveryScheduler;
 
 /// What a campaign has left to spend, and what one schedule costs it.
@@ -69,6 +69,9 @@ pub trait Scheduler: Send + Sync {
     /// How many schedules this will hand out, settled when it is built so the
     /// campaign can say what it is about to run.
     fn total(&self) -> usize;
+
+    /// What each pending schedule is for.
+    fn manifest(&self) -> Vec<(u32, Purpose)>;
 }
 
 /// Every schedule of the first, then every schedule of the second, so a campaign
@@ -82,6 +85,12 @@ impl<A: Scheduler, B: Scheduler> Scheduler for Chain<A, B> {
 
     fn total(&self) -> usize {
         self.0.total() + self.1.total()
+    }
+
+    fn manifest(&self) -> Vec<(u32, Purpose)> {
+        let mut manifest = self.0.manifest();
+        manifest.extend(self.1.manifest());
+        manifest
     }
 }
 

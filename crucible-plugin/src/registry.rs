@@ -169,6 +169,23 @@ impl Registry {
         self.deployments.keys().cloned().collect()
     }
 
+    /// Every plugin loaded, and each of the jobs it is loaded to do.
+    #[must_use]
+    pub fn loaded(&self) -> Vec<(String, Vec<&'static str>)> {
+        let mut roles: std::collections::BTreeMap<String, Vec<&'static str>> =
+            std::collections::BTreeMap::new();
+        for (name, doing) in self
+            .deployments
+            .keys()
+            .map(|name| (name, "deploy"))
+            .chain(self.drivers.keys().map(|name| (name, "drive")))
+            .chain(self.observers.keys().map(|name| (name, "observe")))
+        {
+            roles.entry(name.clone()).or_default().push(doing);
+        }
+        roles.into_iter().collect()
+    }
+
     /// The names of the registered driver plugins.
     #[must_use]
     pub fn driver_names(&self) -> Vec<String> {

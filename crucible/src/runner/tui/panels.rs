@@ -1,32 +1,31 @@
 //! The panels the screen is made of.
 
-use std::{borrow::Cow, time::Duration};
+use std::{borrow::Cow, collections::BTreeMap, time::Duration};
 
 use crucible_core::{
     ipc::Verdict,
-    schedule::{Phase, Purpose},
+    schedule::{Phase, Progress, Purpose, Step},
 };
 use ratatui::{
     buffer::Buffer,
     layout::{Constraint, Layout, Rect},
-    text::Line,
-    widgets::{Block, List, ListState, Paragraph, StatefulWidget, Widget, Wrap},
+    text::{Line, Text},
+    widgets::{Block, Clear, List, ListState, Paragraph, StatefulWidget, Widget, Wrap},
 };
 
-use super::state::{Dispatching, Doing, Row, RowState, State, Step, Worker};
+use super::state::{Dispatching, Row, State};
 
 /// What is being run, how long it has been running, and what it loaded.
-pub struct Header<'a>(pub &'a State<Dispatching>);
+pub struct Header<'a, S>(pub &'a State<S>);
 
-impl Widget for Header<'_> {
+impl<S> Widget for Header<'_, S> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let block = Block::bordered()
             .title_top(format!(" crucible run {} ", self.0.scenario))
             .title_top(
                 Line::from(format!(" {} ", clock(self.0.elapsed, self.0.budget))).right_aligned(),
             );
-        let [left, right] = Layout::horizontal([Constraint::Min(20), Constraint::Length(12)])
-            .areas(block.inner(area));
+        let inner = block.inner(area);
         block.render(area, buf);
 
         Line::from(format!(
@@ -34,67 +33,69 @@ impl Widget for Header<'_> {
             self.0.spec,
             self.0.plugins.join(", ")
         ))
-        .render(left, buf);
-        Line::from(format!("workers: {}", self.0.workers.len()))
-            .right_aligned()
-            .render(right, buf);
+        .render(inner, buf);
     }
 }
 
-/// A card per worker.
-pub struct Workers<'a>(pub &'a [Worker]);
+/// A pane per worker the campaign can have going at once.
+///
+/// The panes are always drawn. A campaign running three at a
+/// time gets three panes, and an empty one means that worker is waiting for a schedule.
+pub struct Workers<'a> {
+    pub driving: Vec<&'a Row>,
+    pub doing: &'a BTreeMap<u32, (Phase, Option<Step>)>,
+    pub panes: usize,
+}
 
 impl Widget for Workers<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let block = Block::bordered().title_top(" Workers ");
+        let block = Block::bordered().title_top(format!(
+            " Workers ({}/{}) ",
+            self.driving.len(),
+            self.panes
+        ));
         let inner = block.inner(area);
         block.render(area, buf);
 
-        let cards = Layout::horizontal(self.0.iter().map(|_| Constraint::Length(10)))
+        let panes = Layout::horizontal((0..self.panes).map(|_| Constraint::Length(17)))
             .spacing(1)
             .split(inner);
-        for (worker, card) in self.0.iter().zip(cards.iter()) {
-            Card(worker).render(*card, buf);
+        for (pane, area) in panes.iter().enumerate() {
+            Card(self.driving.get(pane).copied(), self.doing).render(*area, buf);
         }
     }
 }
 
-/// One worker.
-struct Card<'a>(&'a Worker);
+/// One pane, holding a run or waiting for one.
+struct Card<'a>(Option<&'a Row>, &'a BTreeMap<u32, (Phase, Option<Step>)>);
 
 impl Widget for Card<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let block = Block::bordered().title_top(format!(" W{} ", self.0.id));
+        let Some(row) = self.0 else {
+            let block = Block::bordered();
+            let inner = block.inner(area);
+            block.render(area, buf);
+            Line::from("waiting").render(inner, buf);
+            return;
+        };
+        let worker = match row.state {
+            Progress::Running { worker } => worker,
+            _ => return,
+        };
+        let block = Block::bordered().title_top(format!(" W{worker} "));
         let inner = block.inner(area);
         block.render(area, buf);
 
-        for (text, row) in self.lines().into_iter().zip(inner.rows()) {
-            text.render(row, buf);
-        }
-    }
-}
-
-impl<'a> Card<'a> {
-    /// What the card has room to say, a line at a time.
-    fn lines(&self) -> Vec<Line<'a>> {
-        match &self.0.doing {
-            Doing::Running {
-                schedule,
-                purpose,
-                phase,
-                step,
-                held,
-            } => vec![
-                purpose.short().into(),
-                match step {
-                    Some(Step { taken, of }) => format!("{} {taken}/{of}", phase.short()).into(),
-                    None => format!("{} {:.1}s", phase.short(), held.as_secs_f32()).into(),
-                },
-                format!("#{schedule}").into(),
-            ],
-            Doing::Paused => vec!["paused".into()],
-            Doing::Idle => vec!["idle".into()],
-            Doing::Failed { schedule } => vec!["failed".into(), format!("#{schedule}").into()],
+        let at = match self.1.get(&worker) {
+            Some((phase, Some(step))) => format!("{} {}/{}", phase.short(), step.taken, step.of),
+            Some((phase, None)) => phase.short().into_owned(),
+            None => "starting".to_owned(),
+        };
+        for (text, area) in [Line::from(at), Line::from(format!("#{}", row.schedule))]
+            .into_iter()
+            .zip(inner.rows())
+        {
+            text.render(area, buf);
         }
     }
 }
@@ -104,19 +105,29 @@ pub struct Stats<'a>(pub &'a State<Dispatching>);
 
 impl Widget for Stats<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
+        let held = if self.0.stage.held { " held " } else { "" };
         let block = Block::bordered()
-            .title_top(" Stats ")
-            .title_top(Line::from(format!(" ETA {} ", hms(self.0.stage.eta))).right_aligned());
+            .title_top(format!(" Stats {held}"))
+            .title_top(
+                Line::from(if self.0.stage.over {
+                    " done ".to_owned()
+                } else {
+                    format!(" ETA {} ", hms(self.0.eta()))
+                })
+                .right_aligned(),
+            );
         let inner = block.inner(area);
         block.render(area, buf);
 
         let found = self.0.stats();
         let settled = found.passed + found.failed + found.inconclusive;
         let mut lines = vec![
-            format!("Schedules: {settled}/{}", self.0.stage.schedules.len()).into(),
-            format!("  pass: {}", found.passed).into(),
-            format!("  fail: {}", found.failed).into(),
-            format!("  inc:  {}", found.inconclusive).into(),
+            format!("{settled} of {} settled", self.0.stage.schedules.len()).into(),
+            format!(
+                "pass {}  fail {}  inc {}",
+                found.passed, found.failed, found.inconclusive
+            )
+            .into(),
         ];
         lines.extend(named(&found).map(|(what, count)| format!("{what}: {count}").into()));
 
@@ -139,37 +150,48 @@ fn named(found: &super::state::Stats) -> impl Iterator<Item = (&'static str, usi
     .filter(|(_, count)| *count > 0)
 }
 
-/// Every schedule the campaign holds, most recently changed first.
-pub struct Schedules<'a>(pub &'a [Row]);
+/// One of the two lists of schedules.
+pub struct Schedules<'a> {
+    pub rows: Vec<&'a Row>,
+    pub titled: &'a str,
+    /// Whether this is the list the arrows are moving through.
+    pub looking: bool,
+}
 
 impl StatefulWidget for Schedules<'_> {
     type State = ListState;
 
-    fn render(self, area: Rect, buf: &mut Buffer, selected: &mut ListState) {
-        let rows = self.0.iter().map(|row| {
-            Line::from(format!(
-                "#{:<5} {:<16} {}",
-                row.schedule,
-                row.state.short(),
-                row.summary()
-            ))
-        });
+    fn render(self, area: Rect, buf: &mut Buffer, cursor: &mut ListState) {
         StatefulWidget::render(
-            List::new(rows)
-                .block(Block::bordered().title_top(format!(" Schedules ({}) ", self.0.len())))
-                .highlight_symbol("> "),
+            List::new(self.rows.iter().map(|row| Line::from(row.line())))
+                .block(Block::bordered().title_top(format!(
+                    " {} ({}) ",
+                    self.titled,
+                    self.rows.len()
+                )))
+                .highlight_symbol(if self.looking { "> " } else { "  " }),
             area,
             buf,
-            selected,
+            cursor,
         );
     }
 }
 
 impl Row {
+    /// The row as one line.
+    fn line(&self) -> String {
+        format!(
+            "#{:<5} {:<15} {}",
+            self.schedule,
+            self.state.short(),
+            self.summary()
+        )
+    }
+
     fn summary(&self) -> Cow<'_, str> {
         match (&self.state, &self.purpose) {
             (
-                RowState::Complete(Verdict::Fail { reason, .. } | Verdict::Inconclusive { reason }),
+                Progress::Complete(Verdict::Fail { reason, .. } | Verdict::Inconclusive { reason }),
                 _,
             ) => reason
                 .split_once(". ")
@@ -216,32 +238,113 @@ impl Widget for Detail<'_> {
 impl Row {
     fn detail(&self) -> String {
         match &self.state {
-            RowState::Complete(Verdict::Fail { reason, .. } | Verdict::Inconclusive { reason }) => {
+            Progress::Complete(Verdict::Fail { reason, .. } | Verdict::Inconclusive { reason }) => {
                 reason.clone()
             }
-            RowState::Complete(Verdict::Pass) => {
+            Progress::Complete(Verdict::Pass) => {
                 format!("The fleet held under {}.", self.summary())
             }
-            RowState::CounterExample => format!(
+            Progress::CounterExample { .. } => format!(
                 "The fleet turned some steps away, so this run cannot be compared step by step. \
                  A clean run of just the steps it accepted is under way, to see where they leave \
                  the fleet. It drives {}.",
                 self.summary()
             ),
-            RowState::Pending => format!("Not yet run. Will drive {}.", self.summary()),
-            RowState::Running { worker } => {
+            Progress::Pending => format!("Not yet run. Will drive {}.", self.summary()),
+            Progress::Running { worker } => {
                 format!("Running on worker {worker}, driving {}.", self.summary())
             }
-            RowState::Requeued => format!("A worker failed; driving {} again.", self.summary()),
-            RowState::Abandoned => {
+            Progress::Requeued => format!("A worker failed; driving {} again.", self.summary()),
+            Progress::Abandoned => {
                 "Stopped by an interrupt, so it says nothing about the fleet.".to_owned()
+            }
+            Progress::Skipped => "You gave up on this one, so it never ran.".to_owned(),
+            Progress::Errored => {
+                "A worker kept failing on this one, so it was left. Nothing it did say can be \
+                 trusted to be about the fleet rather than the worker."
+                    .to_owned()
             }
         }
     }
 }
 
+/// The journal, drawn over the screen.
+pub struct Journal<'a>(pub u32, pub &'a [String]);
+
+impl Widget for Journal<'_> {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        let over = centred(area, 78, 80);
+        Clear.render(over, buf);
+        let block = Block::bordered()
+            .title_top(format!(" #{} · journal ", self.0))
+            .title_bottom(Line::from(" ↵ close ").centered());
+        let inner = block.inner(over);
+        block.render(over, buf);
+
+        // Borrow line by line rather than joining. A journal is long, and this
+        // redraws every tick it is open.
+        Paragraph::new(Text::from_iter(
+            self.1.iter().map(String::as_str).map(Line::from),
+        ))
+        .wrap(Wrap { trim: true })
+        .render(inner, buf);
+    }
+}
+
+fn centred(area: Rect, width: u16, height: u16) -> Rect {
+    let [_, middle, _] = Layout::vertical([
+        Constraint::Percentage((100 - height) / 2),
+        Constraint::Percentage(height),
+        Constraint::Percentage((100 - height) / 2),
+    ])
+    .areas(area);
+    let [_, over, _] = Layout::horizontal([
+        Constraint::Percentage((100 - width) / 2),
+        Constraint::Percentage(width),
+        Constraint::Percentage((100 - width) / 2),
+    ])
+    .areas(middle);
+    over
+}
+
+/// The help, drawn over the screen.
+pub struct Help;
+
+impl Widget for Help {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        let over = centred(area, 70, 80);
+        Clear.render(over, buf);
+        let block = Block::bordered()
+            .title_top(" What the screen says ")
+            .title_bottom(Line::from(" ? close ").centered());
+        let inner = block.inner(over);
+        block.render(over, buf);
+
+        let said = [
+            "A worker pane says which schedule it is driving and where that run",
+            "has got to: setting up, driving a step, healing, observing, or",
+            "cleaning up again.",
+            "",
+            "A schedule waiting on a counter example has had some steps turned",
+            "away, and a clean run of the ones it did accept is under way to say",
+            "where those leave the fleet.",
+            "",
+            "A plugin is listed with what it is loaded to do: deploy brings the",
+            "fleet up, drive works it, observe reads it. One plugin can do more",
+            "than one.",
+            "",
+            "  [p] hold, and let it carry on again",
+            "  [s] give up on the selected schedule",
+            "  [S] take nothing else on and report on what there is",
+            "  [↵] what the journal recorded about the selected schedule",
+            "  [q] stop the campaign",
+        ];
+        Paragraph::new(said.join("\n")).render(inner, buf);
+    }
+}
+
 /// Display forms for types the panels render but do not own.
-trait Short {
+pub trait Short {
     fn short(&self) -> Cow<'static, str>;
 }
 
@@ -261,25 +364,17 @@ impl Short for Verdict {
     }
 }
 
-impl Short for RowState {
+impl Short for Progress {
     fn short(&self) -> Cow<'static, str> {
         match self {
-            RowState::Pending => "Pending".into(),
-            RowState::Running { .. } => "Running".into(),
-            RowState::CounterExample => "Counter Example".into(),
-            RowState::Requeued => "Requeued".into(),
-            RowState::Abandoned => "Abandoned".into(),
-            RowState::Complete(verdict) => verdict.short(),
-        }
-    }
-}
-
-impl Short for Purpose {
-    fn short(&self) -> Cow<'static, str> {
-        match self {
-            Purpose::Learn => "learn".into(),
-            Purpose::Reference { .. } => "ref".into(),
-            Purpose::Break(_) => "break".into(),
+            Progress::Pending => "Pending".into(),
+            Progress::Running { .. } => "Running".into(),
+            Progress::CounterExample { .. } => "Counter Example".into(),
+            Progress::Requeued => "Requeued".into(),
+            Progress::Abandoned => "Abandoned".into(),
+            Progress::Skipped => "Skipped".into(),
+            Progress::Errored => "Errored".into(),
+            Progress::Complete(verdict) => verdict.short(),
         }
     }
 }
@@ -287,11 +382,11 @@ impl Short for Purpose {
 impl Short for Phase {
     fn short(&self) -> Cow<'static, str> {
         match self {
-            Phase::Setup => "SU".into(),
-            Phase::Driving => "DR".into(),
-            Phase::Healing => "HL".into(),
-            Phase::Observing => "OB".into(),
-            Phase::Tearing => "TD".into(),
+            Phase::Setup => "setting up".into(),
+            Phase::Driving => "driving".into(),
+            Phase::Healing => "healing".into(),
+            Phase::Observing => "observing".into(),
+            Phase::Tearing => "cleaning up".into(),
         }
     }
 }
@@ -326,7 +421,7 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::tui::state::{Learning, Row, RowState};
+    use crate::tui::state::{Learning, Row};
 
     fn running(budget: Option<Duration>, schedules: Vec<Row>) -> State<Dispatching> {
         State {
@@ -335,10 +430,9 @@ mod tests {
             budget,
             spec: "a31c".to_owned(),
             plugins: vec!["amqp".to_owned(), "http".to_owned()],
-            workers: Vec::new(),
             stage: Learning,
         }
-        .dispatch(schedules, Duration::from_secs(1260))
+        .dispatch(schedules, Duration::from_secs(1260), 3)
     }
 
     fn line(buf: &Buffer, y: u16) -> String {
@@ -357,7 +451,7 @@ mod tests {
         assert_eq!(clock(Duration::from_secs(323), budget), expected);
     }
 
-    fn row(schedule: u32, state: RowState) -> Row {
+    fn row(schedule: u32, state: Progress) -> Row {
         Row {
             schedule,
             purpose: Purpose::Learn,
@@ -365,8 +459,8 @@ mod tests {
         }
     }
 
-    fn failed(invariant: Option<Invariant>) -> RowState {
-        RowState::Complete(Verdict::Fail {
+    fn failed(invariant: Option<Invariant>) -> Progress {
+        Progress::Complete(Verdict::Fail {
             invariant,
             reason: String::new(),
         })
@@ -377,10 +471,10 @@ mod tests {
         let state = running(
             None,
             vec![
-                row(1, RowState::Complete(Verdict::Pass)),
+                row(1, Progress::Complete(Verdict::Pass)),
                 row(2, failed(Some(Invariant::Durable))),
                 row(3, failed(None)),
-                row(4, RowState::Pending),
+                row(4, Progress::Pending),
             ],
         );
 
@@ -395,12 +489,17 @@ mod tests {
         let state = running(
             None,
             vec![
-                row(1, RowState::Complete(Verdict::Pass)),
-                row(2, RowState::Pending),
-                row(3, RowState::Running { worker: 0 }),
-                row(4, RowState::CounterExample),
-                row(5, RowState::Requeued),
-                row(6, RowState::Abandoned),
+                row(1, Progress::Complete(Verdict::Pass)),
+                row(2, Progress::Pending),
+                row(3, Progress::Running { worker: 0 }),
+                row(
+                    4,
+                    Progress::CounterExample {
+                        wants: vec![vec![1, 2, 4, 5]],
+                    },
+                ),
+                row(5, Progress::Requeued),
+                row(6, Progress::Abandoned),
             ],
         );
 
@@ -410,25 +509,13 @@ mod tests {
     }
 
     #[rstest]
-    #[case(Doing::Paused, "paused")]
-    #[case(Doing::Idle, "idle")]
-    #[case(Doing::Failed { schedule: 12 }, "failed")]
-    fn a_card_says_what_a_worker_that_is_not_driving_is_doing(
-        #[case] doing: Doing,
-        #[case] expected: &str,
-    ) {
-        let mut buf = Buffer::empty(Rect::new(0, 0, 12, 6));
-        Card(&Worker { id: 0, doing }).render(buf.area, &mut buf);
-
-        assert!(line(&buf, 1).contains(expected), "{buf:?}");
-    }
-
-    #[rstest]
-    #[case(RowState::Requeued, "driving killing db again")]
-    #[case(RowState::Abandoned, "Stopped by an interrupt")]
-    #[case(RowState::Pending, "Not yet run")]
+    #[case(Progress::Requeued, "driving killing db again")]
+    #[case(Progress::Abandoned, "Stopped by an interrupt")]
+    #[case(Progress::Pending, "Not yet run")]
+    #[case(Progress::Skipped, "gave up on this one")]
+    #[case(Progress::Errored, "kept failing on this one")]
     fn a_row_that_has_not_reached_a_verdict_says_where_it_has_got_to(
-        #[case] state: RowState,
+        #[case] state: Progress,
         #[case] expected: &str,
     ) {
         let row = Row {

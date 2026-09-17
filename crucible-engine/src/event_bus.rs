@@ -3,9 +3,12 @@
 //! Publishers call [`EventBus::publish`] to deliver events to the journal
 //! (mpsc, back-pressured) and to live observers (broadcast, lag-drops).
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
-use crucible_core::ipc::{RunnerToWorker, WorkerToRunner};
+use crucible_core::{
+    ipc::{RunnerToWorker, WorkerEvent, WorkerToRunner},
+    schedule::{Progress, Purpose},
+};
 use tokio::sync::{broadcast, mpsc};
 
 /// Capacity of the mpsc journal channel.
@@ -15,7 +18,7 @@ const MPSC_CAPACITY: usize = 1024;
 const BROADCAST_CAPACITY: usize = 256;
 
 /// Events published on the runner's event bus.
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub enum RunnerEvent {
     /// A message received from a worker over IPC.
     WorkerMessage {
@@ -27,6 +30,49 @@ pub enum RunnerEvent {
         worker_id: u32,
         message: RunnerToWorker,
     },
+    /// The campaign the scheduler fitted, what each schedule is for and how
+    /// long it is expected to take.
+    Fitted {
+        schedules: Vec<(u32, Purpose)>,
+        eta: Duration,
+        /// How many schedules the campaign can run at once.
+        workers: usize,
+    },
+    /// A schedule reached a new state.
+    Moved { schedule: u32, to: Progress },
+}
+
+impl RunnerEvent {
+    /// Whether this is a reference run for one of the step sets in `wanted`.
+    #[must_use]
+    pub fn answers(&self, wanted: &[&Vec<usize>]) -> bool {
+        let RunnerEvent::RunnerMessage {
+            message: RunnerToWorker::Run(schedule),
+            ..
+        } = self
+        else {
+            return false;
+        };
+        matches!(&schedule.purpose, Purpose::Reference { landed } if wanted.contains(&landed))
+    }
+
+    /// Which schedule this event is about.
+    #[must_use]
+    pub fn about(&self) -> Option<u32> {
+        match self {
+            RunnerEvent::Moved { schedule, .. } => Some(*schedule),
+            RunnerEvent::RunnerMessage {
+                message: RunnerToWorker::Run(schedule),
+                ..
+            } => Some(schedule.id),
+            RunnerEvent::WorkerMessage { message, .. } => match message {
+                WorkerToRunner::RunResult { schedule_id, .. } => Some(*schedule_id),
+                WorkerToRunner::Event(WorkerEvent::Fault(report)) => Some(report.schedule_id),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
 }
 
 /// Error returned when [`EventBus::publish`] cannot deliver to the journal
@@ -83,6 +129,28 @@ mod tests {
     use crucible_core::ipc::WorkerToRunner;
 
     use super::*;
+
+    #[rstest::rstest]
+    #[case::fitted(RunnerEvent::Fitted {
+        schedules: vec![(1, Purpose::Learn), (2, Purpose::Reference { landed: vec![1, 2] })],
+        eta: Duration::from_secs(90),
+        workers: 3,
+    })]
+    #[case::moved(RunnerEvent::Moved { schedule: 4, to: Progress::Running { worker: 2 } })]
+    #[case::parked(RunnerEvent::Moved {
+        schedule: 4,
+        to: Progress::CounterExample { wants: vec![vec![1], vec![1, 2]] },
+    })]
+    #[case::errored(RunnerEvent::Moved { schedule: 4, to: Progress::Errored })]
+    #[case::worker(RunnerEvent::WorkerMessage { worker_id: 7, message: WorkerToRunner::Ready })]
+    fn journal_roundtrip(#[case] event: RunnerEvent) {
+        // A variant that will not read back shows up as an empty journal.
+        let line = serde_json::to_string(&event).expect("an event serialises");
+
+        let read: RunnerEvent = serde_json::from_str(&line).expect("an event reads back");
+
+        assert_eq!(read, event);
+    }
 
     #[tokio::test]
     async fn journal_receives_published_event() {

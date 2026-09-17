@@ -66,6 +66,12 @@ struct Parked {
     readings: Readings,
 }
 
+/// What the bench made of a run.
+pub enum Decided {
+    Now((u32, Verdict)),
+    Waiting(Vec<Vec<usize>>),
+}
+
 /// What a run read, judged against where the fleet stands having landed the
 /// steps that run accepted.
 pub struct Bench<'a> {
@@ -104,9 +110,9 @@ impl<'a> Bench<'a> {
 
     /// What a run read says of the fleet, or nothing while it waits on a
     /// reference run to say where its steps leave it.
-    pub fn judge(&mut self, schedule_id: u32, readings: Readings) -> Option<(u32, Verdict)> {
+    pub fn judge(&mut self, schedule_id: u32, readings: Readings) -> Decided {
         match readings.judge(&self.references) {
-            Judged::Now(verdict) => Some((schedule_id, verdict)),
+            Judged::Now(verdict) => Decided::Now((schedule_id, verdict)),
             Judged::Pending(sets) if sets.len() > REFERENCES_PER_RUN => {
                 tracing::warn!(
                     schedule_id,
@@ -114,7 +120,7 @@ impl<'a> Bench<'a> {
                     limit = REFERENCES_PER_RUN,
                     "too many states left open to run them all; leaving the run unjudged"
                 );
-                Some((schedule_id, readings.settle(&self.references)))
+                Decided::Now((schedule_id, readings.settle(&self.references)))
             }
             Judged::Pending(sets) => {
                 for set in &sets {
@@ -125,7 +131,7 @@ impl<'a> Bench<'a> {
                     schedule_id,
                     readings,
                 });
-                None
+                Decided::Waiting(sets)
             }
         }
     }
@@ -219,7 +225,7 @@ impl<'a> Bench<'a> {
     fn rejudge(&mut self) -> Vec<(u32, Verdict)> {
         let mut judged = Vec::new();
         for parked in std::mem::take(&mut self.parked) {
-            if let Some(verdict) = self.judge(parked.schedule_id, parked.readings) {
+            if let Decided::Now(verdict) = self.judge(parked.schedule_id, parked.readings) {
                 judged.push(verdict);
             }
         }
@@ -347,7 +353,9 @@ mod tests {
         let mut bench = Bench::new(&fleet, &scenario, 3);
         let doubted = [Ack::Unknown; 5];
         let readings = run(&doubted, &[0, 1, 2, 3, 4, 5], 99);
-        let (id, verdict) = bench.judge(1, readings).expect("not worth waiting on");
+        let Decided::Now((id, verdict)) = bench.judge(1, readings) else {
+            panic!("not worth waiting on")
+        };
         assert_eq!(id, 1);
         assert!(matches!(verdict, Verdict::Inconclusive { .. }));
         assert!(
@@ -361,7 +369,7 @@ mod tests {
         let (fleet, scenario) = (fleet(), scenario());
         let mut bench = Bench::new(&fleet, &scenario, 3);
         let judged = bench.judge(1, run(&[Ack::Acked, Ack::Acked], &[0, 1, 2], 2));
-        assert_eq!(judged, Some((1, Verdict::Pass)));
+        assert!(matches!(judged, Decided::Now((1, Verdict::Pass))));
         assert!(bench.wanted(Taking::More).is_none());
     }
 
@@ -369,11 +377,10 @@ mod tests {
     fn a_run_answering_to_no_checkpoint_waits_for_a_run_of_its_own() {
         let (fleet, scenario) = (fleet(), scenario());
         let mut bench = Bench::new(&fleet, &scenario, 3);
-        assert!(
-            bench
-                .judge(1, run(&[Ack::Rejected, Ack::Acked], &[0, 1, 2], 1))
-                .is_none()
-        );
+        assert!(matches!(
+            bench.judge(1, run(&[Ack::Rejected, Ack::Acked], &[0, 1, 2], 1)),
+            Decided::Waiting(_)
+        ));
 
         let reference = bench
             .wanted(Taking::More)
@@ -392,11 +399,10 @@ mod tests {
         let (fleet, scenario) = (fleet(), scenario());
         let mut bench = Bench::new(&fleet, &scenario, 3);
         for id in [1, 2] {
-            assert!(
-                bench
-                    .judge(id, run(&[Ack::Rejected, Ack::Acked], &[0, 1, 2], 1))
-                    .is_none()
-            );
+            assert!(matches!(
+                bench.judge(id, run(&[Ack::Rejected, Ack::Acked], &[0, 1, 2], 1)),
+                Decided::Waiting(_)
+            ));
         }
         assert!(bench.wanted(Taking::More).is_some());
         assert!(bench.wanted(Taking::More).is_none(), "one run, not two");
@@ -410,22 +416,20 @@ mod tests {
         let (fleet, scenario) = (fleet(), scenario());
         let mut bench = Bench::new(&fleet, &scenario, 3);
         for ask in 1..=ASKS_PER_SET {
-            assert!(
-                bench
-                    .judge(ask, run(&[Ack::Rejected, Ack::Acked], &[0, 1, 2], 1))
-                    .is_none()
-            );
+            assert!(matches!(
+                bench.judge(ask, run(&[Ack::Rejected, Ack::Acked], &[0, 1, 2], 1)),
+                Decided::Waiting(_)
+            ));
             assert!(
                 bench.wanted(Taking::More).is_some(),
                 "ask {ask} should have gone out"
             );
             bench.failed(&[2], &"docker said no");
         }
-        assert!(
-            bench
-                .judge(99, run(&[Ack::Rejected, Ack::Acked], &[0, 1, 2], 1))
-                .is_none()
-        );
+        assert!(matches!(
+            bench.judge(99, run(&[Ack::Rejected, Ack::Acked], &[0, 1, 2], 1)),
+            Decided::Waiting(_)
+        ));
         assert!(bench.wanted(Taking::More).is_none(), "the set is spent");
     }
 
@@ -438,7 +442,7 @@ mod tests {
         // Step 1 refused, step 2 taken, step 3 in doubt, so the fleet may have
         // landed steps 2 and 3, or step 2 alone.
         let readings = run(&[Ack::Rejected, Ack::Acked, Ack::Unknown], &[0, 1, 2, 3], 2);
-        assert!(bench.judge(1, readings).is_none());
+        assert!(matches!(bench.judge(1, readings), Decided::Waiting(_)));
         assert!(bench.wanted(Taking::More).is_some());
         assert!(bench.wanted(Taking::More).is_some(), "one run per state");
 
@@ -458,20 +462,18 @@ mod tests {
     fn a_set_that_failed_once_is_asked_for_again_and_answers() {
         let (fleet, scenario) = (fleet(), scenario());
         let mut bench = Bench::new(&fleet, &scenario, 3);
-        assert!(
-            bench
-                .judge(1, run(&[Ack::Rejected, Ack::Acked], &[0, 1, 2], 1))
-                .is_none()
-        );
+        assert!(matches!(
+            bench.judge(1, run(&[Ack::Rejected, Ack::Acked], &[0, 1, 2], 1)),
+            Decided::Waiting(_)
+        ));
         assert!(bench.wanted(Taking::More).is_some());
         bench.failed(&[2], &"the replica would not come up");
 
         // The next run to want it asks again, and this time it answers.
-        assert!(
-            bench
-                .judge(2, run(&[Ack::Rejected, Ack::Acked], &[0, 1, 2], 1))
-                .is_none()
-        );
+        assert!(matches!(
+            bench.judge(2, run(&[Ack::Rejected, Ack::Acked], &[0, 1, 2], 1)),
+            Decided::Waiting(_)
+        ));
         assert!(bench.wanted(Taking::More).is_some(), "asked a second time");
         assert_eq!(
             bench.arrived(&[2], &answer(&[2], 1)),
@@ -485,11 +487,10 @@ mod tests {
     fn a_reference_that_turned_steps_away_answers_for_nothing() {
         let (fleet, scenario) = (fleet(), scenario());
         let mut bench = Bench::new(&fleet, &scenario, 3);
-        assert!(
-            bench
-                .judge(1, run(&[Ack::Rejected, Ack::Acked], &[0, 1, 2], 1))
-                .is_none()
-        );
+        assert!(matches!(
+            bench.judge(1, run(&[Ack::Rejected, Ack::Acked], &[0, 1, 2], 1)),
+            Decided::Waiting(_)
+        ));
         assert!(bench.wanted(Taking::More).is_some(), "the run went out");
         let mut refused = answer(&[2], 0);
         refused.outcomes = vec![Outcome { ack: Ack::Rejected }];
@@ -497,11 +498,10 @@ mod tests {
         assert!(bench.arrived(&[2], &refused).is_empty());
         // Spent, not merely unanswered. Even a failure does not buy it another.
         bench.failed(&[2], &"the replica would not come up");
-        assert!(
-            bench
-                .judge(2, run(&[Ack::Rejected, Ack::Acked], &[0, 1, 2], 1))
-                .is_none()
-        );
+        assert!(matches!(
+            bench.judge(2, run(&[Ack::Rejected, Ack::Acked], &[0, 1, 2], 1)),
+            Decided::Waiting(_)
+        ));
         assert!(bench.wanted(Taking::More).is_none(), "the set is spent");
 
         let settled = bench.settle();
@@ -518,11 +518,10 @@ mod tests {
     fn what_a_reference_found_survives_a_later_failure() {
         let (fleet, scenario) = (fleet(), scenario());
         let mut bench = Bench::new(&fleet, &scenario, 3);
-        assert!(
-            bench
-                .judge(1, run(&[Ack::Rejected, Ack::Acked], &[0, 1, 2], 1))
-                .is_none()
-        );
+        assert!(matches!(
+            bench.judge(1, run(&[Ack::Rejected, Ack::Acked], &[0, 1, 2], 1)),
+            Decided::Waiting(_)
+        ));
         assert!(bench.wanted(Taking::More).is_some());
         assert_eq!(
             bench.arrived(&[2], &answer(&[2], 1)),
@@ -531,10 +530,10 @@ mod tests {
 
         bench.failed(&[2], &"a straggler that answers for nothing");
         // Still answered. The next run to want those steps is judged, not held.
-        assert_eq!(
+        assert!(matches!(
             bench.judge(2, run(&[Ack::Rejected, Ack::Acked], &[0, 1, 2], 1)),
-            Some((2, Verdict::Pass))
-        );
+            Decided::Now((2, Verdict::Pass))
+        ));
         assert!(bench.wanted(Taking::More).is_none(), "nothing asked again");
     }
 
@@ -542,11 +541,10 @@ mod tests {
     fn a_campaign_that_gave_up_chases_nothing() {
         let (fleet, scenario) = (fleet(), scenario());
         let mut bench = Bench::new(&fleet, &scenario, 3);
-        assert!(
-            bench
-                .judge(1, run(&[Ack::Rejected, Ack::Acked], &[0, 1, 2], 1))
-                .is_none()
-        );
+        assert!(matches!(
+            bench.judge(1, run(&[Ack::Rejected, Ack::Acked], &[0, 1, 2], 1)),
+            Decided::Waiting(_)
+        ));
         assert!(bench.wanted(Taking::Nothing).is_none());
         assert!(
             bench.wanted(Taking::More).is_none(),
@@ -568,7 +566,10 @@ mod tests {
             (3, [Ack::Rejected, Ack::Acked, Ack::Acked]),
         ] {
             assert!(
-                bench.judge(id, run(&acks, &[0, 1, 2, 3], 1)).is_none(),
+                matches!(
+                    bench.judge(id, run(&acks, &[0, 1, 2, 3], 1)),
+                    Decided::Waiting(_)
+                ),
                 "run {id} should be waiting"
             );
         }
@@ -584,11 +585,10 @@ mod tests {
     fn what_settles_for_want_of_a_reference_settles_once() {
         let (fleet, scenario) = (fleet(), scenario());
         let mut bench = Bench::new(&fleet, &scenario, 3);
-        assert!(
-            bench
-                .judge(7, run(&[Ack::Rejected, Ack::Acked], &[0, 1, 2], 1))
-                .is_none()
-        );
+        assert!(matches!(
+            bench.judge(7, run(&[Ack::Rejected, Ack::Acked], &[0, 1, 2], 1)),
+            Decided::Waiting(_)
+        ));
         let settled = bench.settle();
         assert_eq!(settled.len(), 1);
         assert_eq!(settled[0].0, 7);
@@ -600,11 +600,10 @@ mod tests {
     fn a_reference_run_carries_the_scenario_it_answers_for() {
         let (fleet, scenario) = (fleet(), scenario());
         let mut bench = Bench::new(&fleet, &scenario, 3);
-        assert!(
-            bench
-                .judge(1, run(&[Ack::Rejected, Ack::Acked], &[0, 1, 2], 1))
-                .is_none()
-        );
+        assert!(matches!(
+            bench.judge(1, run(&[Ack::Rejected, Ack::Acked], &[0, 1, 2], 1)),
+            Decided::Waiting(_)
+        ));
         let reference = bench.wanted(Taking::More).expect("asked for");
         assert_eq!(reference.checks, scenario.checks);
         assert_eq!(reference.consistent_within, scenario.consistent_within);

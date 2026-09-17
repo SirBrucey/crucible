@@ -40,6 +40,45 @@ pub enum Purpose {
     Break(Box<Fault>),
 }
 
+/// How far through the scenario's steps a run has got.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct Step {
+    pub taken: usize,
+    pub of: usize,
+}
+
+/// What state a schedule is in.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub enum Progress {
+    /// Fitted, not yet sent to a worker.
+    Pending,
+    /// A worker is driving it.
+    Running { worker: u32 },
+    /// Waiting on a reference run.
+    CounterExample { wants: Vec<Vec<usize>> },
+    /// The worker failed transiently. The schedule is being run again.
+    Requeued,
+    /// An interrupt stopped it.
+    Abandoned,
+    /// The user skipped it.
+    Skipped,
+    /// The worker kept failing, so there won't be a verdict.
+    Errored,
+    /// It completed with a verdict.
+    Complete(crate::ipc::Verdict),
+}
+
+impl Progress {
+    /// Whether the schedule is finished.
+    #[must_use]
+    pub fn finished(&self) -> bool {
+        matches!(
+            self,
+            Progress::Complete(_) | Progress::Skipped | Progress::Abandoned | Progress::Errored
+        )
+    }
+}
+
 /// How far through a run a worker is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub enum Phase {
