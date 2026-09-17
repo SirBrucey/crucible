@@ -9,12 +9,10 @@ use std::{
 };
 
 use crucible_core::{
-    ipc::{RunnerToWorker, WorkerEvent, WorkerToRunner},
-    schedule::{Progress, Purpose},
+    ipc::{WorkerEvent, WorkerToRunner},
+    schedule::Progress,
 };
 use crucible_engine::event_bus::RunnerEvent;
-use crucible_protocol::{At, FaultResult};
-use panels::Short;
 use ratatui::{
     Frame,
     crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
@@ -25,7 +23,7 @@ use state::{Dispatching, Learning, Looking, Row, State};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
-use crate::controls::Controls;
+use crate::{controls::Controls, report::recorded};
 
 /// How long a draw waits for a key before looking at the bus again.
 const TICK: Duration = Duration::from_millis(100);
@@ -149,103 +147,14 @@ pub fn watching(
     }
 }
 
-fn recorded(event: &RunnerEvent) -> Vec<String> {
-    match event {
-        RunnerEvent::Moved { to, .. } => vec![format!("became {}", to.short())],
-        RunnerEvent::RunnerMessage {
-            message: RunnerToWorker::Run(schedule),
-            ..
-        } => match &schedule.purpose {
-            Purpose::Reference { landed } => vec![format!(
-                "a clean run of steps {} answered it",
-                landed
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )],
-            _ => Vec::new(),
-        },
-        RunnerEvent::WorkerMessage { message, .. } => match message {
-            WorkerToRunner::Event(WorkerEvent::Fault(report)) => {
-                vec![match &report.result {
-                    FaultResult::Fired { by, at, .. } => {
-                        format!("{by:?} on {} {}", report.service, placed(at))
-                    }
-                    FaultResult::Missed(why) => {
-                        format!("nothing was done to {}: {why:?}", report.service)
-                    }
-                }]
-            }
-            WorkerToRunner::RunResult { readings, .. } => read_out(readings),
-            _ => Vec::new(),
-        },
-        _ => Vec::new(),
-    }
-}
-
-/// Where in the run a fault landed.
-fn placed(at: &At) -> String {
-    match at {
-        At::Throughout => "for the whole run".to_owned(),
-        At::Moment { mark, why, .. } => {
-            format!("at {mark}, on {why}")
-        }
-    }
-}
-
-/// What a run read, a step at a time.
+/// Hand the report to whatever the desktop opens Markdown with.
 ///
-/// Each step gets a line saying what the fleet answered and under it any
-/// reading that differs from the fault-free run.
-fn read_out(readings: &crucible_core::verdict::Readings) -> Vec<String> {
-    let named: Vec<String> = readings
-        .checks
-        .iter()
-        .map(|observed| observed.check.observable.join("."))
-        .collect();
-    let mut lines = Vec::new();
-    for (step, outcome) in readings.outcomes.iter().enumerate() {
-        lines.push(format!("step {}  {:?}", step + 1, outcome.ack));
-        let (Some(drove), Some(learned)) = (
-            readings.trajectory.at(step + 1),
-            readings.fault_free.trail.at(step + 1),
-        ) else {
-            continue;
-        };
-        lines.extend(apart(&named, drove, learned).map(|line| format!("   {line}")));
+/// The campaign is over by the time this is offered, so a viewer that takes the
+/// terminal does no harm.
+fn open(report: &std::path::Path) {
+    if let Err(e) = std::process::Command::new("xdg-open").arg(report).spawn() {
+        tracing::warn!(error = %e, path = %report.display(), "cannot open the report");
     }
-    lines.push(String::new());
-    lines.extend(readings.checks.iter().map(|observed| {
-        format!(
-            "{} settled {}, wanted {:?}",
-            observed.check.observable.join("."),
-            observed
-                .value
-                .as_ref()
-                .map_or("nothing".to_owned(), |value| format!("{value:?}")),
-            observed.check.value,
-        )
-    }));
-    lines
-}
-
-/// The readings that differ from the fault-free run.
-fn apart<'a>(
-    named: &'a [String],
-    drove: &'a crucible_core::verdict::Checkpoint,
-    learned: &'a crucible_core::verdict::Checkpoint,
-) -> impl Iterator<Item = String> + 'a {
-    named.iter().enumerate().filter_map(move |(at, name)| {
-        let (drove, learned) = (drove.get(at)?.as_ref(), learned.get(at)?.as_ref());
-        (drove != learned).then(|| {
-            format!(
-                "{name} {}, fault-free {}",
-                drove.map_or("nothing".to_owned(), |value| format!("{value:?}")),
-                learned.map_or("nothing".to_owned(), |value| format!("{value:?}")),
-            )
-        })
-    })
 }
 
 /// Draw a campaign that has nothing to show yet.
@@ -492,6 +401,7 @@ mod tests {
     use crucible_core::{
         fault::{By, Edge, Fault},
         ipc::Verdict,
+        schedule::Purpose,
         verdict::Invariant,
     };
     use ratatui::{

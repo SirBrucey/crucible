@@ -1,6 +1,7 @@
 mod bench;
 mod controls;
 mod error;
+mod report;
 mod session;
 mod tui;
 
