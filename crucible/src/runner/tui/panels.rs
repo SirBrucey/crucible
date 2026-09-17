@@ -14,6 +14,7 @@ use ratatui::{
 };
 
 use super::state::{Dispatching, Row, State};
+use crate::report::Short;
 
 /// What is being run, how long it has been running, and what it loaded.
 pub struct Header<'a, S>(pub &'a State<S>);
@@ -343,54 +344,6 @@ impl Widget for Help {
     }
 }
 
-/// Display forms for types the panels render but do not own.
-pub trait Short {
-    fn short(&self) -> Cow<'static, str>;
-}
-
-impl Short for Verdict {
-    fn short(&self) -> Cow<'static, str> {
-        match self {
-            Verdict::Pass => "Pass".into(),
-            Verdict::Fail {
-                invariant: Some(invariant),
-                ..
-            } => format!("Fail {invariant}").into(),
-            Verdict::Fail {
-                invariant: None, ..
-            } => "Fail".into(),
-            Verdict::Inconclusive { .. } => "Inconclusive".into(),
-        }
-    }
-}
-
-impl Short for Progress {
-    fn short(&self) -> Cow<'static, str> {
-        match self {
-            Progress::Pending => "Pending".into(),
-            Progress::Running { .. } => "Running".into(),
-            Progress::CounterExample { .. } => "Counter Example".into(),
-            Progress::Requeued => "Requeued".into(),
-            Progress::Abandoned => "Abandoned".into(),
-            Progress::Skipped => "Skipped".into(),
-            Progress::Errored => "Errored".into(),
-            Progress::Complete(verdict) => verdict.short(),
-        }
-    }
-}
-
-impl Short for Phase {
-    fn short(&self) -> Cow<'static, str> {
-        match self {
-            Phase::Setup => "setting up".into(),
-            Phase::Driving => "driving".into(),
-            Phase::Healing => "healing".into(),
-            Phase::Observing => "observing".into(),
-            Phase::Tearing => "cleaning up".into(),
-        }
-    }
-}
-
 /// How long a campaign has run, against what it is allowed.
 fn clock(elapsed: Duration, budget: Option<Duration>) -> String {
     match budget {
@@ -430,6 +383,7 @@ mod tests {
             budget,
             spec: "a31c".to_owned(),
             plugins: vec!["amqp".to_owned(), "http".to_owned()],
+            report: std::path::PathBuf::from("report.md"),
             stage: Learning,
         }
         .dispatch(schedules, Duration::from_secs(1260), 3)

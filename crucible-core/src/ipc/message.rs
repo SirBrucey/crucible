@@ -61,6 +61,17 @@ pub enum Verdict {
     Inconclusive { reason: String },
 }
 
+impl Verdict {
+    /// Why the verdict went the way it did.
+    #[must_use]
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            Verdict::Fail { reason, .. } | Verdict::Inconclusive { reason } => Some(reason),
+            Verdict::Pass => None,
+        }
+    }
+}
+
 /// Messages passed from the main runner to one of the worker processes.
 #[derive(Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub enum RunnerToWorker {

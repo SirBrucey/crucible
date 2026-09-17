@@ -27,6 +27,8 @@ pub struct State<S> {
     pub spec: String,
     /// The plugins the fleet loaded.
     pub plugins: Vec<String>,
+    /// Where the run's report is written.
+    pub report: std::path::PathBuf,
     pub stage: S,
 }
 
@@ -75,6 +77,7 @@ impl State<Learning> {
             budget: self.budget,
             spec: self.spec.clone(),
             plugins: self.plugins.clone(),
+            report: self.report.clone(),
             stage: Dispatching {
                 schedules,
                 selected: ListState::default().with_selected(Some(0)),

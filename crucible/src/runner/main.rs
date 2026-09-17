@@ -1,6 +1,7 @@
 mod bench;
 mod controls;
 mod error;
+mod report;
 mod session;
 mod tui;
 
@@ -135,6 +136,9 @@ enum Cmd {
         /// Stream the campaign's diagnostic log instead of the TUI.
         #[arg(long)]
         debug: bool,
+        /// Write the run's report here instead of beside the journal.
+        #[arg(long)]
+        report: Option<PathBuf>,
     },
     /// Parse and check a `.cru` scenario file, reporting diagnostics.
     Check {
@@ -147,7 +151,11 @@ enum Cmd {
 async fn main() -> ExitCode {
     match Cli::parse().command {
         Cmd::Check { file } => run_check(&file).await,
-        Cmd::Run { file, debug } => run_campaign(&file, !debug).await,
+        Cmd::Run {
+            file,
+            debug,
+            report,
+        } => run_campaign(&file, !debug, report).await,
     }
 }
 
@@ -155,7 +163,7 @@ async fn main() -> ExitCode {
 ///
 /// A run that draws a screen writes its log to a file beside the journal
 /// rather than to the terminal.
-async fn run_campaign(file: &Path, screen: bool) -> ExitCode {
+async fn run_campaign(file: &Path, screen: bool, report: Option<PathBuf>) -> ExitCode {
     let logging = tracing_subscriber::fmt().with_env_filter(
         tracing_subscriber::EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
@@ -183,7 +191,7 @@ async fn run_campaign(file: &Path, screen: bool) -> ExitCode {
     };
 
     let registry = crucible_plugin::Registry::load().await;
-    match run(&plan, screen, &registry).await {
+    match run(&plan, screen, &registry, report).await {
         Ok(outcome) => outcome.exit_code(),
         Err(e) => {
             tracing::error!(error = %e, "runner exiting with error");
@@ -243,12 +251,15 @@ async fn run(
     plan: &plan::Plan,
     screen: bool,
     registry: &crucible_plugin::Registry,
+    report: Option<PathBuf>,
 ) -> Result<CampaignOutcome> {
     let (bus, journal_rx) = EventBus::new();
     let interrupt = interrupt_token()?;
     let controls = Controls::default();
 
     let journal_path = journal::default_path(std::process::id());
+    let report_path =
+        report.unwrap_or_else(|| journal_path.with_file_name(report::file_name(plan.spec_hash())));
     tracing::info!(path = %journal_path.display(), "journal ready");
     let journal_task = tokio::spawn(journal::run(journal_rx, journal_path.clone()));
 
@@ -271,7 +282,7 @@ async fn run(
     // Closing the screen stops the campaign, same as interrupting it.
     let screen = plan.scenarios.first().filter(|_| screen).map(|scenario| {
         tokio::spawn(tui::live(
-            tui::watching(plan, scenario, registry),
+            tui::watching(plan, scenario, registry, report_path.clone()),
             bus.subscribe(),
             interrupt.clone(),
             controls.clone(),
@@ -291,6 +302,17 @@ async fn run(
     journal_task.await.expect("journal task should not panic")?;
     let _ = observer_task.await;
     cleanup_sockets();
+
+    // Written from the journal, so it waits for the journal to be flushed.
+    let scenario = plan
+        .scenarios
+        .first()
+        .map_or("campaign", |s| s.name.as_str());
+    if let Err(e) = report::write(&journal_path, &report_path, scenario).await {
+        tracing::error!(error = %e, path = %report_path.display(), "cannot write the run's report");
+    } else {
+        tracing::info!(path = %report_path.display(), "report written");
+    }
 
     workload
 }

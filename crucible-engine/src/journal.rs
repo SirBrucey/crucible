@@ -46,11 +46,11 @@ pub async fn run(mut rx: mpsc::Receiver<Arc<RunnerEvent>>, path: PathBuf) -> io:
     Ok(())
 }
 
-/// What the journal recorded about one schedule.
+/// Every event the journal holds.
 ///
 /// # Errors
 /// Returns an [`io::Error`] if the journal cannot be read.
-pub async fn about(path: &std::path::Path, schedule: u32) -> io::Result<Vec<RunnerEvent>> {
+pub async fn read(path: &std::path::Path) -> io::Result<Vec<RunnerEvent>> {
     let journal = tokio::fs::read_to_string(path).await?;
     let lines: Vec<&str> = journal.lines().collect();
     let last = lines.len().saturating_sub(1);
@@ -76,6 +76,15 @@ pub async fn about(path: &std::path::Path, schedule: u32) -> io::Result<Vec<Runn
             "the journal holds entries this build cannot read; what it shows is incomplete"
         );
     }
+    Ok(everything)
+}
+
+/// What the journal recorded about one schedule.
+///
+/// # Errors
+/// Returns an [`io::Error`] if the journal cannot be read.
+pub async fn about(path: &std::path::Path, schedule: u32) -> io::Result<Vec<RunnerEvent>> {
+    let everything = read(path).await?;
     // A run waiting on a counterexample is not complete. The verdict will settle after the counterexample.
     let answering: Vec<&Vec<usize>> = everything
         .iter()
