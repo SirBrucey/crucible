@@ -383,6 +383,7 @@ mod tests {
             budget,
             spec: "a31c".to_owned(),
             plugins: vec!["amqp".to_owned(), "http".to_owned()],
+            report: std::path::PathBuf::from("report.md"),
             stage: Learning,
         }
         .dispatch(schedules, Duration::from_secs(1260), 3)

@@ -119,6 +119,7 @@ pub fn watching(
     plan: &crucible_core::plan::Plan,
     scenario: &crucible_core::plan::Scenario,
     registry: &crucible_plugin::Registry,
+    report: std::path::PathBuf,
 ) -> State<Learning> {
     // Only the plugins this campaign loads.
     let named: std::collections::BTreeSet<&str> = std::iter::once(plan.fleet.deployment.as_str())
@@ -143,6 +144,7 @@ pub fn watching(
         budget: scenario.budget,
         spec: format!("{:x}", plan.spec_hash().0),
         plugins,
+        report,
         stage: Learning,
     }
 }
@@ -308,6 +310,12 @@ impl Screen {
             controls.finish();
             return false;
         }
+        if let (KeyCode::Char('o' | 'O'), Screen::Dispatching(state)) = (key.code, &*self) {
+            if state.stage.over {
+                open(&state.report);
+            }
+            return false;
+        }
         if let (KeyCode::Char('s'), Screen::Dispatching(state)) = (key.code, &*self) {
             if let Some(row) = state.showing() {
                 controls.skip(row.schedule);
@@ -385,15 +393,17 @@ pub fn dispatch(frame: &mut Frame, state: &mut State<Dispatching>) {
     if state.stage.helping {
         frame.render_widget(panels::Help, frame.area());
     }
-    frame.render_widget(
-        Line::from(if state.stage.held {
-            " held · [p] resume  [s]kip  [S] finish  ↑↓ select  [q]uit"
-        } else {
-            " [p]ause  [s]kip  [S] finish  ↑↓←→ select  ↵ journal  [?] help  [q]uit"
-        })
-        .centered(),
-        footer,
-    );
+    let keys = if state.stage.over {
+        format!(
+            " report: {}  ·  [o]pen  ↑↓←→ select  ↵ journal  [q]uit",
+            state.report.display()
+        )
+    } else if state.stage.held {
+        " held · [p] resume  [s]kip  [S] finish  ↑↓ select  [q]uit".to_owned()
+    } else {
+        " [p]ause  [s]kip  [S] finish  ↑↓←→ select  ↵ journal  [?] help  [q]uit".to_owned()
+    };
+    frame.render_widget(Line::from(keys).centered(), footer);
 }
 
 #[cfg(test)]
@@ -437,6 +447,7 @@ mod tests {
             budget: Some(Duration::from_secs(1800)),
             spec: "a31c".to_owned(),
             plugins: vec!["amqp".to_owned(), "http".to_owned(), "mariadb".to_owned()],
+            report: std::path::PathBuf::from("report.md"),
             stage: Learning,
         }
         .dispatch(
