@@ -114,7 +114,7 @@ fn read_out(readings: &crucible_core::verdict::Readings) -> Vec<String> {
     let named: Vec<String> = readings
         .checks
         .iter()
-        .map(|observed| observed.check.observable.join("."))
+        .map(|observed| observed.check.observable())
         .collect();
     let mut lines = Vec::new();
     for (step, outcome) in readings.outcomes.iter().enumerate() {
@@ -130,12 +130,12 @@ fn read_out(readings: &crucible_core::verdict::Readings) -> Vec<String> {
     lines.push(String::new());
     lines.extend(readings.checks.iter().map(|observed| {
         format!(
-            "{} settled {}, a full run leaves {:?}",
-            observed.check.observable.join("."),
+            "{} settled {}, a full run leaves {}",
+            observed.check.observable(),
             observed
                 .value
                 .as_ref()
-                .map_or("nothing".to_owned(), |value| format!("{value:?}")),
+                .map_or("nothing".to_owned(), ToString::to_string),
             observed.check.value,
         )
     }));
@@ -153,8 +153,8 @@ fn apart<'a>(
         (drove != learned).then(|| {
             format!(
                 "{name} {}, fault-free {}",
-                drove.map_or("nothing".to_owned(), |value| format!("{value:?}")),
-                learned.map_or("nothing".to_owned(), |value| format!("{value:?}")),
+                drove.map_or("nothing".to_owned(), ToString::to_string),
+                learned.map_or("nothing".to_owned(), ToString::to_string),
             )
         })
     })
