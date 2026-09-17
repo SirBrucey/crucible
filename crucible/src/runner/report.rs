@@ -130,7 +130,7 @@ fn read_out(readings: &crucible_core::verdict::Readings) -> Vec<String> {
     lines.push(String::new());
     lines.extend(readings.checks.iter().map(|observed| {
         format!(
-            "{} settled {}, wanted {:?}",
+            "{} settled {}, a full run leaves {:?}",
             observed.check.observable.join("."),
             observed
                 .value
