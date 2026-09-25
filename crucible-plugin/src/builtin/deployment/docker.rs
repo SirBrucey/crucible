@@ -57,6 +57,11 @@ const SPAN_PORT: u16 = 4145;
 /// Added to a freeze query's timeout, so the proxy's own wait runs out first
 /// and answers, rather than this side giving up on a reply already on its way.
 const FREEZE_REPLY_MARGIN: Duration = Duration::from_secs(2);
+/// How long to keep offering a network removal the daemon is still holding
+/// endpoints for. See [`remove_network_once_detached`].
+const NETWORK_REMOVAL_TIMEOUT: Duration = Duration::from_secs(10);
+/// How often to offer it again while waiting.
+const NETWORK_REMOVAL_POLL: Duration = Duration::from_millis(200);
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -662,7 +667,7 @@ impl Docker {
             }
         }
         self.endpoints = Endpoints::default();
-        match self.client.remove_network(&self.network).await {
+        match remove_network_once_detached(&self.client, &self.network).await {
             Ok(()) => {}
             Err(e) if is_not_found(&e) => {}
             Err(e) => failures.set_network(e.to_string()),
@@ -719,6 +724,43 @@ fn is_not_found(e: &bollard::errors::Error) -> bool {
             ..
         }
     )
+}
+
+/// Whether the daemon refused this because the network is still in use.
+fn is_in_use(e: &bollard::errors::Error) -> bool {
+    matches!(
+        e,
+        bollard::errors::Error::DockerResponseServerError {
+            status_code: 403,
+            ..
+        }
+    )
+}
+
+/// Remove a replica's network, waiting for the daemon to finish detaching the
+/// endpoints of the containers just removed.
+///
+/// Removing a container returns once the daemon has taken it on, which is
+/// before it has detached that container's endpoint, so a network removal sent
+/// straight afterwards is refused while any of them remain. The daemon stops
+/// tracking an endpoint whose container is gone but leaves it on the network,
+/// so a network abandoned at that point can never be removed and holds its
+/// subnet until the daemon restarts.
+async fn remove_network_once_detached(
+    client: &DockerClient,
+    network: &str,
+) -> std::result::Result<(), bollard::errors::Error> {
+    let give_up_at = tokio::time::Instant::now() + NETWORK_REMOVAL_TIMEOUT;
+    loop {
+        let refused = match client.remove_network(network).await {
+            Err(e) if is_in_use(&e) => e,
+            outcome => return outcome,
+        };
+        if tokio::time::Instant::now() >= give_up_at {
+            return Err(refused);
+        }
+        sleep(NETWORK_REMOVAL_POLL).await;
+    }
 }
 
 async fn ensure_image(docker: &DockerClient, image: &str) -> Result<()> {
@@ -1106,6 +1148,26 @@ mod tests {
         let mut failures = TeardownFailures::new();
         failures.append_container("api", "boom");
         assert_eq!(failures.to_string(), "container `api`: boom");
+    }
+
+    fn server_error(status_code: u16) -> bollard::errors::Error {
+        bollard::errors::Error::DockerResponseServerError {
+            status_code,
+            message: "network crucible-1-2 has active endpoints".to_owned(),
+        }
+    }
+
+    #[test]
+    fn a_network_still_in_use_is_told_from_one_that_is_gone() {
+        assert!(is_in_use(&server_error(403)));
+        assert!(!is_in_use(&server_error(404)));
+        assert!(!is_in_use(&server_error(500)));
+    }
+
+    #[test]
+    fn a_network_that_is_gone_is_not_a_teardown_failure() {
+        assert!(is_not_found(&server_error(404)));
+        assert!(!is_not_found(&server_error(403)));
     }
 
     // Distinct ports: the single proxy container binds one listener per service
