@@ -386,15 +386,21 @@ async fn main() -> Result<()> {
         },
     );
 
-    for spec in cli.control {
-        // A control pair carries the framework's own traffic, which is not
-        // reported and so is not read as anything.
+    serve_control(&cli.control).await?;
+
+    std::future::pending::<()>().await;
+    Ok(())
+}
+
+/// Bring up the pairs carrying the framework's own traffic.
+async fn serve_control(specs: &[String]) -> Result<()> {
+    for spec in specs {
         let Pair {
             service,
             listen,
             upstream,
             ..
-        } = Pair::parse(&spec)?;
+        } = Pair::parse(spec)?;
         let relay = Relay::bind(listen, upstream.clone()).await?;
         tracing::info!(%service, %listen, %upstream, "control pair up");
         tokio::spawn(async move {
@@ -403,8 +409,6 @@ async fn main() -> Result<()> {
             }
         });
     }
-
-    std::future::pending::<()>().await;
     Ok(())
 }
 
