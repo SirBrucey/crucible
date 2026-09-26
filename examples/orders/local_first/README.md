@@ -1,8 +1,13 @@
-# 3. Local first
+# Local first
 
-## What `2_outbox` told us
+Not a step in the staircase. The fleets numbered 1 to 3 each fix what the
+campaign before them found; this one changes the API's storage for availability,
+which no campaign asked for, and gives up a guarantee on the way. It is kept
+because it is the only fleet here whose defect nothing on the wire can see.
 
-Among its failures under a fault held for the whole run:
+## What prompted it
+
+Among `2_outbox`'s failures under a fault held for the whole run:
 
 ```
 `broker` was killed for the whole run.
@@ -12,30 +17,26 @@ Among its failures under a fault held for the whole run:
 
 The API's own database is missing from that list, and not because the fleet came
 through it well. `api -> db` was cut for the whole run and the campaign passed
-it: every request was refused and the API kept nothing back, so the fleet took
-responsibility for nothing and held nothing, which is all these invariants ask
-of it. Refusing everything is not incorrect. A fleet doing it is not available
-either, and availability is not what the four ask about.
-
-So give the API a store of its own. It can then accept orders whatever the
-network is doing, and the relay catches up when the broker comes back.
+it: every request was refused, so the fleet took responsibility for nothing and
+held nothing, which is all these invariants ask of it. Refusing everything is
+not incorrect. It is not available either, and availability is not one of the
+four.
 
 ## What changed
 
-The API's orders live in a SQLite file on its own disk, and its outbox lives in
-a second one. It reaches the network for one thing only: announcing what it has
-already written down.
+The API's orders live in a SQLite file on its own disk, and its outbox in a
+second one. It reaches the network only to announce what it has already written
+down.
 
 ```rust
 sqlx::query("INSERT INTO orders ...").execute(&state.orders).await?;  // one file
 queue(&state, ROUTING_KEY, &payload).await?;                          // another
 ```
 
-The consumer keeps its own copy of the orders now, built from the events it is
-told about, since the API's are no longer in the shared database. That is the
-only change to it.
+The consumer keeps its own copy of the orders, built from the events it is told
+about, since the API's are no longer in the shared database.
 
-The campaign's discovery finds these edges and no others:
+Discovery finds four edges and no others:
 
 ```
 Edge { client: None,              upstream: "api" }       the inbound request
@@ -44,60 +45,45 @@ Edge { client: Some("inventory"), upstream: "broker" }
 Edge { client: Some("inventory"), upstream: "db" }
 ```
 
-`api -> db` is gone. The API no longer depends on a database it has to reach,
-and the recovery schedule that used to cut that edge does not exist.
+`api -> db` is gone, so the campaign builds seven whole-run faults where
+`2_outbox` builds eight.
 
 ## What it undid
 
-The transactional outbox in `2_outbox` was correct for one reason: the order and
-the event announcing it were written in the same transaction, so the fleet could
-not hold one without the other. Two SQLite files cannot share a transaction.
-Nobody removed that guarantee on purpose. It left with the shared database.
+The transactional outbox was correct for one reason: the order and the event
+announcing it shared a transaction. Two SQLite files cannot. Nobody removed that
+guarantee on purpose; it left with the shared database.
 
-So the API is back to two separate writes with a gap between them, which is the
-defect `1_base` had and `2_outbox` fixed. A crash in that gap leaves an order on
-the books that will never be announced, permanently, because there is nothing in
-the outbox to retry.
+So the API is back to two writes with a gap between them, which is the defect
+`1_base` had and `2_outbox` fixed. A crash in that gap loses the event
+permanently, there being nothing in the outbox to retry.
 
 ## Why the wire cannot see it
 
-Look at the edge list again. `INSERT INTO orders` is a write to a local file.
-`INSERT INTO outbox` is a write to another local file. No edge lies between
-them. The nearest packets are the inbound request, which arrives before both,
-and the response, which leaves after both. A proxy watching every byte the fleet
-sends has nothing to anchor a fault to in that window, because nothing crosses
-it.
+Both of those writes are local. No edge lies between them: the nearest packets
+are the inbound request, before both, and the response, after both. This is not
+an argument that the wire tier finds the window hard. The fleet's own edge list
+is the framework's evidence that there is nothing there to anchor to.
 
-This is what the application-aware tier is for. The API reports the boundaries
-of its own spans, so a schedule can name the moment directly:
+Only a moment the service reports reaches it. The API names the boundaries of
+its own spans:
 
 ```rust
 .instrument(tracing::info_span!("record"))   // the order
 .instrument(tracing::info_span!("queue"))    // the announcement
 ```
 
-## What the campaign finds
-
-Moving the store onto local disk changed the shape of the fleet before any fault
-ran. The campaign builds one whole-run fault per service, and one per edge
-between two of them, and this fleet has one edge fewer: seven where `2_outbox`
-builds eight, because `api -> db` is gone. That is the change working.
-
-What it did not do is make the fleet more reliable, and the rest of this section
-says where it went instead.
-
-The gap the shared transaction used to close:
+and the campaign places a fault between them:
 
 > `api` was killed during step 1, on `record:1:end` holds api part way through
 > its own work. The fleet took 5 steps which left `orders.orders.count` at `2`,
 > expected value `3`. It settled where fewer steps would have left it, so work
-> was lost, which is durability. It first differed after step 1.
+> was lost, which is durability.
 
 The API recorded the order and died before queueing its announcement. It came
-back and served the rest of the run, so its own store holds all three orders.
-The consumer only ever heard about two, and it never will.
-
-The run reads both stores and the outbox between them:
+back and served the rest of the run, so its own store holds all three orders;
+the consumer only ever heard about two. The run reads both stores and the outbox
+between them:
 
 | check | reads |
 | --- | --- |
@@ -108,36 +94,28 @@ The run reads both stores and the outbox between them:
 An outbox holding nothing is the whole problem. There is no retry to wait for,
 because the write that would have queued one never happened.
 
-The verdict names durability, and it is `orders.applied.count` that says so.
-Steps 4 and 5 amend order 1. The API holds that order, so it accepted both; the
-consumer was never told the order exists, so it applied neither. Two steps the
-fleet took on and never made good is work lost.
+Reaching that verdict needs the reference run. The API's reply to step 1 never
+arrived, so the fleet may have accepted that step or refused it, and the
+campaign drove steps 2 to 5 on a clean fleet to find where landing only those
+leaves it. No run of these steps leaves the API holding an order the consumer
+never heard about.
 
-Getting there needs the reference run. The API's reply to step 1 never arrived,
-so the fleet may have accepted that step or refused it, and the campaign drove
-steps 2 to 5 on a clean fleet to find where landing only those leaves it. That
-bounds what the fleet owed without having to guess at step 1, and no run of
-these steps leaves the API holding an order the consumer never heard about.
+## What the campaign finds
 
-One fleet holding two answers is the shape of it. What it costs is the work the
-API went on accepting against the half the rest of the fleet cannot see.
+160 schedules, 77 passed, 83 faults, 0 inconclusive, 0 errored.
 
-That verdict is only reachable because the API says where it is. Every other
-fault placed at a moment in this campaign is anchored to a packet. This one is
-anchored to `record:1:end`, a boundary the API reported from inside itself, in a
-window where the fleet sends nothing.
+| invariant | `2_outbox` | `local_first` |
+| --- | --- | --- |
+| durability | 64 | 73 |
+| idempotency | 19 | 5 |
+| recovery | 3 | 4 |
+| convergence | 1 | 1 |
 
-## What it did not fix
-
-The consumer still applies whatever it is handed:
-
-> `inventory -> broker` was redelivered to during step 1 ... left
-> `orders.applied.count` at `6`, expected value `5`. Breaking the fleet this way
-> can show nothing but idempotency, and where it settled says the same, so that
-> is what broke.
-
-Three examples in, and the one defect that has survived every change is the one
-nobody has addressed.
+Durability rises by nine against the fleet this was branched from, which is the
+undone transaction. Idempotency falls to five only because there are fewer
+places left to duplicate from, not because the consumer learned anything:
+[`3_inbox`](../3_inbox) is the fleet that fixed that, and this one does not
+carry the fix.
 
 ## Build and run
 
@@ -148,3 +126,6 @@ cargo run -p crucible -- run examples/orders/local_first/orders.cru
 
 Built from the repository root rather than the examples workspace, because the
 API carries crucible's span adapter.
+
+Figures above are from an unbounded run, with the scenario's `budget` line
+dropped so every schedule is run.

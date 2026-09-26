@@ -5,9 +5,9 @@ COPY . .
 # Its own workspace, since it reaches out of the examples directory for the
 # span adapter.
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
-    --mount=type=cache,target=/build/examples/orders/3_local_first/target,sharing=locked \
-    cargo build --release --manifest-path examples/orders/3_local_first/Cargo.toml -p orders-local-api \
-    && cp examples/orders/3_local_first/target/release/orders-local-api /api
+    --mount=type=cache,target=/build/examples/orders/local_first/target,sharing=locked \
+    cargo build --release --manifest-path examples/orders/local_first/Cargo.toml -p orders-local-api \
+    && cp examples/orders/local_first/target/release/orders-local-api /api
 
 FROM debian:bookworm-slim
 RUN apt-get update \
