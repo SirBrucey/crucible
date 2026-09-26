@@ -7,6 +7,10 @@ members = [
     "orders/2_outbox/inventory",
     "orders/3_inbox/api",
     "orders/3_inbox/inventory",
+    "orders/4_reconnect/api",
+    "orders/4_reconnect/inventory",
+    "orders/5_ack_on_success/api",
+    "orders/5_ack_on_success/inventory",
     "pdns/api",
 ]
 exclude = ["orders/local_first"]
