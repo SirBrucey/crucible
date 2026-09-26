@@ -2,31 +2,16 @@
 
 ## What `1_base` told us
 
-The API wrote an order down, then announced it, then answered. Those are three
-steps and nothing joins them. Cut it off from the broker at the moment it
-announces:
-
-> `api -> broker` was cut off during step 1, on a publish the sender has
-> committed to and the broker has not seen. The fleet took 1 step which left
-> `orders.applied.count` at `0`, expected value `1`. It settled where fewer
-> steps would have left it, so work was lost, which is durability.
-
-And what the same fleet does when the broker dies with a delivery in flight:
-
-> `broker` was killed during step 1 ... The fleet took 1 step which left
-> `orders.orders.count` at `3`, expected value `1`. It holds more than the steps
-> it took responsibility for owed, and no step taken twice puts it there, so it
-> kept work it turned away, which is durability.
-
-One request accepted and nothing done about it, while three order rows sit on
-the books, two of which the fleet told its callers it had refused. This is the
-failure a transactional outbox exists to prevent.
+The API wrote an order down, then announced it, then answered. Three steps, and
+nothing joined them. Cut it off from the broker at the announcement and one
+request was accepted with nothing done about it; kill the broker and three order
+rows sat on the books, two of which the fleet had told its callers it refused.
+This is the failure a transactional outbox exists to prevent.
 
 ## What changed
 
 The API no longer talks to the broker on the request path. It writes the order
-and the event announcing it in one transaction, so the fleet cannot hold one
-without the other:
+and the event announcing it in one transaction:
 
 ```rust
 let mut tx = state.db.begin().await?;
@@ -35,20 +20,29 @@ queue(&mut *tx, ROUTING_KEY, &payload).await?;
 tx.commit().await?;
 ```
 
-A relay task announces what the outbox holds and deletes each row once it has
-gone. It keeps its own broker connection and rebuilds it whenever the broker
-goes away. An outbox that gives up on its first failure keeps the event and
-never sends it, which is not what the pattern is for.
+A relay announces what the outbox holds and deletes each row once it has gone,
+rebuilding its broker connection whenever the broker goes away.
 
 `diff -r ../1_base .` is the whole change, apart from the image names and the
 one check added for the outbox.
 
-## What the campaign finds now
+## What the campaign finds
 
-This campaign's failures are the same shapes as `1_base`'s, durability among
-them still.
-What moved is underneath that. Cutting the API off from the broker at the
-publish, in both fleets:
+221 schedules, 134 passed, 87 faults, 0 inconclusive, 0 errored.
+
+| invariant | `1_base` | `2_outbox` |
+| --- | --- | --- |
+| durability | 78 | 64 |
+| idempotency | 5 | 19 |
+| recovery | 2 | 3 |
+| convergence | 1 | 1 |
+
+Durability falls by fourteen and idempotency rises by fourteen. That trade is
+the whole of what this change does.
+
+### The caller is no longer turned away
+
+Cutting the API off from the broker at the publish, in both fleets:
 
 | fleet | steps accepted | events applied |
 | --- | --- | --- |
@@ -56,78 +50,52 @@ publish, in both fleets:
 | `2_outbox` | 5 of 5 | 4 of 5 |
 
 The API used to fail the caller whenever it could not reach the broker, because
-announcing was part of answering. Now it is not, so the fleet accepts all five
-steps under a fault that previously made it refuse four. That is the outbox
-working: no caller is turned away for a broker it never needed to touch.
+announcing was part of answering. Now it is not.
 
-What it did not do is make the announcement durable:
+### It did not make the announcement durable
 
 > `api -> broker` was cut off during step 1, on a publish the sender has
 > committed to and the broker has not seen. The fleet took 5 steps which left
 > `orders.applied.count` at `4`, expected value `5`. It settled where fewer
-> steps would have left it, so work was lost, which is durability. It first
-> differed after step 1.
+> steps would have left it, so work was lost, which is durability.
 
-Four of five, where `1_base` managed none of one. The one that got away is worth
-understanding: `basic_publish` returns as soon as the frame is written to the
-socket, so when the connection is severed in flight the relay believes it
-announced the event and deletes the row. The channel is never put into confirm
-mode, so the await that reads like a confirm resolves without waiting for one.
-The outbox moved the durability boundary from the API's process surviving to the
-relay's belief that the broker took it, and nothing establishes that belief.
+Four of five, where `1_base` managed none of one. `basic_publish` returns once
+the frame is written to the socket, and the channel is never put into confirm
+mode, so a connection severed in flight leaves the relay believing it announced
+the event and deleting the row.
 
-Kill the broker instead and the same mistake takes all five at once:
+Kill the broker and the same mistake takes all five:
 
-> `broker` was killed during step 1 ... The fleet took 5 steps which left
+> `broker` was killed during step 1, on a publish the sender has committed to
+> and the broker has not seen. The fleet took 5 steps which left
 > `orders.applied.count` at `0`, expected value `5`.
 
-That run settles with `orders.outbox.count` at `0` and `orders.applied.count` at
-`0`. The relay published every row and deleted it, believing each had gone: what
-it sent while the broker was dying, the broker never saw, and what it sent once
-the broker was back had nothing listening, the consumer having exited at the
-kill. An empty outbox has nothing to retry either way.
+That run settles with `orders.outbox.count` at `0`. The relay published every
+row and deleted it; what it sent while the broker was dying the broker never
+saw, and what it sent once the broker was back had nothing listening. An empty
+outbox has nothing to retry.
 
-So durability did not go away. It changed shape: from work the fleet refused and
-kept anyway, to work the fleet accepted and lost. The second is the better
-failure to have, because the caller is no longer told a lie, but it is still a
-failure.
+Durability changed shape rather than going away: from work the fleet refused and
+kept anyway, to work it accepted and lost.
 
 ## What it introduced
 
-Kill the API at the same moment and the number moves the other way:
+Kill the API in the relay's publish-then-delete window and the number moves the
+other way:
 
 > `api` was killed during step 1, on a publish the sender has committed to and
 > the broker has not seen. The fleet took 5 steps which left
 > `orders.applied.count` at `6`, expected value `5`. It settled where the steps
 > it took would have left it had one of them been taken twice, so work was done
-> twice, which is idempotency. It first differed after step 1.
-
-Six applications for five steps is where one step taken twice leaves the count,
-and the stock says the same. Step 1 took eight off `stock.book` where the
-fault-free run took four, and appended two rows to `applied` where it appended
-one. Both are that step applied exactly twice. The book never makes the four
-back, so it settles at `94` against the `98` the scenario expects, which is why
-reading what each step did names this where comparing end states did not.
+> twice, which is idempotency.
 
 The relay announced the event, was killed before it could delete the row, and
-announced it again when it came back. The consumer adjusts stock on every
-delivery, so the order was counted twice.
+announced it again on restart.
 
-The fault did not go away, it turned over. In `1_base` a fault in this window
-lost an event; here the same fault duplicates one. That is what the outbox
-actually buys: it converts a durability problem into an idempotency obligation,
-and this fleet has not met it.
-
-## What it did not fix
-
-The consumer is unchanged, byte for byte:
-`diff -r ../1_base/inventory inventory` is empty apart from the package name. So
-the redelivery case is exactly as it was, because it was never about the API:
-
-> `inventory -> broker` was redelivered to during step 1 ... left
-> `orders.applied.count` at `6`, expected value `5`. Breaking the fleet this way
-> can show nothing but idempotency, and where it settled says the same, so that
-> is what broke.
+Nineteen schedules end in a duplicate here, against five in `1_base`. The
+consumer is unchanged, byte for byte: `diff -r ../1_base/inventory inventory` is
+empty apart from the package name. At-least-once delivery is an obligation on
+the consumer, and this one has not met it. [`3_inbox`](../3_inbox) is that fix.
 
 ## Build and run
 
@@ -135,3 +103,6 @@ the redelivery case is exactly as it was, because it was never about the API:
 ./examples/orders/2_outbox/build.sh
 cargo run -p crucible -- run examples/orders/2_outbox/orders.cru
 ```
+
+Figures above are from an unbounded run, with the scenario's `budget` line
+dropped so every schedule is run.
