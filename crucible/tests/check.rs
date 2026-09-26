@@ -16,7 +16,8 @@ fn check(path: &str) -> Output {
 #[rstest]
 #[case("orders/1_base/orders.cru")]
 #[case("orders/2_outbox/orders.cru")]
-#[case("orders/3_local_first/orders.cru")]
+#[case("orders/3_inbox/orders.cru")]
+#[case("orders/local_first/orders.cru")]
 fn an_example_scenario_checks_cleanly(#[case] scenario: &str) {
     let out = check(&format!(
         "{}/../examples/{scenario}",

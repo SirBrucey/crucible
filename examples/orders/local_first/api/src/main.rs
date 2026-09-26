@@ -24,8 +24,8 @@ const ROUTING_KEY: &str = "order.created";
 const MODIFY_KEY: &str = "order.modified";
 const RETRY_ATTEMPTS: u32 = 30;
 const RETRY_DELAY: Duration = Duration::from_secs(1);
-/// How long the relay sleeps before looking of its own accord, for rows a
-/// restart left behind.
+/// How long the relay waits before looking on its own, for rows a restart
+/// left behind.
 const RELAY_BACKSTOP: Duration = Duration::from_secs(2);
 
 /// The caller names the order, which is what lets it be referred to again and
@@ -66,9 +66,8 @@ struct OrderModified {
 /// database across the network.
 ///
 /// Two files means two connections, and two connections cannot share a
-/// transaction. Writing an order and queueing its announcement are therefore
-/// two separate commits, with a moment in between where only the first has
-/// happened.
+/// transaction. So the order and its announcement are two commits, with a
+/// moment between them where only the first has happened.
 struct AppState {
     orders: SqlitePool,
     outbox: SqlitePool,
@@ -87,8 +86,8 @@ struct Stats {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // The filter sits on the logging layer alone. What a run holds this service
-    // at must not depend on how talkative its logs are.
+    // The filter sits on the logging layer alone, so where a fault holds this
+    // service does not depend on how talkative its logs are.
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::fmt::layer()

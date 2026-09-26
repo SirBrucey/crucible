@@ -5,7 +5,8 @@ use rstest::rstest;
 #[rstest]
 #[case("orders/1_base/orders.cru")]
 #[case("orders/2_outbox/orders.cru")]
-#[case("orders/3_local_first/orders.cru")]
+#[case("orders/3_inbox/orders.cru")]
+#[case("orders/local_first/orders.cru")]
 fn a_bundled_example_compiles(#[case] scenario: &str) {
     let src = std::fs::read_to_string(format!(
         "{}/../examples/{scenario}",

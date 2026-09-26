@@ -142,8 +142,8 @@ nobody has addressed.
 ## Build and run
 
 ```
-./examples/orders/3_local_first/build.sh
-cargo run -p crucible -- run examples/orders/3_local_first/orders.cru
+./examples/orders/local_first/build.sh
+cargo run -p crucible -- run examples/orders/local_first/orders.cru
 ```
 
 Built from the repository root rather than the examples workspace, because the

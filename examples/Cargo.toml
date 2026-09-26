@@ -5,9 +5,11 @@ members = [
     "orders/1_base/inventory",
     "orders/2_outbox/api",
     "orders/2_outbox/inventory",
+    "orders/3_inbox/api",
+    "orders/3_inbox/inventory",
     "pdns/api",
 ]
-exclude = ["orders/3_local_first"]
+exclude = ["orders/local_first"]
 
 [workspace.package]
 edition = "2024"

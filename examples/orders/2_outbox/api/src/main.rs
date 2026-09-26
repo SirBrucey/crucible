@@ -21,8 +21,8 @@ const ROUTING_KEY: &str = "order.created";
 const MODIFY_KEY: &str = "order.modified";
 const RETRY_ATTEMPTS: u32 = 30;
 const RETRY_DELAY: Duration = Duration::from_secs(1);
-/// How long the relay sleeps before looking of its own accord, for rows a
-/// restart left behind.
+/// How long the relay waits before looking on its own, for rows a restart
+/// left behind.
 const RELAY_BACKSTOP: Duration = Duration::from_secs(2);
 
 /// The caller names the order, which is what lets it be referred to again and
@@ -61,12 +61,11 @@ struct OrderModified {
 
 struct AppState {
     db: Pool<MySql>,
-    /// The relay holds the broker connection, since nothing on the request path
-    /// talks to the broker any more.
+    /// Where the relay dials the broker. Nothing on the request path talks to
+    /// it.
     broker_url: String,
-    /// Rung when something is put in the outbox, so the relay answers a write
-    /// rather than asking after one. It still wakes on its own eventually, for
-    /// anything left behind by a restart.
+    /// Rung when something is put in the outbox, so the relay answers a write.
+    /// It still wakes on its own for anything a restart left behind.
     queued: Notify,
 }
 
@@ -140,12 +139,12 @@ async fn main() -> anyhow::Result<()> {
 /// Announce what the outbox holds, oldest first, and take each row away once it
 /// has gone.
 ///
-/// Publishing and deleting are two steps, so a row that has been announced and
-/// not yet deleted is announced again when this comes back. That is what makes
-/// delivery at-least-once, and it is the consumer's job to take it twice.
+/// Publishing and deleting are two steps, so a row announced and not yet
+/// deleted is announced again. Delivery is at-least-once, and it is the
+/// consumer's job to take a message twice.
 async fn relay(state: Arc<AppState>) {
-    // Its own connection, rebuilt whenever the broker goes away. An outbox that
-    // gives up on its first failure keeps the event and never sends it.
+    // Its own connection, rebuilt whenever the broker goes away. An outbox
+    // that gives up keeps the event forever.
     let mut channel: Option<Channel> = None;
     loop {
         if !channel.as_ref().is_some_and(|c| c.status().connected()) {
@@ -273,8 +272,8 @@ fn failed(e: &sqlx::Error) -> StatusCode {
 
 /// Put an event in the outbox, for the relay to announce.
 ///
-/// Takes whatever it is given to write through, so a caller with something to
-/// write alongside it can pass its transaction.
+/// Writes through whatever it is given, so a caller can pass its own
+/// transaction.
 async fn queue<'e, E>(db: E, key: &str, payload: &[u8]) -> Result<(), StatusCode>
 where
     E: sqlx::Executor<'e, Database = MySql>,
