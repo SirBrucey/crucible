@@ -656,14 +656,10 @@ fn ran<'a>(
 }
 
 impl Trajectory {
-    /// Whether every step left this reading where it was or higher.
-    ///
-    /// Holding less of something the steps only ever added to is work missing.
-    /// Holding less of something they took from is work done. The order its
-    /// steps arrived in moves a reading they overwrite and leaves one they add
-    /// to alone, so what a step did tells the two apart.
-    fn climbs(&self, at: usize) -> bool {
-        let mut moved = false;
+    /// Which way every step moved this reading, or `None` where they moved it
+    /// both ways or not at all.
+    fn travels(&self, at: usize) -> Option<Ordering> {
+        let mut way = None;
         for (was, now) in self.iter().zip(self.iter().skip(1)) {
             let (Some(was), Some(now)) = (
                 was.get(at).and_then(Option::as_ref),
@@ -672,12 +668,12 @@ impl Trajectory {
                 continue;
             };
             match super::order(was, now) {
-                Some(Ordering::Less) => moved = true,
                 Some(Ordering::Equal) => {}
-                _ => return false,
+                Some(step) if way.is_none_or(|way| way == step) => way = Some(step),
+                _ => return None,
             }
         }
-        moved
+        way
     }
 }
 
@@ -812,34 +808,40 @@ impl Placed<'_> {
     }
 }
 
-/// The first count that reads to one side of every state the run admits.
+/// The first reading that sits to one side of every state the run admits.
 ///
-/// A counting reading that climbs and settled below all of them lost work;
-/// above all of them it repeated some. This is not always the first reading the
-/// two runs disagree on.
+/// `way` is `Less` for work missing and `Greater` for work repeated. Which
+/// value that is depends on where the steps took the reading. This is not
+/// always the first reading the two runs disagree on.
 fn parted_at(settled: &Checkpoint, admissible: &[Admissible<'_>], way: Ordering) -> Option<usize> {
     if admissible.is_empty() {
         return None;
     }
     let trail = admissible.first()?.trail;
     (0..settled.len()).position(|at| {
-        trail.climbs(at)
-            && settled
-                .get(at)
-                .and_then(Option::as_ref)
-                .filter(|settled| {
-                    matches!(settled, Value::Int(_) | Value::Duration(_) | Value::List(_))
+        let against = match trail.travels(at) {
+            // The steps added to this reading, so low is work missing.
+            Some(Ordering::Less) => way,
+            // They took from it, so low is work done.
+            Some(Ordering::Greater) => way.reverse(),
+            _ => return false,
+        };
+        settled
+            .get(at)
+            .and_then(Option::as_ref)
+            .filter(|settled| {
+                matches!(settled, Value::Int(_) | Value::Duration(_) | Value::List(_))
+            })
+            .is_some_and(|settled| {
+                admissible.iter().all(|admits| {
+                    admits
+                        .settled
+                        .get(at)
+                        .and_then(Option::as_ref)
+                        .and_then(|owed| super::order(settled, owed))
+                        == Some(against)
                 })
-                .is_some_and(|settled| {
-                    admissible.iter().all(|admits| {
-                        admits
-                            .settled
-                            .get(at)
-                            .and_then(Option::as_ref)
-                            .and_then(|owed| super::order(settled, owed))
-                            == Some(way)
-                    })
-                })
+            })
     })
 }
 
@@ -1858,6 +1860,42 @@ mod tests {
         let (broke, why) = showed(obs.verdict());
         assert_eq!(broke, Some(Invariant::Idempotent));
         assert!(why.contains("work was done twice"), "{why}");
+    }
+
+    /// A stock level the steps take from. Holding less than was owed is a
+    /// step's work done twice.
+    #[test]
+    fn a_reading_the_steps_take_from_shows_idempotency_when_it_settles_low() {
+        let mut obs = Readings::empty();
+        obs.fault = Some(fired_fault());
+        obs.outcomes = vec![outcome(Ack::Acked), outcome(Ack::Acked)];
+        obs.checks = vec![reading(485)];
+        obs.trajectory = [500, 495, 490].into_iter().map(checkpoint).collect();
+        obs.fault_free = Baseline {
+            trail: [500, 495, 490].into_iter().map(checkpoint).collect(),
+            settled: checkpoint(490),
+        };
+        let (broke, why) = showed(obs.verdict());
+        assert_eq!(broke, Some(Invariant::Idempotent));
+        assert!(why.contains("work was done twice"), "{why}");
+    }
+
+    /// The same reading held above what was owed. A step's worth was never
+    /// taken, so that work is missing.
+    #[test]
+    fn a_reading_the_steps_take_from_shows_durability_when_it_settles_high() {
+        let mut obs = Readings::empty();
+        obs.fault = Some(fired_fault());
+        obs.outcomes = vec![outcome(Ack::Acked), outcome(Ack::Acked)];
+        obs.checks = vec![reading(495)];
+        obs.trajectory = [500, 495, 490].into_iter().map(checkpoint).collect();
+        obs.fault_free = Baseline {
+            trail: [500, 495, 490].into_iter().map(checkpoint).collect(),
+            settled: checkpoint(490),
+        };
+        let (broke, why) = showed(obs.verdict());
+        assert_eq!(broke, Some(Invariant::Durable));
+        assert!(why.contains("work was lost"), "{why}");
     }
 
     /// A count reaches the same total whichever order its steps arrive in.
