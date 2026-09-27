@@ -199,17 +199,6 @@ async fn init_stock(db: &Pool<MySql>) -> anyhow::Result<()> {
     .execute(db)
     .await
     .context("create stock table")?;
-    // What the consumer did, one row per event it acted on.
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS applied (
-            seq BIGINT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
-            order_id BIGINT UNSIGNED NOT NULL,
-            event VARCHAR(255) NOT NULL
-        )",
-    )
-    .execute(db)
-    .await
-    .context("create applied table")?;
     // How far through each order's history this consumer has got.
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS order_seq (
@@ -259,9 +248,8 @@ async fn apply_modification(
     }
     if !advance(&mut tx, event.id, event.seq).await? {
         // A later amendment already decided what this order is for, so the
-        // right thing to do with this one is nothing. It is still an event the
-        // consumer handled, and `applied` counts those.
-        record(&mut tx, event.id, MODIFY_KEY).await?;
+        // right thing to do with this one is nothing. The claim stands, so it
+        // is not offered again.
         tx.commit().await.context("commit")?;
         tracing::info!(order_id = event.id, seq = event.seq, "superseded");
         return Ok(());
@@ -284,7 +272,6 @@ async fn apply_modification(
         .execute(&mut *tx)
         .await
         .context("adjust stock")?;
-    record(&mut tx, event.id, MODIFY_KEY).await?;
     tx.commit().await.context("commit")?;
     tracing::info!(
         order_id = event.id,
@@ -357,20 +344,6 @@ async fn advance(
     }
 }
 
-/// Note that this event was acted on, in the same transaction as what it did.
-async fn record(
-    tx: &mut sqlx::Transaction<'_, MySql>,
-    order_id: u64,
-    event: &str,
-) -> anyhow::Result<()> {
-    sqlx::query("INSERT INTO applied (order_id, event) VALUES (?, ?)")
-        .bind(order_id)
-        .bind(event)
-        .execute(&mut **tx)
-        .await
-        .context("record applied")?;
-    Ok(())
-}
 
 async fn apply_order(
     db: &Pool<MySql>,
@@ -390,7 +363,6 @@ async fn apply_order(
         .execute(&mut *tx)
         .await
         .context("decrement stock")?;
-    record(&mut tx, event.id, CREATED_KEY).await?;
     tx.commit().await.context("commit")?;
     if result.rows_affected() == 0 {
         tracing::warn!(item = %event.item, "unknown item, stock unchanged");

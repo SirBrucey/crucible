@@ -157,17 +157,6 @@ async fn init_stock(db: &Pool<MySql>) -> anyhow::Result<()> {
     .execute(db)
     .await
     .context("create stock table")?;
-    // What the consumer did, one row per event it acted on.
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS applied (
-            seq BIGINT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
-            order_id BIGINT UNSIGNED NOT NULL,
-            event VARCHAR(255) NOT NULL
-        )",
-    )
-    .execute(db)
-    .await
-    .context("create applied table")?;
     // The events this consumer has already acted on.
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS inbox (
@@ -223,7 +212,6 @@ async fn apply_modification(
         .execute(&mut *tx)
         .await
         .context("adjust stock")?;
-    record(&mut tx, event.id, MODIFY_KEY).await?;
     tx.commit().await.context("commit")?;
     tracing::info!(
         order_id = event.id,
@@ -256,20 +244,6 @@ async fn claim(
     Ok(claimed.rows_affected() == 1)
 }
 
-/// Note that this event was acted on, in the same transaction as what it did.
-async fn record(
-    tx: &mut sqlx::Transaction<'_, MySql>,
-    order_id: u64,
-    event: &str,
-) -> anyhow::Result<()> {
-    sqlx::query("INSERT INTO applied (order_id, event) VALUES (?, ?)")
-        .bind(order_id)
-        .bind(event)
-        .execute(&mut **tx)
-        .await
-        .context("record applied")?;
-    Ok(())
-}
 
 async fn apply_order(
     db: &Pool<MySql>,
@@ -288,7 +262,6 @@ async fn apply_order(
         .execute(&mut *tx)
         .await
         .context("decrement stock")?;
-    record(&mut tx, event.id, CREATED_KEY).await?;
     tx.commit().await.context("commit")?;
     if result.rows_affected() == 0 {
         tracing::warn!(item = %event.item, "unknown item, stock unchanged");
