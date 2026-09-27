@@ -389,6 +389,18 @@ struct Delta {
     to: Value,
 }
 
+/// Whether a stretch moved a reading by exactly what some step of the
+/// fault-free run moved it.
+///
+/// A stretch that owed nothing and moved by an amount no step accounts for is a
+/// reading going somewhere of its own, which names nothing. One that moved by a
+/// step's own amount is that step taken again.
+fn repeats_a_step(span: &Span, spans: &[Span]) -> bool {
+    span.drove.by.is_some_and(|moved| {
+        moved != 0 && spans.iter().any(|other| other.learned.by == Some(moved))
+    })
+}
+
 impl Delta {
     /// Whether this is `once` applied twice over.
     fn is_twice(&self, once: &Delta) -> bool {
@@ -529,6 +541,11 @@ impl Went {
     }
 
     /// What one reading's stretches say, when they are not a rearrangement.
+    ///
+    /// A stretch that owed this reading nothing and moved it anyway is only
+    /// readable where the movement is one a step of the fault-free run made, so
+    /// [`repeats_a_step`] is what tells a step taken again from a reading that
+    /// wandered.
     fn of_spans(spans: &[Span]) -> Went {
         let mut went = Went::Elsewhere;
         for span in spans {
@@ -544,13 +561,17 @@ impl Went {
             if span.matches() {
                 continue;
             }
-            went = went.or(if span.drove.is_twice(&span.learned) {
-                Went::Twice
-            } else if span.drove.is_short_of(&span.learned) {
-                Went::Lost
-            } else {
-                Went::Elsewhere
-            });
+            went = went.or(
+                if span.drove.is_twice(&span.learned)
+                    || (span.learned.is_nothing() && repeats_a_step(span, spans))
+                {
+                    Went::Twice
+                } else if span.drove.is_short_of(&span.learned) {
+                    Went::Lost
+                } else {
+                    Went::Elsewhere
+                },
+            );
         }
         went
     }
@@ -1896,6 +1917,34 @@ mod tests {
         let (broke, why) = showed(obs.verdict());
         assert_eq!(broke, Some(Invariant::Durable));
         assert!(why.contains("work was lost"), "{why}");
+    }
+
+    /// A reading the fleet moved during a step that owed it nothing. The
+    /// fault-free run left it alone there, so the work is a step done again,
+    /// and it reads that way even though the reading ends up somewhere no
+    /// single lost or doubled step would leave it.
+    #[test]
+    fn a_reading_moved_where_nothing_was_owed_shows_idempotency() {
+        let mut obs = Readings::empty();
+        obs.fault = Some(fired_fault());
+        obs.outcomes = vec![outcome(Ack::Acked); 5];
+        obs.checks = vec![reading(94)];
+        // Step 2 owes this reading nothing and takes 4 from it anyway, which is
+        // step 1's work over again. Every later step moves as it should.
+        obs.trajectory = [100, 96, 92, 92, 90, 94]
+            .into_iter()
+            .map(checkpoint)
+            .collect();
+        obs.fault_free = Baseline {
+            trail: [100, 96, 96, 96, 94, 98]
+                .into_iter()
+                .map(checkpoint)
+                .collect(),
+            settled: checkpoint(98),
+        };
+        let (broke, why) = showed(obs.verdict());
+        assert_eq!(broke, Some(Invariant::Idempotent));
+        assert!(why.contains("work was done twice"), "{why}");
     }
 
     /// A count reaches the same total whichever order its steps arrive in.
