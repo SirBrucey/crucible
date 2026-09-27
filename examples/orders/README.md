@@ -17,6 +17,10 @@ the textbook remedy for it.
    broker connection.
 5. [`5_ack_on_success`](5_ack_on_success): the fix for a consumer that
    acknowledges work it failed to do.
+6. [`6_confirm`](6_confirm): the fix for a relay that forgets an event the
+   broker never took.
+7. [`7_sequence`](7_sequence): the fix for amendments applied in the wrong
+   order.
 
 `diff -r 1_base 2_outbox` is the change itself. Each README says what changed,
 quotes the campaign output that motivated it, and reports what the change fixed,
@@ -24,22 +28,31 @@ what it did not, and what it cost.
 
 What each rung does to the campaign, every figure from an unbounded run:
 
-| | durability | idempotency | recovery | convergence | passed | inconclusive |
-| --- | --- | --- | --- | --- | --- | --- |
-| `1_base` | 78 | 5 | 2 | 1 | 129 | 0 |
-| `2_outbox` | 64 | 19 | 3 | 1 | 134 | 0 |
-| `3_inbox` | 64 | 0 | 3 | 1 | 153 | 0 |
-| `4_reconnect` | 28 | 0 | 2 | 1 | 189 | 1 |
-| `5_ack_on_success` | 11 | 0 | 1 | 1 | 206 | 2 |
+| | schedules | durability | idempotency | recovery | convergence | unattributed | passed | inconclusive |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `1_base` | 215 | 78 | 5 | 2 | 1 | 0 | 129 | 0 |
+| `2_outbox` | 221 | 64 | 19 | 3 | 1 | 0 | 134 | 0 |
+| `3_inbox` | 221 | 64 | 0 | 3 | 1 | 0 | 153 | 0 |
+| `4_reconnect` | 221 | 28 | 0 | 2 | 1 | 0 | 189 | 1 |
+| `5_ack_on_success` | 221 | 11 | 0 | 1 | 1 | 0 | 206 | 2 |
+| `6_confirm` | 256 | 1 | 0 | 0 | 1 | 1 | 250 | 3 |
+| `7_sequence` | 256 | 2 | 0 | 0 | **0** | 1 | 246 | 7 |
 
-`1_base` fits 215 schedules and the rest 221, so every row after the first is
-the same faults in the same places. The rungs are not independent: `3_inbox` is
-what makes `5_ack_on_success` safe, because requeuing a failed message means
-redelivering it.
+86 faults become 3, and every invariant reaches zero at some point along the
+way. Read the schedule counts before the fault counts: rungs 2 to 5 fit the same
+221, so those rows are the same faults in the same places, and rungs 6 and 7 fit
+256 because confirm mode puts acknowledgement frames on an edge and there is
+more traffic to burst.
 
-What survives all five is one defect and one gap. The relay never puts its
-channel in confirm mode, which is every remaining durability fault; and nothing
-gives the consumer a per-order sequence to check, which is the convergence one.
+The rungs are not independent. `3_inbox` is what makes `5_ack_on_success` safe,
+because requeuing a failed message means redelivering it, and `7_sequence` needs
+the same claim to record a superseded event as handled.
+
+Each fix costs something, and the READMEs say what. Reconnecting and requeuing
+make the fleet work at a problem a giving-up fleet abandoned, so runs take
+longer and some exceed their budget. `7_sequence` puts a locking read on the
+write path, which makes the packet counts the campaign anchors on drift, so five
+of its faults never landed at all.
 
 ## On its own
 
