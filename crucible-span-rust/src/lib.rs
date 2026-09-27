@@ -12,7 +12,7 @@ use std::{
     time::Duration,
 };
 
-use crucible_protocol::{Boundary, Released, Side, Watching};
+use crucible_protocol::{Boundary, Passed, Released, Side, Watching};
 use tracing_core::span::{Attributes, Id};
 use tracing_subscriber::{
     layer::{Context, Layer},
@@ -39,7 +39,7 @@ pub struct Boundaries {
     counts: Mutex<HashMap<String, u32>>,
     /// Boundaries this run only reports, handed to a thread so the service is
     /// not slowed by reporting them.
-    reports: Option<mpsc::Sender<Boundary>>,
+    reports: Option<mpsc::Sender<Passed>>,
 }
 
 impl Boundaries {
@@ -76,12 +76,12 @@ impl Boundaries {
         let url = format!("{framework}/boundary");
         // A run that only reports must not be slowed by reporting.
         let reports = matches!(watching, Watching::Reporting).then(|| {
-            let (tx, rx) = mpsc::channel::<Boundary>();
+            let (tx, rx) = mpsc::channel::<Passed>();
             let posting = agent.clone();
             let to = url.clone();
             std::thread::spawn(move || {
-                for boundary in rx {
-                    match posting.post(&to).send_json(&boundary) {
+                for passed in rx {
+                    match posting.post(&to).send_json(&passed) {
                         // Read even though there is nothing worth reading. The
                         // connection goes back in the pool only once its body
                         // has been read.
@@ -94,7 +94,7 @@ impl Boundaries {
                             }
                         }
                         Err(e) => tracing::warn!(
-                            target: "crucible::span", mark = %boundary.mark(), %e,
+                            target: "crucible::span", mark = %passed.boundary.mark(), %e,
                             "a moment could not be reported, so the run will not know of it",
                         ),
                     }
@@ -114,14 +114,20 @@ impl Boundaries {
 
     /// Say a boundary was reached, and wait if this run named it.
     fn reached(&self, span: &str, nth: u32, side: Side) {
-        let boundary = Boundary {
-            span: span.to_owned(),
-            side,
-            nth,
+        let passed = Passed {
+            boundary: Boundary {
+                span: span.to_owned(),
+                side,
+                nth,
+            },
+            // Taken here, at the boundary, on the host wall clock the proxy
+            // stamps the traffic with, so the two line up whatever the report
+            // then costs to arrive.
+            at_ns: crucible_protocol::now_ns(),
         };
-        if !self.watching.holds(&boundary.mark()) {
+        if !self.watching.holds(&passed.boundary.mark()) {
             if let Some(reports) = &self.reports
-                && let Err(e) = reports.send(boundary)
+                && let Err(e) = reports.send(passed)
             {
                 tracing::warn!(
                     target: "crucible::span", %e,
@@ -132,7 +138,7 @@ impl Boundaries {
         }
         // Blocking on the thread that reached the boundary. The service is
         // held here until the framework answers.
-        match self.agent.post(&self.url).send_json(&boundary) {
+        match self.agent.post(&self.url).send_json(&passed) {
             Ok(mut answer) => match answer.body_mut().read_json::<Released>() {
                 Ok(released) => tracing::debug!(
                     target: "crucible::span",

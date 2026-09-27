@@ -13,7 +13,7 @@ pub use primitive::Primitive;
 pub use proxy::{ConnEvent, ConnEventKind, ConnId, Direction, Freezes, Waiting};
 use serde::{Deserialize, Serialize};
 pub use session::{Session, WriteRecord};
-pub use tier::{Boundary, Reached, Released, Side, Watching};
+pub use tier::{Boundary, Passed, Reached, Released, Side, Watching};
 
 /// Where a fault can go.
 ///

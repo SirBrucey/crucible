@@ -16,9 +16,7 @@ use axum::{
     extract::{ConnectInfo, Query, State},
     routing::{get, post},
 };
-use crucible_protocol::{
-    Boundary, ConnEvent, ConnId, Freezes, Released, Waiting, Watching, now_ns,
-};
+use crucible_protocol::{ConnEvent, ConnId, Freezes, Passed, Released, Waiting, Watching, now_ns};
 use tokio::{
     net::TcpListener,
     sync::{mpsc, watch},
@@ -62,8 +60,10 @@ impl Spans {
         }
     }
 
-    /// A service has reached `boundary`. Answers when it may carry on.
-    async fn reached(&self, peer: IpAddr, boundary: Boundary) -> Released {
+    /// A service has reached `passed.boundary`, at the time it recorded.
+    /// Answers when it may carry on.
+    async fn reached(&self, peer: IpAddr, passed: Passed) -> Released {
+        let Passed { boundary, at_ns } = passed;
         let mark = boundary.mark();
         // A service is not told its own name, the proxy recognises it by where
         // it reported from. A service the fleet cannot name is one where no fault can be
@@ -74,9 +74,10 @@ impl Spans {
             return Released { at_ns: now_ns() };
         };
         tracing::debug!(%service, %mark, "a service reached a moment inside itself");
-        let _ = self
-            .events
-            .send((service.clone(), ConnEvent::reached(INSIDE, boundary)));
+        let _ = self.events.send((
+            service.clone(),
+            ConnEvent::reached_at(INSIDE, at_ns, boundary),
+        ));
 
         let armed = self
             .anchor
@@ -107,9 +108,9 @@ async fn watching(State(spans): State<Arc<Spans>>) -> Json<Watching> {
 async fn reached(
     State(spans): State<Arc<Spans>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    Json(boundary): Json<Boundary>,
+    Json(passed): Json<Passed>,
 ) -> Json<Released> {
-    Json(spans.reached(peer.ip(), boundary).await)
+    Json(spans.reached(peer.ip(), passed).await)
 }
 
 /// Everything an instrumented service needs to talk to, and how the framework
@@ -173,7 +174,7 @@ pub async fn listen(
 mod tests {
     use std::time::Duration;
 
-    use crucible_protocol::{ConnEventKind, Side};
+    use crucible_protocol::{Boundary, ConnEventKind, Side};
 
     use super::*;
 
@@ -241,6 +242,13 @@ mod tests {
         }
     }
 
+    fn passed(span: &str, nth: u32) -> Passed {
+        Passed {
+            boundary: boundary(span, nth),
+            at_ns: 0,
+        }
+    }
+
     /// A proxy under test.
     struct Under {
         spans: Arc<Spans>,
@@ -283,7 +291,7 @@ mod tests {
 
         let answered = tokio::time::timeout(
             Duration::from_millis(200),
-            under.spans.reached(stranger, boundary("publish", 1)),
+            under.spans.reached(stranger, passed("publish", 1)),
         )
         .await;
 
@@ -297,7 +305,7 @@ mod tests {
     #[tokio::test]
     async fn every_boundary_is_reported() {
         let mut under = proxy(None);
-        under.spans.reached(REPORTER, boundary("publish", 1)).await;
+        under.spans.reached(REPORTER, passed("publish", 1)).await;
 
         let Some((service, event)) = under.reported.recv().await else {
             panic!("nothing was reported");
@@ -311,7 +319,7 @@ mod tests {
         let under = proxy(Some("publish:1:start"));
         let answered = tokio::time::timeout(
             Duration::from_millis(200),
-            under.spans.reached(REPORTER, boundary("handle", 1)),
+            under.spans.reached(REPORTER, passed("handle", 1)),
         )
         .await;
         assert!(answered.is_ok(), "a moment nothing named should not wait");
@@ -324,7 +332,7 @@ mod tests {
         let under = proxy(Some("publish:1:start"));
         let answered = tokio::time::timeout(
             Duration::from_millis(200),
-            under.spans.reached(OTHER, boundary("publish", 1)),
+            under.spans.reached(OTHER, passed("publish", 1)),
         )
         .await;
         assert!(answered.is_ok(), "another service's moment should not wait");
@@ -342,7 +350,7 @@ mod tests {
 
         let held = tokio::spawn({
             let spans = Arc::clone(&under.spans);
-            async move { spans.reached(REPORTER, boundary("publish", 1)).await }
+            async move { spans.reached(REPORTER, passed("publish", 1)).await }
         });
 
         // Reaching it stops the fleet, and the service is still waiting.

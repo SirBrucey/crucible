@@ -36,6 +36,7 @@ async fn run() -> Result<()> {
 
     let worker = Worker::new(
         stream,
+        args.run_id,
         args.worker_id,
         env!("CARGO_PKG_VERSION").to_string(),
     )

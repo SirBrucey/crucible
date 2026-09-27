@@ -57,6 +57,11 @@ const SPAN_PORT: u16 = 4145;
 /// Added to a freeze query's timeout, so the proxy's own wait runs out first
 /// and answers, rather than this side giving up on a reply already on its way.
 const FREEZE_REPLY_MARGIN: Duration = Duration::from_secs(2);
+/// How long to keep offering a network removal the daemon is still holding
+/// endpoints for. See [`remove_network_once_detached`].
+const NETWORK_REMOVAL_TIMEOUT: Duration = Duration::from_secs(10);
+/// How often to offer it again while waiting.
+const NETWORK_REMOVAL_POLL: Duration = Duration::from_millis(200);
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -202,10 +207,17 @@ fn proxy_fault_args(fault: &Fault) -> Vec<String> {
                 ]
             }
             // The moment crosses no pair: the service reports reaching it and
-            // is held there while the fault is placed.
-            Reaches::Inside { service } => {
-                vec!["--inside".to_owned(), format!("{service}={}", anchor.mark)]
-            }
+            // is held there while the fault is placed. A cut breaks the edge
+            // the fault carries; a kill is done to a container.
+            Reaches::Inside { service } => match by {
+                By::Cut(edge) => vec![
+                    "--inside".to_owned(),
+                    format!("{service}={}={}", anchor.mark, edge_arg(edge)),
+                    "--fault".to_owned(),
+                    by.primitive().to_string(),
+                ],
+                _ => vec!["--inside".to_owned(), format!("{service}={}", anchor.mark)],
+            },
         },
         (None, By::Cut(edge)) => vec!["--degrade".to_owned(), edge_arg(edge)],
         // A kill is done to the container, and changing what crosses needs a
@@ -238,11 +250,19 @@ impl Docker {
     /// Connect to the local Docker daemon and prepare a per-worker deployment
     /// handle (nothing is created until [`Docker::setup`]).
     ///
+    /// `run_id` names the runner invocation this replica belongs to, so runs
+    /// sharing a host do not name the same containers and network.
+    ///
     /// # Errors
     /// Errors if connecting to the Docker daemon socket fails.
-    pub fn new(worker_id: u32, services: Vec<ServiceConfig>, fault: Option<Fault>) -> Result<Self> {
+    pub fn new(
+        run_id: u32,
+        worker_id: u32,
+        services: Vec<ServiceConfig>,
+        fault: Option<Fault>,
+    ) -> Result<Self> {
         let client = DockerClient::connect_with_socket_defaults()?;
-        let network = format!("crucible-{worker_id}");
+        let network = format!("crucible-{run_id}-{worker_id}");
         Ok(Self {
             // Both act on the daemon, and the handle is shared rather than a
             // second connection.
@@ -647,7 +667,7 @@ impl Docker {
             }
         }
         self.endpoints = Endpoints::default();
-        match self.client.remove_network(&self.network).await {
+        match remove_network_once_detached(&self.client, &self.network).await {
             Ok(()) => {}
             Err(e) if is_not_found(&e) => {}
             Err(e) => failures.set_network(e.to_string()),
@@ -704,6 +724,43 @@ fn is_not_found(e: &bollard::errors::Error) -> bool {
             ..
         }
     )
+}
+
+/// Whether the daemon refused this because the network is still in use.
+fn is_in_use(e: &bollard::errors::Error) -> bool {
+    matches!(
+        e,
+        bollard::errors::Error::DockerResponseServerError {
+            status_code: 403,
+            ..
+        }
+    )
+}
+
+/// Remove a replica's network, waiting for the daemon to finish detaching the
+/// endpoints of the containers just removed.
+///
+/// Removing a container returns once the daemon has taken it on, which is
+/// before it has detached that container's endpoint, so a network removal sent
+/// straight afterwards is refused while any of them remain. The daemon stops
+/// tracking an endpoint whose container is gone but leaves it on the network,
+/// so a network abandoned at that point can never be removed and holds its
+/// subnet until the daemon restarts.
+async fn remove_network_once_detached(
+    client: &DockerClient,
+    network: &str,
+) -> std::result::Result<(), bollard::errors::Error> {
+    let give_up_at = tokio::time::Instant::now() + NETWORK_REMOVAL_TIMEOUT;
+    loop {
+        let refused = match client.remove_network(network).await {
+            Err(e) if is_in_use(&e) => e,
+            outcome => return outcome,
+        };
+        if tokio::time::Instant::now() >= give_up_at {
+            return Err(refused);
+        }
+        sleep(NETWORK_REMOVAL_POLL).await;
+    }
 }
 
 async fn ensure_image(docker: &DockerClient, image: &str) -> Result<()> {
@@ -1093,6 +1150,26 @@ mod tests {
         assert_eq!(failures.to_string(), "container `api`: boom");
     }
 
+    fn server_error(status_code: u16) -> bollard::errors::Error {
+        bollard::errors::Error::DockerResponseServerError {
+            status_code,
+            message: "network crucible-1-2 has active endpoints".to_owned(),
+        }
+    }
+
+    #[test]
+    fn a_network_still_in_use_is_told_from_one_that_is_gone() {
+        assert!(is_in_use(&server_error(403)));
+        assert!(!is_in_use(&server_error(404)));
+        assert!(!is_in_use(&server_error(500)));
+    }
+
+    #[test]
+    fn a_network_that_is_gone_is_not_a_teardown_failure() {
+        assert!(is_not_found(&server_error(404)));
+        assert!(!is_not_found(&server_error(403)));
+    }
+
     // Distinct ports: the single proxy container binds one listener per service
     // port, so two services must not share one (see `Error::PortCollision`).
     fn lifecycle_test_fleet() -> Vec<ServiceConfig> {
@@ -1121,7 +1198,7 @@ mod tests {
         // Driven through the trait, which is how the framework reaches a
         // deployment, so a delegation wired to the wrong method fails here.
         let mut deployment: Box<dyn DeploymentRuntime> =
-            Box::new(Docker::new(worker_id, fleet.clone(), None).expect("connect to docker"));
+            Box::new(Docker::new(0, worker_id, fleet.clone(), None).expect("connect to docker"));
 
         let setup_outcome = deployment.setup().await;
         for service in &fleet {
@@ -1183,7 +1260,7 @@ mod tests {
             .expect("plant orphan");
 
         let mut docker =
-            Docker::new(worker_id, orphan_test_fleet(), None).expect("connect to docker");
+            Docker::new(0, worker_id, orphan_test_fleet(), None).expect("connect to docker");
         let setup_outcome = docker.create_replica().await;
         let teardown_outcome = docker.destroy_replica().await;
 

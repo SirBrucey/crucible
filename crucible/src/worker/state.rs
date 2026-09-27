@@ -142,6 +142,8 @@ impl Drop for Heartbeat {
 
 pub struct Worker<S> {
     id: u32,
+    /// The runner invocation this worker belongs to.
+    run_id: u32,
     conn: Conn,
     state: S,
 }
@@ -151,6 +153,7 @@ impl<S> Worker<S> {
     fn transition<T>(self, state: T) -> Worker<T> {
         Worker {
             id: self.id,
+            run_id: self.run_id,
             conn: self.conn,
             state,
         }
@@ -195,20 +198,26 @@ pub enum IdleNext {
 /// timeout, a crash) does not leak its containers.
 async fn bring_up(
     registry: &Registry,
+    run_id: u32,
     worker_id: u32,
     schedule: &Schedule,
 ) -> Result<Orchestrator<Ready>> {
-    let deployment =
-        registry.deployment_for(&schedule.fleet, worker_id, schedule.fault().cloned())?;
+    let deployment = registry.deployment_for(
+        &schedule.fleet,
+        run_id,
+        worker_id,
+        schedule.fault().cloned(),
+    )?;
     let actions = registry.actions_for(&schedule.fleet, &schedule.steps)?;
     let orchestrator = Orchestrator::new(deployment, actions).setup().await?;
     Ok(orchestrator)
 }
 
 impl Worker<Handshaking> {
-    pub fn new(stream: UnixStream, id: u32, version: String) -> Self {
+    pub fn new(stream: UnixStream, run_id: u32, id: u32, version: String) -> Self {
         Self {
             id,
+            run_id,
             conn: Conn::new(stream),
             state: Handshaking { version },
         }
@@ -301,7 +310,7 @@ impl Worker<Learning> {
         let heartbeat = self.conn.start_heartbeat();
         let (doing, _reporting) = self.conn.start_reporting();
         doing.at(Phase::Setup, None);
-        let orchestrator = bring_up(&registry, self.id, &self.state.schedule).await?;
+        let orchestrator = bring_up(&registry, self.run_id, self.id, &self.state.schedule).await?;
         let schedule = &self.state.schedule;
         // The checks are read at every step, so the fault-free run says what
         // state each step left behind rather than only where it ended.
@@ -347,7 +356,7 @@ impl Worker<Referencing> {
         let heartbeat = self.conn.start_heartbeat();
         let (doing, _reporting) = self.conn.start_reporting();
         doing.at(Phase::Setup, None);
-        let orchestrator = bring_up(&registry, self.id, schedule).await?;
+        let orchestrator = bring_up(&registry, self.run_id, self.id, schedule).await?;
         let queries = match registry
             .queries_for(&schedule.fleet, &schedule.checks)
             .await
@@ -385,7 +394,7 @@ impl Worker<Executing> {
         let heartbeat = self.conn.start_heartbeat();
         let (doing, _reporting) = self.conn.start_reporting();
         doing.at(Phase::Setup, None);
-        let orchestrator = bring_up(&registry, self.id, schedule).await?;
+        let orchestrator = bring_up(&registry, self.run_id, self.id, schedule).await?;
 
         // A check reads through the proxy's stable host port: it survives the
         // target being killed and restarted (the alias re-resolves to the new

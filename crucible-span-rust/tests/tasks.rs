@@ -6,7 +6,7 @@ use axum::{
     Json, Router,
     routing::{get, post},
 };
-use crucible_protocol::{Boundary, Released, Watching};
+use crucible_protocol::{Passed, Released, Watching};
 use crucible_span_rust::Boundaries;
 use tracing::Instrument;
 use tracing_subscriber::{Layer, layer::SubscriberExt};
@@ -19,8 +19,10 @@ async fn framework() -> (String, Arc<Mutex<Vec<String>>>) {
         .route("/watching", get(async || Json(Watching::Reporting)))
         .route(
             "/boundary",
-            post(async move |Json(boundary): Json<Boundary>| {
-                seen.lock().expect("nothing panicked").push(boundary.mark());
+            post(async move |Json(passed): Json<Passed>| {
+                seen.lock()
+                    .expect("nothing panicked")
+                    .push(passed.boundary.mark());
                 Json(Released { at_ns: 0 })
             }),
         );

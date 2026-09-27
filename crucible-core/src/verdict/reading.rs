@@ -106,17 +106,28 @@ impl Readings {
         Judged::Now(match differing(&settled, expected) {
             Ok(None) => Verdict::Pass,
             Ok(Some(at)) => {
-                let went = Went::of(
+                let mut went = Went::of(
                     &points(&self.trajectory, &settled),
                     &points(&self.fault_free.trail, &self.fault_free.settled),
                     &self.outcomes.iter().map(|o| o.ack).collect::<Vec<_>>(),
                     matches!(fault.at, At::Throughout),
                 );
-                // The reading that says work was lost is the one to quote, and
-                // it need not be the first the two runs disagree on. A fleet
-                // can keep what it refused and lose what it accepted at once.
+                // A run can settle to one side of every state admitted without
+                // any one step reading short or doubled. The work it took
+                // reaches its checkpoints and is then lost or repeated in the
+                // tail.
+                if fault.broke(went).is_none() {
+                    if short_count(&settled, &admissible).is_some() {
+                        went = Went::Lost;
+                    } else if surplus_count(&settled, &admissible).is_some() {
+                        went = Went::Twice;
+                    }
+                }
+                // The reading that says what broke is the one to quote, and it
+                // need not be the first the two runs disagree on.
                 let at = match went {
                     Went::Lost => short_count(&settled, &admissible).unwrap_or(at),
+                    Went::Twice => surplus_count(&settled, &admissible).unwrap_or(at),
                     _ => at,
                 };
                 Verdict::Fail {
@@ -398,11 +409,17 @@ impl Delta {
     /// Steps taken while the observer was out of service are measured together,
     /// so the fleet can land some of that work and lose the rest. Moving none of
     /// what it owed and moving some of it are both work that did not land.
+    ///
+    /// A reading that is not a number has no distance to fall short by, and no
+    /// order to read one value as less than another. Falling short there is
+    /// holding still where `owed` moved.
     fn is_short_of(&self, owed: &Delta) -> bool {
-        let (Some(ours), Some(owed)) = (self.by, owed.by) else {
-            return false;
-        };
-        owed != 0 && ours.signum() != -owed.signum() && ours.abs() < owed.abs()
+        match (self.by, owed.by) {
+            (Some(ours), Some(owed)) => {
+                owed != 0 && ours.signum() != -owed.signum() && ours.abs() < owed.abs()
+            }
+            _ => self.is_nothing() && !owed.is_nothing(),
+        }
     }
 
     /// Whether two runs' steps did the same thing.
@@ -795,10 +812,12 @@ impl Placed<'_> {
     }
 }
 
-/// The first count that reads lower than every state the run admits.
+/// The first count that reads to one side of every state the run admits.
 ///
-/// Not always the first reading the two runs disagree on.
-fn short_count(settled: &Checkpoint, admissible: &[Admissible<'_>]) -> Option<usize> {
+/// A counting reading that climbs and settled below all of them lost work;
+/// above all of them it repeated some. This is not always the first reading the
+/// two runs disagree on.
+fn parted_at(settled: &Checkpoint, admissible: &[Admissible<'_>], way: Ordering) -> Option<usize> {
     if admissible.is_empty() {
         return None;
     }
@@ -818,10 +837,20 @@ fn short_count(settled: &Checkpoint, admissible: &[Admissible<'_>]) -> Option<us
                             .get(at)
                             .and_then(Option::as_ref)
                             .and_then(|owed| super::order(settled, owed))
-                            == Some(Ordering::Less)
+                            == Some(way)
                     })
                 })
     })
+}
+
+/// The first count that reads lower than every state the run admits.
+fn short_count(settled: &Checkpoint, admissible: &[Admissible<'_>]) -> Option<usize> {
+    parted_at(settled, admissible, Ordering::Less)
+}
+
+/// The first count that reads higher than every state the run admits.
+fn surplus_count(settled: &Checkpoint, admissible: &[Admissible<'_>]) -> Option<usize> {
+    parted_at(settled, admissible, Ordering::Greater)
 }
 
 /// Whether `projected` describes where the fleet settled, or `None` where a
@@ -1683,25 +1712,23 @@ mod tests {
         assert!(why.contains("kept work it turned away"), "{why}");
     }
 
-    /// Holding more than it owed is only kept work where driving the steps it
-    /// refused would have put it there. Anywhere else names nothing.
     #[test]
-    fn holding_more_than_any_run_would_leave_is_not_kept_work() {
+    fn holding_more_than_any_run_would_leave_shows_idempotency() {
         let (broke, why) = showed(judged(&[Ack::Acked, Ack::Acked], &[0, 1, 2], 7));
-        assert_eq!(broke, None);
-        assert!(
-            why.contains("would all have left it somewhere else"),
-            "{why}"
-        );
+        assert_eq!(broke, Some(Invariant::Idempotent));
+        assert!(why.contains("work was done twice"), "{why}");
     }
 
-    /// The verdict for a way that was asked and ruled out is worded
-    /// differently from one for a way that could not be asked.
+    /// A run that settled between the states it admits, rather than past them
+    /// all, has ruled out every attributable step.
     #[test]
     fn a_run_that_ruled_every_way_out_says_so() {
-        // Every step acknowledged, so the only state the run admits is the
-        // whole scenario, and every way of leaving it is a prefix away.
-        let (broke, why) = showed(judged(&[Ack::Acked, Ack::Acked], &[0, 1, 2], 7));
+        let (broke, why) = showed(judged_given(
+            &[Ack::Unknown, Ack::Unknown],
+            &[0, 5, 10],
+            7,
+            &[(&[2], 5)],
+        ));
         assert_eq!(broke, None);
         assert!(
             why.contains("would all have left it somewhere else"),
@@ -1781,6 +1808,56 @@ mod tests {
         ));
         assert_eq!(broke, Some(Invariant::Converges));
         assert!(why.contains("arrived after the rest"), "{why}");
+    }
+
+    /// A reading the fleet advances by overwriting, rather than by counting,
+    /// still says work was lost when it stalls.
+    #[test]
+    fn a_reading_stalled_at_an_earlier_value_shows_durability() {
+        let (broke, why) = showed(ordered_trail(
+            placed(Primitive::Kill, 0),
+            &[Ack::Acked, Ack::Acked, Ack::Acked],
+            &[(0, "none"), (1, "one"), (2, "two"), (3, "three")],
+            &[(0, "none"), (1, "one"), (2, "one"), (3, "one")],
+            (3, "one"),
+        ));
+        assert_eq!(broke, Some(Invariant::Durable));
+        assert!(why.contains("work was lost"), "{why}");
+    }
+
+    #[test]
+    fn a_reading_lost_in_the_tail_shows_durability() {
+        let mut obs = Readings::empty();
+        obs.fault = Some(fired_fault());
+        obs.outcomes = vec![outcome(Ack::Acked), outcome(Ack::Acked)];
+        obs.checks = vec![reading(8)];
+        // Both steps landed; only the settled reading fell back.
+        obs.trajectory = [7, 8, 9].into_iter().map(checkpoint).collect();
+        obs.fault_free = Baseline {
+            trail: [7, 8, 9].into_iter().map(checkpoint).collect(),
+            settled: checkpoint(9),
+        };
+        let (broke, why) = showed(obs.verdict());
+        assert_eq!(broke, Some(Invariant::Durable));
+        assert!(why.contains("work was lost"), "{why}");
+    }
+
+    #[test]
+    fn a_reading_gained_in_the_tail_shows_idempotency() {
+        let mut obs = Readings::empty();
+        obs.fault = Some(fired_fault());
+        obs.outcomes = vec![outcome(Ack::Acked), outcome(Ack::Acked)];
+        obs.checks = vec![reading(10)];
+        // Both steps landed; the settled reading then rose as the recovered
+        // consumer reprocessed one.
+        obs.trajectory = [7, 8, 9].into_iter().map(checkpoint).collect();
+        obs.fault_free = Baseline {
+            trail: [7, 8, 9].into_iter().map(checkpoint).collect(),
+            settled: checkpoint(9),
+        };
+        let (broke, why) = showed(obs.verdict());
+        assert_eq!(broke, Some(Invariant::Idempotent));
+        assert!(why.contains("work was done twice"), "{why}");
     }
 
     /// A count reaches the same total whichever order its steps arrive in.

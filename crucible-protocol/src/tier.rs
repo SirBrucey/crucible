@@ -50,6 +50,10 @@ impl std::fmt::Display for Side {
 pub struct Reached {
     pub service: String,
     pub boundary: Boundary,
+    /// When the service reached the boundary.
+    pub at_ns: u128,
+    /// Every edge the service was communicating on across its window.
+    pub edges: Vec<crate::Edge>,
 }
 
 impl Reached {
@@ -76,6 +80,16 @@ impl Boundary {
     pub fn mark(&self) -> String {
         format!("{}:{}:{}", self.span, self.nth, self.side)
     }
+}
+
+/// A boundary a service reached.
+///
+/// The time is the host wall clock, which the proxy also stamps when it forwards traffic.
+/// The service and proxy run on the same host, so the two line up.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct Passed {
+    pub boundary: Boundary,
+    pub at_ns: u128,
 }
 
 /// What the framework says back to a service it was holding.
