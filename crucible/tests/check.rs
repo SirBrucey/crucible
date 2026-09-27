@@ -19,6 +19,8 @@ fn check(path: &str) -> Output {
 #[case("orders/3_inbox/orders.cru")]
 #[case("orders/4_reconnect/orders.cru")]
 #[case("orders/5_ack_on_success/orders.cru")]
+#[case("orders/6_confirm/orders.cru")]
+#[case("orders/7_sequence/orders.cru")]
 #[case("orders/local_first/orders.cru")]
 fn an_example_scenario_checks_cleanly(#[case] scenario: &str) {
     let out = check(&format!(
