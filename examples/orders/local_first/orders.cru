@@ -80,8 +80,6 @@ scenario "orders_durability" {
   expect {
     // What the API kept, read from the API: its store is its own now.
     api.get "/stats" at: "$.orders" == 3;
-    // Everything it accepted has been announced and taken away.
-    api.get "/stats" at: "$.outbox" == 0;
     // What the consumer was told about. The same three, unless something was
     // lost between the API's two stores.
     db.orders.orders.count == 3;

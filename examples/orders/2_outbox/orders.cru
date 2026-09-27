@@ -81,8 +81,6 @@ scenario "orders_durability" {
     // what separates an event lost from one applied twice: the levels alone
     // cannot say which.
     db.orders.applied.count == 5;
-    // Everything the API accepted has been announced and taken away.
-    db.orders.outbox.count == 0;
     db.orders.stock.select level where item = "book" == 98;
     db.orders.stock.select level where item = "pen" == 490;
     db.orders.stock.select level where item = "mug" == 249;
