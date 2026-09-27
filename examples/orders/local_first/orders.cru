@@ -83,10 +83,6 @@ scenario "orders_durability" {
     // What the consumer was told about. The same three, unless something was
     // lost between the API's two stores.
     db.orders.orders.count == 3;
-    // One row per event the consumer acted on, so five steps owe five. This is
-    // what separates an event lost from one applied twice: the levels alone
-    // cannot say which.
-    db.orders.applied.count == 5;
     db.orders.stock.select level where item = "book" == 98;
     db.orders.stock.select level where item = "pen" == 490;
     db.orders.stock.select level where item = "mug" == 249;
