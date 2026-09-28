@@ -50,6 +50,7 @@ const WORKER_BIN: &str = "crucible-worker";
 const LIBEXEC_DIR: &str = "/usr/lib/crucible";
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Room on top of what a run has to do.
 const SCHEDULE_MARGIN: Duration = Duration::from_secs(30);
 const LEARN_MARGIN: Duration = Duration::from_secs(30);
 /// Bound for one learn attempt. A healthy learn brings the fleet up (bounded by
@@ -605,7 +606,8 @@ struct Pool<'a> {
     /// How long the whole campaign may take work on for.
     campaign_budget: Option<Duration>,
     worker_id: u32,
-    schedule_budget: Duration,
+    /// How long each run may take.
+    allowance: Allowance,
     campaign_start: Instant,
     max_inflight: usize,
     exhausted: bool,
@@ -623,6 +625,31 @@ struct Pool<'a> {
     moved: Vec<(u32, Progress)>,
 }
 
+/// How long a run is allowed, based on what it has to do.
+#[derive(Clone, Copy, Debug)]
+struct Allowance {
+    /// One run of the scenario with nothing broken, as the learn run timed it.
+    cycle: Duration,
+    /// How long the scenario allows the fleet to come to rest.
+    settle: Duration,
+    replicas: u32,
+}
+
+impl Allowance {
+    /// How long this schedule may take before it is cut off.
+    fn allows(self, schedule: &Schedule) -> Duration {
+        // The cycle was timed on a quiet machine, and the replicas can end up
+        // queueing behind each other on the docker daemon.
+        let contended = self.cycle * self.replicas;
+        let settling = match schedule.fault() {
+            // Held throughout, so it heals and then catches up.
+            Some(fault) if fault.anchor().is_none() => self.settle * 2,
+            _ => self.settle,
+        };
+        contended + settling + SCHEDULE_MARGIN
+    }
+}
+
 /// What a pool needs to start dispatching.
 struct Dispatch<'a> {
     bus: &'a EventBus,
@@ -630,7 +657,7 @@ struct Dispatch<'a> {
     scenario: &'a plan::Scenario,
     /// The first id not spent on the fault-free run.
     worker_id: u32,
-    schedule_budget: Duration,
+    allowance: Allowance,
     campaign_start: Instant,
     max_inflight: usize,
     interrupt: CancellationToken,
@@ -644,7 +671,7 @@ impl<'a> Pool<'a> {
             fleet,
             scenario,
             worker_id,
-            schedule_budget,
+            allowance,
             campaign_start,
             max_inflight,
             interrupt,
@@ -660,7 +687,7 @@ impl<'a> Pool<'a> {
             recovery: Recovery::default(),
             campaign_budget: scenario.budget,
             worker_id,
-            schedule_budget,
+            allowance,
             campaign_start,
             max_inflight,
             exhausted: false,
@@ -732,12 +759,13 @@ impl<'a> Pool<'a> {
         // cancels every child.
         let leave = self.interrupt.child_token();
         self.running.insert(schedule.id, leave.clone());
+        let allows = self.allowance.allows(&schedule);
         let task = self.inflight.spawn(run_one_schedule(
             self.bus.clone(),
             self.worker_id,
             schedule,
             attempt,
-            self.schedule_budget,
+            allows,
             leave,
         ));
         // A panicked task comes back without its schedule, so what it was for
@@ -1094,7 +1122,11 @@ async fn drive(
         fleet: &plan.fleet,
         scenario,
         worker_id,
-        schedule_budget: cost + SCHEDULE_MARGIN,
+        allowance: Allowance {
+            cycle: cycle_cost,
+            settle: scenario.consistent_within,
+            replicas: u32::try_from(concurrency).unwrap_or(1),
+        },
         campaign_start,
         max_inflight: concurrency,
         interrupt: interrupt.clone(),
@@ -1451,7 +1483,93 @@ async fn wait_worker(
 
 #[cfg(test)]
 mod tests {
+    use crucible_core::{
+        fault::{Anchor, By, Fault},
+        schedule::Purpose,
+        verdict::Baseline,
+    };
+
     use super::*;
+
+    /// A ten second cycle, five seconds to come to rest, three replicas.
+    fn allowance() -> Allowance {
+        Allowance {
+            cycle: Duration::from_secs(10),
+            settle: Duration::from_secs(5),
+            replicas: 3,
+        }
+    }
+
+    fn schedule(purpose: Purpose) -> Schedule {
+        Schedule {
+            id: 1,
+            fleet: plan::Fleet {
+                name: "orders".into(),
+                deployment: "docker".into(),
+                services: Vec::new(),
+            },
+            steps: Vec::new(),
+            checks: Vec::new(),
+            purpose,
+            fault_free: Baseline::default(),
+            consistent_within: Duration::from_secs(5),
+        }
+    }
+
+    fn broken_at_a_moment() -> Schedule {
+        let anchor = Anchor::inside("api".into(), "1".into(), "one read in".into());
+        schedule(Purpose::Break(Box::new(Fault::at(
+            anchor,
+            By::Kill("api".into()),
+        ))))
+    }
+
+    fn broken_throughout() -> Schedule {
+        schedule(Purpose::Break(Box::new(Fault::throughout(By::Kill(
+            "api".into(),
+        )))))
+    }
+
+    /// A fault held throughout heals and then catches up, so it gets the settle
+    /// time twice.
+    #[test]
+    fn a_fault_held_throughout_is_allowed_a_second_settling() {
+        let allowance = allowance();
+        assert_eq!(
+            allowance.allows(&broken_throughout()) - allowance.allows(&broken_at_a_moment()),
+            allowance.settle
+        );
+    }
+
+    /// The cycle was timed on a quiet machine, so a campaign running several
+    /// replicas has to allow for all of them.
+    #[test]
+    fn a_run_is_allowed_a_cycle_for_every_replica_running_at_once() {
+        let alone = Allowance {
+            replicas: 1,
+            ..allowance()
+        };
+        let crowded = Allowance {
+            replicas: 3,
+            ..allowance()
+        };
+        assert_eq!(
+            crowded.allows(&broken_at_a_moment()) - alone.allows(&broken_at_a_moment()),
+            alone.cycle * 2
+        );
+    }
+
+    /// Nothing is broken, so there is no heal to wait out.
+    #[test]
+    fn a_run_with_nothing_broken_is_allowed_what_a_placed_fault_is() {
+        let allowance = allowance();
+        let plain = allowance.allows(&schedule(Purpose::Learn));
+        assert_eq!(plain, allowance.allows(&broken_at_a_moment()));
+        assert_eq!(
+            plain,
+            allowance.allows(&schedule(Purpose::Reference { landed: vec![1] }))
+        );
+    }
 
     #[test]
     fn outcomes_tally_by_verdict_kind() {
