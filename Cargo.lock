@@ -847,6 +847,7 @@ version = "0.1.0"
 dependencies = [
  "amq-protocol",
  "crucible-kind-amqp",
+ "crucible-kind-mariadb",
  "crucible-protocol",
 ]
 
@@ -855,6 +856,14 @@ name = "crucible-kind-amqp"
 version = "0.1.0"
 dependencies = [
  "amq-protocol",
+ "crucible-protocol",
+ "rstest",
+]
+
+[[package]]
+name = "crucible-kind-mariadb"
+version = "0.1.0"
+dependencies = [
  "crucible-protocol",
  "rstest",
 ]
