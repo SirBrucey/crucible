@@ -71,6 +71,16 @@ impl Point<'_> {
             self.doing,
         )
     }
+
+    /// Whether this is on the edge the scenario drives the fleet over. That
+    /// edge is dialled from outside, so it has no client inside the fleet.
+    ///
+    /// Breaking the fleet here refuses the step, so the run settles where it
+    /// should have. It is the only place that asks whether the fleet kept work
+    /// it turned away.
+    fn driven(&self) -> bool {
+        matches!(self.at, Where::Crossing { edge, .. } if edge.client.is_none())
+    }
 }
 
 /// Where a fault can go on `profile`, in the order the points should be spent.
@@ -276,7 +286,10 @@ impl BurstScheduler {
         // Then by turn, so a way of breaking the fleet with few moments is
         // covered before one with many, and the bursts take their share rather
         // than all of it.
-        let mut points = in_turn(by_edge.into_iter(), Point::bucket);
+        let (driven, within): (Vec<Point<'_>>, Vec<Point<'_>>) =
+            by_edge.into_iter().partition(Point::driven);
+        let mut points = in_turn(within.into_iter(), Point::bucket);
+        points.extend(in_turn(driven.into_iter(), Point::bucket));
 
         // The services that report their own boundaries.
         let instrumented: BTreeSet<String> = learned
@@ -939,7 +952,12 @@ mod tests {
     #[test]
     fn a_busy_edge_does_not_spend_the_budget_before_a_named_moment() {
         let profiles = [
-            profile("db", vec![burst(1, 900), burst(2, 800)], vec![]),
+            from(
+                Some("api"),
+                "db",
+                vec![burst(1, 900), burst(2, 800)],
+                vec![],
+            ),
             named(vec!["publish:1"]),
         ];
         let mut scheduler = driven(&profiles, &[Primitive::Kill], None);
@@ -951,6 +969,32 @@ mod tests {
         spent.dedup();
         let named = spent.iter().position(|mark| mark == "publish:1");
         assert_eq!(named, Some(1), "{spent:?}");
+    }
+
+    #[test]
+    fn the_edge_the_scenario_drives_is_spent_last() {
+        let profiles = [
+            profile("api", vec![burst(1, 4)], vec![]),
+            from(Some("api"), "db", vec![burst(1, 4)], vec![]),
+        ];
+        let mut scheduler = driven(&profiles, &[Primitive::Kill], None);
+
+        let mut driven_over = Vec::new();
+        while let Some(schedule) = scheduler.next() {
+            let edge = fault(&schedule)
+                .reaches
+                .edge()
+                .expect("every fault here is anchored on an edge");
+            driven_over.push(edge.client.is_none());
+        }
+        let first = driven_over
+            .iter()
+            .position(|over| *over)
+            .expect("the scenario's edge is reached");
+        assert!(
+            driven_over[first..].iter().all(|over| *over),
+            "{driven_over:?}"
+        );
     }
 
     /// A moment says how it can be broken, and only that way is scheduled.
