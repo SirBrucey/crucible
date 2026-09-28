@@ -1,6 +1,12 @@
 //! Reading a connection as packets, and finding the commits among them.
 
-use std::borrow::Cow;
+use std::{
+    borrow::Cow,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use crucible_protocol::{Carried, Direction, Doing, Placement};
 
@@ -11,6 +17,10 @@ const HEADER: usize = 4;
 const COM_QUERY: u8 = 0x03;
 /// A client numbers each command from zero.
 const FIRST: u8 = 0;
+/// `CLIENT_SSL`, set in the capabilities the client answers the greeting with.
+const CLIENT_SSL: u32 = 0x0000_0800;
+/// How many bytes of capabilities the answer starts with.
+const CAPABILITIES: usize = 4;
 
 /// Which side of a statement a fault goes on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -49,6 +59,17 @@ impl Packet {
         }
     }
 
+    /// Whether the client is asking to encrypt the rest of the connection.
+    ///
+    /// The next thing it sends is a TLS handshake, so this is the last packet
+    /// anything can read.
+    fn upgrades(&self) -> bool {
+        self.bytes
+            .get(self.payload..self.payload + CAPABILITIES)
+            .and_then(|flags| <[u8; CAPABILITIES]>::try_from(flags).ok())
+            .is_some_and(|flags| u32::from_le_bytes(flags) & CLIENT_SSL != 0)
+    }
+
     /// Whether this ends a transaction.
     fn commits(&self) -> bool {
         self.statement().is_some_and(|statement| {
@@ -68,8 +89,12 @@ impl Packet {
 pub struct Reader {
     /// Bytes of a packet that has not finished arriving.
     pending: Vec<u8>,
+    /// How many packets this has taken off the wire.
+    read: usize,
     /// How many commits this has carried.
     commits: u32,
+    /// Whether the two ends encrypted this connection.
+    encrypted: Arc<AtomicBool>,
     /// The moment a schedule named.
     watching: Option<String>,
     /// Which way this reader's traffic runs.
@@ -78,18 +103,26 @@ pub struct Reader {
 
 impl Reader {
     #[must_use]
-    pub fn new(direction: Direction, watching: Option<String>) -> Self {
+    pub fn new(direction: Direction, encrypted: Arc<AtomicBool>, watching: Option<String>) -> Self {
         Self {
             pending: Vec::new(),
+            read: 0,
             commits: 0,
+            encrypted,
             watching,
             direction,
         }
     }
 
-    /// Every packet these bytes complete. A tail that is still arriving is
-    /// kept for the read that finishes it.
-    fn read(&mut self, bytes: &[u8]) -> Vec<Packet> {
+    /// Every packet these bytes complete, and any tail that cannot be read.
+    ///
+    /// A tail that is still arriving is kept for the read that finishes it. An
+    /// encrypted one is handed straight back.
+    fn read(&mut self, bytes: &[u8]) -> (Vec<Packet>, Vec<u8>) {
+        if self.encrypted.load(Ordering::Relaxed) {
+            self.pending.extend_from_slice(bytes);
+            return (Vec::new(), std::mem::take(&mut self.pending));
+        }
         self.pending.extend_from_slice(bytes);
         let mut packets = Vec::new();
         while let Some(header) = self.pending.get(..HEADER) {
@@ -99,13 +132,24 @@ impl Reader {
                 break;
             }
             let bytes: Vec<u8> = self.pending.drain(..whole).collect();
-            packets.push(Packet {
+            let packet = Packet {
                 seq: bytes[3],
                 payload: HEADER,
                 bytes,
-            });
+            };
+            // The client's first packet is the only place it can ask for TLS,
+            // and whatever came with it is already encrypted.
+            let upgrading = self.read == 0
+                && self.direction == Direction::ClientToUpstream
+                && packet.upgrades();
+            self.read += 1;
+            packets.push(packet);
+            if upgrading {
+                self.encrypted.store(true, Ordering::Relaxed);
+                return (packets, std::mem::take(&mut self.pending));
+            }
         }
-        packets
+        (packets, Vec::new())
     }
 
     /// Where a fault could go either side of a commit.
@@ -142,7 +186,7 @@ impl Reader {
 
 impl crucible_protocol::Kind for Reader {
     fn carry<'a>(&mut self, bytes: &'a [u8], placing: bool) -> Carried<'a> {
-        let packets = self.read(bytes);
+        let (packets, opaque) = self.read(bytes);
         let mut freeze_after = None;
         let mut found = Vec::new();
         for (at, packet) in packets.iter().enumerate() {
@@ -160,11 +204,15 @@ impl crucible_protocol::Kind for Reader {
                 found.push(placement);
             }
         }
+        let mut forward: Vec<Cow<'a, [u8]>> = packets
+            .into_iter()
+            .map(|packet| Cow::Owned(packet.bytes))
+            .collect();
+        if !opaque.is_empty() {
+            forward.push(Cow::Owned(opaque));
+        }
         Carried {
-            forward: packets
-                .into_iter()
-                .map(|packet| Cow::Owned(packet.bytes))
-                .collect(),
+            forward,
             freeze_after,
             found,
             did: None,
@@ -195,7 +243,37 @@ mod tests {
     }
 
     fn reading() -> Reader {
-        Reader::new(Direction::ClientToUpstream, None)
+        Reader::new(
+            Direction::ClientToUpstream,
+            Arc::new(AtomicBool::new(false)),
+            None,
+        )
+    }
+
+    /// A pair of readers that share whether the connection was encrypted.
+    fn pair(watching: Option<&str>) -> (Reader, Reader) {
+        let encrypted = Arc::new(AtomicBool::new(false));
+        let watch = |direction| {
+            Reader::new(
+                direction,
+                Arc::clone(&encrypted),
+                watching
+                    .filter(|_| direction == Direction::ClientToUpstream)
+                    .map(ToOwned::to_owned),
+            )
+        };
+        (
+            watch(Direction::ClientToUpstream),
+            watch(Direction::UpstreamToClient),
+        )
+    }
+
+    /// The client answering the server's greeting with the capabilities it
+    /// wants.
+    fn answers_greeting(capabilities: u32) -> Vec<u8> {
+        let mut payload = capabilities.to_le_bytes().to_vec();
+        payload.extend_from_slice(&[0; 28]);
+        packet(FIRST + 1, &payload)
     }
 
     fn marks(carried: &Carried<'_>) -> Vec<String> {
@@ -282,30 +360,48 @@ mod tests {
 
     #[test]
     fn holding_before_a_commit_keeps_it_off_the_wire() {
-        let mut reader = Reader::new(
-            Direction::ClientToUpstream,
-            Some("commit:1:before".to_owned()),
-        );
+        let (mut reader, _) = pair(Some("commit:1:before"));
         let bytes = [query("BEGIN"), query("COMMIT")].concat();
         assert_eq!(reader.carry(&bytes, true).freeze_after, Some(1));
     }
 
     #[test]
     fn holding_after_a_commit_lets_it_go_first() {
-        let mut reader = Reader::new(
-            Direction::ClientToUpstream,
-            Some("commit:1:after".to_owned()),
-        );
+        let (mut reader, _) = pair(Some("commit:1:after"));
         let bytes = [query("BEGIN"), query("COMMIT")].concat();
         assert_eq!(reader.carry(&bytes, true).freeze_after, Some(2));
     }
 
     #[test]
+    fn a_connection_the_client_encrypts_stops_being_read() {
+        let (mut client, _) = pair(None);
+        client.carry(&answers_greeting(CLIENT_SSL), false);
+        // A TLS record, whose first three bytes read as a length far longer
+        // than anything that follows.
+        let hello = [0x16, 0x03, 0x01, 0x00, 0x05, 1, 2, 3, 4, 5];
+        let carried = client.carry(&hello, false);
+        assert_eq!(carried.forward.concat(), hello);
+        assert!(carried.found.is_empty());
+    }
+
+    #[test]
+    fn what_comes_back_over_an_encrypted_connection_is_carried_whole() {
+        let (mut client, mut server) = pair(None);
+        client.carry(&answers_greeting(CLIENT_SSL), false);
+        let hello = [0x16, 0x03, 0x03, 0xff, 0xff, 9];
+        assert_eq!(server.carry(&hello, false).forward.concat(), hello);
+    }
+
+    #[test]
+    fn a_connection_the_client_leaves_alone_is_read_normally() {
+        let (mut client, _) = pair(None);
+        client.carry(&answers_greeting(0), false);
+        assert_eq!(client.carry(&query("COMMIT"), false).found.len(), 2);
+    }
+
+    #[test]
     fn a_moment_is_offered_before_it_is_placed() {
-        let mut reader = Reader::new(
-            Direction::ClientToUpstream,
-            Some("commit:1:before".to_owned()),
-        );
+        let (mut reader, _) = pair(Some("commit:1:before"));
         let commit = query("COMMIT");
         let carried = reader.carry(&commit, false);
         assert_eq!(carried.freeze_after, None);
