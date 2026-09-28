@@ -197,16 +197,19 @@ fn in_turn<T, K: PartialEq>(items: impl Iterator<Item = T>, group: impl Fn(&T) -
 /// Where in `burst` a fault can go, from the middle outwards.
 ///
 /// A `start` of zero is not placeable, since freezing there kills the service
-/// before anything has crossed the edge.
+/// before anything has crossed the edge. On a burst of one packet the middle is
+/// also the end, so offer fewer moments.
 fn points_in(burst: Burst, direction: Direction) -> Vec<u32> {
     let outer = match direction {
         Direction::UpstreamToClient => [burst.end, burst.start],
         Direction::ClientToUpstream => [burst.start, burst.end],
     };
-    let mut points = vec![burst.mid];
-    points.extend(outer);
-    points.retain(|&k| k > 0);
-    points.dedup();
+    let mut points = Vec::with_capacity(1 + outer.len());
+    for k in std::iter::once(burst.mid).chain(outer) {
+        if k > 0 && !points.contains(&k) {
+            points.push(k);
+        }
+    }
     points
 }
 
@@ -969,6 +972,18 @@ mod tests {
         let mut s = s;
         let only = s.next().expect("the moment is placeable");
         assert_eq!(only.fault().map(Fault::primitive), Some(Primitive::Drop));
+    }
+
+    #[test]
+    fn a_burst_offers_each_of_its_moments_once() {
+        let one = burst(1, 1);
+        for direction in [Direction::ClientToUpstream, Direction::UpstreamToClient] {
+            let mut offered = points_in(one, direction);
+            let all = offered.len();
+            offered.sort_unstable();
+            offered.dedup();
+            assert_eq!(offered.len(), all, "{direction:?} offered {one:?}");
+        }
     }
 
     /// A burst is a count of packets. Nothing read the edge, so nothing there
