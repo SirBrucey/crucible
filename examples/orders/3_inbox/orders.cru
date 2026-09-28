@@ -12,7 +12,9 @@ fleet "orders" {
     image: "crucible-example/orders-inbox-api:0.1",
     ports: { http: 8080 },
     env: [
-      "DATABASE_URL=mysql://root@db:3306/orders",
+      // Plain, so the proxy can read the connection and name the commits
+      // on it. Nothing here leaves the fleet's own network.
+      "DATABASE_URL=mysql://root@db:3306/orders?ssl-mode=disabled",
       "BROKER_URL=amqp://broker:5672",
       "RUST_LOG=info"
     ],
@@ -51,7 +53,9 @@ fleet "orders" {
     image: "crucible-example/orders-inbox-inventory:0.1",
     ports: { http: 8081 },
     env: [
-      "DATABASE_URL=mysql://root@db:3306/orders",
+      // Plain, so the proxy can read the connection and name the commits
+      // on it. Nothing here leaves the fleet's own network.
+      "DATABASE_URL=mysql://root@db:3306/orders?ssl-mode=disabled",
       "BROKER_URL=amqp://broker:5672",
       "RUST_LOG=info"
     ],
