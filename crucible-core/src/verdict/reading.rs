@@ -18,6 +18,12 @@ use crate::{fault::Primitive, ipc::Verdict, plan::Value};
 /// Each one doubles the states the fleet could be in.
 const IN_DOUBT_LIMIT: usize = 8;
 
+/// How many steps a stretch may cover before which of them landed stops being
+/// worked out.
+///
+/// Each one doubles the combinations to try.
+const STRETCH_LIMIT: usize = 8;
+
 impl Readings {
     /// What this run's readings say the fleet did.
     ///
@@ -277,6 +283,18 @@ fn moved(was: Option<&Value>, now: Option<&Value>) -> Option<Delta> {
     })
 }
 
+/// What each step across a stretch of a run did to one reading.
+///
+/// Nothing, where any point of the stretch went unread or holds something with
+/// no distance to measure.
+fn apiece(points: &[Option<Value>]) -> Vec<i64> {
+    points
+        .windows(2)
+        .map(|pair| moved(pair[0].as_ref(), pair[1].as_ref())?.by)
+        .collect::<Option<Vec<i64>>>()
+        .unwrap_or_default()
+}
+
 /// What a step did to a reading.
 /// Whether a reading took the same steps in a different order.
 ///
@@ -314,6 +332,9 @@ struct Span {
     drove: Delta,
     /// What the fault-free run did across the same stretch.
     learned: Delta,
+    /// What each step of the stretch did to the reading in the fault-free run,
+    /// where every point between the ends could be read.
+    apiece: Vec<i64>,
     /// Whether the fleet took on any of the work the stretch covers.
     acked: bool,
 }
@@ -347,6 +368,7 @@ impl Span {
                 Some(Span {
                     drove: moved(drove.get(from)?.as_ref(), drove.get(to)?.as_ref())?,
                     learned: moved(learned.get(from)?.as_ref(), learned.get(to)?.as_ref())?,
+                    apiece: apiece(learned.get(from..=to)?),
                     // A stretch past the last step is settling, which nobody
                     // acknowledged and the fleet owes regardless.
                     acked: covered.is_empty() || covered.contains(&Ack::Acked),
@@ -387,6 +409,51 @@ struct Delta {
     by: Option<i64>,
     /// What the reading came to hold.
     to: Value,
+}
+
+/// Whether a stretch moved a reading by exactly what some step of the
+/// fault-free run moved it.
+///
+/// A stretch that owed nothing and moved by an amount no step accounts for is a
+/// reading going somewhere of its own, which names nothing. One that moved by a
+/// step's own amount is that step taken again.
+fn repeats_a_step(span: &Span, spans: &[Span]) -> bool {
+    span.drove.by.is_some_and(|moved| {
+        moved != 0 && spans.iter().any(|other| other.learned.by == Some(moved))
+    })
+}
+
+/// Whether a stretch moved a reading by what some of the steps it covers moved
+/// it, leaving the rest of them undone.
+///
+/// A stretch whose middle went unread holds several steps at once, and the
+/// fleet can land some and lose the others. Where those steps move a reading
+/// both ways, landing the earlier ones leaves it further from where it was
+/// owed, so how far it moved does not say on its own that work is missing.
+///
+/// A fleet that took every step in another order can settle on the same
+/// reading. [`rearranged`] is asked first and reads an order off the trail, so
+/// this answers only for stretches whose steps went unread and whose order
+/// nothing recorded.
+fn did_some_of_the_steps(span: &Span) -> bool {
+    let Some(moved) = span.drove.by else {
+        return false;
+    };
+    if span.apiece.len() < 2 || span.apiece.len() > STRETCH_LIMIT {
+        return false;
+    }
+    // Every combination but none of them and all of them: one is holding still
+    // and the other is doing as it was told, and both are read elsewhere.
+    (1..(1u32 << span.apiece.len()) - 1).any(|some| {
+        let landed: i64 = span
+            .apiece
+            .iter()
+            .enumerate()
+            .filter(|(step, _)| some >> step & 1 == 1)
+            .map(|(_, by)| by)
+            .sum();
+        landed == moved
+    })
 }
 
 impl Delta {
@@ -529,6 +596,12 @@ impl Went {
     }
 
     /// What one reading's stretches say, when they are not a rearrangement.
+    ///
+    /// A stretch that owed this reading nothing and moved it anyway is only
+    /// readable where the movement is one a step of the fault-free run made, so
+    /// [`repeats_a_step`] is what tells a step taken again from a reading that
+    /// wandered. A stretch covering several steps at once is read the same way
+    /// by [`did_some_of_the_steps`], which is how far the fleet got along them.
     fn of_spans(spans: &[Span]) -> Went {
         let mut went = Went::Elsewhere;
         for span in spans {
@@ -544,13 +617,17 @@ impl Went {
             if span.matches() {
                 continue;
             }
-            went = went.or(if span.drove.is_twice(&span.learned) {
-                Went::Twice
-            } else if span.drove.is_short_of(&span.learned) {
-                Went::Lost
-            } else {
-                Went::Elsewhere
-            });
+            went = went.or(
+                if span.drove.is_twice(&span.learned)
+                    || (span.learned.is_nothing() && repeats_a_step(span, spans))
+                {
+                    Went::Twice
+                } else if span.drove.is_short_of(&span.learned) || did_some_of_the_steps(span) {
+                    Went::Lost
+                } else {
+                    Went::Elsewhere
+                },
+            );
         }
         went
     }
@@ -656,14 +733,10 @@ fn ran<'a>(
 }
 
 impl Trajectory {
-    /// Whether every step left this reading where it was or higher.
-    ///
-    /// Holding less of something the steps only ever added to is work missing.
-    /// Holding less of something they took from is work done. The order its
-    /// steps arrived in moves a reading they overwrite and leaves one they add
-    /// to alone, so what a step did tells the two apart.
-    fn climbs(&self, at: usize) -> bool {
-        let mut moved = false;
+    /// Which way every step moved this reading, or `None` where they moved it
+    /// both ways or not at all.
+    fn travels(&self, at: usize) -> Option<Ordering> {
+        let mut way = None;
         for (was, now) in self.iter().zip(self.iter().skip(1)) {
             let (Some(was), Some(now)) = (
                 was.get(at).and_then(Option::as_ref),
@@ -672,12 +745,12 @@ impl Trajectory {
                 continue;
             };
             match super::order(was, now) {
-                Some(Ordering::Less) => moved = true,
                 Some(Ordering::Equal) => {}
-                _ => return false,
+                Some(step) if way.is_none_or(|way| way == step) => way = Some(step),
+                _ => return None,
             }
         }
-        moved
+        way
     }
 }
 
@@ -812,34 +885,40 @@ impl Placed<'_> {
     }
 }
 
-/// The first count that reads to one side of every state the run admits.
+/// The first reading that sits to one side of every state the run admits.
 ///
-/// A counting reading that climbs and settled below all of them lost work;
-/// above all of them it repeated some. This is not always the first reading the
-/// two runs disagree on.
+/// `way` is `Less` for work missing and `Greater` for work repeated. Which
+/// value that is depends on where the steps took the reading. This is not
+/// always the first reading the two runs disagree on.
 fn parted_at(settled: &Checkpoint, admissible: &[Admissible<'_>], way: Ordering) -> Option<usize> {
     if admissible.is_empty() {
         return None;
     }
     let trail = admissible.first()?.trail;
     (0..settled.len()).position(|at| {
-        trail.climbs(at)
-            && settled
-                .get(at)
-                .and_then(Option::as_ref)
-                .filter(|settled| {
-                    matches!(settled, Value::Int(_) | Value::Duration(_) | Value::List(_))
+        let against = match trail.travels(at) {
+            // The steps added to this reading, so low is work missing.
+            Some(Ordering::Less) => way,
+            // They took from it, so low is work done.
+            Some(Ordering::Greater) => way.reverse(),
+            _ => return false,
+        };
+        settled
+            .get(at)
+            .and_then(Option::as_ref)
+            .filter(|settled| {
+                matches!(settled, Value::Int(_) | Value::Duration(_) | Value::List(_))
+            })
+            .is_some_and(|settled| {
+                admissible.iter().all(|admits| {
+                    admits
+                        .settled
+                        .get(at)
+                        .and_then(Option::as_ref)
+                        .and_then(|owed| super::order(settled, owed))
+                        == Some(against)
                 })
-                .is_some_and(|settled| {
-                    admissible.iter().all(|admits| {
-                        admits
-                            .settled
-                            .get(at)
-                            .and_then(Option::as_ref)
-                            .and_then(|owed| super::order(settled, owed))
-                            == Some(way)
-                    })
-                })
+            })
     })
 }
 
@@ -1858,6 +1937,97 @@ mod tests {
         let (broke, why) = showed(obs.verdict());
         assert_eq!(broke, Some(Invariant::Idempotent));
         assert!(why.contains("work was done twice"), "{why}");
+    }
+
+    /// A stock level the steps take from. Holding less than was owed is a
+    /// step's work done twice.
+    #[test]
+    fn a_reading_the_steps_take_from_shows_idempotency_when_it_settles_low() {
+        let mut obs = Readings::empty();
+        obs.fault = Some(fired_fault());
+        obs.outcomes = vec![outcome(Ack::Acked), outcome(Ack::Acked)];
+        obs.checks = vec![reading(485)];
+        obs.trajectory = [500, 495, 490].into_iter().map(checkpoint).collect();
+        obs.fault_free = Baseline {
+            trail: [500, 495, 490].into_iter().map(checkpoint).collect(),
+            settled: checkpoint(490),
+        };
+        let (broke, why) = showed(obs.verdict());
+        assert_eq!(broke, Some(Invariant::Idempotent));
+        assert!(why.contains("work was done twice"), "{why}");
+    }
+
+    /// The same reading held above what was owed. A step's worth was never
+    /// taken, so that work is missing.
+    #[test]
+    fn a_reading_the_steps_take_from_shows_durability_when_it_settles_high() {
+        let mut obs = Readings::empty();
+        obs.fault = Some(fired_fault());
+        obs.outcomes = vec![outcome(Ack::Acked), outcome(Ack::Acked)];
+        obs.checks = vec![reading(495)];
+        obs.trajectory = [500, 495, 490].into_iter().map(checkpoint).collect();
+        obs.fault_free = Baseline {
+            trail: [500, 495, 490].into_iter().map(checkpoint).collect(),
+            settled: checkpoint(490),
+        };
+        let (broke, why) = showed(obs.verdict());
+        assert_eq!(broke, Some(Invariant::Durable));
+        assert!(why.contains("work was lost"), "{why}");
+    }
+
+    /// A reading the fleet moved during a step that owed it nothing. The
+    /// fault-free run left it alone there, so the work is a step done again,
+    /// and it reads that way even though the reading ends up somewhere no
+    /// single lost or doubled step would leave it.
+    #[test]
+    fn a_reading_moved_where_nothing_was_owed_shows_idempotency() {
+        let mut obs = Readings::empty();
+        obs.fault = Some(fired_fault());
+        obs.outcomes = vec![outcome(Ack::Acked); 5];
+        obs.checks = vec![reading(94)];
+        // Step 2 owes this reading nothing and takes 4 from it anyway, which is
+        // step 1's work over again. Every later step moves as it should.
+        obs.trajectory = [100, 96, 92, 92, 90, 94]
+            .into_iter()
+            .map(checkpoint)
+            .collect();
+        obs.fault_free = Baseline {
+            trail: [100, 96, 96, 96, 94, 98]
+                .into_iter()
+                .map(checkpoint)
+                .collect(),
+            settled: checkpoint(98),
+        };
+        let (broke, why) = showed(obs.verdict());
+        assert_eq!(broke, Some(Invariant::Idempotent));
+        assert!(why.contains("work was done twice"), "{why}");
+    }
+
+    /// The observable goes unread part way through, so nothing is read again
+    /// until the run settles. The fleet came to rest holding what the step
+    /// before the fault left, having acknowledged the one after it, and the
+    /// stretch that covers them both moves the reading one way in this run and
+    /// the other way in the fault-free run.
+    #[test]
+    fn a_run_that_stopped_part_way_through_an_unread_stretch_shows_durability() {
+        let mut obs = Readings::empty();
+        obs.fault = Some(fired_fault());
+        obs.outcomes = vec![outcome(Ack::Acked); 5];
+        obs.checks = vec![reading(94)];
+        obs.trajectory = [Some(100), Some(96), Some(96), Some(96), None, None]
+            .into_iter()
+            .map(|at| vec![at.map(plan::Value::Int)])
+            .collect();
+        obs.fault_free = Baseline {
+            trail: [100, 96, 96, 96, 94, 98]
+                .into_iter()
+                .map(checkpoint)
+                .collect(),
+            settled: checkpoint(98),
+        };
+        let (broke, why) = showed(obs.verdict());
+        assert_eq!(broke, Some(Invariant::Durable));
+        assert!(why.contains("work was lost"), "{why}");
     }
 
     /// A count reaches the same total whichever order its steps arrive in.
