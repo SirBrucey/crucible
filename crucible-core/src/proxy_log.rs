@@ -6,15 +6,15 @@ use std::{
 };
 
 use crucible_protocol::{
-    Burst, ConnEvent, ConnEventKind, ConnId, Direction, Edge, EdgeProfile, Placement, Reached,
-    Session, WriteRecord,
+    Burst, ConnEvent, ConnEventKind, ConnId, Direction, Edge, EdgeProfile, Found, Placement,
+    Reached, Session, WriteRecord,
 };
 
 struct Pending {
     opened_ns: u128,
     peer: String,
     writes: Vec<WriteRecord>,
-    placements: Vec<Placement>,
+    placements: Vec<Found>,
 }
 
 /// Sessions observed across a Learn run.
@@ -85,7 +85,7 @@ impl Sessions {
             }),
             ConnEventKind::Placeable { placement } => {
                 if let Some(pending) = self.opened.get_mut(&(service.to_string(), id)) {
-                    pending.placements.push(placement);
+                    pending.placements.push(Found { ts_ns, placement });
                 }
             }
             // What the fault did, not part of a session's byte accounting;
@@ -172,11 +172,17 @@ pub fn edge_profiles_from_sessions<S: std::hash::BuildHasher>(
             client: client_of(session, addresses),
             upstream: session.service.clone(),
         };
-        if !session.placements.is_empty() {
-            placeable
-                .entry(edge.clone())
-                .or_default()
-                .extend(session.placements.iter().cloned());
+        // Only what the scenario caused.
+        // A moment that passed before the first step is one no fault can be
+        // placed at.
+        let drove: Vec<Placement> = session
+            .placements
+            .iter()
+            .filter(|found| (scenario_start_ns..steps_settled_ns).contains(&found.ts_ns))
+            .map(|found| found.placement.clone())
+            .collect();
+        if !drove.is_empty() {
+            placeable.entry(edge.clone()).or_default().extend(drove);
         }
         for write in &session.writes {
             let scenario = scenario_start_ns..steps_settled_ns;
@@ -515,6 +521,19 @@ mod tests {
 
     /// A run with no resting window and no settling boundary, so every write
     /// after `scenario_start` is the scenario's to burst.
+    /// Somewhere a plugin said a fault could go, found at `ts_ns`.
+    fn found(ts_ns: u128) -> Found {
+        Found {
+            ts_ns,
+            placement: Placement {
+                direction: Direction::ClientToUpstream,
+                mark: "ack:1:after".into(),
+                why: "an ack the broker has taken".into(),
+                doing: crucible_protocol::Doing::Holding,
+            },
+        }
+    }
+
     fn timing(scenario_start: u128) -> Timing {
         Timing {
             rest_start_ns: scenario_start,
@@ -770,18 +789,23 @@ mod tests {
     #[test]
     fn an_edge_a_plugin_read_carries_its_placements_and_no_bursts() {
         let mut session = dialled("broker", "10.0.0.1", 100);
-        session.placements = vec![Placement {
-            direction: Direction::ClientToUpstream,
-            mark: "ack:1:after".into(),
-            why: "an ack the broker has taken".into(),
-            doing: crucible_protocol::Doing::Holding,
-        }];
+        session.placements = vec![found(100)];
         let profiles = edge_profiles_from_sessions(&[session], timing(0), &HashMap::new(), &[]);
 
         let profile = profiles.first().expect("the edge was seen");
         assert_eq!(profile.placements.len(), 1);
         assert!(profile.client_to_upstream.is_empty());
         assert!(profile.upstream_to_client.is_empty());
+    }
+
+    #[test]
+    fn a_moment_the_scenario_did_not_cause_is_left_out() {
+        let mut session = dialled("broker", "10.0.0.1", 500);
+        session.placements = vec![found(100), found(500)];
+        let profiles = edge_profiles_from_sessions(&[session], timing(400), &HashMap::new(), &[]);
+
+        let profile = profiles.first().expect("the edge was seen");
+        assert_eq!(profile.placements.len(), 1);
     }
 
     #[test]
