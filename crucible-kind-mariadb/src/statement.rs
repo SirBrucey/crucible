@@ -21,6 +21,12 @@ const FIRST: u8 = 0;
 const CLIENT_SSL: u32 = 0x0000_0800;
 /// How many bytes of capabilities the answer starts with.
 const CAPABILITIES: usize = 4;
+/// DML statements that change data. Outside a transaction each is its own
+/// commit.
+const WRITES: [&[u8]; 4] = [b"insert", b"update", b"delete", b"replace"];
+/// DDL statements that change the schema. MySQL commits an open transaction
+/// before running one.
+const DEFINES: [&[u8]; 3] = [b"create", b"alter", b"drop"];
 
 /// Which side of a statement a fault goes on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -70,16 +76,47 @@ impl Packet {
             .is_some_and(|flags| u32::from_le_bytes(flags) & CLIENT_SSL != 0)
     }
 
-    /// Whether this ends a transaction.
-    fn commits(&self) -> bool {
-        self.statement().is_some_and(|statement| {
-            let statement = statement
-                .iter()
-                .rposition(|byte| !byte.is_ascii_whitespace() && *byte != b';')
-                .map_or(&[][..], |last| &statement[..=last]);
-            statement.trim_ascii_start().eq_ignore_ascii_case(b"commit")
+    /// What this packet asks the server to do, if it is a client asking.
+    fn asks(&self) -> Option<Asking> {
+        let statement = self.statement()?;
+        let trimmed = statement
+            .iter()
+            .rposition(|byte| !byte.is_ascii_whitespace() && *byte != b';')
+            .map_or(&[][..], |last| &statement[..=last])
+            .trim_ascii_start();
+        let opens = |word: &[u8]| {
+            trimmed.len() == word.len() && trimmed.eq_ignore_ascii_case(word)
+                || trimmed
+                    .get(..word.len())
+                    .is_some_and(|start| start.eq_ignore_ascii_case(word))
+                    && trimmed.get(word.len()).is_some_and(u8::is_ascii_whitespace)
+        };
+        Some(match () {
+            () if opens(b"commit") => Asking::Commit,
+            () if opens(b"begin") || opens(b"start") => Asking::Open,
+            () if opens(b"rollback") => Asking::Abandon,
+            () if WRITES.iter().any(|word| opens(word)) => Asking::Write,
+            () if DEFINES.iter().any(|word| opens(word)) => Asking::Define,
+            () => Asking::Other,
         })
     }
+}
+
+/// What a statement asks the server to do, as far as transactions go.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Asking {
+    /// `BEGIN` or `START TRANSACTION`.
+    Open,
+    /// `COMMIT`.
+    Commit,
+    /// `ROLLBACK`.
+    Abandon,
+    /// DML. Its own commit when no transaction is open.
+    Write,
+    /// DDL, which commits an open transaction first.
+    Define,
+    /// Anything else.
+    Other,
 }
 
 /// One direction of one connection, read as packets.
@@ -95,6 +132,8 @@ pub struct Reader {
     commits: u32,
     /// Whether the two ends encrypted this connection.
     encrypted: Arc<AtomicBool>,
+    /// Whether a transaction is open, so a write of its own is not a commit.
+    in_transaction: bool,
     /// The moment a schedule named.
     watching: Option<String>,
     /// Which way this reader's traffic runs.
@@ -109,6 +148,7 @@ impl Reader {
             read: 0,
             commits: 0,
             encrypted,
+            in_transaction: false,
             watching,
             direction,
         }
@@ -178,6 +218,38 @@ impl Reader {
         ]
     }
 
+    /// Whether this packet ends a transaction, following what the client has
+    /// asked for so far.
+    ///
+    /// A client that opened a transaction commits when it says so. One that did
+    /// not is in autocommit, where the server commits each write as it runs
+    /// it.
+    fn commits_at(&mut self, packet: &Packet) -> bool {
+        match packet.asks() {
+            Some(Asking::Open) => {
+                self.in_transaction = true;
+                false
+            }
+            Some(Asking::Commit) => {
+                self.in_transaction = false;
+                true
+            }
+            Some(Asking::Abandon) => {
+                self.in_transaction = false;
+                false
+            }
+            // DDL commits whatever was open before it runs, so it ends a
+            // transaction either way.
+            Some(Asking::Define) => {
+                let open = self.in_transaction;
+                self.in_transaction = false;
+                !open
+            }
+            Some(Asking::Write) => !self.in_transaction,
+            Some(Asking::Other) | None => false,
+        }
+    }
+
     /// Whether this is the moment the schedule named.
     fn watches(&self, placement: &Placement) -> bool {
         self.watching.as_deref() == Some(placement.mark.as_str())
@@ -190,7 +262,7 @@ impl crucible_protocol::Kind for Reader {
         let mut freeze_after = None;
         let mut found = Vec::new();
         for (at, packet) in packets.iter().enumerate() {
-            if !packet.commits() {
+            if !self.commits_at(packet) {
                 continue;
             }
             self.commits += 1;
@@ -294,9 +366,73 @@ mod tests {
     #[rstest::rstest]
     #[case("BEGIN")]
     #[case("ROLLBACK")]
-    #[case("INSERT INTO orders (id) VALUES (1)")]
     #[case("SELECT seq FROM orders WHERE id = 1 FOR UPDATE")]
     fn anything_else_offers_nothing(#[case] statement: &str) {
+        assert!(reading().carry(&query(statement), false).found.is_empty());
+    }
+
+    #[rstest::rstest]
+    #[case("INSERT INTO orders (id) VALUES (1)")]
+    #[case("UPDATE stock SET level = 1 WHERE item = 'book'")]
+    #[case("DELETE FROM outbox WHERE seq = 1")]
+    #[case("CREATE TABLE IF NOT EXISTS orders (id INT)")]
+    fn a_write_outside_a_transaction_is_its_own_commit(#[case] statement: &str) {
+        assert_eq!(reading().carry(&query(statement), false).found.len(), 2);
+    }
+
+    #[test]
+    fn a_write_inside_a_transaction_is_not_a_commit() {
+        let mut reader = reading();
+        reader.carry(&query("BEGIN"), false);
+        let inside = [
+            query("INSERT INTO orders (id) VALUES (1)"),
+            query("DELETE FROM outbox WHERE seq = 1"),
+        ]
+        .concat();
+        assert!(reader.carry(&inside, false).found.is_empty());
+        assert_eq!(reader.carry(&query("COMMIT"), false).found.len(), 2);
+    }
+
+    #[test]
+    fn a_rollback_ends_a_transaction_without_committing() {
+        let mut reader = reading();
+        reader.carry(&query("BEGIN"), false);
+        assert!(reader.carry(&query("ROLLBACK"), false).found.is_empty());
+        assert_eq!(
+            reader
+                .carry(&query("INSERT INTO orders (id) VALUES (1)"), false)
+                .found
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn a_schema_change_ends_an_open_transaction() {
+        let mut reader = reading();
+        reader.carry(&query("BEGIN"), false);
+        // The transaction it ends is the commit, so the statement is not a
+        // second one.
+        assert!(
+            reader
+                .carry(&query("CREATE TABLE t (id INT)"), false)
+                .found
+                .is_empty()
+        );
+        assert_eq!(
+            reader
+                .carry(&query("INSERT INTO orders (id) VALUES (1)"), false)
+                .found
+                .len(),
+            2
+        );
+    }
+
+    #[rstest::rstest]
+    #[case("committed_at = NOW()")]
+    #[case("SELECT * FROM commits")]
+    #[case("INSERTED")]
+    fn a_word_that_merely_starts_the_same_is_not_a_statement(#[case] statement: &str) {
         assert!(reading().carry(&query(statement), false).found.is_empty());
     }
 
