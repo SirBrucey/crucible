@@ -14,7 +14,14 @@ pub struct Session {
     pub closed_ns: Option<u128>,
     pub writes: Vec<WriteRecord>,
     /// Where the plugin reading this said a fault could go.
-    pub placements: Vec<crate::Placement>,
+    pub placements: Vec<Found>,
+}
+
+/// Somewhere a plugin said a fault could go, and when it said so.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct Found {
+    pub ts_ns: u128,
+    pub placement: crate::Placement,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
