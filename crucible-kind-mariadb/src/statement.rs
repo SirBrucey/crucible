@@ -2,8 +2,9 @@
 
 use std::{
     borrow::Cow,
+    collections::{HashMap, VecDeque},
     sync::{
-        Arc,
+        Arc, Mutex, MutexGuard, PoisonError,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -15,6 +16,16 @@ use crucible_protocol::{Carried, Direction, Doing, Placement};
 const HEADER: usize = 4;
 /// `COM_QUERY`. The rest of the payload is the statement being run.
 const COM_QUERY: u8 = 0x03;
+/// `COM_STMT_PREPARE`. The rest is the statement to prepare.
+const COM_STMT_PREPARE: u8 = 0x16;
+/// `COM_STMT_EXECUTE`. The rest opens with the statement id to execute.
+const COM_STMT_EXECUTE: u8 = 0x17;
+/// `COM_STMT_CLOSE`. The rest is the statement id to close.
+const COM_STMT_CLOSE: u8 = 0x19;
+/// The first byte of an OK packet.
+const OK: u8 = 0x00;
+/// How many bytes a statement id takes.
+const STATEMENT_ID: usize = 4;
 /// A client numbers each command from zero.
 const FIRST: u8 = 0;
 /// `CLIENT_SSL`, set in the capabilities the client answers the greeting with.
@@ -53,16 +64,25 @@ struct Packet {
 }
 
 impl Packet {
-    /// The statement this packet runs, if it is a client running one.
-    fn statement(&self) -> Option<&[u8]> {
+    /// The command this packet carries and what follows it, if it is a client
+    /// sending one.
+    fn command(&self) -> Option<(u8, &[u8])> {
         if self.seq != FIRST {
             return None;
         }
-        let payload = self.bytes.get(self.payload..)?;
-        match payload.split_first() {
-            Some((&COM_QUERY, statement)) => Some(statement),
-            _ => None,
+        let (command, rest) = self.bytes.get(self.payload..)?.split_first()?;
+        Some((*command, rest))
+    }
+
+    /// The statement id in a prepare response.
+    fn prepared_id(&self) -> Option<u32> {
+        if self.seq != FIRST + 1 {
+            return None;
         }
+        let (&OK, rest) = self.bytes.get(self.payload..)?.split_first()? else {
+            return None;
+        };
+        statement_id(rest)
     }
 
     /// Whether the client is asking to encrypt the rest of the connection.
@@ -75,10 +95,19 @@ impl Packet {
             .and_then(|flags| <[u8; CAPABILITIES]>::try_from(flags).ok())
             .is_some_and(|flags| u32::from_le_bytes(flags) & CLIENT_SSL != 0)
     }
+}
 
-    /// What this packet asks the server to do, if it is a client asking.
-    fn asks(&self) -> Option<Asking> {
-        let statement = self.statement()?;
+/// The statement id a command opens with.
+fn statement_id(rest: &[u8]) -> Option<u32> {
+    let named = rest.get(..STATEMENT_ID)?;
+    Some(u32::from_le_bytes(
+        <[u8; STATEMENT_ID]>::try_from(named).ok()?,
+    ))
+}
+
+/// What `statement` asks the server to do.
+fn asking(statement: &[u8]) -> Asking {
+    {
         let trimmed = statement
             .iter()
             .rposition(|byte| !byte.is_ascii_whitespace() && *byte != b';')
@@ -91,15 +120,37 @@ impl Packet {
                     .is_some_and(|start| start.eq_ignore_ascii_case(word))
                     && trimmed.get(word.len()).is_some_and(u8::is_ascii_whitespace)
         };
-        Some(match () {
+        match () {
             () if opens(b"commit") => Asking::Commit,
             () if opens(b"begin") || opens(b"start") => Asking::Open,
             () if opens(b"rollback") => Asking::Abandon,
             () if WRITES.iter().any(|word| opens(word)) => Asking::Write,
             () if DEFINES.iter().any(|word| opens(word)) => Asking::Define,
             () => Asking::Other,
-        })
+        }
     }
+}
+
+/// What both directions of one connection agree on.
+///
+/// A prepared statement carries its text once in `COM_STMT_PREPARE` and is
+/// executed by statement id after that. The id is in the server's prepare
+/// response, so neither direction can read it alone.
+#[derive(Debug, Default)]
+pub struct Shared {
+    /// Whether the two ends encrypted this connection.
+    encrypted: AtomicBool,
+    /// The prepared statements on this connection.
+    prepared: Mutex<Prepared>,
+}
+
+/// The prepared statements on one connection, and what each asks for.
+#[derive(Debug, Default)]
+struct Prepared {
+    /// Prepares with no response yet, oldest first.
+    awaiting: VecDeque<Asking>,
+    /// What the statement with each id asks for.
+    by_id: HashMap<u32, Asking>,
 }
 
 /// What a statement asks the server to do, as far as transactions go.
@@ -130,10 +181,9 @@ pub struct Reader {
     read: usize,
     /// How many commits this has carried.
     commits: u32,
-    /// Whether the two ends encrypted this connection.
-    encrypted: Arc<AtomicBool>,
     /// Whether a transaction is open, so a write of its own is not a commit.
     in_transaction: bool,
+    shared: Arc<Shared>,
     /// The moment a schedule named.
     watching: Option<String>,
     /// Which way this reader's traffic runs.
@@ -142,15 +192,60 @@ pub struct Reader {
 
 impl Reader {
     #[must_use]
-    pub fn new(direction: Direction, encrypted: Arc<AtomicBool>, watching: Option<String>) -> Self {
+    pub fn new(direction: Direction, shared: Arc<Shared>, watching: Option<String>) -> Self {
         Self {
             pending: Vec::new(),
             read: 0,
             commits: 0,
-            encrypted,
             in_transaction: false,
+            shared,
             watching,
             direction,
+        }
+    }
+
+    /// The prepared statements on this connection, locked for this read.
+    fn prepared(&self) -> MutexGuard<'_, Prepared> {
+        self.shared
+            .prepared
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// What this packet asks the server to do.
+    ///
+    /// A `COM_QUERY` carries its own text. A prepared statement carried its
+    /// text when it was prepared, so what it asks for is looked up by statement
+    /// id.
+    fn asked(&mut self, packet: &Packet) -> Option<Asking> {
+        let (command, rest) = packet.command()?;
+        let mut held = self.prepared();
+        match command {
+            COM_QUERY => Some(asking(rest)),
+            COM_STMT_PREPARE => {
+                held.awaiting.push_back(asking(rest));
+                // Preparing runs nothing.
+                None
+            }
+            COM_STMT_EXECUTE => held.by_id.get(&statement_id(rest)?).copied(),
+            COM_STMT_CLOSE => {
+                held.by_id.remove(&statement_id(rest)?);
+                None
+            }
+            _ => None,
+        }
+    }
+
+    /// Record the statement id a prepare response carries.
+    fn names_prepared(&self, packet: &Packet) {
+        let mut held = self.prepared();
+        // A client waits for each response before sending again, so the first
+        // response after a prepare is that prepare's.
+        let Some(asking) = held.awaiting.pop_front() else {
+            return;
+        };
+        if let Some(named) = packet.prepared_id() {
+            held.by_id.insert(named, asking);
         }
     }
 
@@ -159,7 +254,7 @@ impl Reader {
     /// A tail that is still arriving is kept for the read that finishes it. An
     /// encrypted one is handed straight back.
     fn read(&mut self, bytes: &[u8]) -> (Vec<Packet>, Vec<u8>) {
-        if self.encrypted.load(Ordering::Relaxed) {
+        if self.shared.encrypted.load(Ordering::Relaxed) {
             self.pending.extend_from_slice(bytes);
             return (Vec::new(), std::mem::take(&mut self.pending));
         }
@@ -185,7 +280,7 @@ impl Reader {
             self.read += 1;
             packets.push(packet);
             if upgrading {
-                self.encrypted.store(true, Ordering::Relaxed);
+                self.shared.encrypted.store(true, Ordering::Relaxed);
                 return (packets, std::mem::take(&mut self.pending));
             }
         }
@@ -225,7 +320,7 @@ impl Reader {
     /// not is in autocommit, where the server commits each write as it runs
     /// it.
     fn commits_at(&mut self, packet: &Packet) -> bool {
-        match packet.asks() {
+        match self.asked(packet) {
             Some(Asking::Open) => {
                 self.in_transaction = true;
                 false
@@ -262,6 +357,12 @@ impl crucible_protocol::Kind for Reader {
         let mut freeze_after = None;
         let mut found = Vec::new();
         for (at, packet) in packets.iter().enumerate() {
+            // Only the client sends commands; what comes back carries the
+            // statement ids.
+            if self.direction == Direction::UpstreamToClient {
+                self.names_prepared(packet);
+                continue;
+            }
             if !self.commits_at(packet) {
                 continue;
             }
@@ -314,21 +415,27 @@ mod tests {
         packet(FIRST, &payload)
     }
 
+    /// A client reader on a connection whose greeting has been answered.
     fn reading() -> Reader {
-        Reader::new(
-            Direction::ClientToUpstream,
-            Arc::new(AtomicBool::new(false)),
-            None,
-        )
+        let (client, _) = session(None);
+        client
     }
 
-    /// A pair of readers that share whether the connection was encrypted.
+    /// A pair of readers on a connection whose greeting has been answered,
+    /// which is where every session starts.
+    fn session(watching: Option<&str>) -> (Reader, Reader) {
+        let (mut client, server) = pair(watching);
+        client.carry(&answers_greeting(0), false);
+        (client, server)
+    }
+
+    /// The same, before the client has answered the greeting.
     fn pair(watching: Option<&str>) -> (Reader, Reader) {
-        let encrypted = Arc::new(AtomicBool::new(false));
+        let shared = Arc::new(Shared::default());
         let watch = |direction| {
             Reader::new(
                 direction,
-                Arc::clone(&encrypted),
+                Arc::clone(&shared),
                 watching
                     .filter(|_| direction == Direction::ClientToUpstream)
                     .map(ToOwned::to_owned),
@@ -496,14 +603,14 @@ mod tests {
 
     #[test]
     fn holding_before_a_commit_keeps_it_off_the_wire() {
-        let (mut reader, _) = pair(Some("commit:1:before"));
+        let (mut reader, _) = session(Some("commit:1:before"));
         let bytes = [query("BEGIN"), query("COMMIT")].concat();
         assert_eq!(reader.carry(&bytes, true).freeze_after, Some(1));
     }
 
     #[test]
     fn holding_after_a_commit_lets_it_go_first() {
-        let (mut reader, _) = pair(Some("commit:1:after"));
+        let (mut reader, _) = session(Some("commit:1:after"));
         let bytes = [query("BEGIN"), query("COMMIT")].concat();
         assert_eq!(reader.carry(&bytes, true).freeze_after, Some(2));
     }
@@ -535,9 +642,77 @@ mod tests {
         assert_eq!(client.carry(&query("COMMIT"), false).found.len(), 2);
     }
 
+    /// `COM_STMT_PREPARE` for `statement`.
+    fn prepares(statement: &str) -> Vec<u8> {
+        let mut payload = vec![COM_STMT_PREPARE];
+        payload.extend_from_slice(statement.as_bytes());
+        packet(FIRST, &payload)
+    }
+
+    /// A prepare response giving the statement id `id`.
+    fn prepare_response(id: u32) -> Vec<u8> {
+        let mut payload = vec![OK];
+        payload.extend_from_slice(&id.to_le_bytes());
+        payload.extend_from_slice(&[0; 6]);
+        packet(FIRST + 1, &payload)
+    }
+
+    /// `COM_STMT_EXECUTE` for the statement id `id`.
+    fn executes(id: u32) -> Vec<u8> {
+        let mut payload = vec![COM_STMT_EXECUTE];
+        payload.extend_from_slice(&id.to_le_bytes());
+        payload.push(0);
+        packet(FIRST, &payload)
+    }
+
+    /// A parameterised statement carries its text only in the prepare, so what
+    /// it asks for has to be read from there.
+    #[test]
+    fn a_prepared_write_is_its_own_commit() {
+        let (mut client, mut server) = session(None);
+        // Preparing runs nothing.
+        assert!(
+            client
+                .carry(&prepares("INSERT INTO orders (id) VALUES (?)"), false)
+                .found
+                .is_empty()
+        );
+        server.carry(&prepare_response(7), false);
+        assert_eq!(client.carry(&executes(7), false).found.len(), 2);
+    }
+
+    /// The statement id is in the server's prepare response, so the direction
+    /// that sees it is not the one that sees the text.
+    #[test]
+    fn a_statement_with_no_id_asks_nothing() {
+        let (mut client, _) = session(None);
+        client.carry(&prepares("INSERT INTO orders (id) VALUES (?)"), false);
+        assert!(client.carry(&executes(7), false).found.is_empty());
+    }
+
+    #[test]
+    fn a_prepared_write_inside_a_transaction_is_not_a_commit() {
+        let (mut client, mut server) = session(None);
+        client.carry(&prepares("INSERT INTO orders (id) VALUES (?)"), false);
+        server.carry(&prepare_response(7), false);
+        client.carry(&query("BEGIN"), false);
+        assert!(client.carry(&executes(7), false).found.is_empty());
+    }
+
+    #[test]
+    fn a_statement_the_client_closed_is_forgotten() {
+        let (mut client, mut server) = session(None);
+        client.carry(&prepares("INSERT INTO orders (id) VALUES (?)"), false);
+        server.carry(&prepare_response(7), false);
+        let mut closes = vec![COM_STMT_CLOSE];
+        closes.extend_from_slice(&7u32.to_le_bytes());
+        client.carry(&packet(FIRST, &closes), false);
+        assert!(client.carry(&executes(7), false).found.is_empty());
+    }
+
     #[test]
     fn a_moment_is_offered_before_it_is_placed() {
-        let (mut reader, _) = pair(Some("commit:1:before"));
+        let (mut reader, _) = session(Some("commit:1:before"));
         let commit = query("COMMIT");
         let carried = reader.carry(&commit, false);
         assert_eq!(carried.freeze_after, None);
