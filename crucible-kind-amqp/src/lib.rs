@@ -7,10 +7,10 @@ pub mod message;
 
 use crucible_protocol::{Direction, Kind};
 
-/// Something to read each direction of one connection with, watching for `mark`
-/// on the direction that carries it.
+/// A reader for each direction of one connection, watching for `mark` on
+/// whichever direction carries it.
 ///
-/// Made as a pair, because the two directions have to agree: a delivery and the
+/// Made as a pair, because the two directions have to agree. A delivery and its
 /// ack cross opposite ways, so neither reader sees both.
 #[must_use]
 pub fn readers(watching: Option<&(Direction, String)>) -> (Box<dyn Kind>, Box<dyn Kind>) {
