@@ -1,5 +1,5 @@
 [package]
-name = "crucible-kind"
+name = "crucible-kind-mariadb"
 version = "0.1.0"
 edition.workspace = true
 authors.workspace = true
@@ -7,12 +7,10 @@ publish.workspace = true
 license.workspace = true
 
 [dependencies]
-crucible-kind-amqp = { path = "../crucible-kind-amqp" }
-crucible-kind-mariadb = { path = "../crucible-kind-mariadb" }
 crucible-protocol = { path = "../crucible-protocol" }
-
-[dev-dependencies]
-amq-protocol = { workspace = true }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+rstest = { workspace = true }

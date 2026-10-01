@@ -925,7 +925,8 @@ mod tests {
     /// names its own moment, and one without counts the moments offered.
     #[test]
     fn what_a_mark_means_comes_from_the_kind_fronting_it() {
-        assert_eq!(crucible_kind::nth("mariadb", "3"), 3);
+        assert_eq!(crucible_kind::nth("http", "3"), 3);
         assert_eq!(crucible_kind::nth("amqp", "ack:7:before"), 1);
+        assert_eq!(crucible_kind::nth("mariadb", "commit:2:after"), 1);
     }
 }

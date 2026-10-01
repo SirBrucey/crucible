@@ -46,9 +46,14 @@ impl Kinds {
     /// counts what crosses.
     #[must_use]
     pub fn connection(&self) -> Readers {
-        if self.kind == crucible_kind_amqp::NAME {
-            let (client_to_upstream, upstream_to_client) =
-                crucible_kind_amqp::readers(self.watching.as_ref());
+        let read = match self.kind.as_str() {
+            crucible_kind_amqp::NAME => Some(crucible_kind_amqp::readers(self.watching.as_ref())),
+            crucible_kind_mariadb::NAME => {
+                Some(crucible_kind_mariadb::readers(self.watching.as_ref()))
+            }
+            _ => None,
+        };
+        if let Some((client_to_upstream, upstream_to_client)) = read {
             return Readers {
                 client_to_upstream,
                 upstream_to_client,
@@ -72,7 +77,7 @@ impl Kinds {
 /// Whether a kind has a plugin that can read it.
 #[must_use]
 pub fn is_read(kind: &str) -> bool {
-    matches!(kind, crucible_kind_amqp::NAME)
+    matches!(kind, crucible_kind_amqp::NAME | crucible_kind_mariadb::NAME)
 }
 
 /// How many candidate moments must pass before the one `mark` names.
