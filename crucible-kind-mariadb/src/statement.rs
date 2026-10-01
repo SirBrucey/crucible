@@ -97,6 +97,14 @@ impl Packet {
     }
 }
 
+/// The command that carried a statement to the server.
+fn sent_as(command: u8) -> &'static str {
+    match command {
+        COM_STMT_EXECUTE => "COM_STMT_EXECUTE",
+        _ => "COM_QUERY",
+    }
+}
+
 /// The statement id a command opens with.
 fn statement_id(rest: &[u8]) -> Option<u32> {
     let named = rest.get(..STATEMENT_ID)?;
@@ -168,6 +176,18 @@ enum Asking {
     Define,
     /// Anything else.
     Other,
+}
+
+impl Asking {
+    /// What the server commits on.
+    fn commits_on(self) -> &'static str {
+        match self {
+            Asking::Commit => "COMMIT",
+            Asking::Write => "of an autocommit DML statement",
+            Asking::Define => "of a DDL statement",
+            Asking::Open | Asking::Abandon | Asking::Other => "of a statement",
+        }
+    }
 }
 
 /// One direction of one connection, read as packets.
@@ -288,61 +308,58 @@ impl Reader {
     }
 
     /// Where a fault could go either side of a commit.
-    fn either_side(&self, nth: u32) -> [(Side, Placement); 2] {
-        let placement = |side: Side, why: &str| Placement {
+    fn either_side(&self, nth: u32, sent: &str) -> [(Side, Placement); 2] {
+        let placement = |side: Side, why: String| Placement {
             direction: self.direction,
             mark: format!("commit:{nth}:{side}"),
-            why: why.to_owned(),
+            why,
             doing: Doing::Holding,
         };
         [
             (
                 Side::Before,
-                placement(
-                    Side::Before,
-                    "a commit the client has written and the server has not seen",
-                ),
+                placement(Side::Before, format!("a {sent} the server has not seen")),
             ),
             (
                 Side::After,
-                placement(
-                    Side::After,
-                    "a commit the server has been asked for and the client has had no answer to",
-                ),
+                placement(Side::After, format!("a {sent} with no OK packet back yet")),
             ),
         ]
     }
 
-    /// Whether this packet ends a transaction, following what the client has
-    /// asked for so far.
+    /// What the server commits on in this packet, or `None` where the packet
+    /// ends no transaction.
     ///
     /// A client that opened a transaction commits when it says so. One that did
     /// not is in autocommit, where the server commits each write as it runs
     /// it.
-    fn commits_at(&mut self, packet: &Packet) -> bool {
-        match self.asked(packet) {
-            Some(Asking::Open) => {
+    fn commits_at(&mut self, packet: &Packet) -> Option<String> {
+        let command = packet.command()?.0;
+        let asking = self.asked(packet)?;
+        let ends = match asking {
+            Asking::Open => {
                 self.in_transaction = true;
                 false
             }
-            Some(Asking::Commit) => {
+            Asking::Commit => {
                 self.in_transaction = false;
                 true
             }
-            Some(Asking::Abandon) => {
+            Asking::Abandon => {
                 self.in_transaction = false;
                 false
             }
             // DDL commits whatever was open before it runs, so it ends a
             // transaction either way.
-            Some(Asking::Define) => {
+            Asking::Define => {
                 let open = self.in_transaction;
                 self.in_transaction = false;
                 !open
             }
-            Some(Asking::Write) => !self.in_transaction,
-            Some(Asking::Other) | None => false,
-        }
+            Asking::Write => !self.in_transaction,
+            Asking::Other => false,
+        };
+        ends.then(|| format!("{} {}", sent_as(command), asking.commits_on()))
     }
 
     /// Whether this is the moment the schedule named.
@@ -363,11 +380,11 @@ impl crucible_protocol::Kind for Reader {
                 self.names_prepared(packet);
                 continue;
             }
-            if !self.commits_at(packet) {
+            let Some(sent) = self.commits_at(packet) else {
                 continue;
-            }
+            };
             self.commits += 1;
-            for (side, placement) in self.either_side(self.commits) {
+            for (side, placement) in self.either_side(self.commits, &sent) {
                 if placing && self.watches(&placement) {
                     freeze_after = Some(match side {
                         Side::Before => at,
@@ -708,6 +725,41 @@ mod tests {
         closes.extend_from_slice(&7u32.to_le_bytes());
         client.carry(&packet(FIRST, &closes), false);
         assert!(client.carry(&executes(7), false).found.is_empty());
+    }
+
+    /// The reporter reads a placement as "on <this>", so it is a noun phrase.
+    #[rstest::rstest]
+    #[case("COMMIT", "COM_QUERY COMMIT")]
+    #[case(
+        "INSERT INTO orders (id) VALUES (1)",
+        "COM_QUERY of an autocommit DML statement"
+    )]
+    #[case("CREATE TABLE t (id INT)", "COM_QUERY of a DDL statement")]
+    fn a_placement_names_the_wire_event(#[case] statement: &str, #[case] names: &str) {
+        let sent = query(statement);
+        let carried = reading().carry(&sent, false);
+        let whys: Vec<&str> = carried.found.iter().map(|p| p.why.as_str()).collect();
+        assert_eq!(
+            whys,
+            [
+                format!("a {names} the server has not seen"),
+                format!("a {names} with no OK packet back yet"),
+            ]
+        );
+    }
+
+    /// A statement run by id reached the server as `COM_STMT_EXECUTE`.
+    #[test]
+    fn a_prepared_statement_is_named_by_the_command_that_ran_it() {
+        let (mut client, mut server) = session(None);
+        client.carry(&prepares("INSERT INTO orders (id) VALUES (?)"), false);
+        server.carry(&prepare_response(7), false);
+        let runs = executes(7);
+        let carried = client.carry(&runs, false);
+        assert_eq!(
+            carried.found.first().map(|p| p.why.as_str()),
+            Some("a COM_STMT_EXECUTE of an autocommit DML statement the server has not seen")
+        );
     }
 
     #[test]
