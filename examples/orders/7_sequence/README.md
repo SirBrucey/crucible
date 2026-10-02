@@ -1,5 +1,8 @@
 # 7. Per-order sequence
 
+Fixes amendments applied in the wrong order, by giving each order a counter the
+consumer checks before applying anything.
+
 ## What `6_confirm` told us
 
 One fault had survived every rung since `1_base`:
@@ -11,21 +14,19 @@ One fault had survived every rung since `1_base`:
 > what broke, though where it settled does not say so.
 
 An amendment works out the stock difference from what the order was, so two
-amendments applied the other way round settle where neither asked. Nothing in
-the events said which came first.
+applied the other way round settle where neither asked.
 
 ## What changed
 
-Each order carries a counter, bumped in the same transaction as the event that
-reports it, so two amendments cannot claim the same place in its history:
+Each order carries a counter, incremented in the same transaction as the event
+that reports it:
 
 ```rust
 let (was,): (i32,) = sqlx::query_as("SELECT seq FROM orders WHERE id = ? FOR UPDATE")
 ```
 
 The consumer records how far through each order it has got, and an event at or
-below that point is recorded as handled without being applied. A later amendment
-has already decided what the order is for.
+below that point is recorded as handled without being applied.
 
 `diff -r ../6_confirm .` is the whole change, apart from the image names.
 
@@ -40,53 +41,47 @@ The first attempt asked the database whether it had moved anything:
 ```
 
 `sqlx` connects with `FOUND_ROWS`, so a write reports the rows it *matched*
-rather than the rows it *changed*. An update that deliberately left the sequence
-alone still reported a row, every stale event looked like progress, and nothing
-was ever superseded.
-
-The campaign caught it and the fault-free run could not have. In delivery order
-the sequence only ever moves forward, so all eight checks passed; the defect
-existed only when something arrived out of order. `advance` now reads the held
-sequence and compares it, which is what the code meant to say.
+rather than the rows it *changed*. Every stale event looked like progress. In
+delivery order the sequence only moves forward, so the fault-free run passed
+every check and only a reordering showed it.
 
 ## What the campaign finds
 
 | invariant | `6_confirm` | `7_sequence` |
 | --- | --- | --- |
-| durability | 1 | 2 |
+| durability | 5 | 3 |
+| idempotency | 1 | 2 |
+| recovery | 1 | 0 |
 | convergence | **1** | **0** |
-| unattributed | 1 | 1 |
-| passed | 250 | 246 |
-| inconclusive | 3 | 7 |
+| unattributed | 0 | 0 |
+| passed | 234 | 235 |
+| inconclusive | 0 | 2 |
 
 Convergence is gone, and with it the last invariant that had failed on every
-fleet in the staircase. Three faults remain out of 256 schedules, against 86 out
-of 215 in `1_base`.
+fleet in the staircase. Five faults out of 242 schedules, against 79 out of 165
+in `1_base`.
 
-## What it cost
+## What is left
 
-**A heavier write path.** An amendment used to be one insert into the outbox.
-It is now a locking read, an update and an insert, in a transaction. The extra
-durability fault is that window:
+Four are the API committing a write and then failing the request:
 
-> `api -> db` was cut off during step 4 ... The fleet took steps 1, 2, 3 and 5
-> which left `orders.applied.count` at `5`, expected value `4`. It holds more
-> than the steps it took responsibility for owed.
+> `api -> db` was cut off during step 3, on a COM_QUERY COMMIT with no OK packet
+> back yet. The fleet took steps 1, 2, 4 and 5 which left `orders.orders.count`
+> at `3`, expected value `2`. It holds more than the steps it took
+> responsibility for owed, and no step taken twice puts it there, so it kept
+> work it turned away, which is durability.
 
-**Faults that no longer land.** Five schedules came back
-`fault did not fire: ScenarioEndedBeforeAnchor`, against none before:
+One cut, two names: on a create it leaves a row the fleet said it had not taken,
+and on an amendment it gives stock back once more than owed. The remedy is an
+identifier on the write that makes the caller's retry safe.
 
-```
-5 reason=fault did not fire: ScenarioEndedBeforeAnchor
-2 reason=worker exceeded its 71.407921673s budget
-```
+The fifth is the dropped publisher confirm `6_confirm` describes. Two further
+runs could not be judged, because the fleet may have accepted steps 2, 3, 4 and
+5 and no reference run has driven that set.
 
-Those faults are aimed at a packet count taken from the learn run, and the
-busier, lock-taking write path this rung introduces makes that count drift
-between runs. The fault was placed at a moment the run never reached. Nothing
-about the fleet is wrong; the campaign simply could not say anything about those
-five. A moment a protocol plugin names does not drift this way, which is the
-argument for anchoring on what crossed rather than on how much.
+The locking read was expected to make the counted anchors drift and leave faults
+unplaced. All 242 placed, because both database edges are anchored on commits
+the MariaDB plugin names.
 
 ## Build and run
 

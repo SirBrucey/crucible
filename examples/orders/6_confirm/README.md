@@ -1,18 +1,17 @@
 # 6. Publisher confirms
 
+Fixes the relay that forgets an event the broker never took, by waiting for the
+broker to answer before deleting the outbox row.
+
 ## What `5_ack_on_success` told us
 
-Eleven of the thirteen faults left were one defect. Every one landed on the
-relay's publish and lost exactly one event:
+Nine of the fifteen faults left were one defect, each losing exactly one event:
 
-> `api -> broker` was cut off during step 3, on a publish the sender has
+> `api -> broker` was cut off during step 1, on a publish the sender has
 > committed to and the broker has not seen. The fleet took 5 steps which left
-> `orders.applied.count` at `4`, expected value `5`.
-
-The relay deleted the outbox row for a message the broker never took. The
-twelfth was the same defect at full width: `api -> broker` cut for the whole run
-left `applied.count` at `0`, because the relay spent the run publishing into a
-severed socket and deleting rows as it went.
+> `orders.stock.select level where item = "book"` at `102`, expected value `98`.
+> It settled where fewer steps would have left it, so work was lost, which is
+> durability.
 
 `create_channel` was never followed by `confirm_select`, so lapin's publish
 future resolved as soon as the frame was on the socket. The `.await` in
@@ -20,22 +19,19 @@ future resolved as soon as the frame was on the socket. The `.await` in
 
 ## What changed
 
-The relay's channel answers for what it publishes:
+The relay's channel answers for what it publishes, and the row goes only once
+the broker has acknowledged the message:
 
 ```rust
 channel.confirm_select(ConfirmSelectOptions::default()).await?;
-```
-
-and the row is deleted only once the broker has acknowledged the message:
-
-```rust
+...
 let confirmation = tokio::time::timeout(CONFIRM_TIMEOUT, sent).await??;
 if !matches!(confirmation, Confirmation::Ack(_)) {
     anyhow::bail!("the broker did not take the message");
 }
 ```
 
-The wait is bounded on purpose. A broker killed mid-publish never answers, and a
+The wait is bounded, because a broker killed mid-publish never answers and a
 relay waiting on it would stop draining the outbox for good.
 
 `diff -r ../5_ack_on_success .` is the whole change, apart from the image names.
@@ -44,44 +40,33 @@ relay waiting on it would stop draining the outbox for good.
 
 | invariant | `5_ack_on_success` | `6_confirm` |
 | --- | --- | --- |
-| durability | 11 | **1** |
-| recovery | 1 | **0** |
+| durability | 14 | **5** |
+| idempotency | 0 | 1 |
+| recovery | 0 | 1 |
 | convergence | 1 | 1 |
-| unattributed | 0 | 1 |
-| passed | 206 | 250 |
-| inconclusive | 2 | 3 |
+| unattributed | 0 | 0 |
+| passed | 192 | 234 |
+| inconclusive | 0 | 0 |
 
-Read the totals with care. This fleet offers 100 points where the last offered
-85, and fits 256 schedules where the last fit 221, because confirm mode puts
-acknowledgement frames on the `api -> broker` edge and there is more traffic to
-burst. More places to break the fleet, and fewer ways it breaks.
+This fleet fits 242 schedules where the last fit 207, because confirm mode puts
+acknowledgement frames on `api -> broker` and there is more traffic to burst.
+More places to break the fleet, fewer ways it breaks. At 46 minutes it is the
+longest campaign of the staircase, because a relay waiting out its confirm
+timeout does nothing for five seconds.
 
 ## What is left
 
-**One unattributed fault**, and it is the fix working rather than failing:
+**One fault the fix cannot reach.** The acknowledgement was dropped in flight,
+so the relay kept the row to offer again and waits out its five-second timeout
+in silence. The framework reads a fleet after a second of silence, so the fleet
+is right and the reading is early.
 
-> `api -> broker` had a message dropped on it during step 5, on a publish the
-> broker took and the publisher was never told about. The fleet took 5 steps
-> which left `orders.outbox.count` at `1`, expected value `0`. It held more
-> than it owed on any reading.
+**Four are the API committing a write and then failing the request**, two read
+as durability and two as idempotency depending on which step the cut landed in.
+[`7_sequence`](../7_sequence) has the verdicts.
 
-The broker took the message and the acknowledgement was dropped, so the relay
-kept the row to offer again. That is what keeping the row is for. The run was
-read before the retry completed, so the scenario's `outbox.count == 0` is a
-statement about a fleet that has finished settling, and this one had not.
-
-**One durability fault**, the API keeping work it told the caller it refused:
-
-> `api -> db` was cut off during step 4, on 45 reads into what this edge
-> carried. The fleet took steps 1, 2, 3 and 5 which left `orders.applied.count`
-> at `5`, expected value `4`. It holds more than the steps it took
-> responsibility for owed.
-
-The write committed and the response did not reach the caller. Nothing in the
-fleet is wrong with the order; the caller was told something untrue about it.
-
-**One convergence fault**, the amendment ordering, unchanged since `1_base`.
-[`7_sequence`](../7_sequence) is that fix.
+**One recovery fault** and **one convergence fault**, the amendment ordering,
+unchanged since `1_base`. [`7_sequence`](../7_sequence) is that fix.
 
 ## Build and run
 
