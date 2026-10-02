@@ -1,8 +1,7 @@
 // The `orders` fleet with a transactional outbox and a consumer that claims
 // each event before acting on it, recording the event's id in the same
 // transaction as the work it causes. The steps are the ones `1_base` drives,
-// with the outbox and the inbox checked as well, so the campaigns can be
-// compared.
+// so the campaigns can be compared.
 
 fleet "orders" {
   deployment: docker;

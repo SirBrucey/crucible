@@ -1,7 +1,7 @@
 // The `orders` fleet with a transactional outbox: the API writes the order and
 // the event to announce it in one transaction, and a relay announces what the
 // outbox holds and then takes it away. The steps are the ones `1_base` drives,
-// with one check added for the outbox, so the two campaigns can be compared.
+// so the two campaigns can be compared.
 
 fleet "orders" {
   deployment: docker;
