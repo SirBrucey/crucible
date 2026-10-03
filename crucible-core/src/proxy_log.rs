@@ -216,9 +216,7 @@ pub fn edge_profiles_from_sessions<S: std::hash::BuildHasher>(
             // A plugin reading the edge drives more accurate faults than a
             // packet count, so its bursts are then unnecessary.
             let (client_to_upstream, upstream_to_client) = if placements.is_empty() {
-                let (mut c2u, mut u2c) = live.get(&edge).cloned().unwrap_or_default();
-                c2u.sort_unstable_by_key(|packet| packet.at);
-                u2c.sort_unstable_by_key(|packet| packet.at);
+                let (c2u, u2c) = live.get(&edge).cloned().unwrap_or_default();
                 let (idle_c2u, idle_u2c) = idle.get(&edge).cloned().unwrap_or_default();
                 (
                     heaviest(above_floor(bursts(&c2u), floor(&idle_c2u))),
@@ -369,11 +367,13 @@ struct Packet {
     at: u128,
 }
 
-/// Cluster `packets` (sorted timestamps) into bursts by inter-packet gap, each
-/// given as the three points a fault can be placed against. A count `K` means
-/// "freeze once `K` packets have crossed", so `start` is `first - 1` and `end` is
-/// `last`.
+/// Cluster `packets` into bursts by inter-packet gap, each given as the three
+/// points a fault can be placed against. A count `K` means "freeze once `K`
+/// packets have crossed", so `start` is `first - 1` and `end` is `last`.
 fn bursts(packets: &[Packet]) -> Vec<Burst> {
+    let mut packets = packets.to_vec();
+    packets.sort_unstable_by_key(|packet| packet.at);
+    let packets = &packets[..];
     let mut bursts = Vec::new();
     let mut start = 0usize; // 0-based index of the current burst's first packet
     for j in 0..packets.len() {
@@ -702,6 +702,13 @@ mod tests {
         let [first, second] = bursts(&packets).try_into().expect("two bursts");
         assert_eq!((first.start, first.mid, first.end), (0, 1, 2));
         assert_eq!((second.start, second.mid, second.end), (2, 3, 4));
+    }
+
+    #[test]
+    fn packets_reported_out_of_order_burst_the_same_as_in_order() {
+        let ordered = bursts(&driven(&[1_000, 2_000, 100_000_000, 101_000_000]));
+        let jumbled = bursts(&driven(&[100_000_000, 1_000, 101_000_000, 2_000]));
+        assert_eq!(ordered, jumbled);
     }
 
     #[test]
