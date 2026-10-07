@@ -1,4 +1,4 @@
-//! The `MariaDB` observer plugin.
+//! The MariaDB observer plugin.
 
 use std::net::SocketAddr;
 
@@ -21,7 +21,7 @@ const WHERE: &str = "where";
 /// The alias every projection is named by.
 const ALIAS: &str = "n";
 
-/// Reads persisted state from a `MariaDB` database.
+/// Reads persisted state from a MariaDB database.
 pub struct Mariadb {
     user: String,
     password: String,
