@@ -29,8 +29,10 @@ pub enum Operation {
         /// Whether this message has been delivered before.
         redelivered: bool,
     },
-    /// A consumer saying it is done with one.
-    Ack { tag: u64 },
+    /// A consumer saying it is done with one, or the broker confirming a
+    /// publish. `multiple` is the broker answering every publish up to `tag`
+    /// rather than that one alone, which it decides for itself.
+    Ack { tag: u64, multiple: bool },
     /// A consumer refusing one, which is what makes the broker requeue it.
     Reject { tag: u64 },
     /// A consumer saying how many deliveries it will hold unacknowledged at
@@ -76,6 +78,7 @@ impl Operation {
             },
             AMQPMethod::Ack(ack) => Operation::Ack {
                 tag: ack.delivery_tag,
+                multiple: ack.multiple,
             },
             AMQPMethod::Reject(reject) => Operation::Reject {
                 tag: reject.delivery_tag,
@@ -369,7 +372,7 @@ impl Consuming {
                 (redelivered && self.answers(message.identity.as_ref()))
                     .then(|| Did::Placed("the broker delivered the message again".to_owned()))
             }
-            Operation::Ack { tag } | Operation::Reject { tag }
+            Operation::Ack { tag, .. } | Operation::Reject { tag }
                 if direction == Direction::ClientToUpstream =>
             {
                 self.finished(message.channel, tag);
@@ -406,6 +409,81 @@ impl Consuming {
     }
 }
 
+/// The publishes one connection has carried, in the order they crossed, and
+/// the tag the broker will confirm each with.
+///
+/// Both directions share it, since a publish and its confirm cross opposite
+/// ways. One connection is one stream, so a publish holds the same position
+/// here in every run that drives the same work.
+#[derive(Clone, Default, Debug)]
+pub struct Publishing(std::sync::Arc<std::sync::Mutex<Publishes>>);
+
+#[derive(Default, Debug)]
+struct Publishes {
+    /// Whether this log has already been told the scenario started.
+    started: bool,
+    /// Each publish the scenario caused, in the order it crossed.
+    sent: Vec<(u16, u64)>,
+    /// What the broker will call the next publish on each channel. The
+    /// broker's own sequence, which runs from the channel entering confirm
+    /// mode and so does not restart when a scenario does.
+    next_tag: BTreeMap<u16, u64>,
+    /// The highest tag answered on each channel.
+    answered: BTreeMap<u16, u64>,
+}
+
+impl Publishing {
+    fn held(&self) -> std::sync::MutexGuard<'_, Publishes> {
+        self.0.lock().expect("no panic holds this lock")
+    }
+
+    /// Record a publish.
+    fn sent(&self, channel: u16) -> usize {
+        let mut held = self.held();
+        let tag = *held
+            .next_tag
+            .entry(channel)
+            .and_modify(|tag| *tag += 1)
+            .or_insert(1);
+        held.sent.push((channel, tag));
+        held.sent.len()
+    }
+
+    /// Which publishes a confirm of `tag` on `channel` answers, lowest first.
+    ///
+    /// Several of them, where `multiple` is set. A publish from before the
+    /// scenario is not held here and names nothing.
+    fn answered(&self, channel: u16, tag: u64, multiple: bool) -> Vec<usize> {
+        let mut held = self.held();
+        let from = if multiple {
+            held.answered.get(&channel).map_or(0, |answered| *answered)
+        } else {
+            tag - 1
+        };
+        held.answered.insert(channel, tag);
+        held.sent
+            .iter()
+            .enumerate()
+            .filter(|(_, (on, sent))| *on == channel && *sent > from && *sent <= tag)
+            .map(|(at, _)| at + 1)
+            .collect()
+    }
+
+    /// Clears the publishes from before the scenario.
+    ///
+    /// Only the first call clears. Both directions share this log and each is
+    /// told on its own first read, so the second would throw away publishes
+    /// the first has already named.
+    fn scenario_started(&self) {
+        let mut held = self.held();
+        if held.started {
+            return;
+        }
+        held.started = true;
+        held.sent.clear();
+    }
+}
+
 /// Reads one direction of one connection, across as many reads as it takes.
 ///
 /// A frame can arrive split over several reads and a message over several
@@ -419,12 +497,12 @@ pub struct Reader {
     /// Bytes parsed into `frames`, which is what makes every extent count from
     /// the same place however the stream was broken up.
     taken: usize,
-    /// Operations of each kind this has seen, which is what a mark counts.
-    seen: Seen,
     /// The moment a schedule named, watched for as the run goes.
     watching: Option<String>,
     /// What both directions of this connection agree on.
     consuming: Consuming,
+    /// The publishes this connection has carried.
+    publishing: Publishing,
     /// The last delivery this carried on each channel, so the one before it can
     /// be offered as somewhere to be told things out of order. The flag is
     /// whether the broker had room to send behind that delivery, read as it
@@ -470,63 +548,92 @@ impl std::fmt::Display for Side {
     }
 }
 
-/// How many of each operation have crossed, so a placement can name the second
-/// publish rather than the fifth packet.
-#[derive(Debug, Default)]
-struct Seen(BTreeMap<&'static str, u32>);
-
-impl Seen {
-    /// Count one of `what` and name it by where it fell in the run.
-    fn nth(&mut self, what: &'static str) -> String {
-        let seen = self.0.entry(what).or_default();
-        *seen += 1;
-        format!("{what}:{seen}")
-    }
-
-    /// Count `operation` and place a fault either side of it.
-    fn count(&mut self, operation: Operation, direction: Direction) -> Vec<(Side, Placement)> {
-        let (name, before, after) = match operation {
-            Operation::Publish => (
-                self.nth("publish"),
-                "a publish the sender has committed to and the broker has not seen",
-                "a publish the broker has taken but not confirmed",
-            ),
-            Operation::Deliver { tag, .. } => (
-                format!("deliver:{tag}"),
-                "a delivery the broker has released and the consumer has not seen",
-                "a delivery the consumer has but has not acknowledged",
-            ),
-            Operation::Ack { tag } => (
-                format!("ack:{tag}"),
-                "an ack the consumer has sent and the broker has not seen",
-                "an ack the broker has taken, releasing its copy",
-            ),
-            Operation::Reject { tag } => (
-                format!("reject:{tag}"),
-                "a refusal the consumer has sent and the broker has not seen",
-                "a refusal the broker has taken, requeueing or dead-lettering it",
-            ),
-            // Setting a limit, giving deliveries back, and minding the
-            // connection are the fleet arranging itself, not work a fault has
-            // anything to catch either side of.
-            Operation::Prefetch { .. }
-            | Operation::HandedBack
-            | Operation::ChannelClosed
-            | Operation::Housekeeping => return Vec::new(),
-        };
-        [(Side::Before, before), (Side::After, after)]
-            .into_iter()
-            .map(|(side, why)| {
-                let placement = Placement {
-                    direction,
-                    mark: format!("{name}:{side}"),
-                    why: why.to_owned(),
-                    doing: Doing::Holding,
-                };
-                (side, placement)
-            })
-            .collect()
-    }
+/// Name `operation` and place a fault either side of it.
+///
+/// `answers` is which publishes this is, counting from one.
+fn boundaries(
+    operation: Operation,
+    direction: Direction,
+    answers: &[usize],
+) -> Vec<(Side, Placement)> {
+    let (name, before, after) = match operation {
+        Operation::Publish => (
+            match answers {
+                [at] => format!("publish:{at}"),
+                // A publish the scenario did not cause names nothing.
+                _ => return Vec::new(),
+            },
+            "a publish the sender has committed to and the broker has not seen",
+            "a publish the broker has taken but not confirmed",
+        ),
+        Operation::Deliver { tag, .. } => (
+            format!("deliver:{tag}"),
+            "a delivery the broker has released and the consumer has not seen",
+            "a delivery the consumer has but has not acknowledged",
+        ),
+        // `basic.ack` is a consumer ending a delivery on the way to the
+        // broker, and a publisher confirm on the way back.
+        Operation::Ack { tag, .. } if direction == Direction::ClientToUpstream => (
+            format!("ack:{tag}"),
+            "an ack the consumer has sent and the broker has not seen",
+            "an ack the broker has taken, releasing its copy",
+        ),
+        // One frame can stand for several publishes, so it is offered as each
+        // of them. Those are the same publishes however the broker batched.
+        Operation::Ack { .. } => {
+            return answers
+                .iter()
+                .flat_map(|at| {
+                    [
+                        (
+                            Side::Before,
+                            "a confirm the broker has sent and the publisher has not seen",
+                        ),
+                        (
+                            Side::After,
+                            "a confirm the publisher has, so it knows the publish landed",
+                        ),
+                    ]
+                    .into_iter()
+                    .map(move |(side, why)| {
+                        (
+                            side,
+                            Placement {
+                                direction,
+                                mark: format!("confirmed:{at}:{side}"),
+                                why: why.to_owned(),
+                                doing: Doing::Holding,
+                            },
+                        )
+                    })
+                })
+                .collect();
+        }
+        Operation::Reject { tag } => (
+            format!("reject:{tag}"),
+            "a refusal the consumer has sent and the broker has not seen",
+            "a refusal the broker has taken, requeueing or dead-lettering it",
+        ),
+        // Setting a limit, giving deliveries back, and minding the
+        // connection are the fleet arranging itself, not work a fault has
+        // anything to catch either side of.
+        Operation::Prefetch { .. }
+        | Operation::HandedBack
+        | Operation::ChannelClosed
+        | Operation::Housekeeping => return Vec::new(),
+    };
+    [(Side::Before, before), (Side::After, after)]
+        .into_iter()
+        .map(|(side, why)| {
+            let placement = Placement {
+                direction,
+                mark: format!("{name}:{side}"),
+                why: why.to_owned(),
+                doing: Doing::Holding,
+            };
+            (side, placement)
+        })
+        .collect()
 }
 
 impl crucible_protocol::Kind for Reader {
@@ -550,7 +657,8 @@ impl crucible_protocol::Kind for Reader {
                 }
                 found.push(placement);
             }
-            if let Some(placement) = confirm(&message, self.direction) {
+            let answers = self.answers(&message);
+            for placement in confirm(&message, self.direction, &answers) {
                 if placing && self.watches(&placement) {
                     self.watching = None;
                     let (at, said) = drop_confirm(&wire, &message);
@@ -602,7 +710,7 @@ impl crucible_protocol::Kind for Reader {
             if let Some(answered) = self.consuming.track(&message, self.direction) {
                 did = Some(answered);
             }
-            for (side, placement) in self.seen.count(message.operation, self.direction) {
+            for (side, placement) in boundaries(message.operation, self.direction, &answers) {
                 if self.watches(&placement) {
                     freeze_after = Some(side.holds(&wire, &message));
                 }
@@ -640,6 +748,15 @@ impl crucible_protocol::Kind for Reader {
             unreadable: None,
         }
     }
+
+    /// Count the operations this names from the scenario rather than from the
+    /// connection.
+    ///
+    /// Only the counts this keeps itself. Delivery tags are the broker's own
+    /// sequence, and the protocol state carries on untouched.
+    fn scenario_started(&mut self) {
+        self.publishing.scenario_started();
+    }
 }
 
 /// Where `message` offers to have the fleet do the same thing twice.
@@ -653,7 +770,7 @@ impl crucible_protocol::Kind for Reader {
 /// broker sends one back to confirm a publish. Only the first ends a delivery
 /// there is anything to ask for again.
 fn redelivery(message: &Message, direction: Direction) -> Option<Placement> {
-    let Operation::Ack { tag } = message.operation else {
+    let Operation::Ack { tag, .. } = message.operation else {
         return None;
     };
     if direction != Direction::ClientToUpstream {
@@ -674,19 +791,37 @@ fn redelivery(message: &Message, direction: Direction) -> Option<Placement> {
 /// not a redelivery: there is no delivery behind a confirm to ask for again, so
 /// the frame is dropped rather than rewritten, and the publisher is left to
 /// decide for itself what became of the publish.
-fn confirm(message: &Message, direction: Direction) -> Option<Placement> {
-    let Operation::Ack { tag } = message.operation else {
-        return None;
+///
+/// The confirm is named by the publishes it answers rather than by how many
+/// frames the broker chose to reply to.
+///
+/// One frame answering several is offered as each of them, since
+/// dropping it leaves every one unconfirmed.
+fn confirm(message: &Message, direction: Direction, answers: &[usize]) -> Vec<Placement> {
+    let Operation::Ack { .. } = message.operation else {
+        return Vec::new();
     };
     if direction != Direction::UpstreamToClient {
-        return None;
+        return Vec::new();
     }
-    Some(Placement {
-        direction,
-        mark: format!("confirm:{tag}"),
-        why: "a publish the broker took and the publisher was never told about".to_owned(),
-        doing: Doing::Rewriting(Primitive::Drop),
-    })
+    let why = match answers {
+        [] => return Vec::new(),
+        [one] => format!(
+            "the publish the broker took and never told the publisher about, which is publish {one}"
+        ),
+        [first, .., last] => format!(
+            "a publish the broker took and the publisher was never told about, in a confirm answering publishes {first} to {last}"
+        ),
+    };
+    answers
+        .iter()
+        .map(|at| Placement {
+            direction,
+            mark: format!("confirm:{at}"),
+            why: why.clone(),
+            doing: Doing::Rewriting(Primitive::Drop),
+        })
+        .collect()
 }
 
 /// Why a delivery whose first frames have already crossed cannot be held back.
@@ -751,17 +886,33 @@ fn write(frame: &AMQPFrame) -> Option<Vec<u8>> {
 impl Reader {
     /// Reads a fault-free run, so we can say where a fault should go.
     #[must_use]
-    pub fn new(direction: Direction, consuming: Consuming) -> Self {
+    pub fn new(direction: Direction, consuming: Consuming, publishing: Publishing) -> Self {
         Self {
             direction,
             consuming,
+            publishing,
             last: BTreeMap::new(),
             held: None,
             pending: Vec::new(),
             frames: Vec::new(),
             taken: 0,
-            seen: Seen::default(),
             watching: None,
+        }
+    }
+
+    /// Which publishes a message is, or answers, counting from one.
+    ///
+    /// One for a publish, however many it answers for a confirm, none for
+    /// anything else.
+    fn answers(&self, message: &Message) -> Vec<usize> {
+        match message.operation {
+            Operation::Publish if self.direction == Direction::ClientToUpstream => {
+                vec![self.publishing.sent(message.channel)]
+            }
+            Operation::Ack { tag, multiple } if self.direction == Direction::UpstreamToClient => {
+                self.publishing.answered(message.channel, tag, multiple)
+            }
+            _ => Vec::new(),
         }
     }
 
@@ -776,7 +927,7 @@ impl Reader {
     /// Nothing is placed yet, the broker may dead-letter the message instead of
     /// requeueing it.
     fn refuse(&self, wire: &mut [Wire<'_>], message: &Message) -> Did {
-        let Operation::Ack { tag } = message.operation else {
+        let Operation::Ack { tag, .. } = message.operation else {
             return Did::Unplaceable("not an ack, so there is nothing to refuse".to_owned());
         };
         let Some(identity) = self.consuming.holding(message.channel, tag) else {
@@ -807,10 +958,15 @@ impl Reader {
 
     /// Reads a faulted run, holding the fleet when it sees `mark`.
     #[must_use]
-    pub fn watching(direction: Direction, consuming: Consuming, mark: String) -> Self {
+    pub fn watching(
+        direction: Direction,
+        consuming: Consuming,
+        publishing: Publishing,
+        mark: String,
+    ) -> Self {
         Self {
             watching: Some(mark),
-            ..Self::new(direction, consuming)
+            ..Self::new(direction, consuming, publishing)
         }
     }
 
@@ -905,6 +1061,40 @@ mod tests {
         wire(&AMQPFrame::Body(CHANNEL, payload.to_vec()))
     }
 
+    /// A publish on `channel`, for a publisher using more than one.
+    fn publish_on(channel: u16, payload: &[u8]) -> Vec<u8> {
+        let mut bytes = wire(&AMQPFrame::Method(
+            channel,
+            AMQPClass::Basic(AMQPMethod::Publish(Publish::default())),
+        ));
+        bytes.extend(wire(&AMQPFrame::Header(
+            channel,
+            AMQPContentHeader {
+                class_id: 60,
+                body_size: payload.len() as u64,
+                properties: AMQPProperties::default(),
+            },
+        )));
+        bytes.extend(wire(&AMQPFrame::Body(channel, payload.to_vec())));
+        bytes
+    }
+
+    /// A broker confirming up to `tag`, on `channel`.
+    fn confirming_on(channel: u16, tag: u64, multiple: bool) -> Vec<u8> {
+        wire(&AMQPFrame::Method(
+            channel,
+            AMQPClass::Basic(AMQPMethod::Ack(Ack {
+                delivery_tag: tag,
+                multiple,
+            })),
+        ))
+    }
+
+    /// A broker confirming up to `tag` on the channel the tests publish on.
+    fn confirming(tag: u64, multiple: bool) -> Vec<u8> {
+        confirming_on(CHANNEL, tag, multiple)
+    }
+
     /// A publish carrying `payload`.
     fn publish(payload: &[u8]) -> Vec<u8> {
         let mut bytes = method(AMQPMethod::Publish(Publish::default()));
@@ -917,6 +1107,11 @@ mod tests {
 
     fn ack() -> Vec<u8> {
         acked(TAG)
+    }
+
+    /// The broker confirming the first publish on the channel.
+    fn first_confirm() -> Vec<u8> {
+        acked(1)
     }
 
     /// A consumer finishing with the delivery the broker labelled `tag`.
@@ -1009,9 +1204,14 @@ mod tests {
     /// A consumer's connection to the broker, watching for nothing.
     fn connection() -> (Reader, Reader) {
         let consuming = Consuming::default();
+        let publishing = Publishing::default();
         (
-            Reader::new(Direction::UpstreamToClient, consuming.clone()),
-            Reader::new(WAY, consuming),
+            Reader::new(
+                Direction::UpstreamToClient,
+                consuming.clone(),
+                publishing.clone(),
+            ),
+            Reader::new(WAY, consuming, publishing.clone()),
         )
     }
 
@@ -1040,11 +1240,16 @@ mod tests {
     /// acknowledged the first delivery before the second arrived if `keeps_up`.
     fn reorders(prefetch: Option<u16>, keeps_up: bool) -> Vec<String> {
         let consuming = Consuming::default();
-        let mut consumer = Reader::new(Direction::ClientToUpstream, consuming.clone());
+        let publishing = Publishing::default();
+        let mut consumer = Reader::new(
+            Direction::ClientToUpstream,
+            consuming.clone(),
+            publishing.clone(),
+        );
         if let Some(count) = prefetch {
             consumer.carry(&qos(count), false);
         }
-        let mut broker = Reader::new(Direction::UpstreamToClient, consuming);
+        let mut broker = Reader::new(Direction::UpstreamToClient, consuming, publishing.clone());
         broker.carry(&delivered(1, b"an order"), false);
         if keeps_up {
             consumer.carry(&acked(1), false);
@@ -1065,6 +1270,7 @@ mod tests {
         let mut broker = Reader::watching(
             Direction::UpstreamToClient,
             Consuming::default(),
+            Publishing::default(),
             "reorder:1".to_owned(),
         );
         let whole = delivered(1, b"an order");
@@ -1089,6 +1295,7 @@ mod tests {
         let mut broker = Reader::watching(
             Direction::UpstreamToClient,
             Consuming::default(),
+            Publishing::default(),
             "reorder:1".to_owned(),
         );
         let mut bytes = delivered(1, b"an order");
@@ -1117,25 +1324,35 @@ mod tests {
 
     /// Placements a fault-free run of `bytes` offers.
     fn placements(bytes: &[u8]) -> Vec<Placement> {
-        Reader::new(WAY, Consuming::default())
+        Reader::new(WAY, Consuming::default(), Publishing::default())
             .carry(bytes, false)
             .found
     }
 
     /// Where a run watching `mark` holds the fleet.
     fn freeze(bytes: &[u8], mark: &str) -> Option<usize> {
-        Reader::watching(WAY, Consuming::default(), mark.to_owned())
-            .carry(bytes, true)
-            .freeze_after
+        Reader::watching(
+            WAY,
+            Consuming::default(),
+            Publishing::default(),
+            mark.to_owned(),
+        )
+        .carry(bytes, true)
+        .freeze_after
     }
 
     /// A consumer's connection to the broker: what it is sent, and what it
     /// sends back, watching for `mark` on the way out.
     fn consumer(mark: &str) -> (Reader, Reader) {
         let consuming = Consuming::default();
+        let publishing = Publishing::default();
         (
-            Reader::new(Direction::UpstreamToClient, consuming.clone()),
-            Reader::watching(WAY, consuming, mark.to_owned()),
+            Reader::new(
+                Direction::UpstreamToClient,
+                consuming.clone(),
+                publishing.clone(),
+            ),
+            Reader::watching(WAY, consuming, publishing.clone(), mark.to_owned()),
         )
     }
 
@@ -1160,12 +1377,16 @@ mod tests {
     /// delivery, so there is nothing there to ask for again.
     #[test]
     fn a_publisher_confirm_offers_no_redelivery() {
-        let marks: Vec<String> = Reader::new(Direction::UpstreamToClient, Consuming::default())
-            .carry(&ack(), false)
-            .found
-            .into_iter()
-            .map(|placement| placement.mark)
-            .collect();
+        let marks: Vec<String> = Reader::new(
+            Direction::UpstreamToClient,
+            Consuming::default(),
+            Publishing::default(),
+        )
+        .carry(&ack(), false)
+        .found
+        .into_iter()
+        .map(|placement| placement.mark)
+        .collect();
         assert!(
             !marks.iter().any(|mark| mark.starts_with("redeliver:")),
             "{marks:?}"
@@ -1175,9 +1396,18 @@ mod tests {
     /// A publisher's connection to the broker: what it sends, and the confirms
     /// coming back, watching for `mark` on the way in.
     fn publisher(mark: &str) -> Reader {
+        // A confirm answers a publish, so there has to have been one.
+        let publishing = Publishing::default();
+        Reader::new(
+            Direction::ClientToUpstream,
+            Consuming::default(),
+            publishing.clone(),
+        )
+        .carry(&publish(b"an order"), false);
         Reader::watching(
             Direction::UpstreamToClient,
             Consuming::default(),
+            publishing,
             mark.to_owned(),
         )
     }
@@ -1186,17 +1416,196 @@ mod tests {
     /// somewhere the publisher could be left never knowing whether it landed.
     #[test]
     fn a_confirm_offers_to_leave_the_publisher_in_doubt() {
-        let offered: Vec<(String, Doing)> =
-            Reader::new(Direction::UpstreamToClient, Consuming::default())
-                .carry(&ack(), false)
-                .found
-                .into_iter()
-                .map(|placement| (placement.mark, placement.doing))
-                .collect();
+        let publishing = Publishing::default();
+        Reader::new(
+            Direction::ClientToUpstream,
+            Consuming::default(),
+            publishing.clone(),
+        )
+        .carry(&publish(b"an order"), false);
+        let offered: Vec<(String, Doing)> = Reader::new(
+            Direction::UpstreamToClient,
+            Consuming::default(),
+            publishing,
+        )
+        .carry(&first_confirm(), false)
+        .found
+        .into_iter()
+        .map(|placement| (placement.mark, placement.doing))
+        .collect();
         assert!(
-            offered.contains(&(format!("confirm:{TAG}"), Doing::Rewriting(Primitive::Drop))),
+            offered.contains(&("confirm:1".to_owned(), Doing::Rewriting(Primitive::Drop))),
             "{offered:?}"
         );
+    }
+
+    /// The direction carrying confirms reads nothing until the scenario has
+    /// published, so it is always the second to be told.
+    #[test]
+    fn the_second_direction_told_the_scenario_started_does_not_renumber() {
+        let publishing = Publishing::default();
+        let mut sender = Reader::new(
+            Direction::ClientToUpstream,
+            Consuming::default(),
+            publishing.clone(),
+        );
+        let mut broker = Reader::new(
+            Direction::UpstreamToClient,
+            Consuming::default(),
+            publishing,
+        );
+
+        sender.scenario_started();
+        sender.carry(&publish(b"first"), false);
+        sender.carry(&publish(b"second"), false);
+        // The confirms for those two are the first thing this half reads, so
+        // this is when it is told.
+        broker.scenario_started();
+
+        let named = marks(sender.carry(&publish(b"third"), false).found);
+        assert!(
+            named.iter().any(|mark| mark == "publish:3:before"),
+            "{named:?}"
+        );
+    }
+
+    /// The publishes a scenario causes are numbered from the scenario. What the
+    /// fleet published while it was starting up is not the scenario's work.
+    #[test]
+    fn publishes_are_numbered_from_the_scenario_and_not_the_connection() {
+        let mut sender = Reader::new(
+            Direction::ClientToUpstream,
+            Consuming::default(),
+            Publishing::default(),
+        );
+        for _ in 0..2 {
+            sender.carry(&publish(b"while coming up"), false);
+        }
+        sender.scenario_started();
+        let named = marks(sender.carry(&publish(b"an order"), false).found);
+        assert!(
+            named.iter().any(|mark| mark == "publish:1:before"),
+            "{named:?}"
+        );
+    }
+
+    /// A delivery tag is the broker's own numbering, so starting the scenario
+    /// does not touch it: the consumer and the broker have to agree on which
+    /// message an ack ends, and this reader does not get a say.
+    #[test]
+    fn the_brokers_own_numbering_is_left_alone() {
+        let mut consumer = Reader::new(
+            Direction::ClientToUpstream,
+            Consuming::default(),
+            Publishing::default(),
+        );
+        consumer.scenario_started();
+        let named = marks(consumer.carry(&acked(7), false).found);
+        assert!(named.iter().any(|mark| mark == "ack:7:before"), "{named:?}");
+    }
+
+    /// Six publishes come back as anything from six frames to one. Counting
+    /// frames names a different set of moments each way, and counting the
+    /// publishes names the same six.
+    #[rstest]
+    #[case::one_frame_each(&[(1, false), (2, false), (3, false), (4, false), (5, false), (6, false)])]
+    #[case::two_batches_of_three(&[(3, true), (6, true)])]
+    #[case::one_batch_for_all(&[(6, true)])]
+    #[case::four_then_a_pair(&[(1, false), (2, false), (3, false), (4, false), (6, true)])]
+    fn a_confirm_names_the_publishes_it_answers_however_the_broker_batches(
+        #[case] batching: &[(u64, bool)],
+    ) {
+        let consuming = Consuming::default();
+        let publishing = Publishing::default();
+        let mut client = Reader::new(
+            Direction::ClientToUpstream,
+            consuming.clone(),
+            publishing.clone(),
+        );
+        let mut broker = Reader::new(Direction::UpstreamToClient, consuming, publishing.clone());
+        for i in 0..6 {
+            client.carry(&publish(format!("m{i}").as_bytes()), false);
+        }
+
+        let mut named = Vec::new();
+        for (tag, multiple) in batching {
+            named.extend(
+                marks(broker.carry(&confirming(*tag, *multiple), false).found)
+                    .into_iter()
+                    .filter(|mark| mark.starts_with("confirm:")),
+            );
+        }
+        assert_eq!(
+            named,
+            [
+                "confirm:1",
+                "confirm:2",
+                "confirm:3",
+                "confirm:4",
+                "confirm:5",
+                "confirm:6"
+            ]
+        );
+    }
+
+    /// Dropping one frame loses the confirmation of every publish it answered,
+    /// so a report that names one publish describes a smaller fault than the
+    /// fleet met.
+    #[test]
+    fn a_confirm_says_which_publishes_it_answers() {
+        let consuming = Consuming::default();
+        let publishing = Publishing::default();
+        let mut client = Reader::new(
+            Direction::ClientToUpstream,
+            consuming.clone(),
+            publishing.clone(),
+        );
+        let mut broker = Reader::new(Direction::UpstreamToClient, consuming, publishing.clone());
+        for i in 0..3 {
+            client.carry(&publish(format!("m{i}").as_bytes()), false);
+        }
+
+        let found = broker.carry(&confirming(3, true), false).found;
+        let why = found
+            .iter()
+            .find(|placement| placement.mark == "confirm:1")
+            .map(|placement| placement.why.clone())
+            .expect("the frame answers the first publish");
+        assert!(why.contains("publishes 1 to 3"), "{why}");
+    }
+
+    /// A publisher may spread its work over several channels of one connection.
+    /// The tags are the broker's and run per channel, so they collide; the
+    /// order the frames crossed does not, because one connection is one stream.
+    #[test]
+    fn publishes_are_ordered_across_the_channels_of_one_connection() {
+        let consuming = Consuming::default();
+        let publishing = Publishing::default();
+        let mut client = Reader::new(
+            Direction::ClientToUpstream,
+            consuming.clone(),
+            publishing.clone(),
+        );
+        let mut broker = Reader::new(Direction::UpstreamToClient, consuming, publishing.clone());
+        for (channel, body) in [(1, "a"), (2, "b"), (1, "c"), (2, "d")] {
+            client.carry(&publish_on(channel, body.as_bytes()), false);
+        }
+
+        // Channel 2 answers both of its publishes, which are the second and
+        // fourth the connection carried.
+        let named: Vec<String> = marks(broker.carry(&confirming_on(2, 2, true), false).found)
+            .into_iter()
+            .filter(|mark| mark.starts_with("confirm:"))
+            .collect();
+        assert_eq!(named, ["confirm:2", "confirm:4"]);
+    }
+
+    /// A consumer's ack ends the delivery the broker gave it that tag for, so
+    /// the tag identifies the message and the mark keeps it.
+    #[test]
+    fn a_consumers_ack_is_named_by_the_delivery_it_ends() {
+        let marks = marks(placements(&acked(7)));
+        assert!(marks.contains(&"ack:7:before".to_owned()), "{marks:?}");
     }
 
     /// A consumer's ack going the other way ends a delivery. There is no
@@ -1215,8 +1624,8 @@ mod tests {
     /// publisher is left to decide what became of the publish.
     #[test]
     fn dropping_a_confirm_takes_it_off_the_wire() {
-        let mut broker = publisher(&format!("confirm:{TAG}"));
-        let confirm = ack();
+        let mut broker = publisher("confirm:1");
+        let confirm = first_confirm();
         let carried = broker.carry(&confirm, true);
         assert!(
             carried.forward.concat().is_empty(),
@@ -1238,10 +1647,10 @@ mod tests {
     }
 
     /// The schedule names one moment. Once it is placed there is nothing left
-    /// to watch for, so a later confirm on the same tag goes as it was sent.
+    /// to watch for, so the next confirm back goes as it was sent.
     #[test]
     fn only_the_first_confirm_of_the_moment_is_dropped() {
-        let mut broker = publisher(&format!("confirm:{TAG}"));
+        let mut broker = publisher("confirm:1");
         let first = ack();
         broker.carry(&first, true);
         let bytes = ack();
@@ -1253,9 +1662,9 @@ mod tests {
     /// A confirm rides in with other traffic. Only it is taken.
     #[test]
     fn dropping_a_confirm_leaves_the_rest_of_the_read_alone() {
-        let mut broker = publisher(&format!("confirm:{TAG}"));
+        let mut broker = publisher("confirm:1");
         let delivery = pushed(false, b"an order");
-        let bytes = [ack(), delivery.clone()].concat();
+        let bytes = [first_confirm(), delivery.clone()].concat();
         let carried = broker.carry(&bytes, true);
         assert_eq!(carried.forward.concat(), delivery);
     }
@@ -1264,7 +1673,7 @@ mod tests {
     /// to hold the fleet for.
     #[test]
     fn dropping_a_confirm_holds_nothing_back() {
-        let mut broker = publisher(&format!("confirm:{TAG}"));
+        let mut broker = publisher("confirm:1");
         let confirm = ack();
         assert_eq!(broker.carry(&confirm, true).freeze_after, None);
     }
@@ -1345,7 +1754,11 @@ mod tests {
     /// nothing behind it to go first, holding it back takes the message away.
     #[test]
     fn a_delivery_offers_a_reorder_once_another_follows_it() {
-        let mut reader = Reader::new(Direction::UpstreamToClient, Consuming::default());
+        let mut reader = Reader::new(
+            Direction::UpstreamToClient,
+            Consuming::default(),
+            Publishing::default(),
+        );
         let first = delivered(1, b"an order");
         assert!(
             marks(reader.carry(&first, false).found)
@@ -1362,6 +1775,7 @@ mod tests {
         let mut reader = Reader::watching(
             Direction::UpstreamToClient,
             Consuming::default(),
+            Publishing::default(),
             "reorder:1".into(),
         );
 
@@ -1414,9 +1828,14 @@ mod tests {
     #[test]
     fn a_consumer_that_can_acknowledge_its_way_out_is_offered_a_reorder() {
         let consuming = Consuming::default();
-        let mut consumer = Reader::new(Direction::ClientToUpstream, consuming.clone());
+        let publishing = Publishing::default();
+        let mut consumer = Reader::new(
+            Direction::ClientToUpstream,
+            consuming.clone(),
+            publishing.clone(),
+        );
         consumer.carry(&qos(2), false);
-        let mut broker = Reader::new(Direction::UpstreamToClient, consuming);
+        let mut broker = Reader::new(Direction::UpstreamToClient, consuming, publishing.clone());
 
         broker.carry(&delivered(1, b"an order"), false);
         // Both places taken, so the broker sends no more until one is freed.
@@ -1510,9 +1929,19 @@ mod tests {
     #[test]
     fn a_reorder_that_would_stall_the_broker_says_it_cannot_be_placed() {
         let consuming = Consuming::default();
-        Reader::new(Direction::ClientToUpstream, consuming.clone()).carry(&qos(1), false);
-        let mut broker =
-            Reader::watching(Direction::UpstreamToClient, consuming, "reorder:1".into());
+        let publishing = Publishing::default();
+        Reader::new(
+            Direction::ClientToUpstream,
+            consuming.clone(),
+            publishing.clone(),
+        )
+        .carry(&qos(1), false);
+        let mut broker = Reader::watching(
+            Direction::UpstreamToClient,
+            consuming,
+            publishing.clone(),
+            "reorder:1".into(),
+        );
 
         let delivery = delivered(1, b"an order");
         let carried = broker.carry(&delivery, true);
@@ -1534,8 +1963,14 @@ mod tests {
     #[test]
     fn a_limit_the_broker_sent_back_is_not_the_consumer_asking() {
         let consuming = Consuming::default();
-        Reader::new(Direction::UpstreamToClient, consuming.clone()).carry(&qos(1), false);
-        let mut broker = Reader::new(Direction::UpstreamToClient, consuming);
+        let publishing = Publishing::default();
+        Reader::new(
+            Direction::UpstreamToClient,
+            consuming.clone(),
+            publishing.clone(),
+        )
+        .carry(&qos(1), false);
+        let mut broker = Reader::new(Direction::UpstreamToClient, consuming, publishing.clone());
         broker.carry(&delivered(1, b"an order"), false);
         assert!(
             marks(broker.carry(&delivered(2, b"another order"), false).found)
@@ -1562,7 +1997,10 @@ mod tests {
         );
         assert_eq!(
             operations(&carried.forward.concat()),
-            [Operation::Ack { tag: TAG }],
+            [Operation::Ack {
+                tag: TAG,
+                multiple: false
+            }],
             "left alone"
         );
     }
@@ -1641,7 +2079,12 @@ mod tests {
     fn a_message_split_across_reads_is_held_on_the_read_that_finishes_it() {
         let bytes = publish(b"an order");
         let split = bytes.len() - 4;
-        let mut reader = Reader::watching(WAY, Consuming::default(), "publish:1:after".to_owned());
+        let mut reader = Reader::watching(
+            WAY,
+            Consuming::default(),
+            Publishing::default(),
+            "publish:1:after".to_owned(),
+        );
         assert_eq!(
             reader.carry(&bytes[..split], true).freeze_after,
             None,
@@ -1660,7 +2103,7 @@ mod tests {
     fn what_is_carried_is_what_arrived() {
         let bytes = [publish(b"an order"), ack()].concat();
         assert_eq!(
-            Reader::new(WAY, Consuming::default())
+            Reader::new(WAY, Consuming::default(), Publishing::default())
                 .carry(&bytes, false)
                 .forward
                 .concat(),
@@ -1674,7 +2117,7 @@ mod tests {
     fn a_frame_split_across_reads_goes_out_whole() {
         let bytes = ack();
         let split = bytes.len() - 4;
-        let mut reader = Reader::new(WAY, Consuming::default());
+        let mut reader = Reader::new(WAY, Consuming::default(), Publishing::default());
         assert!(
             reader.carry(&bytes[..split], false).forward.is_empty(),
             "none of it is whole yet"
@@ -1688,7 +2131,12 @@ mod tests {
     fn a_message_split_before_the_mark_holds_the_whole_read() {
         let bytes = publish(b"an order");
         let split = bytes.len() - 4;
-        let mut reader = Reader::watching(WAY, Consuming::default(), "publish:1:before".to_owned());
+        let mut reader = Reader::watching(
+            WAY,
+            Consuming::default(),
+            Publishing::default(),
+            "publish:1:before".to_owned(),
+        );
         assert_eq!(reader.carry(&bytes[..split], true).freeze_after, None);
         assert_eq!(reader.carry(&bytes[split..], true).freeze_after, Some(0));
     }
