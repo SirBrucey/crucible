@@ -637,6 +637,7 @@ impl crucible_protocol::Kind for Reader {
             freeze_after,
             found,
             did,
+            unreadable: None,
         }
     }
 }

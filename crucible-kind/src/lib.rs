@@ -117,6 +117,9 @@ impl Kind for Unread {
             // It cannot say where a fault should go.
             found: Vec::new(),
             did: None,
+            // Nothing tried to read this, so nothing failed. The framework
+            // already knows no plugin speaks this kind.
+            unreadable: None,
         }
     }
 }

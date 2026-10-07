@@ -717,6 +717,7 @@ mod tests {
                 freeze_after: Some(0),
                 found: Vec::new(),
                 did: None,
+                unreadable: None,
             }
         }
     }
