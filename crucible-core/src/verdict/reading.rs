@@ -604,6 +604,11 @@ impl Went {
     /// by [`did_some_of_the_steps`], which is how far the fleet got along them.
     fn of_spans(spans: &[Span]) -> Went {
         let mut went = Went::Elsewhere;
+        // A refused step's work can land after the stretch it was driven in,
+        // where the only sign of it is an unexplained surplus.
+        let owes_a_refusal = spans
+            .iter()
+            .any(|span| !span.acked && span.drove.is_nothing());
         for span in spans {
             // A stretch the fleet turned away owes nothing, whatever the
             // fault-free run did in its place. Moving at all is the fleet
@@ -621,7 +626,11 @@ impl Went {
                 if span.drove.is_twice(&span.learned)
                     || (span.learned.is_nothing() && repeats_a_step(span, spans))
                 {
-                    Went::Twice
+                    if owes_a_refusal {
+                        Went::Kept
+                    } else {
+                        Went::Twice
+                    }
                 } else if span.drove.is_short_of(&span.learned) || did_some_of_the_steps(span) {
                     Went::Lost
                 } else {
@@ -1787,6 +1796,20 @@ mod tests {
             3,
         );
         let (broke, why) = showed(run.verdict());
+        assert_eq!(broke, Some(Invariant::Durable));
+        assert!(why.contains("kept work it turned away"), "{why}");
+    }
+
+    /// The surplus only shows once the fleet has settled, so no stretch
+    /// carries it.
+    #[test]
+    fn a_surplus_no_stretch_accounts_for_is_work_the_fleet_refused() {
+        let (broke, why) = showed(judged_given(
+            &[Ack::Rejected, Ack::Acked, Ack::Acked],
+            &[0, 1, 2, 3],
+            3,
+            &[(&[2, 3], 0)],
+        ));
         assert_eq!(broke, Some(Invariant::Durable));
         assert!(why.contains("kept work it turned away"), "{why}");
     }
