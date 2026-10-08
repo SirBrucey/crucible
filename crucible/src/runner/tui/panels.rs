@@ -79,9 +79,8 @@ impl Widget for Card<'_> {
             Line::from("waiting").render(inner, buf);
             return;
         };
-        let worker = match row.state {
-            Progress::Running { worker } => worker,
-            _ => return,
+        let Progress::Running { worker } = row.state else {
+            return;
         };
         let block = Block::bordered().title_top(format!(" W{worker} "));
         let inner = block.inner(area);
