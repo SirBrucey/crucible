@@ -386,7 +386,7 @@ mod tests {
             report: std::path::PathBuf::from("report.md"),
             stage: Learning,
         }
-        .dispatch(schedules, Duration::from_secs(1260), 3)
+        .dispatch(schedules, Duration::from_mins(21), 3)
     }
 
     fn line(buf: &Buffer, y: u16) -> String {
@@ -396,7 +396,7 @@ mod tests {
     }
 
     #[rstest]
-    #[case(Some(Duration::from_secs(1800)), "0:05:23 / 0:30:00")]
+    #[case(Some(Duration::from_mins(30)), "0:05:23 / 0:30:00")]
     #[case(None, "0:05:23")]
     fn clock_reads_against_a_budget_only_when_one_is_given(
         #[case] budget: Option<Duration>,
@@ -484,7 +484,7 @@ mod tests {
     #[test]
     fn header_carries_the_clock_and_what_the_campaign_loaded() {
         let mut buf = Buffer::empty(Rect::new(0, 0, 70, 3));
-        Header(&running(Some(Duration::from_secs(1800)), Vec::new())).render(buf.area, &mut buf);
+        Header(&running(Some(Duration::from_mins(30)), Vec::new())).render(buf.area, &mut buf);
 
         assert!(line(&buf, 0).contains("0:05:23 / 0:30:00"), "{buf:?}");
         assert!(line(&buf, 1).contains("plugins: amqp, http"), "{buf:?}");

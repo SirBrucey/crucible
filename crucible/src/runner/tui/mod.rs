@@ -444,7 +444,7 @@ mod tests {
         State {
             scenario: "orders.cru".to_owned(),
             elapsed: Duration::from_secs(323),
-            budget: Some(Duration::from_secs(1800)),
+            budget: Some(Duration::from_mins(30)),
             spec: "a31c".to_owned(),
             plugins: vec!["amqp".to_owned(), "http".to_owned(), "mariadb".to_owned()],
             report: std::path::PathBuf::from("report.md"),
@@ -476,7 +476,7 @@ mod tests {
                 row(177, cutting(), Progress::Requeued),
                 row(176, Purpose::Learn, Progress::Abandoned),
             ],
-            Duration::from_secs(1260),
+            Duration::from_mins(21),
             3,
         )
     }
@@ -601,7 +601,7 @@ mod tests {
     #[test]
     fn the_eta_is_read_from_what_the_campaign_has_cost() {
         let mut state = example();
-        state.elapsed = Duration::from_secs(300);
+        state.elapsed = Duration::from_mins(5);
 
         state.moved(179, Progress::Complete(Verdict::Pass));
 
@@ -611,10 +611,10 @@ mod tests {
     #[test]
     fn the_eta_counts_down_between_the_schedules_that_revise_it() {
         let mut state = example();
-        state.elapsed = Duration::from_secs(300);
+        state.elapsed = Duration::from_mins(5);
         state.moved(179, Progress::Complete(Verdict::Pass));
 
-        state.elapsed = Duration::from_secs(360);
+        state.elapsed = Duration::from_mins(6);
 
         assert_eq!(state.eta(), Duration::from_secs(165));
     }
@@ -622,7 +622,7 @@ mod tests {
     #[test]
     fn a_run_picked_up_does_not_make_the_campaign_look_longer() {
         let mut state = example();
-        state.elapsed = Duration::from_secs(300);
+        state.elapsed = Duration::from_mins(5);
         state.moved(179, Progress::Complete(Verdict::Pass));
         let priced = state.eta();
 

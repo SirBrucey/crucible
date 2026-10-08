@@ -339,7 +339,7 @@ mod tests {
     fn fitted(schedules: Vec<(u32, Purpose)>) -> RunnerEvent {
         RunnerEvent::Fitted {
             schedules,
-            eta: std::time::Duration::from_secs(60),
+            eta: std::time::Duration::from_mins(1),
             workers: 3,
         }
     }
