@@ -214,6 +214,18 @@ pub fn edge_profiles_from_sessions<S: std::hash::BuildHasher>(
         .into_iter()
         .map(|edge| {
             let placements = placeable.get(&edge).cloned().unwrap_or_default();
+            // The catalogue keeps each name once, so by the time the campaign
+            // sees this edge one of the two has gone.
+            if let Some(mark) = repeated_mark(&placements) {
+                tracing::warn!(
+                    ?edge,
+                    %mark,
+                    moments = placements.len(),
+                    names = distinct_marks(&placements),
+                    "at least two moments on this edge are offered under one name, so that name \
+                     stands for more than one packet and the others are not offered at all"
+                );
+            }
             // A plugin reading the edge drives more accurate faults than a
             // packet count, so its bursts are then unnecessary.
             let (client_to_upstream, upstream_to_client) = if placements.is_empty() {
@@ -234,6 +246,27 @@ pub fn edge_profiles_from_sessions<S: std::hash::BuildHasher>(
             }
         })
         .collect()
+}
+
+/// The first name two of these placements share.
+///
+/// A plugin numbers the moments it finds within a connection, so two
+/// placements on one edge with the same name are two different packets.
+fn repeated_mark(placements: &[Placement]) -> Option<String> {
+    let mut seen = BTreeSet::new();
+    placements
+        .iter()
+        .find(|placement| !seen.insert(placement.mark.clone()))
+        .map(|placement| placement.mark.clone())
+}
+
+/// How many names these placements use between them.
+fn distinct_marks(placements: &[Placement]) -> usize {
+    placements
+        .iter()
+        .map(|placement| &placement.mark)
+        .collect::<BTreeSet<_>>()
+        .len()
 }
 
 /// A window a span held its host open.
@@ -535,6 +568,17 @@ mod tests {
                 why: "an ack the broker has taken".into(),
                 doing: crucible_protocol::Doing::Holding,
             },
+        }
+    }
+
+    /// Somewhere a plugin said a fault could go.
+    fn found_named(ts_ns: u128, mark: &str) -> Found {
+        Found {
+            placement: Placement {
+                mark: mark.into(),
+                ..found(ts_ns).placement
+            },
+            ts_ns,
         }
     }
 
@@ -886,5 +930,47 @@ mod tests {
         .into_iter()
         .collect();
         assert!(out.is_empty());
+    }
+
+    /// Dropping one would hide that the edge offers fewer moments than it has.
+    #[test]
+    fn two_moments_offered_under_one_name_are_both_kept_and_found() {
+        let publishing = |conn_id, at| Session {
+            service: "broker".into(),
+            conn_id,
+            peer: "127.0.0.1:1".to_string(),
+            opened_ns: 0,
+            closed_ns: None,
+            placements: vec![found_named(at, "publish:1:before")],
+            unreadable: None,
+            writes: Vec::new(),
+        };
+        let addresses = HashMap::from([("127.0.0.1".parse().unwrap(), "api".to_string())]);
+        let profiles = edge_profiles_from_sessions(
+            &[publishing(0, 100), publishing(1, 200)],
+            timing(50),
+            &addresses,
+            &[],
+        );
+
+        let placements = &profiles[0].placements;
+        assert_eq!(placements.len(), 2);
+        assert_eq!(distinct_marks(placements), 1);
+        assert_eq!(
+            repeated_mark(placements).as_deref(),
+            Some("publish:1:before")
+        );
+    }
+
+    /// An edge naming each of its moments once has nothing to report, however
+    /// many moments it offers.
+    #[test]
+    fn an_edge_naming_each_moment_once_has_no_repeated_name() {
+        let placements: Vec<Placement> = ["publish:1:before", "publish:2:before", "confirm:1"]
+            .iter()
+            .map(|mark| found_named(100, mark).placement)
+            .collect();
+        assert!(repeated_mark(&placements).is_none());
+        assert_eq!(distinct_marks(&placements), placements.len());
     }
 }
