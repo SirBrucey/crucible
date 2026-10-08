@@ -17,6 +17,61 @@ use amq_protocol::{
 };
 use crucible_protocol::{Carried, Did, Direction, Doing, Placement, Primitive};
 
+/// One of a connection's channels, which the broker numbers from one.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Channel(u16);
+
+/// What the broker calls a message on a channel, counting from one.
+///
+/// The broker's own numbering, so a tag means nothing without the channel it
+/// was given on.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Tag(u64);
+
+impl Tag {
+    /// The tag after this one.
+    fn increment(self) -> Tag {
+        Tag(self.0 + 1)
+    }
+
+    /// The tag before this one.
+    fn decrement(self) -> Tag {
+        Tag(self.0 - 1)
+    }
+}
+
+macro_rules! wraps {
+    ($name:ident, $inner:ty) => {
+        impl $name {
+            /// The broker's own number, read as one of these.
+            pub const fn new(inner: $inner) -> Self {
+                Self(inner)
+            }
+        }
+
+        impl From<$inner> for $name {
+            fn from(inner: $inner) -> Self {
+                Self::new(inner)
+            }
+        }
+
+        impl From<$name> for $inner {
+            fn from(outer: $name) -> Self {
+                outer.0
+            }
+        }
+
+        impl std::fmt::Display for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                self.0.fmt(f)
+            }
+        }
+    };
+}
+
+wraps!(Channel, u16);
+wraps!(Tag, u64);
+
 /// What a fleet was doing, in terms a fault is placed against.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Operation {
@@ -25,16 +80,16 @@ pub enum Operation {
     /// A message handed to a consumer, whether pushed or fetched.
     Deliver {
         /// What the broker labelled it, which names it on this channel.
-        tag: u64,
+        tag: Tag,
         /// Whether this message has been delivered before.
         redelivered: bool,
     },
     /// A consumer saying it is done with one, or the broker confirming a
     /// publish. `multiple` is the broker answering every publish up to `tag`
     /// rather than that one alone, which it decides for itself.
-    Ack { tag: u64, multiple: bool },
+    Ack { tag: Tag, multiple: bool },
     /// A consumer refusing one, which is what makes the broker requeue it.
-    Reject { tag: u64 },
+    Reject { tag: Tag },
     /// A consumer saying how many deliveries it will hold unacknowledged at
     /// once. Zero is AMQP's no limit.
     Prefetch { count: u16 },
@@ -69,22 +124,22 @@ impl Operation {
         Some(match method {
             AMQPMethod::Publish(_) => Operation::Publish,
             AMQPMethod::Deliver(deliver) => Operation::Deliver {
-                tag: deliver.delivery_tag,
+                tag: Tag::from(deliver.delivery_tag),
                 redelivered: deliver.redelivered,
             },
             AMQPMethod::GetOk(get) => Operation::Deliver {
-                tag: get.delivery_tag,
+                tag: Tag::from(get.delivery_tag),
                 redelivered: get.redelivered,
             },
             AMQPMethod::Ack(ack) => Operation::Ack {
-                tag: ack.delivery_tag,
+                tag: Tag::from(ack.delivery_tag),
                 multiple: ack.multiple,
             },
             AMQPMethod::Reject(reject) => Operation::Reject {
-                tag: reject.delivery_tag,
+                tag: Tag::from(reject.delivery_tag),
             },
             AMQPMethod::Nack(nack) => Operation::Reject {
-                tag: nack.delivery_tag,
+                tag: Tag::from(nack.delivery_tag),
             },
             AMQPMethod::Qos(qos) => Operation::Prefetch {
                 count: qos.prefetch_count,
@@ -113,7 +168,7 @@ impl Operation {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Message {
     pub operation: Operation,
-    pub channel: u16,
+    pub channel: Channel,
     pub at: Range<usize>,
     /// What this is, for an operation that carries a message.
     identity: Option<Identity>,
@@ -214,7 +269,7 @@ fn read(frames: &[Framed]) -> (Vec<Message>, usize) {
         };
         messages.push(Message {
             operation,
-            channel: framed.frame.channel_id(),
+            channel: Channel::from(framed.frame.channel_id()),
             at: framed.at.start..frames[last].at.end,
             identity: operation
                 .has_body()
@@ -263,11 +318,11 @@ struct Deliveries {
     /// What the consumer holds and has not finished with, by the tag naming
     /// each delivery of it, and what names it across deliveries.
     /// Bounded by the prefetch the channel negotiated.
-    outstanding: BTreeMap<(u16, u64), Option<Identity>>,
+    outstanding: BTreeMap<(Channel, Tag), Option<Identity>>,
     /// The message a fault asked the broker to send again.
     asked: Option<Identity>,
     /// How many deliveries each channel said it would hold at once.
-    prefetch: BTreeMap<u16, u16>,
+    prefetch: BTreeMap<Channel, u16>,
 }
 
 impl Consuming {
@@ -275,12 +330,12 @@ impl Consuming {
     ///
     /// A delivery nothing names still fills a place the broker is counting, so
     /// it is held here either way.
-    fn delivered(&self, channel: u16, tag: u64, identity: Option<Identity>) {
+    fn delivered(&self, channel: Channel, tag: Tag, identity: Option<Identity>) {
         self.held().outstanding.insert((channel, tag), identity);
     }
 
     /// What names the delivery the consumer is holding as `tag`.
-    fn holding(&self, channel: u16, tag: u64) -> Option<Identity> {
+    fn holding(&self, channel: Channel, tag: Tag) -> Option<Identity> {
         self.held()
             .outstanding
             .get(&(channel, tag))
@@ -289,7 +344,7 @@ impl Consuming {
     }
 
     /// The consumer is done with `tag`, one way or another.
-    fn finished(&self, channel: u16, tag: u64) {
+    fn finished(&self, channel: Channel, tag: Tag) {
         self.held().outstanding.remove(&(channel, tag));
     }
 
@@ -298,21 +353,21 @@ impl Consuming {
     ///
     /// A delivery tag does not say which consumer held it, so the whole channel
     /// is emptied.
-    fn handed_back(&self, channel: u16) {
+    fn handed_back(&self, channel: Channel) {
         self.held().outstanding.retain(|(on, _), _| *on != channel);
     }
 
     /// The channel has ended, so nothing counted against it still holds. A
     /// channel opened on the number afterwards asks for its own limit and
     /// numbers its own deliveries.
-    fn closed(&self, channel: u16) {
+    fn closed(&self, channel: Channel) {
         let mut held = self.held();
         held.outstanding.retain(|(on, _), _| *on != channel);
         held.prefetch.remove(&channel);
     }
 
     /// The consumer will hold at most `count` deliveries at once on `channel`.
-    fn holds_at_most(&self, channel: u16, count: u16) {
+    fn holds_at_most(&self, channel: Channel, count: u16) {
         self.held().prefetch.insert(channel, count);
     }
 
@@ -327,7 +382,7 @@ impl Consuming {
     ///
     /// The arriving delivery is counted here rather than read back, since what
     /// the consumer is holding is followed after a fault is decided.
-    fn would_stall(&self, channel: u16) -> bool {
+    fn would_stall(&self, channel: Channel) -> bool {
         let held = self.held();
         // Only a limit of one leaves the broker nothing to send behind a held
         // delivery. A larger limit leaves room, and a channel that said nothing
@@ -336,7 +391,7 @@ impl Consuming {
             return false;
         }
         held.outstanding
-            .range((channel, u64::MIN)..=(channel, u64::MAX))
+            .range((channel, Tag::new(u64::MIN))..=(channel, Tag::new(u64::MAX)))
             .next()
             .is_none()
     }
@@ -423,13 +478,21 @@ struct Publishes {
     /// Whether this log has already been told the scenario started.
     started: bool,
     /// Each publish the scenario caused, in the order it crossed.
-    sent: Vec<(u16, u64)>,
-    /// What the broker will call the next publish on each channel. The
-    /// broker's own sequence, which runs from the channel entering confirm
-    /// mode and so does not restart when a scenario does.
-    next_tag: BTreeMap<u16, u64>,
-    /// The highest tag answered on each channel.
-    answered: BTreeMap<u16, u64>,
+    sent: Vec<(Channel, Tag)>,
+    /// The broker's numbering on each channel.
+    tags: BTreeMap<Channel, Tags>,
+}
+
+/// The broker's numbering on one channel.
+///
+/// Its own sequence, which runs from the channel entering confirm mode and so
+/// does not restart when a scenario does.
+#[derive(Default, Debug)]
+struct Tags {
+    /// What it will call the next publish.
+    next: Tag,
+    /// The highest tag it has answered.
+    answered: Tag,
 }
 
 impl Publishing {
@@ -438,13 +501,11 @@ impl Publishing {
     }
 
     /// Record a publish.
-    fn sent(&self, channel: u16) -> usize {
+    fn sent(&self, channel: Channel) -> usize {
         let mut held = self.held();
-        let tag = *held
-            .next_tag
-            .entry(channel)
-            .and_modify(|tag| *tag += 1)
-            .or_insert(1);
+        let tags = held.tags.entry(channel).or_default();
+        tags.next = tags.next.increment();
+        let tag = tags.next;
         held.sent.push((channel, tag));
         held.sent.len()
     }
@@ -453,14 +514,15 @@ impl Publishing {
     ///
     /// Several of them, where `multiple` is set. A publish from before the
     /// scenario is not held here and names nothing.
-    fn answered(&self, channel: u16, tag: u64, multiple: bool) -> Vec<usize> {
+    fn answered(&self, channel: Channel, tag: Tag, multiple: bool) -> Vec<usize> {
         let mut held = self.held();
+        let tags = held.tags.entry(channel).or_default();
         let from = if multiple {
-            held.answered.get(&channel).map_or(0, |answered| *answered)
+            tags.answered
         } else {
-            tag - 1
+            tag.decrement()
         };
-        held.answered.insert(channel, tag);
+        tags.answered = tag;
         held.sent
             .iter()
             .enumerate()
@@ -507,7 +569,7 @@ pub struct Reader {
     /// be offered as somewhere to be told things out of order. The flag is
     /// whether the broker had room to send behind that delivery, read as it
     /// arrived rather than as the next one did.
-    last: BTreeMap<u16, (u64, bool)>,
+    last: BTreeMap<Channel, (Tag, bool)>,
     /// A message kept back, waiting for the one the broker sent next to go
     /// first.
     held: Option<Vec<u8>>,
@@ -848,7 +910,7 @@ const WOULD_STALL: &str = "the broker keeps at most as many deliveries unacknowl
 /// broker would have something left to send while this one is held. It keeps at
 /// most as many deliveries unacknowledged as the consumer asked for, and a held
 /// delivery is never acknowledged.
-fn reorderable(followed: u64, direction: Direction) -> Placement {
+fn reorderable(followed: Tag, direction: Direction) -> Placement {
     Placement {
         direction,
         mark: format!("reorder:{followed}"),
@@ -941,9 +1003,9 @@ impl Reader {
             return Did::Unplaceable("the ack had already gone".to_owned());
         };
         let nack = AMQPFrame::Method(
-            message.channel,
+            u16::from(message.channel),
             AMQPClass::Basic(AMQPMethod::Nack(Nack {
-                delivery_tag: tag,
+                delivery_tag: u64::from(tag),
                 multiple: false,
                 requeue: true,
             })),
@@ -1026,10 +1088,10 @@ mod tests {
 
     use super::*;
 
-    const CHANNEL: u16 = 1;
+    const CHANNEL: Channel = Channel::new(1);
     /// Which way the traffic these read runs.
     const WAY: Direction = Direction::ClientToUpstream;
-    const TAG: u64 = 7;
+    const TAG: Tag = Tag::new(7);
 
     /// A frame as it goes on the wire.
     fn wire(frame: &AMQPFrame) -> Vec<u8> {
@@ -1042,13 +1104,16 @@ mod tests {
 
     /// A method frame in the class a fault is placed against.
     fn method(method: AMQPMethod) -> Vec<u8> {
-        wire(&AMQPFrame::Method(CHANNEL, AMQPClass::Basic(method)))
+        wire(&AMQPFrame::Method(
+            u16::from(CHANNEL),
+            AMQPClass::Basic(method),
+        ))
     }
 
     /// The content header that follows a message, stating its body size.
     fn header(size: u64) -> Vec<u8> {
         wire(&AMQPFrame::Header(
-            CHANNEL,
+            u16::from(CHANNEL),
             AMQPContentHeader {
                 class_id: 60,
                 body_size: size,
@@ -1058,33 +1123,33 @@ mod tests {
     }
 
     fn body(payload: &[u8]) -> Vec<u8> {
-        wire(&AMQPFrame::Body(CHANNEL, payload.to_vec()))
+        wire(&AMQPFrame::Body(u16::from(CHANNEL), payload.to_vec()))
     }
 
     /// A publish on `channel`, for a publisher using more than one.
-    fn publish_on(channel: u16, payload: &[u8]) -> Vec<u8> {
+    fn publish_on(channel: Channel, payload: &[u8]) -> Vec<u8> {
         let mut bytes = wire(&AMQPFrame::Method(
-            channel,
+            u16::from(channel),
             AMQPClass::Basic(AMQPMethod::Publish(Publish::default())),
         ));
         bytes.extend(wire(&AMQPFrame::Header(
-            channel,
+            u16::from(channel),
             AMQPContentHeader {
                 class_id: 60,
                 body_size: payload.len() as u64,
                 properties: AMQPProperties::default(),
             },
         )));
-        bytes.extend(wire(&AMQPFrame::Body(channel, payload.to_vec())));
+        bytes.extend(wire(&AMQPFrame::Body(u16::from(channel), payload.to_vec())));
         bytes
     }
 
     /// A broker confirming up to `tag`, on `channel`.
-    fn confirming_on(channel: u16, tag: u64, multiple: bool) -> Vec<u8> {
+    fn confirming_on(channel: Channel, tag: Tag, multiple: bool) -> Vec<u8> {
         wire(&AMQPFrame::Method(
-            channel,
+            u16::from(channel),
             AMQPClass::Basic(AMQPMethod::Ack(Ack {
-                delivery_tag: tag,
+                delivery_tag: u64::from(tag),
                 multiple,
             })),
         ))
@@ -1092,7 +1157,7 @@ mod tests {
 
     /// A broker confirming up to `tag` on the channel the tests publish on.
     fn confirming(tag: u64, multiple: bool) -> Vec<u8> {
-        confirming_on(CHANNEL, tag, multiple)
+        confirming_on(CHANNEL, Tag::new(tag), multiple)
     }
 
     /// A publish carrying `payload`.
@@ -1106,7 +1171,7 @@ mod tests {
     }
 
     fn ack() -> Vec<u8> {
-        acked(TAG)
+        acked(u64::from(TAG))
     }
 
     /// The broker confirming the first publish on the channel.
@@ -1126,7 +1191,7 @@ mod tests {
     fn pushed(redelivered: bool, payload: &[u8]) -> Vec<u8> {
         let mut bytes = method(AMQPMethod::Deliver(Deliver {
             consumer_tag: "consumer-1".into(),
-            delivery_tag: TAG,
+            delivery_tag: u64::from(TAG),
             redelivered,
             ..Default::default()
         }));
@@ -1138,7 +1203,7 @@ mod tests {
     /// A delivery a consumer fetched.
     fn fetched(redelivered: bool, payload: &[u8]) -> Vec<u8> {
         let mut bytes = method(AMQPMethod::GetOk(GetOk {
-            delivery_tag: TAG,
+            delivery_tag: u64::from(TAG),
             redelivered,
             ..Default::default()
         }));
@@ -1177,7 +1242,7 @@ mod tests {
     /// One side asking to end the channel.
     fn closing() -> Vec<u8> {
         wire(&AMQPFrame::Method(
-            CHANNEL,
+            u16::from(CHANNEL),
             AMQPClass::Channel(channel::AMQPMethod::Close(channel::Close::default())),
         ))
     }
@@ -1185,7 +1250,7 @@ mod tests {
     /// The other side agreeing to it.
     fn closed() -> Vec<u8> {
         wire(&AMQPFrame::Method(
-            CHANNEL,
+            u16::from(CHANNEL),
             AMQPClass::Channel(channel::AMQPMethod::CloseOk(channel::CloseOk {})),
         ))
     }
@@ -1308,11 +1373,11 @@ mod tests {
             carried.did
         );
         let forwarded: Vec<u8> = carried.forward.concat();
-        assert_eq!(tags(&forwarded), [2, 1]);
+        assert_eq!(tags(&forwarded), [Tag::new(2), Tag::new(1)]);
     }
 
     /// The delivery tags in `bytes`, in the order they go on the wire.
-    fn tags(bytes: &[u8]) -> Vec<u64> {
+    fn tags(bytes: &[u8]) -> Vec<Tag> {
         operations(bytes)
             .into_iter()
             .filter_map(|operation| match operation {
@@ -1588,15 +1653,20 @@ mod tests {
         );
         let mut broker = Reader::new(Direction::UpstreamToClient, consuming, publishing.clone());
         for (channel, body) in [(1, "a"), (2, "b"), (1, "c"), (2, "d")] {
+            let channel = Channel::new(channel);
             client.carry(&publish_on(channel, body.as_bytes()), false);
         }
 
         // Channel 2 answers both of its publishes, which are the second and
         // fourth the connection carried.
-        let named: Vec<String> = marks(broker.carry(&confirming_on(2, 2, true), false).found)
-            .into_iter()
-            .filter(|mark| mark.starts_with("confirm:"))
-            .collect();
+        let named: Vec<String> = marks(
+            broker
+                .carry(&confirming_on(Channel::new(2), Tag::new(2), true), false)
+                .found,
+        )
+        .into_iter()
+        .filter(|mark| mark.starts_with("confirm:"))
+        .collect();
         assert_eq!(named, ["confirm:2", "confirm:4"]);
     }
 
@@ -1788,7 +1858,7 @@ mod tests {
         let released = reader.carry(&second, true);
         assert_eq!(
             tags(&released.forward.concat()),
-            [2, 1],
+            [Tag::new(2), Tag::new(1)],
             "the one sent first arrives second"
         );
         assert!(
@@ -1952,7 +2022,7 @@ mod tests {
         );
         assert_eq!(
             tags(&carried.forward.concat()),
-            [1],
+            [Tag::new(1)],
             "the delivery goes on untouched"
         );
     }
