@@ -342,7 +342,7 @@ pub fn dispatch(frame: &mut Frame, state: &mut State<Dispatching>) {
         Constraint::Length(1),
     ])
     .areas(frame.area());
-    let [workers, stats] =
+    let [workers, stats_area] =
         Layout::horizontal([Constraint::Min(40), Constraint::Length(24)]).areas(fleet);
 
     frame.render_widget(panels::Header(state), header);
@@ -359,7 +359,7 @@ pub fn dispatch(frame: &mut Frame, state: &mut State<Dispatching>) {
         },
         workers,
     );
-    frame.render_widget(panels::Stats(state), stats);
+    frame.render_widget(panels::Stats(state), stats_area);
     let [queued_area, found_area] =
         Layout::horizontal([Constraint::Percentage(45), Constraint::Percentage(55)])
             .areas(schedules);

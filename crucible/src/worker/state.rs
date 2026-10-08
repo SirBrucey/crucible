@@ -87,8 +87,8 @@ impl Conn {
     fn start_reporting(&self) -> (Doing, Reporting) {
         let write = self.write.clone();
         let (telling, mut heard) = tokio::sync::mpsc::unbounded_channel();
-        let stop = Arc::new(Notify::new());
-        let signal = stop.clone();
+        let stopping = Arc::new(Notify::new());
+        let signal = stopping.clone();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -111,7 +111,7 @@ impl Conn {
                 }
             }
         });
-        (Doing::to(telling), Reporting { stop })
+        (Doing::to(telling), Reporting { stop: stopping })
     }
 }
 
