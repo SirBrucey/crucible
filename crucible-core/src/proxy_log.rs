@@ -71,6 +71,7 @@ impl Sessions {
                         closed_ns: Some(ts_ns),
                         writes: pending.writes,
                         placements: pending.placements,
+                        unreadable: None,
                     });
                 }
             }
@@ -424,6 +425,7 @@ impl IntoIterator for Sessions {
                 closed_ns: None,
                 writes: pending.writes,
                 placements: pending.placements,
+                unreadable: None,
             });
         }
         self.finished
@@ -462,6 +464,7 @@ mod tests {
                 closed_ns: None,
                 writes,
                 placements: Vec::new(),
+                unreadable: None,
             }
         })
     }
@@ -482,6 +485,7 @@ mod tests {
                 })
                 .collect(),
             placements: Vec::new(),
+            unreadable: None,
         }
     }
 
@@ -720,6 +724,7 @@ mod tests {
             opened_ns: 0,
             closed_ns: None,
             placements: Vec::new(),
+            unreadable: None,
             writes: vec![
                 // Before scenario start (50): ignored.
                 WriteRecord {
@@ -762,6 +767,7 @@ mod tests {
             opened_ns: 0,
             closed_ns: None,
             placements: Vec::new(),
+            unreadable: None,
             writes: vec![WriteRecord {
                 ts_ns: at,
                 direction: Direction::ClientToUpstream,

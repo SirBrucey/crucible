@@ -15,6 +15,9 @@ pub struct Session {
     pub writes: Vec<WriteRecord>,
     /// Where the plugin reading this said a fault could go.
     pub placements: Vec<Found>,
+    /// Why the plugin reading this connection could do nothing with its
+    /// traffic.
+    pub unreadable: Option<String>,
 }
 
 /// Somewhere a plugin said a fault could go, and when it said so.
