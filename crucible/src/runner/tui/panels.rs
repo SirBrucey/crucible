@@ -283,9 +283,13 @@ impl Widget for Journal<'_> {
 
         // Borrow line by line rather than joining. A journal is long, and this
         // redraws every tick it is open.
-        Paragraph::new(Text::from_iter(
-            self.1.iter().map(String::as_str).map(Line::from),
-        ))
+        Paragraph::new(
+            self.1
+                .iter()
+                .map(String::as_str)
+                .map(Line::from)
+                .collect::<Text>(),
+        )
         .wrap(Wrap { trim: true })
         .render(inner, buf);
     }
