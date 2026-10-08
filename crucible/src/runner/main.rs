@@ -1057,6 +1057,27 @@ fn interrupt_token() -> Result<CancellationToken> {
     Ok(token)
 }
 
+/// Write down what the learn run saw, which is what the schedules derive from.
+fn report_catalogue(learned: &Learned, cycle_cost: Duration) {
+    let readings = learned.fault_free.trail.iter().flatten();
+    tracing::info!(
+        edges = learned.profiles.len(),
+        checkpoints = learned.fault_free.trail.len(),
+        read = readings.clone().filter(|r| r.is_some()).count(),
+        unread = readings.filter(|r| r.is_none()).count(),
+        cycle_cost_ms = cycle_cost.as_millis(),
+        "session catalogue received"
+    );
+    for profile in &learned.profiles {
+        tracing::debug!(
+            edge = %profile.edge,
+            requests = ?profile.client_to_upstream,
+            responses = ?profile.upstream_to_client,
+            "learned"
+        );
+    }
+}
+
 async fn drive(
     bus: &EventBus,
     plan: &plan::Plan,
@@ -1087,23 +1108,7 @@ async fn drive(
             }
             Err(e) => return Err(e),
         };
-    let readings = learned.fault_free.trail.iter().flatten();
-    tracing::info!(
-        edges = learned.profiles.len(),
-        checkpoints = learned.fault_free.trail.len(),
-        read = readings.clone().filter(|r| r.is_some()).count(),
-        unread = readings.filter(|r| r.is_none()).count(),
-        cycle_cost_ms = cycle_cost.as_millis(),
-        "session catalogue received"
-    );
-    for profile in &learned.profiles {
-        tracing::debug!(
-            edge = %profile.edge,
-            requests = ?profile.client_to_upstream,
-            responses = ?profile.upstream_to_client,
-            "learned"
-        );
-    }
+    report_catalogue(&learned, cycle_cost);
 
     // The scenario is held to where the fleet settled, which is the reading
     // taken once it had the whole of `consistent_within` to go quiet in.
