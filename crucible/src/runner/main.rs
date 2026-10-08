@@ -1536,8 +1536,8 @@ mod tests {
     fn a_fault_held_throughout_is_allowed_a_second_settling() {
         let allowance = allowance();
         assert_eq!(
-            allowance.allows(&broken_throughout()) - allowance.allows(&broken_at_a_moment()),
-            allowance.settle
+            allowance.allows(&broken_throughout()),
+            allowance.allows(&broken_at_a_moment()) + allowance.settle
         );
     }
 
@@ -1554,8 +1554,8 @@ mod tests {
             ..allowance()
         };
         assert_eq!(
-            crowded.allows(&broken_at_a_moment()) - alone.allows(&broken_at_a_moment()),
-            alone.cycle * 2
+            crowded.allows(&broken_at_a_moment()),
+            alone.allows(&broken_at_a_moment()) + alone.cycle * 2
         );
     }
 
