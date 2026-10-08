@@ -59,7 +59,7 @@ impl Controls {
     fn hold(&self) -> std::sync::MutexGuard<'_, BTreeSet<u32>> {
         self.skipping
             .lock()
-            .unwrap_or_else(|held| held.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
