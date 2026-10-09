@@ -2,15 +2,35 @@
 //! binary so the CLI wiring, exit codes, and the example's lexability are all
 //! covered.
 
-use std::process::{Command, Output};
+use std::{
+    ffi::OsString,
+    path::PathBuf,
+    process::{Command, Output},
+};
 
 use rstest::rstest;
 
 fn check(path: &str) -> Output {
     Command::new(env!("CARGO_BIN_EXE_crucible"))
         .args(["check", path])
+        .env("CRUCIBLE_PLUGIN_PATH", plugins())
         .output()
         .expect("run crucible check")
+}
+
+/// Where the example plugins are built.
+///
+/// `pdns.cru` observes through the DNS observer, so `check` can only say
+/// whether it is sound with that plugin on the search path. Named here rather
+/// than left to the default, which is whatever the machine has installed and
+/// so is not the same answer twice.
+///
+/// One directory, because two copies of a plugin claim one name and the
+/// registry then leaves that name to neither of them.
+fn plugins() -> OsString {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../examples/dns-observer/target/debug")
+        .into()
 }
 
 #[rstest]
