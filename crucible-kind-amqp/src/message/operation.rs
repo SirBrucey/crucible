@@ -23,9 +23,11 @@ impl Tag {
         Tag(self.0 + 1)
     }
 
-    /// The tag before this one.
-    pub(super) fn decrement(self) -> Tag {
-        Tag(self.0 - 1)
+    /// The tag before this one, or `None` for a tag the broker never gave out.
+    ///
+    /// It numbers from one, so nothing comes before zero.
+    pub(super) fn decrement(self) -> Option<Tag> {
+        self.0.checked_sub(1).map(Tag)
     }
 }
 

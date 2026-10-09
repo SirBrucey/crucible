@@ -58,7 +58,12 @@ impl Publishing {
         let from = if multiple {
             tags.answered
         } else {
-            tag.decrement()
+            let Some(from) = tag.decrement() else {
+                // Zero answers every publish so far, which the broker says
+                // with `multiple`. On its own it answers none.
+                return Vec::new();
+            };
+            from
         };
         tags.answered = tag;
         held.sent
@@ -230,5 +235,26 @@ mod tests {
         .filter(|mark| mark.starts_with("confirm:"))
         .collect();
         assert_eq!(named, ["confirm:2", "confirm:4"]);
+    }
+
+    /// Zero answers every publish so far, which the broker says with
+    /// `multiple`. On its own it is not a tag the broker ever gave out.
+    #[test]
+    fn a_confirm_of_tag_zero_on_its_own_names_no_publish() {
+        let consuming = Consuming::default();
+        let publishing = Publishing::default();
+        let mut client = Reader::new(
+            Direction::ClientToUpstream,
+            consuming.clone(),
+            publishing.clone(),
+        );
+        let mut broker = Reader::new(Direction::UpstreamToClient, consuming, publishing.clone());
+        client.carry(&publish(b"an order"), false);
+
+        let named = marks(broker.carry(&confirming(0, false), false).found);
+        assert!(
+            !named.iter().any(|mark| mark.starts_with("confirm:")),
+            "{named:?}"
+        );
     }
 }
