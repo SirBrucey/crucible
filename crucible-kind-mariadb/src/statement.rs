@@ -497,11 +497,13 @@ impl Reader {
                     Some(doing)
                 }
             }
-            // Work that belongs to an open transaction, and to nothing
-            // outside one.
+            // Anything else, which belongs to a transaction the server may
+            // have opened for it. Outside it belongs to nothing.
             Asking::Other => {
-                if let Some(doing) = &mut self.open {
+                if was_open || self.server_holds_a_transaction() {
+                    let mut doing = self.open.take().unwrap_or_else(Fingerprint::new);
                     doing.update(&statement.to_le_bytes());
+                    self.open = Some(doing);
                 }
                 None
             }
@@ -684,6 +686,19 @@ mod tests {
         let (mut bare, _) = session(None);
         let nothing = marks(&bare.carry(&query("COMMIT"), false));
         assert_ne!(committed, nothing, "the commit carries the statement");
+    }
+
+    /// A `SELECT` opens a transaction just as a write does.
+    #[test]
+    fn a_select_the_server_holds_a_transaction_for_is_carried_by_the_commit() {
+        let (mut client, mut server) = session(None);
+        server.carry(&reports(IN_TRANS), false);
+        client.carry(&query("SELECT id FROM records WHERE name = 'www'"), false);
+        let committed = marks(&client.carry(&query("COMMIT"), false));
+
+        let (mut bare, _) = session(None);
+        let nothing = marks(&bare.carry(&query("COMMIT"), false));
+        assert_ne!(committed, nothing, "the commit carries the read");
     }
 
     #[test]
