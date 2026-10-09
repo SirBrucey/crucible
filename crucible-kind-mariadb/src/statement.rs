@@ -155,10 +155,53 @@ pub struct Shared {
 /// The prepared statements on one connection, and what each asks for.
 #[derive(Debug, Default)]
 struct Prepared {
-    /// Prepares with no response yet, oldest first.
-    awaiting: VecDeque<Asking>,
-    /// What the statement with each id asks for.
-    by_id: HashMap<u32, Asking>,
+    /// Prepares with no response yet, oldest first, each with what it asks
+    /// for and what its text names.
+    awaiting: VecDeque<(Asking, u32)>,
+    /// What the statement with each id asks for, and what its text names.
+    by_id: HashMap<u32, (Asking, u32)>,
+}
+
+/// FNV-1a over the bytes that say what a statement did.
+///
+/// `std::hash::DefaultHasher` is unspecified across releases, and a mark has
+/// to match the one a schedule saved by an earlier run carries. The constants
+/// and the loop are FNV-1a as published, taken from
+/// <https://en.wikipedia.org/wiki/Fowler–Noll–Vo_hash_function>.
+#[derive(Clone, Copy, Debug)]
+struct Fingerprint(u32);
+
+impl Fingerprint {
+    const OFFSET: u32 = 0x811c_9dc5;
+    const PRIME: u32 = 0x0100_0193;
+
+    fn new() -> Self {
+        Self(Self::OFFSET)
+    }
+
+    fn update(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.0 ^= u32::from(*byte);
+            self.0 = self.0.wrapping_mul(Self::PRIME);
+        }
+    }
+
+    fn identity(self) -> Identity {
+        Identity(self.0)
+    }
+}
+
+/// What names a transaction, taken from the statements it carried.
+///
+/// Two transactions sending the same statements with the same literals are one
+/// identity, which is as far as the wire can tell.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct Identity(u32);
+
+impl std::fmt::Display for Identity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:08x}", self.0)
+    }
 }
 
 /// What a statement asks the server to do, as far as transactions go.
@@ -199,10 +242,12 @@ pub struct Reader {
     pending: Vec<u8>,
     /// How many packets this has taken off the wire.
     read: usize,
-    /// How many commits this has carried.
-    commits: u32,
-    /// Whether a transaction is open, so a write of its own is not a commit.
-    in_transaction: bool,
+    /// What the open transaction's statements name so far. `None` where none
+    /// is open.
+    open: Option<Fingerprint>,
+    /// How many times this connection has committed each identity, so the
+    /// same work twice is two moments.
+    seen: HashMap<Identity, u32>,
     shared: Arc<Shared>,
     /// The moment a schedule named.
     watching: Option<String>,
@@ -216,8 +261,8 @@ impl Reader {
         Self {
             pending: Vec::new(),
             read: 0,
-            commits: 0,
-            in_transaction: false,
+            open: None,
+            seen: HashMap::new(),
             shared,
             watching,
             direction,
@@ -237,17 +282,30 @@ impl Reader {
     /// A `COM_QUERY` carries its own text. A prepared statement carried its
     /// text when it was prepared, so what it asks for is looked up by statement
     /// id.
-    fn asked(&mut self, packet: &Packet) -> Option<Asking> {
+    fn asked(&mut self, packet: &Packet) -> Option<(Asking, u32)> {
         let (command, rest) = packet.command()?;
         let mut held = self.prepared();
         match command {
-            COM_QUERY => Some(asking(rest)),
+            COM_QUERY => {
+                let mut text = Fingerprint::new();
+                text.update(rest);
+                Some((asking(rest), text.0))
+            }
             COM_STMT_PREPARE => {
-                held.awaiting.push_back(asking(rest));
+                let mut text = Fingerprint::new();
+                text.update(rest);
+                held.awaiting.push_back((asking(rest), text.0));
                 // Preparing runs nothing.
                 None
             }
-            COM_STMT_EXECUTE => held.by_id.get(&statement_id(rest)?).copied(),
+            COM_STMT_EXECUTE => {
+                let (asking, text) = *held.by_id.get(&statement_id(rest)?)?;
+                // The statement id is the server's to choose, so what is
+                // eaten is the text it stands for and the parameters after it.
+                let mut statement = Fingerprint(text);
+                statement.update(rest.get(STATEMENT_ID..)?);
+                Some((asking, statement.0))
+            }
             COM_STMT_CLOSE => {
                 held.by_id.remove(&statement_id(rest)?);
                 None
@@ -261,11 +319,11 @@ impl Reader {
         let mut held = self.prepared();
         // A client waits for each response before sending again, so the first
         // response after a prepare is that prepare's.
-        let Some(asking) = held.awaiting.pop_front() else {
+        let Some(prepared) = held.awaiting.pop_front() else {
             return;
         };
         if let Some(named) = packet.prepared_id() {
-            held.by_id.insert(named, asking);
+            held.by_id.insert(named, prepared);
         }
     }
 
@@ -308,10 +366,11 @@ impl Reader {
     }
 
     /// Where a fault could go either side of a commit.
-    fn either_side(&self, nth: u32, sent: &str) -> [(Side, Placement); 2] {
+    fn either_side(&self, at: (Identity, u32), sent: &str) -> [(Side, Placement); 2] {
+        let (identity, nth) = at;
         let placement = |side: Side, why: String| Placement {
             direction: self.direction,
-            mark: format!("commit:{nth}:{side}"),
+            mark: format!("commit:{identity}:{nth}:{side}"),
             why,
             doing: Doing::Holding,
         };
@@ -333,33 +392,59 @@ impl Reader {
     /// A client that opened a transaction commits when it says so. One that did
     /// not is in autocommit, where the server commits each write as it runs
     /// it.
-    fn commits_at(&mut self, packet: &Packet) -> Option<String> {
+    fn commits_at(&mut self, packet: &Packet) -> Option<(Identity, u32, String)> {
         let command = packet.command()?.0;
-        let asking = self.asked(packet)?;
-        let ends = match asking {
+        let (asking, statement) = self.asked(packet)?;
+        let was_open = self.open.is_some();
+        // What the transaction named.
+        let committed = match asking {
+            // `BEGIN` opens one and says nothing about what it will do.
             Asking::Open => {
-                self.in_transaction = true;
-                false
+                self.open = Some(Fingerprint::new());
+                None
             }
-            Asking::Commit => {
-                self.in_transaction = false;
-                true
-            }
+            // Nor does `COMMIT`. A bare one with nothing open commits an
+            // empty transaction, which is still a moment.
+            Asking::Commit => Some(self.open.take().unwrap_or_else(Fingerprint::new)),
             Asking::Abandon => {
-                self.in_transaction = false;
-                false
+                self.open = None;
+                None
             }
             // DDL commits whatever was open before it runs, so it ends a
             // transaction either way.
             Asking::Define => {
-                let open = self.in_transaction;
-                self.in_transaction = false;
-                !open
+                let mut doing = self.open.take().unwrap_or_else(Fingerprint::new);
+                doing.update(&statement.to_le_bytes());
+                (!was_open).then_some(doing)
             }
-            Asking::Write => !self.in_transaction,
-            Asking::Other => false,
+            // Work, which is its own transaction where none is open.
+            Asking::Write => {
+                let mut doing = self.open.take().unwrap_or_else(Fingerprint::new);
+                doing.update(&statement.to_le_bytes());
+                if was_open {
+                    self.open = Some(doing);
+                    None
+                } else {
+                    Some(doing)
+                }
+            }
+            // Work that belongs to an open transaction, and to nothing
+            // outside one.
+            Asking::Other => {
+                if let Some(doing) = &mut self.open {
+                    doing.update(&statement.to_le_bytes());
+                }
+                None
+            }
         };
-        ends.then(|| format!("{} {}", sent_as(command), asking.commits_on()))
+        let identity = committed?.identity();
+        let nth = self.seen.entry(identity).or_insert(0);
+        *nth += 1;
+        Some((
+            identity,
+            *nth,
+            format!("{} {}", sent_as(command), asking.commits_on()),
+        ))
     }
 
     /// Whether this is the moment the schedule named.
@@ -380,11 +465,10 @@ impl crucible_protocol::Kind for Reader {
                 self.names_prepared(packet);
                 continue;
             }
-            let Some(sent) = self.commits_at(packet) else {
+            let Some((identity, nth, sent)) = self.commits_at(packet) else {
                 continue;
             };
-            self.commits += 1;
-            for (side, placement) in self.either_side(self.commits, &sent) {
+            for (side, placement) in self.either_side((identity, nth), &sent) {
                 if placing && self.watches(&placement) {
                     freeze_after = Some(match side {
                         Side::Before => at,
@@ -441,6 +525,39 @@ mod tests {
 
     /// A pair of readers on a connection whose greeting has been answered,
     /// which is where every session starts.
+    /// A service that opens a connection per request numbers every
+    /// connection's first commit the same.
+    #[test]
+    fn two_connections_doing_different_work_name_different_moments() {
+        let (mut one, _) = session(None);
+        let (mut two, _) = session(None);
+        for (reader, name) in [(&mut one, "www"), (&mut two, "mail")] {
+            reader.carry(&query("BEGIN"), false);
+            reader.carry(
+                &query(&format!("INSERT INTO records VALUES ('{name}')")),
+                false,
+            );
+        }
+
+        let named = |carried: &Carried<'_>| marks(carried)[0].clone();
+        assert_ne!(
+            named(&one.carry(&query("COMMIT"), false)),
+            named(&two.carry(&query("COMMIT"), false)),
+        );
+    }
+
+    /// A saved schedule is replayed against the name an earlier run gave.
+    #[test]
+    fn the_same_work_names_the_same_moment_twice_over() {
+        let same = || {
+            let (mut reader, _) = session(None);
+            reader.carry(&query("BEGIN"), false);
+            reader.carry(&query("INSERT INTO records VALUES ('www')"), false);
+            marks(&reader.carry(&query("COMMIT"), false))
+        };
+        assert_eq!(same(), same());
+    }
+
     fn session(watching: Option<&str>) -> (Reader, Reader) {
         let (mut client, server) = pair(watching);
         client.carry(&answers_greeting(0), false);
@@ -485,7 +602,15 @@ mod tests {
     fn a_commit_offers_a_moment_either_side_of_itself() {
         let commit = query("COMMIT");
         let carried = reading().carry(&commit, false);
-        assert_eq!(marks(&carried), ["commit:1:before", "commit:1:after"]);
+        let named = marks(&carried);
+        let [before, after] = named.as_slice() else {
+            panic!("one moment each side: {named:?}");
+        };
+        assert_eq!(
+            before.strip_suffix("before"),
+            after.strip_suffix("after"),
+            "both sides of the one moment"
+        );
     }
 
     #[rstest::rstest]
@@ -573,10 +698,12 @@ mod tests {
     #[test]
     fn commits_are_numbered_along_the_connection() {
         let mut reader = reading();
-        reader.carry(&query("COMMIT"), false);
+        let first = marks(&reader.carry(&query("COMMIT"), false));
         let commit = query("COMMIT");
-        let carried = reader.carry(&commit, false);
-        assert_eq!(marks(&carried), ["commit:2:before", "commit:2:after"]);
+        let again = marks(&reader.carry(&commit, false));
+
+        assert_ne!(first, again, "the same work twice is two moments");
+        assert!(again[0].ends_with(":2:before"), "{again:?}");
     }
 
     #[test]
@@ -621,16 +748,25 @@ mod tests {
 
     #[test]
     fn holding_before_a_commit_keeps_it_off_the_wire() {
-        let (mut reader, _) = session(Some("commit:1:before"));
         let bytes = [query("BEGIN"), query("COMMIT")].concat();
+        let (mut reader, _) = session(Some(&learned(&bytes, ":before")));
         assert_eq!(reader.carry(&bytes, true).freeze_after, Some(1));
     }
 
     #[test]
     fn holding_after_a_commit_lets_it_go_first() {
-        let (mut reader, _) = session(Some("commit:1:after"));
         let bytes = [query("BEGIN"), query("COMMIT")].concat();
+        let (mut reader, _) = session(Some(&learned(&bytes, ":after")));
         assert_eq!(reader.carry(&bytes, true).freeze_after, Some(2));
+    }
+
+    /// The mark a fault-free run offers for the moment on `side` of `bytes`.
+    fn learned(bytes: &[u8], side: &str) -> String {
+        let (mut reader, _) = session(None);
+        marks(&reader.carry(bytes, false))
+            .into_iter()
+            .find(|mark| mark.ends_with(side))
+            .expect("a commit was named")
     }
 
     #[test]
