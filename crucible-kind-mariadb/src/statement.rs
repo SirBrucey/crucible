@@ -238,6 +238,25 @@ impl Fingerprint {
     }
 }
 
+/// A transaction open on a connection.
+#[derive(Clone, Copy, Debug)]
+struct Open {
+    /// What its statements name so far.
+    doing: Fingerprint,
+    /// Whether any of them changed anything. A transaction that only read
+    /// commits nothing, so it is nowhere to put a fault.
+    wrote: bool,
+}
+
+impl Open {
+    fn new() -> Self {
+        Self {
+            doing: Fingerprint::new(),
+            wrote: false,
+        }
+    }
+}
+
 /// What names a transaction, taken from the statements it carried.
 ///
 /// Two transactions sending the same statements with the same literals are one
@@ -300,9 +319,8 @@ pub struct Reader {
     pending: Vec<u8>,
     /// How many packets this has taken off the wire.
     read: usize,
-    /// What the open transaction's statements name so far. `None` where none
-    /// is open.
-    open: Option<Fingerprint>,
+    /// The transaction open on this connection.
+    open: Option<Open>,
     /// How many times this connection has committed each identity, so the
     /// same work twice is two moments.
     seen: HashMap<Identity, u32>,
@@ -469,46 +487,50 @@ impl Reader {
         let committed = match asking {
             // `BEGIN` opens one and says nothing about what it will do.
             Asking::Open => {
-                self.open = Some(Fingerprint::new());
+                self.open = Some(Open::new());
                 None
             }
-            // Nor does `COMMIT`. A bare one with nothing open commits an
-            // empty transaction, which is still a moment.
-            Asking::Commit => Some(self.open.take().unwrap_or_else(Fingerprint::new)),
+            // Nor does `COMMIT`, which commits whatever is open and nothing
+            // where none is.
+            Asking::Commit => self.open.take(),
             Asking::Abandon => {
                 self.open = None;
                 None
             }
             // DDL commits whatever was open before it runs, so it ends a
-            // transaction either way.
+            // transaction either way, and it changes the schema.
             Asking::Define => {
-                let mut doing = self.open.take().unwrap_or_else(Fingerprint::new);
-                doing.update(&statement.to_le_bytes());
-                (!was_open).then_some(doing)
+                let mut open = self.open.take().unwrap_or_else(Open::new);
+                open.doing.update(&statement.to_le_bytes());
+                open.wrote = true;
+                (!was_open).then_some(open)
             }
             // Work, which commits itself only where no transaction is open.
             Asking::Write => {
-                let mut doing = self.open.take().unwrap_or_else(Fingerprint::new);
-                doing.update(&statement.to_le_bytes());
+                let mut open = self.open.take().unwrap_or_else(Open::new);
+                open.doing.update(&statement.to_le_bytes());
+                open.wrote = true;
                 if was_open || self.server_holds_a_transaction() {
-                    self.open = Some(doing);
+                    self.open = Some(open);
                     None
                 } else {
-                    Some(doing)
+                    Some(open)
                 }
             }
             // Anything else, which belongs to a transaction the server may
             // have opened for it. Outside it belongs to nothing.
             Asking::Other => {
                 if was_open || self.server_holds_a_transaction() {
-                    let mut doing = self.open.take().unwrap_or_else(Fingerprint::new);
-                    doing.update(&statement.to_le_bytes());
-                    self.open = Some(doing);
+                    let mut open = self.open.take().unwrap_or_else(Open::new);
+                    open.doing.update(&statement.to_le_bytes());
+                    self.open = Some(open);
                 }
                 None
             }
         };
-        let identity = committed?.identity();
+        // A transaction that changed nothing commits nothing, so there is no
+        // work for a fault to catch either side of it.
+        let identity = committed.filter(|open| open.wrote)?.doing.identity();
         let nth = self.seen.entry(identity).or_insert(0);
         *nth += 1;
         Some((
@@ -594,9 +616,32 @@ mod tests {
     }
 
     /// A client reader on a connection whose greeting has been answered.
+    /// A client with autocommit on and no transaction open.
     fn reading() -> Reader {
         let (client, _) = session(None);
         client
+    }
+
+    /// A client with a transaction open that has written something, so the
+    /// next `COMMIT` it sends is a moment. Watching for `mark`, where given.
+    fn committing(watching: Option<&str>) -> Reader {
+        let (mut client, mut server) = pair(watching);
+        client.carry(&answers_greeting(0), false);
+        // Autocommit off, so the server opens the transaction itself.
+        server.carry(&reports(IN_TRANS), false);
+        client.carry(&wrote(), false);
+        client
+    }
+
+    /// A statement that puts work in the open transaction.
+    fn wrote() -> Vec<u8> {
+        query("INSERT INTO records VALUES ('www')")
+    }
+
+    #[test]
+    fn a_commit_that_carried_no_statements_is_not_a_moment() {
+        let (mut client, _) = session(None);
+        assert!(marks(&client.carry(&query("COMMIT"), false)).is_empty());
     }
 
     /// A pair of readers on a connection whose greeting has been answered,
@@ -688,17 +733,30 @@ mod tests {
         assert_ne!(committed, nothing, "the commit carries the statement");
     }
 
-    /// A `SELECT` opens a transaction just as a write does.
+    /// A `SELECT` opens a transaction just as a write does, and is part of
+    /// what the commit that follows names.
     #[test]
     fn a_select_the_server_holds_a_transaction_for_is_carried_by_the_commit() {
+        let committed = |read: bool| {
+            let (mut client, mut server) = session(None);
+            server.carry(&reports(IN_TRANS), false);
+            if read {
+                client.carry(&query("SELECT id FROM records"), false);
+            }
+            client.carry(&wrote(), false);
+            marks(&client.carry(&query("COMMIT"), false))
+        };
+        assert_ne!(committed(true), committed(false));
+    }
+
+    /// A transaction that only read changed nothing, so its commit is nowhere
+    /// to put a fault.
+    #[test]
+    fn a_transaction_that_only_read_is_not_a_moment() {
         let (mut client, mut server) = session(None);
         server.carry(&reports(IN_TRANS), false);
-        client.carry(&query("SELECT id FROM records WHERE name = 'www'"), false);
-        let committed = marks(&client.carry(&query("COMMIT"), false));
-
-        let (mut bare, _) = session(None);
-        let nothing = marks(&bare.carry(&query("COMMIT"), false));
-        assert_ne!(committed, nothing, "the commit carries the read");
+        client.carry(&query("SELECT id FROM records"), false);
+        assert!(marks(&client.carry(&query("COMMIT"), false)).is_empty());
     }
 
     #[test]
@@ -727,7 +785,7 @@ mod tests {
     #[test]
     fn a_commit_offers_a_moment_either_side_of_itself() {
         let commit = query("COMMIT");
-        let carried = reading().carry(&commit, false);
+        let carried = committing(None).carry(&commit, false);
         let named = marks(&carried);
         let [before, after] = named.as_slice() else {
             panic!("one moment each side: {named:?}");
@@ -818,13 +876,15 @@ mod tests {
     #[case("COMMIT;")]
     #[case("  COMMIT ; ")]
     fn a_commit_is_read_however_it_is_spelt(#[case] statement: &str) {
-        assert_eq!(reading().carry(&query(statement), false).found.len(), 2);
+        let found = committing(None).carry(&query(statement), false).found;
+        assert_eq!(found.len(), 2);
     }
 
     #[test]
     fn commits_are_numbered_along_the_connection() {
-        let mut reader = reading();
+        let mut reader = committing(None);
         let first = marks(&reader.carry(&query("COMMIT"), false));
+        reader.carry(&wrote(), false);
         let commit = query("COMMIT");
         let again = marks(&reader.carry(&commit, false));
 
@@ -844,7 +904,7 @@ mod tests {
     #[test]
     fn a_commit_split_across_reads_is_still_one_commit() {
         let bytes = query("COMMIT");
-        let mut reader = reading();
+        let mut reader = committing(None);
         let split = bytes.len() / 2;
         assert!(reader.carry(&bytes[..split], false).found.is_empty());
         assert_eq!(reader.carry(&bytes[split..], false).found.len(), 2);
@@ -874,16 +934,16 @@ mod tests {
 
     #[test]
     fn holding_before_a_commit_keeps_it_off_the_wire() {
-        let bytes = [query("BEGIN"), query("COMMIT")].concat();
+        let bytes = [query("BEGIN"), wrote(), query("COMMIT")].concat();
         let (mut reader, _) = session(Some(&learned(&bytes, ":before")));
-        assert_eq!(reader.carry(&bytes, true).freeze_after, Some(1));
+        assert_eq!(reader.carry(&bytes, true).freeze_after, Some(2));
     }
 
     #[test]
     fn holding_after_a_commit_lets_it_go_first() {
-        let bytes = [query("BEGIN"), query("COMMIT")].concat();
+        let bytes = [query("BEGIN"), wrote(), query("COMMIT")].concat();
         let (mut reader, _) = session(Some(&learned(&bytes, ":after")));
-        assert_eq!(reader.carry(&bytes, true).freeze_after, Some(2));
+        assert_eq!(reader.carry(&bytes, true).freeze_after, Some(3));
     }
 
     /// The mark a fault-free run offers for the moment on `side` of `bytes`.
@@ -917,8 +977,7 @@ mod tests {
 
     #[test]
     fn a_connection_the_client_leaves_alone_is_read_normally() {
-        let (mut client, _) = pair(None);
-        client.carry(&answers_greeting(0), false);
+        let mut client = committing(None);
         assert_eq!(client.carry(&query("COMMIT"), false).found.len(), 2);
     }
 
@@ -992,15 +1051,21 @@ mod tests {
 
     /// The reporter reads a placement as "on <this>", so it is a noun phrase.
     #[rstest::rstest]
-    #[case("COMMIT", "COM_QUERY COMMIT")]
+    #[case("COMMIT", "COM_QUERY COMMIT", true)]
     #[case(
         "INSERT INTO orders (id) VALUES (1)",
-        "COM_QUERY of an autocommit DML statement"
+        "COM_QUERY of an autocommit DML statement",
+        false
     )]
-    #[case("CREATE TABLE t (id INT)", "COM_QUERY of a DDL statement")]
-    fn a_placement_names_the_wire_event(#[case] statement: &str, #[case] names: &str) {
+    #[case("CREATE TABLE t (id INT)", "COM_QUERY of a DDL statement", false)]
+    fn a_placement_names_the_wire_event(
+        #[case] statement: &str,
+        #[case] names: &str,
+        #[case] open: bool,
+    ) {
         let sent = query(statement);
-        let carried = reading().carry(&sent, false);
+        let mut reader = if open { committing(None) } else { reading() };
+        let carried = reader.carry(&sent, false);
         let whys: Vec<&str> = carried.found.iter().map(|p| p.why.as_str()).collect();
         assert_eq!(
             whys,
@@ -1027,7 +1092,7 @@ mod tests {
 
     #[test]
     fn a_moment_is_offered_before_it_is_placed() {
-        let (mut reader, _) = session(Some("commit:1:before"));
+        let mut reader = committing(Some("commit:1:before"));
         let commit = query("COMMIT");
         let carried = reader.carry(&commit, false);
         assert_eq!(carried.freeze_after, None);
