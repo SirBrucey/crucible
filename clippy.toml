@@ -1,0 +1,3 @@
+# Product names, which `doc_markdown` reads as code items. `..` keeps the
+# lint's own list of the ones it already allows.
+doc-valid-idents = ["MariaDB", "MySQL", ".."]

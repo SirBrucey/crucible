@@ -57,6 +57,9 @@ pub struct Carried<'a> {
     pub found: Vec<Placement>,
     /// What the plugin did.
     pub did: Option<Did>,
+    /// Why the plugin could do nothing with these bytes. `None` where it read
+    /// them.
+    pub unreadable: Option<&'static str>,
 }
 
 /// What a plugin made of the fault it was asked to place.
@@ -87,6 +90,12 @@ pub trait Kind: Send {
     /// the scenario has started, and this is the edge the schedule named.
     /// Neither is anything the bytes can say, so the framework says it.
     fn carry<'a>(&mut self, bytes: &'a [u8], placing: bool) -> Carried<'a>;
+
+    /// The scenario has started, so what crosses from here is work it drove.
+    ///
+    /// Called once per connection and not at all for one opened after the
+    /// scenario began.
+    fn scenario_started(&mut self) {}
 }
 
 /// A service in the fleet and the host its container answers at.

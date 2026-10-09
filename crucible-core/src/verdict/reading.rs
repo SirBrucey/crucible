@@ -112,30 +112,7 @@ impl Readings {
         Judged::Now(match differing(&settled, expected) {
             Ok(None) => Verdict::Pass,
             Ok(Some(at)) => {
-                let mut went = Went::of(
-                    &points(&self.trajectory, &settled),
-                    &points(&self.fault_free.trail, &self.fault_free.settled),
-                    &self.outcomes.iter().map(|o| o.ack).collect::<Vec<_>>(),
-                    matches!(fault.at, At::Throughout),
-                );
-                // A run can settle to one side of every state admitted without
-                // any one step reading short or doubled. The work it took
-                // reaches its checkpoints and is then lost or repeated in the
-                // tail.
-                if fault.broke(went).is_none() {
-                    if short_count(&settled, &admissible).is_some() {
-                        went = Went::Lost;
-                    } else if surplus_count(&settled, &admissible).is_some() {
-                        went = Went::Twice;
-                    }
-                }
-                // The reading that says what broke is the one to quote, and it
-                // need not be the first the two runs disagree on.
-                let at = match went {
-                    Went::Lost => short_count(&settled, &admissible).unwrap_or(at),
-                    Went::Twice => surplus_count(&settled, &admissible).unwrap_or(at),
-                    _ => at,
-                };
+                let (went, at) = self.how_it_went(fault, &settled, &admissible, &landed, at);
                 Verdict::Fail {
                     invariant: fault.broke(went),
                     reason: self.failure(fault, &settled, &admissible, &landed, at, went),
@@ -211,6 +188,53 @@ impl Readings {
 
     /// What the fault was, where it landed, what should have been true, and the step
     /// the fleet started getting it wrong at.
+    /// What the run did, and which reading to quote for it.
+    ///
+    /// How the readings moved is read first and where they stand second, since
+    /// an observable every step overwrites has nothing to compare.
+    fn how_it_went(
+        &self,
+        fault: Placed<'_>,
+        settled: &Checkpoint,
+        admissible: &[Admissible<'_>],
+        landed: &[usize],
+        at: usize,
+    ) -> (Went, usize) {
+        let mut went = Went::of(
+            &points(&self.trajectory, settled),
+            &points(&self.fault_free.trail, &self.fault_free.settled),
+            &self.outcomes.iter().map(|o| o.ack).collect::<Vec<_>>(),
+            matches!(fault.at, At::Throughout),
+        );
+        // A run can settle to one side of every state admitted without any one
+        // step reading short or doubled. The work it took reaches its
+        // checkpoints and is then lost or repeated in the tail.
+        if fault.broke(went).is_none() {
+            if short_count(settled, admissible).is_some() {
+                went = Went::Lost;
+            } else if surplus_count(settled, admissible).is_some() {
+                went = Went::Twice;
+            }
+        }
+        // Nothing named by how the readings moved, so fall back to the count.
+        if fault.broke(went).is_none()
+            && let Some(reached) = steps_behind(&self.fault_free.trail, settled)
+        {
+            went = match reached.cmp(&landed.len()) {
+                Ordering::Greater => Went::Kept,
+                Ordering::Less => Went::Lost,
+                Ordering::Equal => went,
+            };
+        }
+        // The reading that says what broke is the one to quote.
+        let at = match went {
+            Went::Lost => short_count(settled, admissible).unwrap_or(at),
+            Went::Twice => surplus_count(settled, admissible).unwrap_or(at),
+            _ => at,
+        };
+        (went, at)
+    }
+
     fn failure(
         &self,
         fault: Placed<'_>,
@@ -604,6 +628,11 @@ impl Went {
     /// by [`did_some_of_the_steps`], which is how far the fleet got along them.
     fn of_spans(spans: &[Span]) -> Went {
         let mut went = Went::Elsewhere;
+        // A refused step's work can land after the stretch it was driven in,
+        // where the only sign of it is an unexplained surplus.
+        let owes_a_refusal = spans
+            .iter()
+            .any(|span| !span.acked && span.drove.is_nothing());
         for span in spans {
             // A stretch the fleet turned away owes nothing, whatever the
             // fault-free run did in its place. Moving at all is the fleet
@@ -621,7 +650,11 @@ impl Went {
                 if span.drove.is_twice(&span.learned)
                     || (span.learned.is_nothing() && repeats_a_step(span, spans))
                 {
-                    Went::Twice
+                    if owes_a_refusal {
+                        Went::Kept
+                    } else {
+                        Went::Twice
+                    }
                 } else if span.drove.is_short_of(&span.learned) || did_some_of_the_steps(span) {
                     Went::Lost
                 } else {
@@ -666,6 +699,24 @@ impl Went {
             Went::Elsewhere | Went::Unreadable => None,
         }
     }
+}
+
+/// How many steps' work the fleet is holding, read from fault-free run's
+/// checkpoints.
+///
+/// `None` where no point matches a checkpoint. Where more than one does, the
+/// count is ambiguous.
+fn steps_behind(trail: &Trajectory, settled: &Checkpoint) -> Option<usize> {
+    let mut found = None;
+    for (step, point) in trail.iter().enumerate() {
+        if point == settled {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(step);
+        }
+    }
+    found
 }
 
 /// A run nothing can be said about, which no reference run would change.
@@ -1787,6 +1838,57 @@ mod tests {
             3,
         );
         let (broke, why) = showed(run.verdict());
+        assert_eq!(broke, Some(Invariant::Durable));
+        assert!(why.contains("kept work it turned away"), "{why}");
+    }
+
+    /// The surplus only shows once the fleet has settled, so no stretch
+    /// carries it.
+    #[test]
+    fn a_surplus_no_stretch_accounts_for_is_work_the_fleet_refused() {
+        let (broke, why) = showed(judged_given(
+            &[Ack::Rejected, Ack::Acked, Ack::Acked],
+            &[0, 1, 2, 3],
+            3,
+            &[(&[2, 3], 0)],
+        ));
+        assert_eq!(broke, Some(Invariant::Durable));
+        assert!(why.contains("kept work it turned away"), "{why}");
+    }
+
+    /// Nothing about how this reading moved says anything, so the verdict
+    /// has only the fleet's position to go on.
+    #[test]
+    fn standing_further_along_than_it_owed_is_work_the_fleet_refused() {
+        let mut run = Readings::empty();
+        run.fault = Some(fired_fault());
+        run.outcomes = [Ack::Rejected, Ack::Acked, Ack::Acked]
+            .into_iter()
+            .map(outcome)
+            .collect();
+        run.checks = vec![address("p")];
+        run.trajectory = [None, None, Some("m"), Some("p")]
+            .into_iter()
+            .map(|at| vec![at.map(|s: &str| plan::Value::Str(s.to_owned()))])
+            .collect();
+        run.fault_free = Baseline::unsettled(
+            [None, Some("n"), Some("m"), Some("p")]
+                .into_iter()
+                .map(|at| vec![at.map(|s: &str| plan::Value::Str(s.to_owned()))]),
+        );
+        // The clean fleet refused both amendments, so that set leaves the
+        // address where it started.
+        let references: References = [(
+            vec![2, 3],
+            Baseline {
+                trail: Trajectory::default(),
+                settled: vec![Some(plan::Value::Null)],
+            },
+        )]
+        .into_iter()
+        .collect();
+
+        let (broke, why) = showed(run.settle(&references));
         assert_eq!(broke, Some(Invariant::Durable));
         assert!(why.contains("kept work it turned away"), "{why}");
     }

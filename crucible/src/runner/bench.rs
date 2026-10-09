@@ -146,20 +146,18 @@ impl<'a> Bench<'a> {
             .filter(|(_, outcome)| outcome.ack == Ack::Acked)
             .filter_map(|(i, _)| landed.get(i).copied())
             .collect();
-        // A run that was told these steps and turned some of them away has not
-        // been where landing all of them leaves the fleet. It answers a
-        // different question, and asking again would answer the same different
-        // question, so the set is spent.
-        if accepted != landed {
-            tracing::warn!(
+        // The refusal is the answer, a clean fleet that will not take these
+        // steps cannot reach the state landing them would.
+        if accepted == landed {
+            tracing::info!(?landed, "reference run settled");
+        } else {
+            tracing::info!(
                 drove = ?landed,
                 ?accepted,
-                "a clean fleet turned away steps this reference drove, so it cannot say where they leave the fleet"
+                "a clean fleet turned away steps this reference drove, so this set accounts for \
+                 no more than where it left the fleet"
             );
-            self.asks.insert(landed.to_vec(), Ask::Spent);
-            return Vec::new();
         }
-        tracing::info!(?landed, "reference run settled");
         self.asks.insert(landed.to_vec(), Ask::Answered);
         self.references.insert(landed.to_vec(), readings.baseline());
         self.rejudge()
@@ -481,10 +479,8 @@ mod tests {
         );
     }
 
-    /// A clean fleet that will not take the steps has not been where taking
-    /// them leaves it.
     #[test]
-    fn a_reference_that_turned_steps_away_answers_for_nothing() {
+    fn a_reference_that_turned_steps_away_still_answers() {
         let (fleet, scenario) = (fleet(), scenario());
         let mut bench = Bench::new(&fleet, &scenario, 3);
         assert!(matches!(
@@ -492,25 +488,24 @@ mod tests {
             Decided::Waiting(_)
         ));
         assert!(bench.wanted(Taking::More).is_some(), "the run went out");
+        // Driven with both steps, the clean fleet took neither and stayed put.
         let mut refused = answer(&[2], 0);
         refused.outcomes = vec![Outcome { ack: Ack::Rejected }];
 
-        assert!(bench.arrived(&[2], &refused).is_empty());
-        // Spent, not merely unanswered. Even a failure does not buy it another.
+        let judged = bench.arrived(&[2], &refused);
+        assert_eq!(judged.len(), 1, "the run waiting on it was judged");
+        assert!(
+            !matches!(judged[0].1, Verdict::Inconclusive { .. }),
+            "{:?}",
+            judged[0].1
+        );
+        // Answered, so a later failure buys nothing and nothing goes out again.
         bench.failed(&[2], &"the replica would not come up");
         assert!(matches!(
             bench.judge(2, run(&[Ack::Rejected, Ack::Acked], &[0, 1, 2], 1)),
-            Decided::Waiting(_)
+            Decided::Now(_)
         ));
-        assert!(bench.wanted(Taking::More).is_none(), "the set is spent");
-
-        let settled = bench.settle();
-        assert_eq!(settled.len(), 2);
-        assert!(
-            settled
-                .iter()
-                .all(|(_, verdict)| matches!(verdict, Verdict::Inconclusive { .. }))
-        );
+        assert!(bench.wanted(Taking::More).is_none(), "nothing left to ask");
     }
 
     /// A late report cannot take away what an answered set found.

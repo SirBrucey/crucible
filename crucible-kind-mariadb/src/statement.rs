@@ -5,7 +5,7 @@ use std::{
     collections::{HashMap, VecDeque},
     sync::{
         Arc, Mutex, MutexGuard, PoisonError,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU16, Ordering},
     },
 };
 
@@ -24,6 +24,10 @@ const COM_STMT_EXECUTE: u8 = 0x17;
 const COM_STMT_CLOSE: u8 = 0x19;
 /// The first byte of an OK packet.
 const OK: u8 = 0x00;
+/// `SERVER_STATUS_IN_TRANS`: a transaction is currently active.
+const IN_TRANS: u16 = 0x0001;
+/// `SERVER_STATUS_AUTOCOMMIT`: autocommit mode is set.
+const AUTOCOMMIT: u16 = 0x0002;
 /// How many bytes a statement id takes.
 const STATEMENT_ID: usize = 4;
 /// A client numbers each command from zero.
@@ -74,6 +78,29 @@ impl Packet {
         Some((*command, rest))
     }
 
+    /// What the server says about the session, from a packet that carries its
+    /// status flags.
+    ///
+    /// An OK packet carries them after the rows it affected and the id it
+    /// generated, both length encoded. An EOF packet carries them after its
+    /// warning count. Nothing else does.
+    fn session(&self) -> Option<u16> {
+        let (&header, rest) = self.bytes.get(self.payload..)?.split_first()?;
+        let status = match header {
+            OK => {
+                let (_, affected) = lenenc(rest)?;
+                let (_, generated) = lenenc(rest.get(affected..)?)?;
+                rest.get(affected + generated..)?
+            }
+            // An EOF packet, which the newer protocol replaces with an OK.
+            0xfe if rest.len() < 8 => rest.get(2..)?,
+            _ => return None,
+        };
+        Some(u16::from_le_bytes(
+            <[u8; 2]>::try_from(status.get(..2)?).ok()?,
+        ))
+    }
+
     /// The statement id in a prepare response.
     fn prepared_id(&self) -> Option<u32> {
         if self.seq != FIRST + 1 {
@@ -106,6 +133,112 @@ fn sent_as(command: u8) -> &'static str {
 }
 
 /// The statement id a command opens with.
+/// What `statement` says with the values taken out of it.
+///
+/// Each string or number becomes one `?`, so two statements that differ only
+/// in what they carry read the same.
+///
+/// A name in backticks is a name rather than a value, so it is kept, and a
+/// digit inside a word is part of the word.
+fn shape(statement: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(statement.len());
+    let mut at = 0;
+    while at < statement.len() {
+        let byte = statement[at];
+        let word = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$';
+        match byte {
+            b'\'' | b'"' => {
+                out.push(b'?');
+                at = past_string(statement, at);
+            }
+            b'`' => {
+                let end = past_quoted_name(statement, at);
+                out.extend_from_slice(&statement[at..end]);
+                at = end;
+            }
+            b'0'..=b'9' | b'.' if !out.last().copied().is_some_and(word) => {
+                out.push(b'?');
+                at = past_number(statement, at);
+            }
+            _ => {
+                out.push(byte);
+                at += 1;
+            }
+        }
+    }
+    out
+}
+
+/// Where the string opening at `at` ends, past the closing quote.
+///
+/// A quote is escaped by a backslash or by doubling it.
+fn past_string(statement: &[u8], at: usize) -> usize {
+    let quote = statement[at];
+    let mut next = at + 1;
+    while next < statement.len() {
+        match statement[next] {
+            b'\\' => next += 2,
+            byte if byte == quote => {
+                if statement.get(next + 1) == Some(&quote) {
+                    next += 2;
+                } else {
+                    return next + 1;
+                }
+            }
+            _ => next += 1,
+        }
+    }
+    statement.len()
+}
+
+/// Where the backtick name opening at `at` ends, past the closing backtick.
+fn past_quoted_name(statement: &[u8], at: usize) -> usize {
+    let mut next = at + 1;
+    while next < statement.len() {
+        if statement[next] == b'`' {
+            return next + 1;
+        }
+        next += 1;
+    }
+    statement.len()
+}
+
+/// Where the number opening at `at` ends.
+///
+/// Hexadecimal, decimal and exponent forms all count as one value.
+fn past_number(statement: &[u8], at: usize) -> usize {
+    let mut next = at;
+    while next < statement.len() {
+        let byte = statement[next];
+        let exponent =
+            matches!(byte, b'+' | b'-') && matches!(statement.get(next - 1), Some(b'e' | b'E'));
+        if byte.is_ascii_hexdigit() || matches!(byte, b'.' | b'x' | b'X') || exponent {
+            next += 1;
+        } else {
+            return next;
+        }
+    }
+    statement.len()
+}
+
+/// A length-encoded integer and how many bytes it took.
+fn lenenc(rest: &[u8]) -> Option<(u64, usize)> {
+    let (&first, after) = rest.split_first()?;
+    let wide = |width: usize| {
+        let mut eight = [0u8; 8];
+        eight[..width].copy_from_slice(after.get(..width)?);
+        Some((u64::from_le_bytes(eight), 1 + width))
+    };
+    match first {
+        0xfc => wide(2),
+        0xfd => wide(3),
+        0xfe => wide(8),
+        // 0xfb says a column is null, which only row data carries.
+        0xfb => None,
+        _ => Some((u64::from(first), 1)),
+    }
+}
+
 fn statement_id(rest: &[u8]) -> Option<u32> {
     let named = rest.get(..STATEMENT_ID)?;
     Some(u32::from_le_bytes(
@@ -144,10 +277,12 @@ fn asking(statement: &[u8]) -> Asking {
 /// A prepared statement carries its text once in `COM_STMT_PREPARE` and is
 /// executed by statement id after that. The id is in the server's prepare
 /// response, so neither direction can read it alone.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Shared {
     /// Whether the two ends encrypted this connection.
     encrypted: AtomicBool,
+    /// What the server last said about the session.
+    session: AtomicU16,
     /// The prepared statements on this connection.
     prepared: Mutex<Prepared>,
 }
@@ -155,10 +290,83 @@ pub struct Shared {
 /// The prepared statements on one connection, and what each asks for.
 #[derive(Debug, Default)]
 struct Prepared {
-    /// Prepares with no response yet, oldest first.
-    awaiting: VecDeque<Asking>,
-    /// What the statement with each id asks for.
-    by_id: HashMap<u32, Asking>,
+    /// Prepares with no response yet, oldest first, each with what it asks
+    /// for and what its text names.
+    awaiting: VecDeque<(Asking, u32)>,
+    /// What the statement with each id asks for, and what its text names.
+    by_id: HashMap<u32, (Asking, u32)>,
+}
+
+/// FNV-1a over the bytes that say what a statement did.
+///
+/// `std::hash::DefaultHasher` is unspecified across releases, and a mark has
+/// to match the one a schedule saved by an earlier run carries. The constants
+/// and the loop are FNV-1a as published, taken from
+/// <https://en.wikipedia.org/wiki/Fowler–Noll–Vo_hash_function>.
+#[derive(Clone, Copy, Debug)]
+struct Fingerprint(u32);
+
+impl Fingerprint {
+    const OFFSET: u32 = 0x811c_9dc5;
+    const PRIME: u32 = 0x0100_0193;
+
+    fn new() -> Self {
+        Self(Self::OFFSET)
+    }
+
+    fn update(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.0 ^= u32::from(*byte);
+            self.0 = self.0.wrapping_mul(Self::PRIME);
+        }
+    }
+
+    fn identity(self) -> Identity {
+        Identity(self.0)
+    }
+}
+
+/// A transaction open on a connection.
+#[derive(Clone, Copy, Debug)]
+struct Open {
+    /// What its statements name so far.
+    doing: Fingerprint,
+    /// Whether any of them changed anything. A transaction that only read
+    /// commits nothing, so it is nowhere to put a fault.
+    wrote: bool,
+}
+
+impl Open {
+    fn new() -> Self {
+        Self {
+            doing: Fingerprint::new(),
+            wrote: false,
+        }
+    }
+}
+
+/// What names a transaction, taken from the statements it carried.
+///
+/// Two transactions sending the same statements with the same literals are one
+/// identity, which is as far as the wire can tell.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct Identity(u32);
+
+impl std::fmt::Display for Identity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:08x}", self.0)
+    }
+}
+
+impl Default for Shared {
+    fn default() -> Self {
+        Self {
+            encrypted: AtomicBool::new(false),
+            // What a server's own default is, until we see otherwise.
+            session: AtomicU16::new(AUTOCOMMIT),
+            prepared: Mutex::default(),
+        }
+    }
 }
 
 /// What a statement asks the server to do, as far as transactions go.
@@ -199,10 +407,11 @@ pub struct Reader {
     pending: Vec<u8>,
     /// How many packets this has taken off the wire.
     read: usize,
-    /// How many commits this has carried.
-    commits: u32,
-    /// Whether a transaction is open, so a write of its own is not a commit.
-    in_transaction: bool,
+    /// The transaction open on this connection.
+    open: Option<Open>,
+    /// How many times this connection has committed each identity, so the
+    /// same work twice is two moments.
+    seen: HashMap<Identity, u32>,
     shared: Arc<Shared>,
     /// The moment a schedule named.
     watching: Option<String>,
@@ -216,8 +425,8 @@ impl Reader {
         Self {
             pending: Vec::new(),
             read: 0,
-            commits: 0,
-            in_transaction: false,
+            open: None,
+            seen: HashMap::new(),
             shared,
             watching,
             direction,
@@ -237,16 +446,24 @@ impl Reader {
     /// A `COM_QUERY` carries its own text. A prepared statement carried its
     /// text when it was prepared, so what it asks for is looked up by statement
     /// id.
-    fn asked(&mut self, packet: &Packet) -> Option<Asking> {
+    fn asked(&mut self, packet: &Packet) -> Option<(Asking, u32)> {
         let (command, rest) = packet.command()?;
         let mut held = self.prepared();
         match command {
-            COM_QUERY => Some(asking(rest)),
+            COM_QUERY => {
+                let mut text = Fingerprint::new();
+                text.update(&shape(rest));
+                Some((asking(rest), text.0))
+            }
             COM_STMT_PREPARE => {
-                held.awaiting.push_back(asking(rest));
+                let mut text = Fingerprint::new();
+                text.update(&shape(rest));
+                held.awaiting.push_back((asking(rest), text.0));
                 // Preparing runs nothing.
                 None
             }
+            // The statement id is the server's to choose and the parameters
+            // are values, so what the statement did is its text alone.
             COM_STMT_EXECUTE => held.by_id.get(&statement_id(rest)?).copied(),
             COM_STMT_CLOSE => {
                 held.by_id.remove(&statement_id(rest)?);
@@ -256,17 +473,28 @@ impl Reader {
         }
     }
 
-    /// Record the statement id a prepare response carries.
-    fn names_prepared(&self, packet: &Packet) {
+    /// Record the statement id a prepare response carries, and say whether
+    /// this packet was one.
+    fn names_prepared(&self, packet: &Packet) -> bool {
         let mut held = self.prepared();
         // A client waits for each response before sending again, so the first
         // response after a prepare is that prepare's.
-        let Some(asking) = held.awaiting.pop_front() else {
-            return;
+        let Some(prepared) = held.awaiting.pop_front() else {
+            return false;
         };
         if let Some(named) = packet.prepared_id() {
-            held.by_id.insert(named, asking);
+            held.by_id.insert(named, prepared);
         }
+        true
+    }
+
+    /// Whether the server has a transaction open that no `BEGIN` announced.
+    ///
+    /// A client with autocommit off opens one by running its first statement,
+    /// so the only account of it is what the server reports.
+    fn server_holds_a_transaction(&self) -> bool {
+        let session = self.shared.session.load(Ordering::Relaxed);
+        session & IN_TRANS != 0 || session & AUTOCOMMIT == 0
     }
 
     /// Every packet these bytes complete, and any tail that cannot be read.
@@ -308,10 +536,11 @@ impl Reader {
     }
 
     /// Where a fault could go either side of a commit.
-    fn either_side(&self, nth: u32, sent: &str) -> [(Side, Placement); 2] {
+    fn either_side(&self, at: (Identity, u32), sent: &str) -> [(Side, Placement); 2] {
+        let (identity, nth) = at;
         let placement = |side: Side, why: String| Placement {
             direction: self.direction,
-            mark: format!("commit:{nth}:{side}"),
+            mark: format!("commit:{identity}:{nth}:{side}"),
             why,
             doing: Doing::Holding,
         };
@@ -333,33 +562,65 @@ impl Reader {
     /// A client that opened a transaction commits when it says so. One that did
     /// not is in autocommit, where the server commits each write as it runs
     /// it.
-    fn commits_at(&mut self, packet: &Packet) -> Option<String> {
+    fn commits_at(&mut self, packet: &Packet) -> Option<(Identity, u32, String)> {
         let command = packet.command()?.0;
-        let asking = self.asked(packet)?;
-        let ends = match asking {
+        let (asking, statement) = self.asked(packet)?;
+        let was_open = self.open.is_some();
+        // What the transaction named.
+        let committed = match asking {
+            // `BEGIN` opens one and says nothing about what it will do.
             Asking::Open => {
-                self.in_transaction = true;
-                false
+                self.open = Some(Open::new());
+                None
             }
-            Asking::Commit => {
-                self.in_transaction = false;
-                true
-            }
+            // Nor does `COMMIT`, which commits whatever is open and nothing
+            // where none is.
+            Asking::Commit => self.open.take(),
             Asking::Abandon => {
-                self.in_transaction = false;
-                false
+                self.open = None;
+                None
             }
             // DDL commits whatever was open before it runs, so it ends a
-            // transaction either way.
+            // transaction either way, and it changes the schema.
             Asking::Define => {
-                let open = self.in_transaction;
-                self.in_transaction = false;
-                !open
+                let mut open = self.open.take().unwrap_or_else(Open::new);
+                open.doing.update(&statement.to_le_bytes());
+                open.wrote = true;
+                (!was_open).then_some(open)
             }
-            Asking::Write => !self.in_transaction,
-            Asking::Other => false,
+            // Work, which commits itself only where no transaction is open.
+            Asking::Write => {
+                let mut open = self.open.take().unwrap_or_else(Open::new);
+                open.doing.update(&statement.to_le_bytes());
+                open.wrote = true;
+                if was_open || self.server_holds_a_transaction() {
+                    self.open = Some(open);
+                    None
+                } else {
+                    Some(open)
+                }
+            }
+            // Anything else, which belongs to a transaction the server may
+            // have opened for it. Outside it belongs to nothing.
+            Asking::Other => {
+                if was_open || self.server_holds_a_transaction() {
+                    let mut open = self.open.take().unwrap_or_else(Open::new);
+                    open.doing.update(&statement.to_le_bytes());
+                    self.open = Some(open);
+                }
+                None
+            }
         };
-        ends.then(|| format!("{} {}", sent_as(command), asking.commits_on()))
+        // A transaction that changed nothing commits nothing, so there is no
+        // work for a fault to catch either side of it.
+        let identity = committed.filter(|open| open.wrote)?.doing.identity();
+        let nth = self.seen.entry(identity).or_insert(0);
+        *nth += 1;
+        Some((
+            identity,
+            *nth,
+            format!("{} {}", sent_as(command), asking.commits_on()),
+        ))
     }
 
     /// Whether this is the moment the schedule named.
@@ -377,14 +638,18 @@ impl crucible_protocol::Kind for Reader {
             // Only the client sends commands; what comes back carries the
             // statement ids.
             if self.direction == Direction::UpstreamToClient {
-                self.names_prepared(packet);
+                if self.names_prepared(packet) {
+                    continue;
+                }
+                if let Some(session) = packet.session() {
+                    self.shared.session.store(session, Ordering::Relaxed);
+                }
                 continue;
             }
-            let Some(sent) = self.commits_at(packet) else {
+            let Some((identity, nth, sent)) = self.commits_at(packet) else {
                 continue;
             };
-            self.commits += 1;
-            for (side, placement) in self.either_side(self.commits, &sent) {
+            for (side, placement) in self.either_side((identity, nth), &sent) {
                 if placing && self.watches(&placement) {
                     freeze_after = Some(match side {
                         Side::Before => at,
@@ -406,6 +671,7 @@ impl crucible_protocol::Kind for Reader {
             freeze_after,
             found,
             did: None,
+            unreadable: None,
         }
     }
 }
@@ -433,13 +699,71 @@ mod tests {
     }
 
     /// A client reader on a connection whose greeting has been answered.
+    /// A client with autocommit on and no transaction open.
     fn reading() -> Reader {
         let (client, _) = session(None);
         client
     }
 
+    /// A client with a transaction open that has written something, so the
+    /// next `COMMIT` it sends is a moment. Watching for `mark`, where given.
+    fn committing(watching: Option<&str>) -> Reader {
+        let (mut client, mut server) = pair(watching);
+        client.carry(&answers_greeting(0), false);
+        // Autocommit off, so the server opens the transaction itself.
+        server.carry(&reports(IN_TRANS), false);
+        client.carry(&wrote(), false);
+        client
+    }
+
+    /// A statement that puts work in the open transaction.
+    fn wrote() -> Vec<u8> {
+        query("INSERT INTO records VALUES ('www')")
+    }
+
+    #[test]
+    fn a_commit_that_carried_no_statements_is_not_a_moment() {
+        let (mut client, _) = session(None);
+        assert!(marks(&client.carry(&query("COMMIT"), false)).is_empty());
+    }
+
     /// A pair of readers on a connection whose greeting has been answered,
     /// which is where every session starts.
+    /// A service that opens a connection per request numbers every
+    /// connection's first commit the same, so two connections doing different
+    /// work have to be told apart by the work.
+    #[test]
+    fn two_connections_doing_different_work_name_different_moments() {
+        let (mut one, _) = session(None);
+        let (mut two, _) = session(None);
+        let work = [
+            (&mut one, "INSERT INTO records VALUES ('www')"),
+            (&mut two, "UPDATE zones SET serial = serial + 1"),
+        ];
+        for (reader, statement) in work {
+            reader.carry(&query("BEGIN"), false);
+            reader.carry(&query(statement), false);
+        }
+
+        let named = |carried: &Carried<'_>| marks(carried)[0].clone();
+        assert_ne!(
+            named(&one.carry(&query("COMMIT"), false)),
+            named(&two.carry(&query("COMMIT"), false)),
+        );
+    }
+
+    /// A saved schedule is replayed against the name an earlier run gave.
+    #[test]
+    fn the_same_work_names_the_same_moment_twice_over() {
+        let same = || {
+            let (mut reader, _) = session(None);
+            reader.carry(&query("BEGIN"), false);
+            reader.carry(&query("INSERT INTO records VALUES ('www')"), false);
+            marks(&reader.carry(&query("COMMIT"), false))
+        };
+        assert_eq!(same(), same());
+    }
+
     fn session(watching: Option<&str>) -> (Reader, Reader) {
         let (mut client, server) = pair(watching);
         client.carry(&answers_greeting(0), false);
@@ -466,6 +790,69 @@ mod tests {
 
     /// The client answering the server's greeting with the capabilities it
     /// wants.
+    /// The server answering a statement, reporting `status` about the session.
+    fn reports(status: u16) -> Vec<u8> {
+        let mut payload = vec![OK, 0, 0];
+        payload.extend_from_slice(&status.to_le_bytes());
+        payload.extend_from_slice(&0u16.to_le_bytes());
+        packet(FIRST + 1, &payload)
+    }
+
+    #[test]
+    fn a_statement_the_server_holds_a_transaction_for_is_not_its_own_commit() {
+        let (mut client, mut server) = session(None);
+        server.carry(&reports(IN_TRANS), false);
+
+        let wrote = marks(&client.carry(&query("INSERT INTO records VALUES ('www')"), false));
+        assert!(
+            wrote.is_empty(),
+            "the statement committed nothing: {wrote:?}"
+        );
+
+        let committed = marks(&client.carry(&query("COMMIT"), false));
+        assert!(!committed.is_empty(), "the COMMIT is the moment");
+
+        // A bare commit names an empty transaction, and this one is not that.
+        let (mut bare, _) = session(None);
+        let nothing = marks(&bare.carry(&query("COMMIT"), false));
+        assert_ne!(committed, nothing, "the commit carries the statement");
+    }
+
+    /// A `SELECT` opens a transaction just as a write does, and is part of
+    /// what the commit that follows names.
+    #[test]
+    fn a_select_the_server_holds_a_transaction_for_is_carried_by_the_commit() {
+        let committed = |read: bool| {
+            let (mut client, mut server) = session(None);
+            server.carry(&reports(IN_TRANS), false);
+            if read {
+                client.carry(&query("SELECT id FROM records"), false);
+            }
+            client.carry(&wrote(), false);
+            marks(&client.carry(&query("COMMIT"), false))
+        };
+        assert_ne!(committed(true), committed(false));
+    }
+
+    /// A transaction that only read changed nothing, so its commit is nowhere
+    /// to put a fault.
+    #[test]
+    fn a_transaction_that_only_read_is_not_a_moment() {
+        let (mut client, mut server) = session(None);
+        server.carry(&reports(IN_TRANS), false);
+        client.carry(&query("SELECT id FROM records"), false);
+        assert!(marks(&client.carry(&query("COMMIT"), false)).is_empty());
+    }
+
+    #[test]
+    fn a_statement_the_server_holds_no_transaction_for_commits_itself() {
+        let (mut client, mut server) = session(None);
+        server.carry(&reports(AUTOCOMMIT), false);
+
+        let wrote = marks(&client.carry(&query("INSERT INTO records VALUES ('www')"), false));
+        assert_eq!(wrote.len(), 2, "either side of its own commit: {wrote:?}");
+    }
+
     fn answers_greeting(capabilities: u32) -> Vec<u8> {
         let mut payload = capabilities.to_le_bytes().to_vec();
         payload.extend_from_slice(&[0; 28]);
@@ -483,8 +870,53 @@ mod tests {
     #[test]
     fn a_commit_offers_a_moment_either_side_of_itself() {
         let commit = query("COMMIT");
-        let carried = reading().carry(&commit, false);
-        assert_eq!(marks(&carried), ["commit:1:before", "commit:1:after"]);
+        let carried = committing(None).carry(&commit, false);
+        let named = marks(&carried);
+        let [before, after] = named.as_slice() else {
+            panic!("one moment each side: {named:?}");
+        };
+        assert_eq!(
+            before.strip_suffix("before"),
+            after.strip_suffix("after"),
+            "both sides of the one moment"
+        );
+    }
+
+    #[test]
+    fn two_transactions_differing_only_in_their_values_are_one_moment() {
+        let same = |value: &str| {
+            let (mut reader, _) = session(None);
+            reader.carry(&query("BEGIN"), false);
+            let statement = format!("INSERT INTO records VALUES ('{value}')");
+            reader.carry(&query(&statement), false);
+            marks(&reader.carry(&query("COMMIT"), false))
+        };
+        assert_eq!(same("www"), same("mail"));
+    }
+
+    #[rstest::rstest]
+    #[case(
+        "INSERT INTO records VALUES ('www', 1)",
+        "INSERT INTO records VALUES (?, ?)"
+    )]
+    #[case(
+        "SELECT id FROM col1 WHERE id = 42",
+        "SELECT id FROM col1 WHERE id = ?"
+    )]
+    #[case(
+        "SELECT * FROM `records` WHERE x = 0xdead",
+        "SELECT * FROM `records` WHERE x = ?"
+    )]
+    #[case(
+        r"INSERT INTO t VALUES ('it''s', 'a\'b')",
+        "INSERT INTO t VALUES (?, ?)"
+    )]
+    #[case("UPDATE t SET at = 1.5e-3", "UPDATE t SET at = ?")]
+    fn a_statement_reads_as_its_shape(#[case] statement: &str, #[case] shaped: &str) {
+        assert_eq!(
+            String::from_utf8(shape(statement.as_bytes())).expect("ascii in, ascii out"),
+            shaped
+        );
     }
 
     #[rstest::rstest]
@@ -566,16 +998,20 @@ mod tests {
     #[case("COMMIT;")]
     #[case("  COMMIT ; ")]
     fn a_commit_is_read_however_it_is_spelt(#[case] statement: &str) {
-        assert_eq!(reading().carry(&query(statement), false).found.len(), 2);
+        let found = committing(None).carry(&query(statement), false).found;
+        assert_eq!(found.len(), 2);
     }
 
     #[test]
     fn commits_are_numbered_along_the_connection() {
-        let mut reader = reading();
-        reader.carry(&query("COMMIT"), false);
+        let mut reader = committing(None);
+        let first = marks(&reader.carry(&query("COMMIT"), false));
+        reader.carry(&wrote(), false);
         let commit = query("COMMIT");
-        let carried = reader.carry(&commit, false);
-        assert_eq!(marks(&carried), ["commit:2:before", "commit:2:after"]);
+        let again = marks(&reader.carry(&commit, false));
+
+        assert_ne!(first, again, "the same work twice is two moments");
+        assert!(again[0].ends_with(":2:before"), "{again:?}");
     }
 
     #[test]
@@ -590,7 +1026,7 @@ mod tests {
     #[test]
     fn a_commit_split_across_reads_is_still_one_commit() {
         let bytes = query("COMMIT");
-        let mut reader = reading();
+        let mut reader = committing(None);
         let split = bytes.len() / 2;
         assert!(reader.carry(&bytes[..split], false).found.is_empty());
         assert_eq!(reader.carry(&bytes[split..], false).found.len(), 2);
@@ -620,16 +1056,25 @@ mod tests {
 
     #[test]
     fn holding_before_a_commit_keeps_it_off_the_wire() {
-        let (mut reader, _) = session(Some("commit:1:before"));
-        let bytes = [query("BEGIN"), query("COMMIT")].concat();
-        assert_eq!(reader.carry(&bytes, true).freeze_after, Some(1));
+        let bytes = [query("BEGIN"), wrote(), query("COMMIT")].concat();
+        let (mut reader, _) = session(Some(&learned(&bytes, ":before")));
+        assert_eq!(reader.carry(&bytes, true).freeze_after, Some(2));
     }
 
     #[test]
     fn holding_after_a_commit_lets_it_go_first() {
-        let (mut reader, _) = session(Some("commit:1:after"));
-        let bytes = [query("BEGIN"), query("COMMIT")].concat();
-        assert_eq!(reader.carry(&bytes, true).freeze_after, Some(2));
+        let bytes = [query("BEGIN"), wrote(), query("COMMIT")].concat();
+        let (mut reader, _) = session(Some(&learned(&bytes, ":after")));
+        assert_eq!(reader.carry(&bytes, true).freeze_after, Some(3));
+    }
+
+    /// The mark a fault-free run offers for the moment on `side` of `bytes`.
+    fn learned(bytes: &[u8], side: &str) -> String {
+        let (mut reader, _) = session(None);
+        marks(&reader.carry(bytes, false))
+            .into_iter()
+            .find(|mark| mark.ends_with(side))
+            .expect("a commit was named")
     }
 
     #[test]
@@ -654,8 +1099,7 @@ mod tests {
 
     #[test]
     fn a_connection_the_client_leaves_alone_is_read_normally() {
-        let (mut client, _) = pair(None);
-        client.carry(&answers_greeting(0), false);
+        let mut client = committing(None);
         assert_eq!(client.carry(&query("COMMIT"), false).found.len(), 2);
     }
 
@@ -729,15 +1173,21 @@ mod tests {
 
     /// The reporter reads a placement as "on <this>", so it is a noun phrase.
     #[rstest::rstest]
-    #[case("COMMIT", "COM_QUERY COMMIT")]
+    #[case("COMMIT", "COM_QUERY COMMIT", true)]
     #[case(
         "INSERT INTO orders (id) VALUES (1)",
-        "COM_QUERY of an autocommit DML statement"
+        "COM_QUERY of an autocommit DML statement",
+        false
     )]
-    #[case("CREATE TABLE t (id INT)", "COM_QUERY of a DDL statement")]
-    fn a_placement_names_the_wire_event(#[case] statement: &str, #[case] names: &str) {
+    #[case("CREATE TABLE t (id INT)", "COM_QUERY of a DDL statement", false)]
+    fn a_placement_names_the_wire_event(
+        #[case] statement: &str,
+        #[case] names: &str,
+        #[case] open: bool,
+    ) {
         let sent = query(statement);
-        let carried = reading().carry(&sent, false);
+        let mut reader = if open { committing(None) } else { reading() };
+        let carried = reader.carry(&sent, false);
         let whys: Vec<&str> = carried.found.iter().map(|p| p.why.as_str()).collect();
         assert_eq!(
             whys,
@@ -764,7 +1214,7 @@ mod tests {
 
     #[test]
     fn a_moment_is_offered_before_it_is_placed() {
-        let (mut reader, _) = session(Some("commit:1:before"));
+        let mut reader = committing(Some("commit:1:before"));
         let commit = query("COMMIT");
         let carried = reader.carry(&commit, false);
         assert_eq!(carried.freeze_after, None);

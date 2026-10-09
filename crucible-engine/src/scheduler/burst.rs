@@ -89,20 +89,22 @@ impl Point<'_> {
 /// and its edges after.
 fn points_on(profile: &EdgeProfile) -> Vec<Point<'_>> {
     if !profile.placements.is_empty() {
-        return profile
-            .placements
-            .iter()
-            .map(|placement| Point {
-                at: Where::Crossing {
-                    edge: &profile.edge,
-                    direction: placement.direction,
-                },
-                mark: placement.mark.clone(),
-                why: placement.why.clone(),
-                doing: placement.doing,
-                packets: None,
-            })
-            .collect();
+        return one_per_name(
+            profile
+                .placements
+                .iter()
+                .map(|placement| Point {
+                    at: Where::Crossing {
+                        edge: &profile.edge,
+                        direction: placement.direction,
+                    },
+                    mark: placement.mark.clone(),
+                    why: placement.why.clone(),
+                    doing: placement.doing,
+                    packets: None,
+                })
+                .collect(),
+        );
     }
 
     // Per burst, in preference order, then transposed so every burst gets its
@@ -137,7 +139,28 @@ fn points_on(profile: &EdgeProfile) -> Vec<Point<'_>> {
     for round in &mut rounds {
         round.sort_by_key(|point| std::cmp::Reverse(point.packets));
     }
-    rounds.concat()
+    one_per_name(rounds.concat())
+}
+
+/// One point for each name on each direction of the edge, keeping the first.
+///
+/// A schedule carries the name, so two points under one name break the same
+/// packet.
+fn one_per_name(points: Vec<Point<'_>>) -> Vec<Point<'_>> {
+    let mut named: Vec<(Direction, String)> = Vec::new();
+    let mut once_each = Vec::with_capacity(points.len());
+    for point in points {
+        let Where::Crossing { direction, .. } = &point.at else {
+            once_each.push(point);
+            continue;
+        };
+        let name = (*direction, point.mark.clone());
+        if !named.contains(&name) {
+            named.push(name);
+            once_each.push(point);
+        }
+    }
+    once_each
 }
 
 /// Where inside its services a fault can go, one point per moment reported.
@@ -551,6 +574,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_name_two_moments_share_is_offered_once() {
+        let profile = named(vec![
+            "commit:1:before",
+            "commit:1:before",
+            "commit:2:before",
+        ]);
+        let marks: Vec<String> = points_on(&profile)
+            .into_iter()
+            .map(|point| point.mark)
+            .collect();
+        assert_eq!(marks, ["commit:1:before", "commit:2:before"]);
+    }
+
+    /// Bursts do not overlap, but adjacent ones meet at a read they share: a
+    /// burst's start is the read before its first packet, which is the one
+    /// before it ended on.
+    #[test]
+    fn a_read_two_bursts_share_is_offered_once() {
+        let profile = profile("db", vec![burst(0, 2), burst(1, 2)], vec![]);
+        let marks: Vec<String> = points_on(&profile)
+            .into_iter()
+            .map(|point| point.mark)
+            .collect();
+        assert_eq!(
+            marks,
+            ["1", "3", "2", "4"],
+            "read 2 ends one and starts the other"
+        );
+    }
+
     fn burst(nth: u32, packets: u32) -> Burst {
         let first = nth * packets + 1;
         let last = first + packets - 1;
@@ -806,11 +860,14 @@ mod tests {
         assert!(s.next().is_none());
     }
 
+    /// Two bursts meet at a read they share, since the read before the second
+    /// burst's first packet is the first burst's last. Three points each is
+    /// five between them.
     #[test]
     fn an_unbounded_campaign_faults_every_point_of_every_burst() {
         let s = scheduler(&[profile("db", vec![burst(1, 4), burst(2, 4)], vec![])]);
-        assert_eq!(s.total(), 6);
-        assert_eq!(s.coverage().taken, 6, "every point of both bursts");
+        assert_eq!(s.total(), 5);
+        assert_eq!(s.coverage().taken, 5, "every point of both bursts");
     }
 
     /// Freezing before the first packet kills the service before the scenario
@@ -1140,10 +1197,10 @@ mod tests {
         let s = driven(
             &[profile("db", vec![burst(1, 4), burst(2, 4)], vec![])],
             &[Primitive::Kill],
-            Some(6),
+            Some(5),
         );
-        assert_eq!(s.coverage().taken, 6);
-        assert_eq!(s.total(), 6);
+        assert_eq!(s.coverage().taken, 5);
+        assert_eq!(s.total(), 5);
     }
 
     #[test]

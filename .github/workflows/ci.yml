@@ -46,6 +46,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
+      # `pdns.cru` observes through the DNS observer, so `crucible check` has
+      # to find it to say whether that scenario is sound.
+      - run: cargo build --manifest-path examples/dns-observer/Cargo.toml
       - run: cargo nextest run --workspace --all-targets --all-features
 
   deny:

@@ -79,9 +79,8 @@ impl Widget for Card<'_> {
             Line::from("waiting").render(inner, buf);
             return;
         };
-        let worker = match row.state {
-            Progress::Running { worker } => worker,
-            _ => return,
+        let Progress::Running { worker } = row.state else {
+            return;
         };
         let block = Block::bordered().title_top(format!(" W{worker} "));
         let inner = block.inner(area);
@@ -284,9 +283,13 @@ impl Widget for Journal<'_> {
 
         // Borrow line by line rather than joining. A journal is long, and this
         // redraws every tick it is open.
-        Paragraph::new(Text::from_iter(
-            self.1.iter().map(String::as_str).map(Line::from),
-        ))
+        Paragraph::new(
+            self.1
+                .iter()
+                .map(String::as_str)
+                .map(Line::from)
+                .collect::<Text>(),
+        )
         .wrap(Wrap { trim: true })
         .render(inner, buf);
     }
@@ -386,7 +389,7 @@ mod tests {
             report: std::path::PathBuf::from("report.md"),
             stage: Learning,
         }
-        .dispatch(schedules, Duration::from_secs(1260), 3)
+        .dispatch(schedules, Duration::from_mins(21), 3)
     }
 
     fn line(buf: &Buffer, y: u16) -> String {
@@ -396,7 +399,7 @@ mod tests {
     }
 
     #[rstest]
-    #[case(Some(Duration::from_secs(1800)), "0:05:23 / 0:30:00")]
+    #[case(Some(Duration::from_mins(30)), "0:05:23 / 0:30:00")]
     #[case(None, "0:05:23")]
     fn clock_reads_against_a_budget_only_when_one_is_given(
         #[case] budget: Option<Duration>,
@@ -484,7 +487,7 @@ mod tests {
     #[test]
     fn header_carries_the_clock_and_what_the_campaign_loaded() {
         let mut buf = Buffer::empty(Rect::new(0, 0, 70, 3));
-        Header(&running(Some(Duration::from_secs(1800)), Vec::new())).render(buf.area, &mut buf);
+        Header(&running(Some(Duration::from_mins(30)), Vec::new())).render(buf.area, &mut buf);
 
         assert!(line(&buf, 0).contains("0:05:23 / 0:30:00"), "{buf:?}");
         assert!(line(&buf, 1).contains("plugins: amqp, http"), "{buf:?}");

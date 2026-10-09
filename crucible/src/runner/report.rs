@@ -2,7 +2,7 @@
 //!
 //! Both the screen and the end-of-run report read the journal.
 
-use std::{borrow::Cow, collections::BTreeMap, io, path::Path};
+use std::{borrow::Cow, collections::BTreeMap, fmt::Write, io, path::Path};
 
 use crucible_core::{
     ipc::{RunnerToWorker, Verdict, WorkerEvent, WorkerToRunner},
@@ -190,6 +190,8 @@ pub async fn write(journal: &Path, path: &Path, scenario: &str) -> io::Result<()
 ///
 /// What it found and every schedule it ran.
 fn render(events: &[RunnerEvent], scenario: &str) -> String {
+    const INFALLIBLE: &str = "writing to a String cannot fail";
+
     let verdicts = settled(events);
     let fitted = fitted(events);
 
@@ -204,12 +206,16 @@ fn render(events: &[RunnerEvent], scenario: &str) -> String {
         if ran.is_empty() {
             continue;
         }
-        out.push_str(&format!("\n## {outcome} ({})\n", ran.len()));
+        // SAFETY: Writing to a String cannot fail, so it is safe to ignore the result.
+        writeln!(out, "\n## {outcome} ({})", ran.len()).expect(INFALLIBLE);
         for (schedule, purpose) in ran {
-            out.push_str(&format!("\n### #{schedule}\n\n"));
-            out.push_str(&format!("{}\n\n", purpose.drove()));
+            // SAFETY: Writing to a String cannot fail, so it is safe to ignore the result.
+            writeln!(out, "\n### #{schedule}\n").expect(INFALLIBLE);
+            // SAFETY: Writing to a String cannot fail, so it is safe to ignore the result.
+            writeln!(out, "{}\n", purpose.drove()).expect(INFALLIBLE);
             if let Some(why) = verdicts.get(schedule).and_then(Verdict::reason) {
-                out.push_str(&format!("{why}\n\n"));
+                // SAFETY: Writing to a String cannot fail, so it is safe to ignore the result.
+                writeln!(out, "{why}\n").expect(INFALLIBLE);
             }
             out.push_str("```\n");
             for line in events
@@ -339,7 +345,7 @@ mod tests {
     fn fitted(schedules: Vec<(u32, Purpose)>) -> RunnerEvent {
         RunnerEvent::Fitted {
             schedules,
-            eta: std::time::Duration::from_secs(60),
+            eta: std::time::Duration::from_mins(1),
             workers: 3,
         }
     }

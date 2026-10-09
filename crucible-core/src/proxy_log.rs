@@ -71,6 +71,7 @@ impl Sessions {
                         closed_ns: Some(ts_ns),
                         writes: pending.writes,
                         placements: pending.placements,
+                        unreadable: None,
                     });
                 }
             }
@@ -213,12 +214,22 @@ pub fn edge_profiles_from_sessions<S: std::hash::BuildHasher>(
         .into_iter()
         .map(|edge| {
             let placements = placeable.get(&edge).cloned().unwrap_or_default();
+            // The catalogue keeps each name once, so by the time the campaign
+            // sees this edge one of the two has gone.
+            if let Some(mark) = repeated_mark(&placements) {
+                tracing::warn!(
+                    ?edge,
+                    %mark,
+                    moments = placements.len(),
+                    names = distinct_marks(&placements),
+                    "at least two moments on this edge are offered under one name, so that name \
+                     stands for more than one packet and the others are not offered at all"
+                );
+            }
             // A plugin reading the edge drives more accurate faults than a
             // packet count, so its bursts are then unnecessary.
             let (client_to_upstream, upstream_to_client) = if placements.is_empty() {
-                let (mut c2u, mut u2c) = live.get(&edge).cloned().unwrap_or_default();
-                c2u.sort_unstable_by_key(|packet| packet.at);
-                u2c.sort_unstable_by_key(|packet| packet.at);
+                let (c2u, u2c) = live.get(&edge).cloned().unwrap_or_default();
                 let (idle_c2u, idle_u2c) = idle.get(&edge).cloned().unwrap_or_default();
                 (
                     heaviest(above_floor(bursts(&c2u), floor(&idle_c2u))),
@@ -235,6 +246,27 @@ pub fn edge_profiles_from_sessions<S: std::hash::BuildHasher>(
             }
         })
         .collect()
+}
+
+/// The first name two of these placements share.
+///
+/// A plugin numbers the moments it finds within a connection, so two
+/// placements on one edge with the same name are two different packets.
+fn repeated_mark(placements: &[Placement]) -> Option<String> {
+    let mut seen = BTreeSet::new();
+    placements
+        .iter()
+        .find(|placement| !seen.insert(placement.mark.clone()))
+        .map(|placement| placement.mark.clone())
+}
+
+/// How many names these placements use between them.
+fn distinct_marks(placements: &[Placement]) -> usize {
+    placements
+        .iter()
+        .map(|placement| &placement.mark)
+        .collect::<BTreeSet<_>>()
+        .len()
 }
 
 /// A window a span held its host open.
@@ -369,11 +401,13 @@ struct Packet {
     at: u128,
 }
 
-/// Cluster `packets` (sorted timestamps) into bursts by inter-packet gap, each
-/// given as the three points a fault can be placed against. A count `K` means
-/// "freeze once `K` packets have crossed", so `start` is `first - 1` and `end` is
-/// `last`.
+/// Cluster `packets` into bursts by inter-packet gap, each given as the three
+/// points a fault can be placed against. A count `K` means "freeze once `K`
+/// packets have crossed", so `start` is `first - 1` and `end` is `last`.
 fn bursts(packets: &[Packet]) -> Vec<Burst> {
+    let mut packets = packets.to_vec();
+    packets.sort_unstable_by_key(|packet| packet.at);
+    let packets = &packets[..];
     let mut bursts = Vec::new();
     let mut start = 0usize; // 0-based index of the current burst's first packet
     for j in 0..packets.len() {
@@ -424,6 +458,7 @@ impl IntoIterator for Sessions {
                 closed_ns: None,
                 writes: pending.writes,
                 placements: pending.placements,
+                unreadable: None,
             });
         }
         self.finished
@@ -462,6 +497,7 @@ mod tests {
                 closed_ns: None,
                 writes,
                 placements: Vec::new(),
+                unreadable: None,
             }
         })
     }
@@ -482,6 +518,7 @@ mod tests {
                 })
                 .collect(),
             placements: Vec::new(),
+            unreadable: None,
         }
     }
 
@@ -531,6 +568,17 @@ mod tests {
                 why: "an ack the broker has taken".into(),
                 doing: crucible_protocol::Doing::Holding,
             },
+        }
+    }
+
+    /// Somewhere a plugin said a fault could go.
+    fn found_named(ts_ns: u128, mark: &str) -> Found {
+        Found {
+            placement: Placement {
+                mark: mark.into(),
+                ..found(ts_ns).placement
+            },
+            ts_ns,
         }
     }
 
@@ -705,6 +753,13 @@ mod tests {
     }
 
     #[test]
+    fn packets_reported_out_of_order_burst_the_same_as_in_order() {
+        let ordered = bursts(&driven(&[1_000, 2_000, 100_000_000, 101_000_000]));
+        let jumbled = bursts(&driven(&[100_000_000, 1_000, 101_000_000, 2_000]));
+        assert_eq!(ordered, jumbled);
+    }
+
+    #[test]
     fn edge_profiles_split_by_direction_and_skip_pre_scenario_writes() {
         let session = Session {
             service: "db".into(),
@@ -713,6 +768,7 @@ mod tests {
             opened_ns: 0,
             closed_ns: None,
             placements: Vec::new(),
+            unreadable: None,
             writes: vec![
                 // Before scenario start (50): ignored.
                 WriteRecord {
@@ -755,6 +811,7 @@ mod tests {
             opened_ns: 0,
             closed_ns: None,
             placements: Vec::new(),
+            unreadable: None,
             writes: vec![WriteRecord {
                 ts_ns: at,
                 direction: Direction::ClientToUpstream,
@@ -873,5 +930,47 @@ mod tests {
         .into_iter()
         .collect();
         assert!(out.is_empty());
+    }
+
+    /// Dropping one would hide that the edge offers fewer moments than it has.
+    #[test]
+    fn two_moments_offered_under_one_name_are_both_kept_and_found() {
+        let publishing = |conn_id, at| Session {
+            service: "broker".into(),
+            conn_id,
+            peer: "127.0.0.1:1".to_string(),
+            opened_ns: 0,
+            closed_ns: None,
+            placements: vec![found_named(at, "publish:1:before")],
+            unreadable: None,
+            writes: Vec::new(),
+        };
+        let addresses = HashMap::from([("127.0.0.1".parse().unwrap(), "api".to_string())]);
+        let profiles = edge_profiles_from_sessions(
+            &[publishing(0, 100), publishing(1, 200)],
+            timing(50),
+            &addresses,
+            &[],
+        );
+
+        let placements = &profiles[0].placements;
+        assert_eq!(placements.len(), 2);
+        assert_eq!(distinct_marks(placements), 1);
+        assert_eq!(
+            repeated_mark(placements).as_deref(),
+            Some("publish:1:before")
+        );
+    }
+
+    /// An edge naming each of its moments once has nothing to report, however
+    /// many moments it offers.
+    #[test]
+    fn an_edge_naming_each_moment_once_has_no_repeated_name() {
+        let placements: Vec<Placement> = ["publish:1:before", "publish:2:before", "confirm:1"]
+            .iter()
+            .map(|mark| found_named(100, mark).placement)
+            .collect();
+        assert!(repeated_mark(&placements).is_none());
+        assert_eq!(distinct_marks(&placements), placements.len());
     }
 }
