@@ -5,7 +5,7 @@ use std::{
     collections::{HashMap, VecDeque},
     sync::{
         Arc, Mutex, MutexGuard, PoisonError,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU16, Ordering},
     },
 };
 
@@ -24,6 +24,10 @@ const COM_STMT_EXECUTE: u8 = 0x17;
 const COM_STMT_CLOSE: u8 = 0x19;
 /// The first byte of an OK packet.
 const OK: u8 = 0x00;
+/// `SERVER_STATUS_IN_TRANS`: a transaction is currently active.
+const IN_TRANS: u16 = 0x0001;
+/// `SERVER_STATUS_AUTOCOMMIT`: autocommit mode is set.
+const AUTOCOMMIT: u16 = 0x0002;
 /// How many bytes a statement id takes.
 const STATEMENT_ID: usize = 4;
 /// A client numbers each command from zero.
@@ -74,6 +78,29 @@ impl Packet {
         Some((*command, rest))
     }
 
+    /// What the server says about the session, from a packet that carries its
+    /// status flags.
+    ///
+    /// An OK packet carries them after the rows it affected and the id it
+    /// generated, both length encoded. An EOF packet carries them after its
+    /// warning count. Nothing else does.
+    fn session(&self) -> Option<u16> {
+        let (&header, rest) = self.bytes.get(self.payload..)?.split_first()?;
+        let status = match header {
+            OK => {
+                let (_, affected) = lenenc(rest)?;
+                let (_, generated) = lenenc(rest.get(affected..)?)?;
+                rest.get(affected + generated..)?
+            }
+            // An EOF packet, which the newer protocol replaces with an OK.
+            0xfe if rest.len() < 8 => rest.get(2..)?,
+            _ => return None,
+        };
+        Some(u16::from_le_bytes(
+            <[u8; 2]>::try_from(status.get(..2)?).ok()?,
+        ))
+    }
+
     /// The statement id in a prepare response.
     fn prepared_id(&self) -> Option<u32> {
         if self.seq != FIRST + 1 {
@@ -106,6 +133,24 @@ fn sent_as(command: u8) -> &'static str {
 }
 
 /// The statement id a command opens with.
+/// A length-encoded integer and how many bytes it took.
+fn lenenc(rest: &[u8]) -> Option<(u64, usize)> {
+    let (&first, after) = rest.split_first()?;
+    let wide = |width: usize| {
+        let mut eight = [0u8; 8];
+        eight[..width].copy_from_slice(after.get(..width)?);
+        Some((u64::from_le_bytes(eight), 1 + width))
+    };
+    match first {
+        0xfc => wide(2),
+        0xfd => wide(3),
+        0xfe => wide(8),
+        // 0xfb says a column is null, which only row data carries.
+        0xfb => None,
+        _ => Some((u64::from(first), 1)),
+    }
+}
+
 fn statement_id(rest: &[u8]) -> Option<u32> {
     let named = rest.get(..STATEMENT_ID)?;
     Some(u32::from_le_bytes(
@@ -144,10 +189,12 @@ fn asking(statement: &[u8]) -> Asking {
 /// A prepared statement carries its text once in `COM_STMT_PREPARE` and is
 /// executed by statement id after that. The id is in the server's prepare
 /// response, so neither direction can read it alone.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Shared {
     /// Whether the two ends encrypted this connection.
     encrypted: AtomicBool,
+    /// What the server last said about the session.
+    session: AtomicU16,
     /// The prepared statements on this connection.
     prepared: Mutex<Prepared>,
 }
@@ -201,6 +248,17 @@ struct Identity(u32);
 impl std::fmt::Display for Identity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{:08x}", self.0)
+    }
+}
+
+impl Default for Shared {
+    fn default() -> Self {
+        Self {
+            encrypted: AtomicBool::new(false),
+            // What a server's own default is, until we see otherwise.
+            session: AtomicU16::new(AUTOCOMMIT),
+            prepared: Mutex::default(),
+        }
     }
 }
 
@@ -314,17 +372,28 @@ impl Reader {
         }
     }
 
-    /// Record the statement id a prepare response carries.
-    fn names_prepared(&self, packet: &Packet) {
+    /// Record the statement id a prepare response carries, and say whether
+    /// this packet was one.
+    fn names_prepared(&self, packet: &Packet) -> bool {
         let mut held = self.prepared();
         // A client waits for each response before sending again, so the first
         // response after a prepare is that prepare's.
         let Some(prepared) = held.awaiting.pop_front() else {
-            return;
+            return false;
         };
         if let Some(named) = packet.prepared_id() {
             held.by_id.insert(named, prepared);
         }
+        true
+    }
+
+    /// Whether the server has a transaction open that no `BEGIN` announced.
+    ///
+    /// A client with autocommit off opens one by running its first statement,
+    /// so the only account of it is what the server reports.
+    fn server_holds_a_transaction(&self) -> bool {
+        let session = self.shared.session.load(Ordering::Relaxed);
+        session & IN_TRANS != 0 || session & AUTOCOMMIT == 0
     }
 
     /// Every packet these bytes complete, and any tail that cannot be read.
@@ -417,11 +486,11 @@ impl Reader {
                 doing.update(&statement.to_le_bytes());
                 (!was_open).then_some(doing)
             }
-            // Work, which is its own transaction where none is open.
+            // Work, which commits itself only where no transaction is open.
             Asking::Write => {
                 let mut doing = self.open.take().unwrap_or_else(Fingerprint::new);
                 doing.update(&statement.to_le_bytes());
-                if was_open {
+                if was_open || self.server_holds_a_transaction() {
                     self.open = Some(doing);
                     None
                 } else {
@@ -462,7 +531,12 @@ impl crucible_protocol::Kind for Reader {
             // Only the client sends commands; what comes back carries the
             // statement ids.
             if self.direction == Direction::UpstreamToClient {
-                self.names_prepared(packet);
+                if self.names_prepared(packet) {
+                    continue;
+                }
+                if let Some(session) = packet.session() {
+                    self.shared.session.store(session, Ordering::Relaxed);
+                }
                 continue;
             }
             let Some((identity, nth, sent)) = self.commits_at(packet) else {
@@ -584,6 +658,43 @@ mod tests {
 
     /// The client answering the server's greeting with the capabilities it
     /// wants.
+    /// The server answering a statement, reporting `status` about the session.
+    fn reports(status: u16) -> Vec<u8> {
+        let mut payload = vec![OK, 0, 0];
+        payload.extend_from_slice(&status.to_le_bytes());
+        payload.extend_from_slice(&0u16.to_le_bytes());
+        packet(FIRST + 1, &payload)
+    }
+
+    #[test]
+    fn a_statement_the_server_holds_a_transaction_for_is_not_its_own_commit() {
+        let (mut client, mut server) = session(None);
+        server.carry(&reports(IN_TRANS), false);
+
+        let wrote = marks(&client.carry(&query("INSERT INTO records VALUES ('www')"), false));
+        assert!(
+            wrote.is_empty(),
+            "the statement committed nothing: {wrote:?}"
+        );
+
+        let committed = marks(&client.carry(&query("COMMIT"), false));
+        assert!(!committed.is_empty(), "the COMMIT is the moment");
+
+        // A bare commit names an empty transaction, and this one is not that.
+        let (mut bare, _) = session(None);
+        let nothing = marks(&bare.carry(&query("COMMIT"), false));
+        assert_ne!(committed, nothing, "the commit carries the statement");
+    }
+
+    #[test]
+    fn a_statement_the_server_holds_no_transaction_for_commits_itself() {
+        let (mut client, mut server) = session(None);
+        server.carry(&reports(AUTOCOMMIT), false);
+
+        let wrote = marks(&client.carry(&query("INSERT INTO records VALUES ('www')"), false));
+        assert_eq!(wrote.len(), 2, "either side of its own commit: {wrote:?}");
+    }
+
     fn answers_greeting(capabilities: u32) -> Vec<u8> {
         let mut payload = capabilities.to_le_bytes().to_vec();
         payload.extend_from_slice(&[0; 28]);
