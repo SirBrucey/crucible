@@ -133,6 +133,94 @@ fn sent_as(command: u8) -> &'static str {
 }
 
 /// The statement id a command opens with.
+/// What `statement` says with the values taken out of it.
+///
+/// Each string or number becomes one `?`, so two statements that differ only
+/// in what they carry read the same.
+///
+/// A name in backticks is a name rather than a value, so it is kept, and a
+/// digit inside a word is part of the word.
+fn shape(statement: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(statement.len());
+    let mut at = 0;
+    while at < statement.len() {
+        let byte = statement[at];
+        let word = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$';
+        match byte {
+            b'\'' | b'"' => {
+                out.push(b'?');
+                at = past_string(statement, at);
+            }
+            b'`' => {
+                let end = past_quoted_name(statement, at);
+                out.extend_from_slice(&statement[at..end]);
+                at = end;
+            }
+            b'0'..=b'9' | b'.' if !out.last().copied().is_some_and(word) => {
+                out.push(b'?');
+                at = past_number(statement, at);
+            }
+            _ => {
+                out.push(byte);
+                at += 1;
+            }
+        }
+    }
+    out
+}
+
+/// Where the string opening at `at` ends, past the closing quote.
+///
+/// A quote is escaped by a backslash or by doubling it.
+fn past_string(statement: &[u8], at: usize) -> usize {
+    let quote = statement[at];
+    let mut next = at + 1;
+    while next < statement.len() {
+        match statement[next] {
+            b'\\' => next += 2,
+            byte if byte == quote => {
+                if statement.get(next + 1) == Some(&quote) {
+                    next += 2;
+                } else {
+                    return next + 1;
+                }
+            }
+            _ => next += 1,
+        }
+    }
+    statement.len()
+}
+
+/// Where the backtick name opening at `at` ends, past the closing backtick.
+fn past_quoted_name(statement: &[u8], at: usize) -> usize {
+    let mut next = at + 1;
+    while next < statement.len() {
+        if statement[next] == b'`' {
+            return next + 1;
+        }
+        next += 1;
+    }
+    statement.len()
+}
+
+/// Where the number opening at `at` ends.
+///
+/// Hexadecimal, decimal and exponent forms all count as one value.
+fn past_number(statement: &[u8], at: usize) -> usize {
+    let mut next = at;
+    while next < statement.len() {
+        let byte = statement[next];
+        let exponent =
+            matches!(byte, b'+' | b'-') && matches!(statement.get(next - 1), Some(b'e' | b'E'));
+        if byte.is_ascii_hexdigit() || matches!(byte, b'.' | b'x' | b'X') || exponent {
+            next += 1;
+        } else {
+            return next;
+        }
+    }
+    statement.len()
+}
+
 /// A length-encoded integer and how many bytes it took.
 fn lenenc(rest: &[u8]) -> Option<(u64, usize)> {
     let (&first, after) = rest.split_first()?;
@@ -364,24 +452,19 @@ impl Reader {
         match command {
             COM_QUERY => {
                 let mut text = Fingerprint::new();
-                text.update(rest);
+                text.update(&shape(rest));
                 Some((asking(rest), text.0))
             }
             COM_STMT_PREPARE => {
                 let mut text = Fingerprint::new();
-                text.update(rest);
+                text.update(&shape(rest));
                 held.awaiting.push_back((asking(rest), text.0));
                 // Preparing runs nothing.
                 None
             }
-            COM_STMT_EXECUTE => {
-                let (asking, text) = *held.by_id.get(&statement_id(rest)?)?;
-                // The statement id is the server's to choose, so what is
-                // eaten is the text it stands for and the parameters after it.
-                let mut statement = Fingerprint(text);
-                statement.update(rest.get(STATEMENT_ID..)?);
-                Some((asking, statement.0))
-            }
+            // The statement id is the server's to choose and the parameters
+            // are values, so what the statement did is its text alone.
+            COM_STMT_EXECUTE => held.by_id.get(&statement_id(rest)?).copied(),
             COM_STMT_CLOSE => {
                 held.by_id.remove(&statement_id(rest)?);
                 None
@@ -647,17 +730,19 @@ mod tests {
     /// A pair of readers on a connection whose greeting has been answered,
     /// which is where every session starts.
     /// A service that opens a connection per request numbers every
-    /// connection's first commit the same.
+    /// connection's first commit the same, so two connections doing different
+    /// work have to be told apart by the work.
     #[test]
     fn two_connections_doing_different_work_name_different_moments() {
         let (mut one, _) = session(None);
         let (mut two, _) = session(None);
-        for (reader, name) in [(&mut one, "www"), (&mut two, "mail")] {
+        let work = [
+            (&mut one, "INSERT INTO records VALUES ('www')"),
+            (&mut two, "UPDATE zones SET serial = serial + 1"),
+        ];
+        for (reader, statement) in work {
             reader.carry(&query("BEGIN"), false);
-            reader.carry(
-                &query(&format!("INSERT INTO records VALUES ('{name}')")),
-                false,
-            );
+            reader.carry(&query(statement), false);
         }
 
         let named = |carried: &Carried<'_>| marks(carried)[0].clone();
@@ -794,6 +879,43 @@ mod tests {
             before.strip_suffix("before"),
             after.strip_suffix("after"),
             "both sides of the one moment"
+        );
+    }
+
+    #[test]
+    fn two_transactions_differing_only_in_their_values_are_one_moment() {
+        let same = |value: &str| {
+            let (mut reader, _) = session(None);
+            reader.carry(&query("BEGIN"), false);
+            let statement = format!("INSERT INTO records VALUES ('{value}')");
+            reader.carry(&query(&statement), false);
+            marks(&reader.carry(&query("COMMIT"), false))
+        };
+        assert_eq!(same("www"), same("mail"));
+    }
+
+    #[rstest::rstest]
+    #[case(
+        "INSERT INTO records VALUES ('www', 1)",
+        "INSERT INTO records VALUES (?, ?)"
+    )]
+    #[case(
+        "SELECT id FROM col1 WHERE id = 42",
+        "SELECT id FROM col1 WHERE id = ?"
+    )]
+    #[case(
+        "SELECT * FROM `records` WHERE x = 0xdead",
+        "SELECT * FROM `records` WHERE x = ?"
+    )]
+    #[case(
+        r"INSERT INTO t VALUES ('it''s', 'a\'b')",
+        "INSERT INTO t VALUES (?, ?)"
+    )]
+    #[case("UPDATE t SET at = 1.5e-3", "UPDATE t SET at = ?")]
+    fn a_statement_reads_as_its_shape(#[case] statement: &str, #[case] shaped: &str) {
+        assert_eq!(
+            String::from_utf8(shape(statement.as_bytes())).expect("ascii in, ascii out"),
+            shaped
         );
     }
 
