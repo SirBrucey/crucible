@@ -80,7 +80,9 @@ pub enum Operation {
     /// rather than that one alone, which it decides for itself.
     Ack { tag: Tag, multiple: bool },
     /// A consumer refusing one, which is what makes the broker requeue it.
-    Reject { tag: Tag },
+    /// `multiple` is the consumer refusing every delivery up to `tag`, which
+    /// only `basic.nack` can say.
+    Reject { tag: Tag, multiple: bool },
     /// A consumer saying how many deliveries it will hold unacknowledged at
     /// once. Zero is AMQP's no limit.
     Prefetch { count: u16 },
@@ -128,9 +130,12 @@ impl Operation {
             },
             AMQPMethod::Reject(reject) => Operation::Reject {
                 tag: Tag::from(reject.delivery_tag),
+                // `basic.reject` refuses one delivery and has no say in it.
+                multiple: false,
             },
             AMQPMethod::Nack(nack) => Operation::Reject {
                 tag: Tag::from(nack.delivery_tag),
+                multiple: nack.multiple,
             },
             AMQPMethod::Qos(qos) => Operation::Prefetch {
                 count: qos.prefetch_count,

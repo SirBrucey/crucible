@@ -98,7 +98,7 @@ pub(super) fn boundaries(
                 })
                 .collect();
         }
-        Operation::Reject { tag } => (
+        Operation::Reject { tag, .. } => (
             format!("reject:{tag}"),
             "a refusal the consumer has sent and the broker has not seen",
             "a refusal the broker has taken, requeueing or dead-lettering it",

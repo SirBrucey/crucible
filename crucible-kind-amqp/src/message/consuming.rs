@@ -44,9 +44,24 @@ impl Consuming {
             .flatten()
     }
 
-    /// The consumer is done with `tag`, one way or another.
-    pub(super) fn finished(&self, channel: Channel, tag: Tag) {
-        self.held().outstanding.remove(&(channel, tag));
+    /// The consumer is done with `tag`, one way or another, and with every
+    /// delivery up to it where `multiple` is set.
+    ///
+    /// Zero with `multiple` is every delivery on the channel, which is one
+    /// tag the broker never gives out.
+    pub(super) fn finished(&self, channel: Channel, tag: Tag, multiple: bool) {
+        let mut held = self.held();
+        if multiple {
+            let through = if tag == Tag::new(0) {
+                Tag::new(u64::MAX)
+            } else {
+                tag
+            };
+            held.outstanding
+                .retain(|(on, at), _| *on != channel || *at > through);
+        } else {
+            held.outstanding.remove(&(channel, tag));
+        }
     }
 
     /// The broker takes back everything on `channel` the consumer never
@@ -119,10 +134,12 @@ impl Consuming {
                 (redelivered && self.answers(message.identity.as_ref()))
                     .then(|| Did::Placed("the broker delivered the message again".to_owned()))
             }
-            Operation::Ack { tag, .. } | Operation::Reject { tag }
-                if direction == Direction::ClientToUpstream =>
-            {
-                self.finished(message.channel, tag);
+            Operation::Ack { tag, multiple } if direction == Direction::ClientToUpstream => {
+                self.finished(message.channel, tag, multiple);
+                None
+            }
+            Operation::Reject { tag, multiple } if direction == Direction::ClientToUpstream => {
+                self.finished(message.channel, tag, multiple);
                 None
             }
             Operation::Prefetch { count } if direction == Direction::ClientToUpstream => {
@@ -165,7 +182,7 @@ mod tests {
     use crate::message::reader::Reader;
     use crate::message::tests::{
         TAG, ack, acked, cancel, closed, closing, connection, consumer, delivered, marks,
-        offered_a_reorder, pushed, qos, recover,
+        offered_a_reorder, pushed, qos, recover, refused,
     };
 
     use super::*;
@@ -323,6 +340,78 @@ mod tests {
         assert!(
             marks(broker.carry(&delivered(2, b"another order"), false).found)
                 .contains(&"reorder:1".to_owned())
+        );
+    }
+
+    /// Acknowledging in bulk gives back every delivery up to the tag, so none
+    /// of them still counts against the room the broker has.
+    #[test]
+    fn an_ack_with_multiple_gives_back_every_delivery_up_to_its_tag() {
+        let consuming = Consuming::default();
+        let channel = Channel::new(1);
+        consuming.holds_at_most(channel, 1);
+        for tag in 1..=3 {
+            consuming.delivered(channel, Tag::new(tag), None);
+        }
+
+        consuming.finished(channel, Tag::new(2), true);
+        assert!(
+            !consuming.would_stall(channel),
+            "the third is still in hand"
+        );
+        consuming.finished(channel, Tag::new(3), false);
+        assert!(consuming.would_stall(channel), "nothing is left in hand");
+    }
+
+    /// Zero with `multiple` is every delivery on the channel, which is one
+    /// tag the broker never gives out.
+    #[test]
+    fn an_ack_of_tag_zero_with_multiple_gives_back_everything() {
+        let consuming = Consuming::default();
+        let channel = Channel::new(1);
+        consuming.holds_at_most(channel, 1);
+        for tag in 1..=3 {
+            consuming.delivered(channel, Tag::new(tag), None);
+        }
+
+        consuming.finished(channel, Tag::new(0), true);
+        assert!(consuming.would_stall(channel), "nothing is left in hand");
+    }
+
+    /// A tag is the broker's numbering on one channel, so acknowledging in
+    /// bulk on one says nothing about what another holds.
+    #[test]
+    fn an_ack_with_multiple_leaves_another_channel_alone() {
+        let consuming = Consuming::default();
+        let (one, two) = (Channel::new(1), Channel::new(2));
+        for channel in [one, two] {
+            consuming.holds_at_most(channel, 1);
+            consuming.delivered(channel, Tag::new(1), None);
+        }
+
+        consuming.finished(one, Tag::new(0), true);
+        assert!(consuming.would_stall(one));
+        assert!(
+            !consuming.would_stall(two),
+            "the second channel still holds one"
+        );
+    }
+
+    /// A consumer refusing in bulk has given its deliveries back just as one
+    /// acknowledging in bulk has, so neither leaves the broker stuck.
+    #[test]
+    fn a_nack_with_multiple_gives_back_every_delivery_up_to_its_tag() {
+        let (mut broker, mut consumer) = connection();
+        consumer.carry(&qos(1), false);
+        for tag in 1..=3 {
+            broker.carry(&delivered(tag, b"an order"), false);
+        }
+
+        consumer.carry(&refused(3, true), false);
+        broker.carry(&delivered(4, b"a fourth order"), false);
+        assert!(
+            !offered_a_reorder(&mut broker, &delivered(5, b"a fifth order")),
+            "all three went back, so the consumer has nothing left to acknowledge"
         );
     }
 }

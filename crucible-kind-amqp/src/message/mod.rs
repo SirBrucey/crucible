@@ -32,7 +32,7 @@ mod tests {
     use amq_protocol::{
         frame::{AMQPContentHeader, WriteContext, gen_frame},
         protocol::basic::{
-            AMQPMethod, AMQPProperties, Ack, Cancel, Deliver, GetOk, Publish, Qos, Recover,
+            AMQPMethod, AMQPProperties, Ack, Cancel, Deliver, GetOk, Nack, Publish, Qos, Recover,
         },
     };
     use crucible_protocol::{Did, Direction, Kind as _, Placement};
@@ -141,6 +141,16 @@ mod tests {
         method(AMQPMethod::Ack(Ack {
             delivery_tag: tag,
             multiple: false,
+        }))
+    }
+
+    /// A consumer refusing the delivery the broker labelled `tag`, and every
+    /// one up to it where `multiple` is set.
+    pub(super) fn refused(tag: u64, multiple: bool) -> Vec<u8> {
+        method(AMQPMethod::Nack(Nack {
+            delivery_tag: tag,
+            multiple,
+            requeue: true,
         }))
     }
 
@@ -290,7 +300,13 @@ mod tests {
         from_broker.carry(&pushed(false, b"an order"), false);
         let forward = to_broker.carry(&ack(), true).forward.concat();
 
-        assert_eq!(operations(&forward), [Operation::Reject { tag: TAG }]);
+        assert_eq!(
+            operations(&forward),
+            [Operation::Reject {
+                tag: TAG,
+                multiple: false
+            }]
+        );
         let AMQPFrame::Method(_, AMQPClass::Basic(AMQPMethod::Nack(nack))) =
             &decode(&forward)[0].frame
         else {
