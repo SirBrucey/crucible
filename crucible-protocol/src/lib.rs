@@ -171,6 +171,8 @@ pub struct EdgeProfile {
     /// Where the plugin reading this edge said a fault could go. Empty for an
     /// edge nothing can read, which is what the bursts are for.
     pub placements: Vec<Placement>,
+    /// Why a plugin could do nothing with this edge's traffic.
+    pub unreadable: Option<String>,
 }
 
 /// One run of packets with no long gap in it, given as the three points a fault

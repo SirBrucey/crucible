@@ -140,6 +140,8 @@ pub struct Gate {
     /// While `true` the pair carries nothing, so the peer meets a partition
     /// rather than a blip.
     down: watch::Receiver<bool>,
+    /// Whether the scenario has started.
+    started: watch::Receiver<bool>,
     /// The edge being cut, which only some of this pair's connections carry.
     edge: Arc<OnceLock<OnEdge>>,
     /// Who dialled, so this connection can tell whether it is that edge.
@@ -152,6 +154,7 @@ impl Gate {
         pause: watch::Receiver<bool>,
         severings: watch::Receiver<u64>,
         down: watch::Receiver<bool>,
+        started: watch::Receiver<bool>,
         edge: Arc<OnceLock<OnEdge>>,
     ) -> Self {
         let opened_at = *severings.borrow();
@@ -160,9 +163,15 @@ impl Gate {
             severings,
             opened_at,
             down,
+            started,
             edge,
             peer: None,
         }
+    }
+
+    /// Whether the scenario has started.
+    fn started(&self) -> bool {
+        *self.started.borrow()
     }
 
     /// The gate a connection from `peer` is subject to.
@@ -173,6 +182,7 @@ impl Gate {
             pause: self.pause.clone(),
             severings: self.severings.clone(),
             down: self.down.clone(),
+            started: self.started.clone(),
             edge: Arc::clone(&self.edge),
         }
     }
@@ -578,6 +588,10 @@ async fn forward_bytes(
     };
     let mut bytes_total: u64 = 0;
     let mut buf = vec![0u8; 4096];
+    // Whether this half has already said the plugin cannot read it.
+    let mut said_unreadable = false;
+    // Whether the reader has been told the scenario started.
+    let mut told_started = gate.started();
     loop {
         // A cut severs an idle connection too, so it races the read rather than
         // waiting for a packet that is never coming.
@@ -603,7 +617,26 @@ async fn forward_bytes(
         let placing = anchor
             .as_ref()
             .is_some_and(|anchor| anchor.placing(conn.peer));
+        // Told before the bytes are read, so the first read of the scenario is
+        // counted as the scenario's first.
+        if !told_started && gate.started() {
+            told_started = true;
+            operations.scenario_started();
+        }
         let carried = operations.carry(&buf[..n], placing);
+        if let Some(why) = carried.unreadable
+            && !said_unreadable
+        {
+            said_unreadable = true;
+            tracing::warn!(
+                %conn.peer,
+                ?direction,
+                why,
+                "the plugin reading this connection cannot make anything of it, so the \
+                 framework will fall back to using bursts"
+            );
+            emit(&events, ConnEvent::unreadable(conn.id, why));
+        }
         for placement in carried.found {
             emit(&events, ConnEvent::placeable(conn.id, placement));
         }
@@ -702,6 +735,7 @@ mod tests {
             watch::channel(false).1,
             watch::channel(0).1,
             watch::channel(false).1,
+            watch::channel(true).1,
             every_peer(),
         )
     }
@@ -728,6 +762,7 @@ mod tests {
             pause,
             watch::channel(0).1,
             watch::channel(false).1,
+            watch::channel(true).1,
             every_peer(),
         )
     }
@@ -826,6 +861,9 @@ mod tests {
                 ConnEventKind::Placeable { placement } => {
                     panic!("unexpected placement from an unread kind: {placement:?}")
                 }
+                ConnEventKind::Unreadable { why } => {
+                    panic!("an unread kind reported a failed reading: {why}")
+                }
                 ConnEventKind::Did { did } => {
                     panic!("an unread kind changed nothing: {did:?}")
                 }
@@ -920,6 +958,7 @@ mod tests {
                 watch::channel(false).1,
                 watch::channel(0).1,
                 down_rx,
+                watch::channel(true).1,
                 every_peer(),
             ),
             None,
@@ -959,6 +998,7 @@ mod tests {
                 watch::channel(false).1,
                 sever_rx,
                 watch::channel(false).1,
+                watch::channel(true).1,
                 every_peer(),
             ),
             None,
@@ -1049,6 +1089,141 @@ mod tests {
             }
         };
         assert_eq!(stopped_on, "2");
+    }
+
+    #[tokio::test]
+    async fn a_connection_older_than_the_scenario_renumbers_when_it_starts() {
+        let kind = "mariadb";
+        assert!(crucible_kind::is_read(kind), "no plugin reads {kind}");
+        let (started_tx, started_rx) = watch::channel(false);
+        let echo = spawn_echo().await;
+        let (proxy, proxy_addr, mut events) = Proxy::bind(
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            Upstream {
+                host: echo.to_string(),
+                kinds: crucible_kind::Kinds::new(kind, None),
+            },
+            Gate::new(
+                watch::channel(false).1,
+                watch::channel(0).1,
+                watch::channel(false).1,
+                started_rx,
+                every_peer(),
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+        tokio::spawn(proxy.run());
+
+        // Two commits while the fleet comes up, then the scenario starts and
+        // one more crosses.
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+        round_trip(&mut client, &handshake()).await;
+        for _ in 0..2 {
+            round_trip(&mut client, &wrote()).await;
+        }
+        started_tx.send_replace(true);
+        round_trip(&mut client, &wrote()).await;
+
+        let drained = Duration::from_millis(300);
+        let mut named = Vec::new();
+        while let Ok(event) = timeout(drained, recv(&mut events)).await {
+            if let ConnEventKind::Placeable { placement } = event.kind
+                && placement.mark.ends_with(":before")
+            {
+                named.push(placement.mark);
+            }
+        }
+        // Three identical commits, so one identity counted 1, 2 and then 1
+        // again once the scenario has started.
+        let counted: Vec<Option<&str>> = named
+            .iter()
+            .map(|mark| mark.strip_prefix("commit:").and_then(|rest| rest.get(9..)))
+            .collect();
+        assert_eq!(
+            counted,
+            [Some("1:before"), Some("2:before"), Some("1:before")],
+            "the scenario's commit should be its first, not the connection's third"
+        );
+    }
+
+    async fn round_trip(client: &mut TcpStream, bytes: &[u8]) {
+        client.write_all(bytes).await.unwrap();
+        let mut back = vec![0u8; bytes.len()];
+        client.read_exact(&mut back).await.unwrap();
+    }
+
+    /// A client's handshake answer, asking for no capabilities.
+    fn handshake() -> Vec<u8> {
+        let mut bytes = vec![32, 0, 0, 1];
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&[0; 28]);
+        bytes
+    }
+
+    /// A `COM_QUERY` carrying a write.
+    fn wrote() -> Vec<u8> {
+        let mut bytes = vec![35, 0, 0, 0, 0x03];
+        bytes.extend_from_slice(b"INSERT INTO records VALUES ('www')");
+        bytes
+    }
+
+    #[tokio::test]
+    async fn a_connection_the_plugin_gives_up_on_is_announced_by_each_direction() {
+        // The proxy reaches plugins only through the registry, so the kind is
+        // named here and the assertion checks the registry still has one.
+        let kind = "mariadb";
+        assert!(crucible_kind::is_read(kind), "no plugin reads {kind}");
+
+        let echo = spawn_echo().await;
+        let (proxy, proxy_addr, mut events) = Proxy::bind(
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            Upstream {
+                host: echo.to_string(),
+                kinds: crucible_kind::Kinds::new(kind, None),
+            },
+            open(),
+            None,
+        )
+        .await
+        .unwrap();
+        tokio::spawn(proxy.run());
+
+        // A handshake answer with the TLS capability set.
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+        let mut payload = 0x0000_0800u32.to_le_bytes().to_vec();
+        payload.extend_from_slice(&[0; 28]);
+        let mut asks_for_tls = vec![32, 0, 0, 1];
+        asks_for_tls.extend_from_slice(&payload);
+        client.write_all(&asks_for_tls).await.unwrap();
+        let mut buf = vec![0u8; asks_for_tls.len()];
+        client.read_exact(&mut buf).await.unwrap();
+        for _ in 0..3 {
+            client.write_all(b"ciphertext").await.unwrap();
+            let mut back = [0u8; 10];
+            client.read_exact(&mut back).await.unwrap();
+        }
+
+        // One report per direction.
+        let mut said = 0;
+        let mut after_the_first = 0;
+        let drained = Duration::from_millis(300);
+        while let Ok(event) = timeout(drained, recv(&mut events)).await {
+            match event.kind {
+                ConnEventKind::Unreadable { ref why } => {
+                    assert!(why.contains("TLS"), "{why}");
+                    said += 1;
+                }
+                ConnEventKind::Wrote { .. } if said > 0 => after_the_first += 1,
+                _ => {}
+            }
+        }
+        assert_eq!(said, 2, "once each way, not once per read");
+        assert!(
+            after_the_first > 0,
+            "the connection has to keep carrying traffic for that to mean anything"
+        );
     }
 
     #[tokio::test]
@@ -1157,7 +1332,13 @@ mod tests {
         let (proxy, proxy_addr, _events) = Proxy::bind(
             (Ipv4Addr::LOCALHOST, 0).into(),
             watching(echo, &anchor),
-            Gate::new(pause_rx, sever_rx, watch::channel(false).1, edge),
+            Gate::new(
+                pause_rx,
+                sever_rx,
+                watch::channel(false).1,
+                watch::channel(true).1,
+                edge,
+            ),
             Some(anchor.clone()),
         )
         .await

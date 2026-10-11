@@ -625,6 +625,7 @@ mod tests {
     fn from(client: Option<&str>, upstream: &str, c2u: Vec<Burst>, u2c: Vec<Burst>) -> EdgeProfile {
         EdgeProfile {
             placements: Vec::new(),
+            unreadable: None,
             edge: Edge {
                 client: client.map(ToOwned::to_owned),
                 upstream: upstream.into(),

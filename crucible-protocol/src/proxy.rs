@@ -115,6 +115,17 @@ impl ConnEvent {
     }
 
     #[must_use]
+    pub fn unreadable(id: ConnId, why: &str) -> Self {
+        Self {
+            id,
+            ts_ns: now_ns(),
+            kind: ConnEventKind::Unreadable {
+                why: why.to_owned(),
+            },
+        }
+    }
+
+    #[must_use]
     pub fn placeable(id: ConnId, placement: crate::Placement) -> Self {
         Self {
             id,
@@ -199,6 +210,12 @@ pub enum ConnEventKind {
     /// A moment inside a service, reported by the service itself.
     Reached {
         boundary: crate::Boundary,
+    },
+    /// The plugin reading this connection could do nothing with its traffic.
+    /// Emitted once by each direction, so at most twice however many reads
+    /// follow.
+    Unreadable {
+        why: String,
     },
 }
 

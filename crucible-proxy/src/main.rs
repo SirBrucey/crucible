@@ -1,3 +1,16 @@
+//! The sidecar every service in a replica is reached through.
+//!
+//! One of these fronts each service twice. The data plane is what a scenario
+//! drives through and what a fault acts on, and the control plane is a side
+//! channel the framework reads state on, so what it asks a fleet never counts
+//! towards the fleet's own traffic.
+//!
+//! A pair's traffic is read by the kind plugin for whatever protocol it
+//! speaks, which is what lets a fault name a commit or a publish rather than a
+//! byte offset. The plugin only reads and reports; holding the fleet still,
+//! severing a pair and deciding that a moment is the one a schedule named are
+//! this crate's.
+
 mod error;
 mod fleet;
 mod proxy;
@@ -329,6 +342,7 @@ async fn main() -> Result<()> {
         &edge,
     );
     let anchor = job.anchor();
+    let (started_tx, started_rx) = watch::channel(false);
     // Every pair and every instrumented service counts here, so one number
     // answers for the whole fleet.
     let freezes = watch::Sender::new(0u32);
@@ -346,6 +360,7 @@ async fn main() -> Result<()> {
             pause: &pause_rx,
             sever: &sever_rx,
             down: &down_rx,
+            started: &started_rx,
             edge: &edge,
             freezes: &freezes,
         },
@@ -379,6 +394,7 @@ async fn main() -> Result<()> {
         trip_rx,
         pause_tx,
         sever_tx,
+        started_tx,
         Fleet {
             named,
             client,
@@ -602,6 +618,9 @@ struct Gates<'a> {
     pause: &'a watch::Receiver<bool>,
     sever: &'a watch::Receiver<u64>,
     down: &'a watch::Receiver<bool>,
+    /// Flipped at scenario start, for every job, so a plugin numbering its
+    /// moments counts the scenario's work and not the fleet coming up.
+    started: &'a watch::Receiver<bool>,
     edge: &'a Arc<OnceLock<OnEdge>>,
     /// Counted as each pair reports a freeze.
     freezes: &'a watch::Sender<u32>,
@@ -633,6 +652,7 @@ async fn serve_pairs(pairs: Vec<Pair>, gates: Gates<'_>) -> Result<()> {
             } else {
                 watch::channel(false).1
             },
+            gates.started.clone(),
             Arc::clone(gates.edge),
         );
         serve(
@@ -664,6 +684,7 @@ fn spawn_fault_control(
     mut trip: watch::Receiver<bool>,
     pause: watch::Sender<bool>,
     sever: watch::Sender<u64>,
+    started: watch::Sender<bool>,
     fleet: Fleet,
 ) {
     tokio::spawn(async move {
@@ -681,6 +702,16 @@ fn spawn_fault_control(
         loop {
             tokio::select! {
                 _ = arm.recv() => {
+                    // Said before anything that waits. Resolving the fleet
+                    // takes a DNS round trip, which is long enough for a step
+                    // to have been driven and published.
+                    if !*started.borrow() {
+                        send(&started, true);
+                        tracing::info!(
+                            "the scenario has started, so the moments are \
+                             counted from here (SIGUSR1)"
+                        );
+                    }
                     // The fleet answers to its names only once it is up, so the
                     // edge is resolved here rather than at bind.
                     if fleet.edge.get().is_none() {

@@ -167,6 +167,7 @@ mod tests {
     fn profile(edge: Edge) -> EdgeProfile {
         EdgeProfile {
             placements: Vec::new(),
+            unreadable: None,
             edge,
             client_to_upstream: vec![carrying(1)],
             upstream_to_client: vec![carrying(1)],

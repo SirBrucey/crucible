@@ -213,6 +213,8 @@ impl Orchestrator<Ready> {
             consistent_within,
         };
         let outcome: Result<Readings, crucible_plugin::Error> = async {
+            // Tell the proxies the scenario is starting.
+            deployment.substrate().arm_anchor().await?;
             let mut observations =
                 run_actions(deployment.as_ref(), driving, Instant::now()).await?;
             session_observer
@@ -270,6 +272,7 @@ impl Orchestrator<Ready> {
         // can be differentiated from the traffic the scenario causes.
         let rest_start_ns = now_ns();
         tokio::time::sleep(REST_OBSERVE).await;
+        deployment.substrate().arm_anchor().await?;
         let scenario_start_ns = now_ns();
         let mut observations = match run_actions(deployment.as_ref(), driving, Instant::now()).await
         {
@@ -322,6 +325,21 @@ impl Orchestrator<Ready> {
             &mut observations.inside,
             &addresses,
         );
+        // Every moment the learn run found, with the connection and the time.
+        for session in &observations.sessions {
+            for found in &session.placements {
+                tracing::debug!(
+                    service = %session.service,
+                    conn = session.conn_id,
+                    peer = %session.peer,
+                    at_ns = found.ts_ns.saturating_sub(scenario_start_ns),
+                    direction = ?found.placement.direction,
+                    mark = %found.placement.mark,
+                    why = %found.placement.why,
+                    "a plugin found somewhere a fault could go"
+                );
+            }
+        }
         let learned = Learned {
             profiles: edge_profiles_from_sessions(
                 &observations.sessions,
