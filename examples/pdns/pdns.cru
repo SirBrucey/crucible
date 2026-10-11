@@ -10,7 +10,8 @@ fleet "pdns" {
     image: "crucible-example/pdns-api:0.1",
     ports: { http: 8080 },
     env: [
-      "DATABASE_URL=mysql://root@db:3306/pdns",
+      // Plain, so the proxy can read the connection and name the commits on it.
+      "DATABASE_URL=mysql://root@db:3306/pdns?ssl-mode=disabled",
       "RUST_LOG=info"
     ],
     healthcheck: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/healthz"],
@@ -22,7 +23,8 @@ fleet "pdns" {
     image: "crucible-example/pdns-db:0.1",
     ports: { mariadb: 3306 },
     env: ["MARIADB_ALLOW_EMPTY_ROOT_PASSWORD=yes"],
-    healthcheck: ["CMD", "mariadb-admin", "ping", "-h", "127.0.0.1"]
+    // `--skip-ssl` because the client requires TLS unless told otherwise.
+    healthcheck: ["CMD", "mariadb-admin", "ping", "-h", "127.0.0.1", "--skip-ssl"]
   };
 
   // Served by a plugin, so `dns` means whatever the plugin installed under that
