@@ -48,7 +48,7 @@ pub struct Reader {
     direction: Direction,
 }
 
-impl crucible_protocol::Kind for Reader {
+impl crucible_protocol::Protocol for Reader {
     fn carry<'a>(&mut self, bytes: &'a [u8], placing: bool) -> Carried<'a> {
         let (mut wire, messages) = self.read(bytes);
         let mut freeze_after = None;
@@ -298,7 +298,7 @@ impl Reader {
 
 #[cfg(test)]
 mod tests {
-    use crucible_protocol::Kind as _;
+    use crucible_protocol::Protocol as _;
 
     use crate::message::tests::{
         TAG, WAY, ack, closed, connection, consumer, delivered, first_confirm, freeze, marks,

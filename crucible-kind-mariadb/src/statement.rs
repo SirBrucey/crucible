@@ -629,7 +629,7 @@ impl Reader {
     }
 }
 
-impl crucible_protocol::Kind for Reader {
+impl crucible_protocol::Protocol for Reader {
     fn carry<'a>(&mut self, bytes: &'a [u8], placing: bool) -> Carried<'a> {
         let (packets, opaque) = self.read(bytes);
         let mut freeze_after = None;
@@ -678,7 +678,7 @@ impl crucible_protocol::Kind for Reader {
 
 #[cfg(test)]
 mod tests {
-    use crucible_protocol::Kind;
+    use crucible_protocol::Protocol;
 
     use super::*;
 

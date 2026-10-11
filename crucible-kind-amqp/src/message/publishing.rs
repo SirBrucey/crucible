@@ -91,7 +91,7 @@ impl Publishing {
 
 #[cfg(test)]
 mod tests {
-    use crucible_protocol::{Direction, Kind as _};
+    use crucible_protocol::{Direction, Protocol as _};
     use rstest::rstest;
 
     use crate::message::consuming::Consuming;

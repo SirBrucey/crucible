@@ -35,7 +35,7 @@ mod tests {
             AMQPMethod, AMQPProperties, Ack, Cancel, Deliver, GetOk, Nack, Publish, Qos, Recover,
         },
     };
-    use crucible_protocol::{Did, Direction, Kind as _, Placement};
+    use crucible_protocol::{Did, Direction, Placement, Protocol as _};
 
     use super::{
         consuming::Consuming,

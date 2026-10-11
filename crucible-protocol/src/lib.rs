@@ -83,7 +83,7 @@ pub enum Did {
 /// bytes mean is the protocol's business, so it is delegated to the plugin.
 ///
 /// One is made per direction, and holds whatever has not finished arriving.
-pub trait Kind: Send {
+pub trait Protocol: Send {
     /// Take the next bytes off the wire and say what goes on it in their place.
     ///
     /// `placing` says whether a fault may be placed on this connection now:

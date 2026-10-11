@@ -175,7 +175,7 @@ impl Consuming {
 
 #[cfg(test)]
 mod tests {
-    use crucible_protocol::Kind as _;
+    use crucible_protocol::Protocol as _;
     use rstest::rstest;
 
     use crate::message::publishing::Publishing;

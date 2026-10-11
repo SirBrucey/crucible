@@ -11,7 +11,7 @@ use std::{
 };
 
 use crucible_kind::Readers;
-use crucible_protocol::{ConnEvent, ConnId, Direction, Kind};
+use crucible_protocol::{ConnEvent, ConnId, Direction, Protocol};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{
@@ -562,7 +562,7 @@ async fn forward(
 async fn forward_bytes(
     conn: Conn,
     half: Half,
-    mut operations: Box<dyn Kind>,
+    mut operations: Box<dyn Protocol>,
     events: mpsc::UnboundedSender<ConnEvent>,
     mut gate: Gate,
     anchor: Option<Anchor>,
@@ -710,7 +710,7 @@ mod tests {
     /// is what a fault placed before an operation asks for.
     struct Before;
 
-    impl Kind for Before {
+    impl Protocol for Before {
         fn carry<'a>(&mut self, bytes: &'a [u8], _placing: bool) -> crucible_protocol::Carried<'a> {
             crucible_protocol::Carried {
                 forward: vec![std::borrow::Cow::Borrowed(bytes)],
