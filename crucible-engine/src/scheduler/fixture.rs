@@ -16,7 +16,12 @@ pub(super) fn fleet() -> plan::Fleet {
     plan::Fleet {
         name: "f".into(),
         deployment: "docker".into(),
-        services: vec![service("api", "http"), service("db", "mariadb")],
+        // `cache` speaks something no reader understands.
+        services: vec![
+            service("api", "http"),
+            service("db", "mariadb"),
+            service("cache", "redis"),
+        ],
     }
 }
 

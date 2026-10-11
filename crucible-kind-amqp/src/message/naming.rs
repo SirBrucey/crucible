@@ -232,7 +232,7 @@ pub(super) fn drop_confirm(wire: &[Wire<'_>], message: &Message) -> (Option<Rang
 
 #[cfg(test)]
 mod tests {
-    use crucible_protocol::Kind as _;
+    use crucible_protocol::Protocol as _;
 
     use crate::message::consuming::Consuming;
     use crate::message::publishing::Publishing;

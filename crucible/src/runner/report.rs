@@ -250,7 +250,7 @@ const OUTCOMES: [&str; 8] = [
 fn told(verdicts: &BTreeMap<u32, Verdict>, schedule: u32) -> &'static str {
     verdicts
         .get(&schedule)
-        .map_or("Never finished", Verdict::kind)
+        .map_or("Never finished", Verdict::section)
 }
 
 /// The schedules the campaign set out to run, in the order it fitted them.
@@ -279,12 +279,12 @@ fn settled(events: &[RunnerEvent]) -> BTreeMap<u32, Verdict> {
 }
 
 /// Which section of the report a verdict falls under.
-trait Kind {
-    fn kind(&self) -> &'static str;
+trait Section {
+    fn section(&self) -> &'static str;
 }
 
-impl Kind for Verdict {
-    fn kind(&self) -> &'static str {
+impl Section for Verdict {
+    fn section(&self) -> &'static str {
         match self {
             Verdict::Pass => "Passed",
             Verdict::Fail {

@@ -987,6 +987,20 @@ fn report_reach(available: &BTreeSet<Primitive>) {
     }
 }
 
+/// Say which edges a plugin tried to read and could not.
+fn report_unreadable(profiles: &[crucible_protocol::EdgeProfile]) {
+    for profile in profiles {
+        if let Some(why) = &profile.unreadable {
+            let client = profile.edge.client.as_deref().unwrap_or("the driver");
+            tracing::warn!(
+                "`{client} -> {}` could not be read: {why}. Faults on it are anchored on \
+                 counts of its reads, which hold only while its traffic stays the same",
+                profile.edge.upstream
+            );
+        }
+    }
+}
+
 /// Every schedule the campaign will run, in the order it will run them.
 ///
 /// Recovery comes off the top. The bursts take what is left.
@@ -999,6 +1013,7 @@ fn fit(
     concurrency: usize,
 ) -> Chain<RecoveryScheduler, BurstScheduler> {
     report_reach(&learned.primitives);
+    report_unreadable(&learned.profiles);
     let ways = recovery::ways(&learned.primitives);
     let budget = scenario.budget.map(|budget| Budget {
         left: budget.saturating_sub(campaign_start.elapsed()),

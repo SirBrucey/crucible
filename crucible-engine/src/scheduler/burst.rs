@@ -83,11 +83,27 @@ impl Point<'_> {
     }
 }
 
+/// Whether a reader understands what `upstream` speaks.
+fn reads(fleet: &plan::Fleet, upstream: &str) -> bool {
+    fleet
+        .services
+        .iter()
+        .find(|service| service.name == upstream)
+        .is_some_and(|service| {
+            service
+                .kinds
+                .iter()
+                .any(|kind| crucible_kind::is_read(kind))
+        })
+}
+
 /// Where a fault can go on `profile`, in the order the points should be spent.
 ///
 /// Where nothing read the edge, a fault goes by the middle of a burst first
-/// and its edges after.
-fn points_on(profile: &EdgeProfile) -> Vec<Point<'_>> {
+/// and its edges after. `read` says a reader understands this edge's
+/// protocol. One that understood an edge and named no moment has said there is
+/// nothing there to fault, so its bursts are left alone.
+fn points_on(profile: &EdgeProfile, read: bool) -> Vec<Point<'_>> {
     if !profile.placements.is_empty() {
         return one_per_name(
             profile
@@ -105,6 +121,10 @@ fn points_on(profile: &EdgeProfile) -> Vec<Point<'_>> {
                 })
                 .collect(),
         );
+    }
+
+    if read && profile.unreadable.is_none() {
+        return Vec::new();
     }
 
     // Per burst, in preference order, then transposed so every burst gets its
@@ -298,7 +318,11 @@ impl BurstScheduler {
 
         // Interleaved, so an edge's second point comes after every edge's
         // first.
-        let on_edge: Vec<Vec<Point<'_>>> = learned.profiles.iter().map(points_on).collect();
+        let on_edge: Vec<Vec<Point<'_>>> = learned
+            .profiles
+            .iter()
+            .map(|profile| points_on(profile, reads(fleet, &profile.edge.upstream)))
+            .collect();
         let inside = points_inside(&learned.inside);
         let found: usize = on_edge.iter().map(Vec::len).sum::<usize>() + inside.len();
         let mut by_edge: Vec<Point<'_>> = Vec::with_capacity(found);
@@ -581,11 +605,25 @@ mod tests {
             "commit:1:before",
             "commit:2:before",
         ]);
-        let marks: Vec<String> = points_on(&profile)
+        let marks: Vec<String> = points_on(&profile, true)
             .into_iter()
             .map(|point| point.mark)
             .collect();
         assert_eq!(marks, ["commit:1:before", "commit:2:before"]);
+    }
+
+    #[test]
+    fn an_edge_a_reader_read_and_named_nothing_on_offers_no_points() {
+        let profile = profile("db", vec![burst(0, 4)], vec![burst(0, 4)]);
+        assert!(points_on(&profile, true).is_empty());
+        assert!(!points_on(&profile, false).is_empty());
+    }
+
+    #[test]
+    fn an_edge_a_reader_gave_up_on_still_offers_its_bursts() {
+        let mut profile = profile("db", vec![burst(0, 4)], vec![burst(0, 4)]);
+        profile.unreadable = Some("the connection is encrypted".to_owned());
+        assert!(!points_on(&profile, true).is_empty());
     }
 
     /// Bursts do not overlap, but adjacent ones meet at a read they share: a
@@ -594,7 +632,7 @@ mod tests {
     #[test]
     fn a_read_two_bursts_share_is_offered_once() {
         let profile = profile("db", vec![burst(0, 2), burst(1, 2)], vec![]);
-        let marks: Vec<String> = points_on(&profile)
+        let marks: Vec<String> = points_on(&profile, false)
             .into_iter()
             .map(|point| point.mark)
             .collect();
@@ -625,6 +663,7 @@ mod tests {
     fn from(client: Option<&str>, upstream: &str, c2u: Vec<Burst>, u2c: Vec<Burst>) -> EdgeProfile {
         EdgeProfile {
             placements: Vec::new(),
+            unreadable: None,
             edge: Edge {
                 client: client.map(ToOwned::to_owned),
                 upstream: upstream.into(),
@@ -805,7 +844,7 @@ mod tests {
     #[test]
     fn a_short_budget_reaches_the_moments_inside_services() {
         let learned = Learned {
-            profiles: vec![profile("db", vec![burst(0, 4), burst(1, 4)], vec![])],
+            profiles: vec![profile("cache", vec![burst(0, 4), burst(1, 4)], vec![])],
             fault_free: crucible_core::verdict::Baseline::default(),
             inside: vec![reached("api", "publish", Side::Started, 1)],
             primitives: BTreeSet::from([Primitive::Kill]),
@@ -829,7 +868,7 @@ mod tests {
     #[test]
     fn a_fleet_that_reports_nothing_is_still_scheduled_from_its_edges() {
         let learned = Learned {
-            profiles: vec![profile("db", vec![burst(0, 4)], vec![])],
+            profiles: vec![profile("cache", vec![burst(0, 4)], vec![])],
             fault_free: crucible_core::verdict::Baseline::default(),
             inside: Vec::new(),
             primitives: BTreeSet::from([Primitive::Kill]),
@@ -843,7 +882,7 @@ mod tests {
     #[test]
     fn nothing_testable_yields_nothing() {
         let learned = Learned {
-            profiles: vec![profile("db", vec![burst(0, 4)], vec![])],
+            profiles: vec![profile("cache", vec![burst(0, 4)], vec![])],
             fault_free: crucible_core::verdict::Baseline::default(),
             inside: Vec::new(),
             primitives: BTreeSet::new(),
@@ -865,7 +904,7 @@ mod tests {
     /// five between them.
     #[test]
     fn an_unbounded_campaign_faults_every_point_of_every_burst() {
-        let s = scheduler(&[profile("db", vec![burst(1, 4), burst(2, 4)], vec![])]);
+        let s = scheduler(&[profile("cache", vec![burst(1, 4), burst(2, 4)], vec![])]);
         assert_eq!(s.total(), 5);
         assert_eq!(s.coverage().taken, 5, "every point of both bursts");
     }
@@ -874,7 +913,7 @@ mod tests {
     /// has driven anything across the edge, so that point is not placeable.
     #[test]
     fn the_first_burst_on_an_edge_offers_no_start() {
-        let s = scheduler(&[profile("db", vec![burst(0, 4)], vec![])]);
+        let s = scheduler(&[profile("cache", vec![burst(0, 4)], vec![])]);
         assert_eq!(s.total(), 2);
     }
 
@@ -882,7 +921,7 @@ mod tests {
     #[test]
     fn every_way_of_breaking_the_fleet_gets_its_own_schedule() {
         let s = driven(
-            &[from(Some("api"), "db", vec![burst(1, 4)], vec![])],
+            &[from(Some("api"), "cache", vec![burst(1, 4)], vec![])],
             &[Primitive::Kill, Primitive::Cut],
             None,
         );
@@ -891,7 +930,7 @@ mod tests {
 
     #[test]
     fn both_directions_are_scheduled() {
-        let scheduler = scheduler(&[profile("db", vec![burst(0, 1)], vec![burst(0, 1)])]);
+        let scheduler = scheduler(&[profile("cache", vec![burst(0, 1)], vec![burst(0, 1)])]);
         let all: Vec<_> = std::iter::from_fn({
             let mut s = scheduler;
             move || s.next()
@@ -911,7 +950,7 @@ mod tests {
     fn emission_is_round_robin_across_edges() {
         let scheduler = scheduler(&[
             profile("api", vec![burst(0, 1)], vec![]),
-            profile("db", vec![burst(0, 1)], vec![]),
+            profile("cache", vec![burst(0, 1)], vec![]),
         ]);
         let first_two: Vec<String> = std::iter::from_fn({
             let mut s = scheduler;
@@ -921,7 +960,7 @@ mod tests {
         .filter_map(|s| fault(&s).reaches.edge().map(|e| e.upstream.clone()))
         .collect();
         assert!(first_two.contains(&"api".to_string()));
-        assert!(first_two.contains(&"db".to_string()));
+        assert!(first_two.contains(&"cache".to_string()));
     }
 
     /// What each schedule takes away.
@@ -1011,7 +1050,7 @@ mod tests {
         let profiles = [
             from(
                 Some("api"),
-                "db",
+                "cache",
                 vec![burst(1, 900), burst(2, 800)],
                 vec![],
             ),
@@ -1032,7 +1071,7 @@ mod tests {
     fn the_edge_the_scenario_drives_is_spent_last() {
         let profiles = [
             profile("api", vec![burst(1, 4)], vec![]),
-            from(Some("api"), "db", vec![burst(1, 4)], vec![]),
+            from(Some("api"), "cache", vec![burst(1, 4)], vec![]),
         ];
         let mut scheduler = driven(&profiles, &[Primitive::Kill], None);
 
@@ -1092,7 +1131,7 @@ mod tests {
     #[test]
     fn a_burst_is_only_a_place_to_hold_the_fleet() {
         let s = driven(
-            &[profile("db", vec![burst(1, 4)], vec![])],
+            &[profile("cache", vec![burst(1, 4)], vec![])],
             &[Primitive::Kill, Primitive::Drop],
             None,
         );
@@ -1126,12 +1165,12 @@ mod tests {
     #[test]
     fn a_cut_takes_the_edge_itself() {
         let taken = taken(driven(
-            &[from(Some("api"), "db", vec![burst(1, 4)], vec![])],
+            &[from(Some("api"), "cache", vec![burst(1, 4)], vec![])],
             &[Primitive::Cut],
             None,
         ));
         assert!(
-            taken.iter().all(|target| target == "api -> db"),
+            taken.iter().all(|target| target == "api -> cache"),
             "{taken:?}"
         );
     }
@@ -1139,7 +1178,7 @@ mod tests {
     #[test]
     fn a_budget_that_affords_one_point_takes_the_middle_of_each_burst() {
         let s = driven(
-            &[profile("db", vec![burst(0, 4), burst(1, 4)], vec![])],
+            &[profile("cache", vec![burst(0, 4), burst(1, 4)], vec![])],
             &[Primitive::Kill],
             Some(2),
         );
@@ -1159,7 +1198,7 @@ mod tests {
     #[test]
     fn a_second_point_lands_on_the_boundary_the_service_is_on() {
         let s = driven(
-            &[profile("db", vec![burst(1, 4)], vec![burst(1, 4)])],
+            &[profile("cache", vec![burst(1, 4)], vec![burst(1, 4)])],
             &[Primitive::Kill],
             Some(4),
         );
@@ -1180,7 +1219,7 @@ mod tests {
     #[test]
     fn a_budget_below_one_point_per_burst_keeps_the_busiest() {
         let s = driven(
-            &[profile("db", vec![burst(0, 1), burst(1, 9)], vec![])],
+            &[profile("cache", vec![burst(0, 1), burst(1, 9)], vec![])],
             &[Primitive::Kill],
             Some(1),
         );
@@ -1195,7 +1234,7 @@ mod tests {
     #[test]
     fn recovery_takes_no_share_of_what_the_bursts_are_fitted_to() {
         let s = driven(
-            &[profile("db", vec![burst(1, 4), burst(2, 4)], vec![])],
+            &[profile("cache", vec![burst(1, 4), burst(2, 4)], vec![])],
             &[Primitive::Kill],
             Some(5),
         );
@@ -1206,7 +1245,7 @@ mod tests {
     #[test]
     fn covering_both_ways_of_breaking_the_fleet_comes_before_more_points() {
         let s = driven(
-            &[from(Some("api"), "db", vec![burst(0, 4)], vec![])],
+            &[from(Some("api"), "cache", vec![burst(0, 4)], vec![])],
             &[Primitive::Kill, Primitive::Cut],
             Some(3),
         );

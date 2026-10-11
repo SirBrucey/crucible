@@ -5,7 +5,7 @@ pub const NAME: &str = "amqp";
 
 pub mod message;
 
-use crucible_protocol::{Direction, Kind};
+use crucible_protocol::{Direction, Protocol};
 
 /// A reader for each direction of one connection, watching for `mark` on
 /// whichever direction carries it.
@@ -13,10 +13,10 @@ use crucible_protocol::{Direction, Kind};
 /// Made as a pair, because the two directions have to agree. A delivery and its
 /// ack cross opposite ways, so neither reader sees both.
 #[must_use]
-pub fn readers(watching: Option<&(Direction, String)>) -> (Box<dyn Kind>, Box<dyn Kind>) {
+pub fn readers(watching: Option<&(Direction, String)>) -> (Box<dyn Protocol>, Box<dyn Protocol>) {
     let consuming = message::Consuming::default();
     let publishing = message::Publishing::default();
-    let reader = |direction: Direction| -> Box<dyn Kind> {
+    let reader = |direction: Direction| -> Box<dyn Protocol> {
         let mark = watching
             .filter(|(way, _)| *way == direction)
             .map(|(_, mark)| mark.clone());

@@ -8,6 +8,7 @@ license.workspace = true
 
 [dependencies]
 crucible-core = { path = "../crucible-core" }
+crucible-kind = { path = "../crucible-kind" }
 crucible-plugin = { path = "../crucible-plugin", features = ["framework"] }
 crucible-protocol = { path = "../crucible-protocol" }
 serde = { workspace = true }

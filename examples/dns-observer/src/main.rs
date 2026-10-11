@@ -15,7 +15,8 @@ use hickory_resolver::{
     config::{
         ConnectionConfig, LookupIpStrategy, NameServerConfig, ProtocolConfig, ResolverConfig,
     },
-    net::{NetError, runtime::TokioRuntimeProvider},
+    net::{DnsError, NetError, runtime::TokioRuntimeProvider},
+    proto::op::ResponseCode,
 };
 
 /// Reads the address a nameserver answers with.
@@ -130,9 +131,15 @@ impl Lookup {
         // A name that is not there is something the nameserver answered, not
         // a failure to ask it: a scenario that expected an address wants to be
         // told it is absent rather than told the reading could not be taken.
+        //
+        // Two answers say it is not there: the name absent from a zone the
+        // server holds, and the server holding no such zone, which it says by
+        // refusing. Anything else is a failure to ask.
         let answer = match resolver.lookup_ip(&self.host).await {
             Ok(answer) => answer,
-            Err(source) if source.is_no_records_found() => return Ok(plan::Value::Null),
+            Err(source) if source.is_no_records_found() || refused(&source) => {
+                return Ok(plan::Value::Null);
+            }
             Err(source) => {
                 return Err(Error::Unresolved {
                     host: self.host.clone(),
@@ -146,8 +153,52 @@ impl Lookup {
     }
 }
 
+/// Whether the nameserver refused the query, which it does for a zone it does
+/// not hold.
+fn refused(source: &NetError) -> bool {
+    matches!(
+        source,
+        NetError::Dns(DnsError::ResponseCode(ResponseCode::Refused))
+    )
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     crucible_plugin::serve_observer::<Dns>().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use hickory_resolver::proto::op::Query;
+
+    use super::*;
+
+    #[test]
+    fn a_refused_query_is_an_answer_that_the_name_is_absent() {
+        assert!(refused(&NetError::Dns(DnsError::ResponseCode(
+            ResponseCode::Refused
+        ))));
+    }
+
+    #[test]
+    fn nothing_else_counts_as_an_answer() {
+        for other in [
+            NetError::Dns(DnsError::ResponseCode(ResponseCode::ServFail)),
+            NetError::Dns(DnsError::ResponseCode(ResponseCode::NXDomain)),
+            NetError::Busy,
+            NetError::Timeout,
+        ] {
+            assert!(!refused(&other), "{other:?}");
+        }
+    }
+
+    #[test]
+    fn a_name_missing_from_a_zone_is_still_an_absence() {
+        let missing = NetError::Dns(DnsError::NoRecordsFound(
+            hickory_resolver::net::NoRecords::new(Query::new(), ResponseCode::NXDomain),
+        ));
+        assert!(missing.is_no_records_found());
+        assert!(!refused(&missing));
+    }
 }

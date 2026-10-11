@@ -15,6 +15,7 @@ struct Pending {
     peer: String,
     writes: Vec<WriteRecord>,
     placements: Vec<Found>,
+    unreadable: Option<String>,
 }
 
 /// Sessions observed across a Learn run.
@@ -49,6 +50,7 @@ impl Sessions {
                         peer: peer.to_string(),
                         writes: Vec::new(),
                         placements: Vec::new(),
+                        unreadable: None,
                     },
                 );
             }
@@ -71,7 +73,7 @@ impl Sessions {
                         closed_ns: Some(ts_ns),
                         writes: pending.writes,
                         placements: pending.placements,
-                        unreadable: None,
+                        unreadable: pending.unreadable,
                     });
                 }
             }
@@ -87,6 +89,13 @@ impl Sessions {
             ConnEventKind::Placeable { placement } => {
                 if let Some(pending) = self.opened.get_mut(&(service.to_string(), id)) {
                     pending.placements.push(Found { ts_ns, placement });
+                }
+            }
+            // Both halves of a connection report it, and they agree, so the
+            // first to say so is kept.
+            ConnEventKind::Unreadable { why } => {
+                if let Some(pending) = self.opened.get_mut(&(service.to_string(), id)) {
+                    pending.unreadable.get_or_insert(why);
                 }
             }
             // What the fault did, not part of a session's byte accounting;
@@ -168,6 +177,7 @@ pub fn edge_profiles_from_sessions<S: std::hash::BuildHasher>(
     let mut live: BTreeMap<Edge, (Vec<Packet>, Vec<Packet>)> = BTreeMap::new();
     // Where the plugins reading each edge said a fault could go.
     let mut placeable: BTreeMap<Edge, Vec<Placement>> = BTreeMap::new();
+    let mut unreadable: BTreeMap<Edge, String> = BTreeMap::new();
     for session in sessions {
         let edge = Edge {
             client: client_of(session, addresses),
@@ -184,6 +194,11 @@ pub fn edge_profiles_from_sessions<S: std::hash::BuildHasher>(
             .collect();
         if !drove.is_empty() {
             placeable.entry(edge.clone()).or_default().extend(drove);
+        }
+        if let Some(why) = &session.unreadable {
+            unreadable
+                .entry(edge.clone())
+                .or_insert_with(|| why.clone());
         }
         for write in &session.writes {
             let scenario = scenario_start_ns..steps_settled_ns;
@@ -242,6 +257,7 @@ pub fn edge_profiles_from_sessions<S: std::hash::BuildHasher>(
                 client_to_upstream,
                 upstream_to_client,
                 placements,
+                unreadable: unreadable.get(&edge).cloned(),
                 edge,
             }
         })
@@ -458,7 +474,7 @@ impl IntoIterator for Sessions {
                 closed_ns: None,
                 writes: pending.writes,
                 placements: pending.placements,
-                unreadable: None,
+                unreadable: pending.unreadable,
             });
         }
         self.finished
@@ -853,6 +869,31 @@ mod tests {
         assert_eq!(profile.placements.len(), 1);
         assert!(profile.client_to_upstream.is_empty());
         assert!(profile.upstream_to_client.is_empty());
+    }
+
+    #[test]
+    fn an_edge_a_plugin_could_not_read_says_so_and_keeps_its_bursts() {
+        let mut session = calling("10.0.0.1", "db", &[100, 200, 300]);
+        session.unreadable = Some("the connection is encrypted".to_owned());
+        let profiles = edge_profiles_from_sessions(&[session], timing(0), &HashMap::new(), &[]);
+
+        let profile = profiles.first().expect("the edge was seen");
+        assert_eq!(
+            profile.unreadable.as_deref(),
+            Some("the connection is encrypted")
+        );
+        assert!(profile.placements.is_empty());
+        assert!(!profile.client_to_upstream.is_empty());
+    }
+
+    #[test]
+    fn an_edge_nothing_tried_to_read_gives_no_reason() {
+        let session = calling("10.0.0.1", "db", &[100, 200, 300]);
+        let profiles = edge_profiles_from_sessions(&[session], timing(0), &HashMap::new(), &[]);
+
+        let profile = profiles.first().expect("the edge was seen");
+        assert_eq!(profile.unreadable, None);
+        assert!(!profile.client_to_upstream.is_empty());
     }
 
     #[test]

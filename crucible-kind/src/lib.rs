@@ -7,7 +7,7 @@
 
 use std::borrow::Cow;
 
-use crucible_protocol::{Carried, Direction, Kind};
+use crucible_protocol::{Carried, Direction, Protocol};
 
 /// What reads one pair's traffic, watching for a moment if a schedule named
 /// one.
@@ -26,8 +26,8 @@ pub struct Kinds {
 /// Both directions of one connection, read by things that agree with each
 /// other and with no other connection.
 pub struct Readers {
-    pub client_to_upstream: Box<dyn Kind>,
-    pub upstream_to_client: Box<dyn Kind>,
+    pub client_to_upstream: Box<dyn Protocol>,
+    pub upstream_to_client: Box<dyn Protocol>,
 }
 
 impl Kinds {
@@ -105,7 +105,7 @@ struct Unread {
     watching: bool,
 }
 
-impl Kind for Unread {
+impl Protocol for Unread {
     // It cannot read the traffic, so it cannot change it either, and whether a
     // fault may be placed here is not its business.
     fn carry<'a>(&mut self, bytes: &'a [u8], _placing: bool) -> Carried<'a> {

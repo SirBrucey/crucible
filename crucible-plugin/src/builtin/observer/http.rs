@@ -200,7 +200,12 @@ impl Read {
         for (name, value) in &self.headers {
             request = request.header(name, value);
         }
-        let body = request.send().await?.text().await?;
+        let response = request.send().await?;
+        // A path the service does not have is something it answered.
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(plan::Value::Null);
+        }
+        let body = response.text().await?;
 
         let answer: serde_json::Value =
             serde_json::from_str(&body).map_err(|_| Error::NotJson(self.get.path.clone()))?;
@@ -326,6 +331,50 @@ mod tests {
         let answer: serde_json::Value = serde_json::json!({"count": "3"});
         let found = JsonPath::parse("$.count").unwrap().query(&answer).all();
         assert_eq!(reading(found[0]), Some(plan::Value::Str("3".into())));
+    }
+
+    #[tokio::test]
+    async fn a_path_the_service_does_not_have_reads_as_absent() {
+        let answered = answering("HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\r\n").await;
+        assert_eq!(reader().take(answered).await.ok(), Some(plan::Value::Null));
+    }
+
+    #[tokio::test]
+    async fn an_answer_that_is_not_json_is_still_not_a_reading() {
+        let answered = answering("HTTP/1.1 200 OK\r\ncontent-length: 11\r\n\r\nnot at all!").await;
+        assert!(matches!(
+            reader().take(answered).await,
+            Err(Error::NotJson(_))
+        ));
+    }
+
+    /// A reading bound to the zone metadata this fleet asks for.
+    fn reader() -> Read {
+        Read {
+            get: Http::bind(&check("/api/v1/zones/x/metadata", Some("$[0].kind"))).expect("binds"),
+            headers: Vec::new(),
+            client: Client::new(),
+        }
+    }
+
+    /// A server that answers `response` once, and where to reach it.
+    async fn answering(response: &'static str) -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("a port");
+        let endpoint = listener.local_addr().expect("an address");
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("a connection");
+            let mut read = [0u8; 1024];
+            let asked = stream.read(&mut read).await.expect("the request arrives");
+            assert!(asked > 0, "the reader sent a request");
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("the answer is written");
+        });
+        endpoint
     }
 
     #[test]

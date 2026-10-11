@@ -535,6 +535,16 @@ impl Reader {
         (packets, Vec::new())
     }
 
+    /// Count a transaction's occurrences from the scenario rather than from
+    /// the connection.
+    ///
+    /// Only the counts, because `read` says whether a packet is the handshake
+    /// and zeroing it would make the next packet look like one. A transaction
+    /// already open stays open.
+    fn restart_counts(&mut self) {
+        self.seen.clear();
+    }
+
     /// Where a fault could go either side of a commit.
     fn either_side(&self, at: (Identity, u32), sent: &str) -> [(Side, Placement); 2] {
         let (identity, nth) = at;
@@ -629,7 +639,7 @@ impl Reader {
     }
 }
 
-impl crucible_protocol::Kind for Reader {
+impl crucible_protocol::Protocol for Reader {
     fn carry<'a>(&mut self, bytes: &'a [u8], placing: bool) -> Carried<'a> {
         let (packets, opaque) = self.read(bytes);
         let mut freeze_after = None;
@@ -671,14 +681,29 @@ impl crucible_protocol::Kind for Reader {
             freeze_after,
             found,
             did: None,
-            unreadable: None,
+            unreadable: self
+                .shared
+                .encrypted
+                .load(Ordering::Relaxed)
+                .then_some(ENCRYPTED),
         }
+    }
+
+    fn scenario_started(&mut self) {
+        self.restart_counts();
     }
 }
 
+/// Why no moment is named on an encrypted connection.
+///
+/// The client asks for TLS in its first packet, and everything after it is
+/// ciphertext.
+const ENCRYPTED: &str = "the client asked the server for TLS, so every packet after the handshake \
+                         is encrypted and no statement or commit can be read from it";
+
 #[cfg(test)]
 mod tests {
-    use crucible_protocol::Kind;
+    use crucible_protocol::Protocol;
 
     use super::*;
 
@@ -1098,6 +1123,67 @@ mod tests {
     }
 
     #[test]
+    fn an_encrypted_connection_says_why_it_can_be_read_no_further() {
+        let (mut client, mut server) = pair(None);
+        let asks_for_tls = answers_greeting(CLIENT_SSL);
+        assert!(
+            client
+                .carry(&asks_for_tls, false)
+                .unreadable
+                .is_some_and(|why| why.contains("TLS")),
+            "the packet asking for TLS is the one that says so"
+        );
+        // Both halves of the connection say it, since both are now ciphertext.
+        let ciphertext = [0x16, 0x03, 0x03, 0x00, 0x01, 9];
+        assert!(server.carry(&ciphertext, false).unreadable.is_some());
+    }
+
+    #[test]
+    fn a_connection_read_normally_gives_no_reason() {
+        let (mut client, _) = pair(None);
+        assert!(
+            client
+                .carry(&answers_greeting(0), false)
+                .unreadable
+                .is_none()
+        );
+        assert!(client.carry(&query("COMMIT"), false).unreadable.is_none());
+    }
+
+    #[test]
+    fn commits_are_numbered_from_the_scenario_and_not_the_connection() {
+        let mut client = committing(None);
+        // Two of the same transaction while the fleet comes up.
+        for _ in 0..2 {
+            client.carry(&query("COMMIT"), false);
+            client.carry(&wrote(), false);
+        }
+        client.scenario_started();
+        let marks: Vec<String> = client
+            .carry(&query("COMMIT"), false)
+            .found
+            .into_iter()
+            .map(|placement| placement.mark)
+            .collect();
+        assert!(marks[0].ends_with(":1:before"), "{marks:?}");
+        assert!(marks[1].ends_with(":1:after"), "{marks:?}");
+    }
+
+    #[test]
+    fn the_scenario_starting_does_not_make_the_next_packet_a_handshake() {
+        let (mut client, _) = pair(None);
+        client.carry(&answers_greeting(0), false);
+        client.scenario_started();
+        // A client only asks for TLS in its first packet. This is not one, so
+        // whatever it holds, the connection stays readable.
+        client.carry(&answers_greeting(CLIENT_SSL), false);
+        assert!(
+            client.carry(&query("COMMIT"), false).unreadable.is_none(),
+            "a mid-connection packet was taken for a TLS request"
+        );
+    }
+
+    #[test]
     fn a_connection_the_client_leaves_alone_is_read_normally() {
         let mut client = committing(None);
         assert_eq!(client.carry(&query("COMMIT"), false).found.len(), 2);
@@ -1183,6 +1269,7 @@ mod tests {
     fn a_placement_names_the_wire_event(
         #[case] statement: &str,
         #[case] names: &str,
+        // Whether a transaction is open.
         #[case] open: bool,
     ) {
         let sent = query(statement);

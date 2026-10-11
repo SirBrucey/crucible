@@ -8,7 +8,7 @@ pub mod statement;
 
 use std::sync::Arc;
 
-use crucible_protocol::{Direction, Kind};
+use crucible_protocol::{Direction, Protocol};
 
 /// A reader for each direction of one connection, watching for `mark` on
 /// whichever direction carries it.
@@ -16,9 +16,9 @@ use crucible_protocol::{Direction, Kind};
 /// Made as a pair, because the two directions have to agree about whether the
 /// connection was encrypted and what the client put by to run later.
 #[must_use]
-pub fn readers(watching: Option<&(Direction, String)>) -> (Box<dyn Kind>, Box<dyn Kind>) {
+pub fn readers(watching: Option<&(Direction, String)>) -> (Box<dyn Protocol>, Box<dyn Protocol>) {
     let shared = Arc::new(statement::Shared::default());
-    let reader = |direction: Direction| -> Box<dyn Kind> {
+    let reader = |direction: Direction| -> Box<dyn Protocol> {
         let mark = watching
             .filter(|(way, _)| *way == direction)
             .map(|(_, mark)| mark.clone());
