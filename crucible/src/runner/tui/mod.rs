@@ -151,10 +151,18 @@ pub fn watching(
 
 /// Hand the report to whatever the desktop opens Markdown with.
 ///
-/// The campaign is over by the time this is offered, so a viewer that takes the
-/// terminal does no harm.
+/// The campaign is over and the report is written by the time this is offered,
+/// so a viewer that takes the terminal does no harm.
 fn open(report: &std::path::Path) {
-    if let Err(e) = std::process::Command::new("xdg-open").arg(report).spawn() {
+    // Silenced because the screen is in raw mode: whatever the opener has to
+    // say would land on top of it.
+    let spawned = std::process::Command::new("xdg-open")
+        .arg(report)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    if let Err(e) = spawned {
         tracing::warn!(error = %e, path = %report.display(), "cannot open the report");
     }
 }
@@ -311,7 +319,7 @@ impl Screen {
             return false;
         }
         if let (KeyCode::Char('o' | 'O'), Screen::Dispatching(state)) = (key.code, &*self) {
-            if state.stage.over {
+            if state.readable() {
                 open(&state.report);
             }
             return false;
@@ -393,11 +401,13 @@ pub fn dispatch(frame: &mut Frame, state: &mut State<Dispatching>) {
     if state.stage.helping {
         frame.render_widget(panels::Help, frame.area());
     }
-    let keys = if state.stage.over {
+    let keys = if state.readable() {
         format!(
             " report: {}  ·  [o]pen  ↑↓←→ select  ↵ journal  [q]uit",
             state.report.display()
         )
+    } else if state.stage.over {
+        " writing the report  ·  ↑↓←→ select  ↵ journal  [q]uit".to_owned()
     } else if state.stage.held {
         " held · [p] resume  [s]kip  [S] finish  ↑↓ select  [q]uit".to_owned()
     } else {
@@ -644,6 +654,20 @@ mod tests {
             unreachable!("built as dispatching")
         };
         assert!(state.stage.over);
+    }
+
+    #[test]
+    fn the_report_is_offered_once_it_is_on_disk() {
+        let mut state = example();
+        state.report = std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"));
+        assert!(!state.readable(), "the campaign is still running");
+
+        state.stage.over = true;
+        assert!(state.readable());
+
+        state.report =
+            std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/no-such-report.md"));
+        assert!(!state.readable(), "the report has not been written yet");
     }
 
     #[test]

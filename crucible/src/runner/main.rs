@@ -294,26 +294,33 @@ async fn run(
     let workload = drive(&bus, plan, &interrupt, &controls).await;
 
     drop(bus);
+    // The journal closes with the bus, so it flushes while the screen is still
+    // up. The screen offers to open the report as soon as the campaign is over,
+    // and the file has to be there by then.
+    let journalled = journal_task.await.expect("journal task should not panic");
+    if journalled.is_ok() {
+        let scenario = plan
+            .scenarios
+            .first()
+            .map_or("campaign", |s| s.name.as_str());
+        if let Err(e) = report::write(&journal_path, &report_path, scenario).await {
+            tracing::error!(error = %e, path = %report_path.display(), "cannot write the run's report");
+        } else {
+            tracing::info!(path = %report_path.display(), "report written");
+        }
+    }
+
     if let Some(screen) = screen {
         // A panicked screen leaves the terminal in raw mode.
         if let Err(e) = screen.await {
             tracing::error!(error = %e, "the screen stopped badly; the terminal may need a reset");
         }
     }
-    journal_task.await.expect("journal task should not panic")?;
+    // Raised with the screen down, so the error reaches a terminal that is out
+    // of raw mode.
+    journalled?;
     let _ = observer_task.await;
     cleanup_sockets();
-
-    // Written from the journal, so it waits for the journal to be flushed.
-    let scenario = plan
-        .scenarios
-        .first()
-        .map_or("campaign", |s| s.name.as_str());
-    if let Err(e) = report::write(&journal_path, &report_path, scenario).await {
-        tracing::error!(error = %e, path = %report_path.display(), "cannot write the run's report");
-    } else {
-        tracing::info!(path = %report_path.display(), "report written");
-    }
 
     workload
 }

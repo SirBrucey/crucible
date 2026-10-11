@@ -107,6 +107,11 @@ impl State<Dispatching> {
         found(&self.stage.schedules)
     }
 
+    /// Whether the campaign has finished and its report is on disk.
+    pub fn readable(&self) -> bool {
+        self.stage.over && self.report.is_file()
+    }
+
     /// The selected row, from whichever list is being looked through.
     pub fn showing(&self) -> Option<&Row> {
         match self.stage.looking {
