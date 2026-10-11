@@ -831,6 +831,7 @@ name = "crucible-engine"
 version = "0.1.0"
 dependencies = [
  "crucible-core",
+ "crucible-kind",
  "crucible-plugin",
  "crucible-protocol",
  "futures-util",
