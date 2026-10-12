@@ -19,7 +19,8 @@ proxy fronting it reads the wire protocols it knows.
 
 ## What you need
 
-- A Rust stable toolchain. Built and tested on 1.97.1.
+- A Rust toolchain from rustup, 1.97 or newer. Built and tested on 1.97.1.
+  Debian's packaged `rustc` is older than the dependency set needs.
 - Docker, with the daemon running and your user able to reach it. Tested on
   26.1.5. A campaign brings containers up and tears them down, and it leaves
   nothing behind on a clean exit.
@@ -93,8 +94,24 @@ the textbook remedy for that fault. `diff -r 1_base 2_outbox` is the change
 itself. Each has its own `build.sh`, and `examples/orders/README.md` works
 through the sequence.
 
-`examples/pdns` is a second fleet around an off-the-shelf nameserver, built
-the same way.
+`examples/pdns` is a second fleet around an off-the-shelf nameserver. Its
+scenario reads what the nameserver answers, which needs a plugin that is not a
+built-in, so it takes two more steps:
+
+```
+examples/pdns/build.sh
+cargo build --release --manifest-path examples/dns-observer/Cargo.toml
+mkdir -p ~/.local/share/crucible/plugins
+cp examples/dns-observer/target/release/crucible-observer-dns \
+   ~/.local/share/crucible/plugins/
+./target/release/crucible run examples/pdns/pdns.cru
+```
+
+A plugin is an executable under `~/.local/share/crucible/plugins` or
+`/usr/lib/crucible/plugins`. The framework asks each one what its capabilities
+are. `examples/dns-observer` is its own workspace and only depends on
+`crucible-plugin`, which is an example of how a third party plugin would be
+authored.
 
 ## Architecture
 
